@@ -47,11 +47,14 @@ ASK = """A neuron in a language model has this explanation of its {pole} side:
 {explanation}
 
 Write JSON with these fields, nothing else:
-"max_texts": {blind} different texts of 1 to 3 sentences, each written to drive this side of the neuron as strongly as possible;
+"max_texts": {blind} different texts of {blind_len}, each written to drive this side of the neuron as strongly as possible;
 "near_misses": {near} texts on closely related subjects that, by the explanation, should NOT drive it;
 "distant_concept": the concept farthest from what the explanation describes;
 "distant_texts": {distant} texts about that distant concept;
 "steering_prediction": one sentence saying what the model would write if this side of the neuron were turned up strongly while it continues ordinary prompts."""
+
+BLIND_LEN = {"short": "1 to 3 sentences",  # T1's pre-registered blind text
+             "long": "up to about 150 tokens (a passage that may set up the context the explanation describes)"}
 
 JUDGE = """Prediction of how a language model's writing changes when one of its neurons is turned up:
 {prediction}
@@ -226,21 +229,23 @@ def _proposal(plan):
     return groups
 
 
-def _responses(rd, asks, max_tokens):
-    replies=rd(asks,max_tokens=max_tokens)
+def _responses(rd, asks, max_tokens, **sampling):
+    replies=rd(asks,max_tokens=max_tokens,**sampling)
     if not isinstance(replies,(list,tuple)) or len(replies)!=len(asks) or any(not isinstance(x,str) for x in replies):
         raise ValueError("reader response count/type must exactly match requests")
     return list(replies)
 
 
-def plan(rd, items: list[dict]) -> list[dict]:
-    """The reader's test texts for each item (ASK), parsed and validated (_proposal); an invalid proposal stays an
-    explicit failure that cannot earn T1 credit."""
+def plan(rd, items: list[dict], length: str = "short", temperature: float = 0.0, seed: int | None = None) -> list[dict]:
+    """The reader's test texts for each item (ASK, blind texts of BLIND_LEN[length]), parsed and validated (_proposal); an
+    invalid proposal stays an explicit failure that cannot earn T1 credit. temperature > 0 with a seed draws a fresh set
+    (texts the explanation's writer never saw)."""
     source_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
     asked=[it for it in items if it.get("writer_valid") is not False]  # t1_audit explain's failures get no reader call
     asks=[ASK.format(pole="positive" if it["pole"]=="+" else "negative",explanation=it["explanation"],
-                     blind=BLIND,near=NEAR,distant=DISTANT) for it in asked]
-    replies=iter(zip(asks,_responses(rd,asks,1500) if asks else []))
+                     blind=BLIND,blind_len=BLIND_LEN[length],near=NEAR,distant=DISTANT) for it in asked]
+    sampling={"temperature":temperature,"seed":seed} if temperature else {}
+    replies=iter(zip(asks,_responses(rd,asks,1500,**sampling) if asks else []))
     rows=[]
     for it in items:
         if it.get("writer_valid") is False:
@@ -252,7 +257,8 @@ def plan(rd, items: list[dict]) -> list[dict]:
         row={k:it[k] for k in ("layer","index","pole","corpus_max","explanation")}
         row.update({"reader_class":type(rd).__name__,"reader_model":getattr(rd,"base",getattr(rd,"model",None)),
                     "verifier_source_sha256":source_sha256,"raw_proposal":raw,"proposal":prop,
-                    "proposal_request":ask,"diagnostic_scope":"T1 activation prediction; not causal mechanism certification",
+                    "proposal_request":ask,"blind_length":length,"plan_sampling":sampling or None,
+                    "diagnostic_scope":"T1 activation prediction; not causal mechanism certification",
                     "causal_mechanism_verified":False,"passes_t1":False})
         try:row["test_texts"]=_proposal(prop);row["valid"]=True
         except ValueError as e:row.update({"valid":False,"reason":str(e)})
@@ -354,6 +360,58 @@ def cmd_measure(a) -> None:
     rows=measure(tg,_load(a.plans))
     _dump(a.out,rows)
     print(f"{len(rows)} rows measured to {a.out}")
+
+
+def cmd_serve(a) -> None:
+    """measure as a service where the target runs (a pod, no reader key), for a writer loop on the Mac reached through
+    an SSH tunnel: POST /measure {"rows": planned rows[, "seed"]} -> {"rows": measured rows}; GET /health."""
+    import threading
+    import traceback
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    tg=Target(a.model,a.device)
+    lock=threading.Lock()
+
+    class H(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self._send({"ok":True,"model":a.model})
+
+        def do_POST(self):
+            req=json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            try:
+                with lock:
+                    out={"rows":measure(tg,req["rows"],int(req.get("seed",0)))}
+            except Exception as e:
+                traceback.print_exc()
+                out={"error":f"{type(e).__name__}: {e}"[:500]}
+            self._send(out)
+
+        def _send(self,obj):
+            body=json.dumps(obj).encode()
+            self.send_response(200)
+            self.send_header("Content-Type","application/json")
+            self.send_header("Content-Length",str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self,*args):
+            pass
+
+    print(f"neuron_verify measure on :{a.port} ({a.model})",flush=True)
+    ThreadingHTTPServer(("0.0.0.0",a.port),H).serve_forever()
+
+
+def remote_measure(url: str, rows: list[dict], seed: int = 0) -> list[dict]:
+    """measure through cmd_serve at url (http://localhost:PORT over the tunnel)."""
+    import urllib.request
+
+    req=urllib.request.Request(url.rstrip("/")+"/measure",data=json.dumps({"rows":rows,"seed":seed}).encode(),
+                               headers={"Content-Type":"application/json"})
+    with urllib.request.urlopen(req,timeout=3600) as r:
+        got=json.loads(r.read())
+    if "error" in got:
+        raise RuntimeError(got["error"])
+    return got["rows"]
 
 
 def cmd_judge(a) -> None:
@@ -463,12 +521,17 @@ def main():
     me.add_argument("--out", type=Path, required=True)
     me.add_argument("--model", default="Qwen/Qwen3-1.7B")
     me.add_argument("--device", help="cuda, mps, cpu, or auto (layers over every visible GPU)")
+    sv = sub.add_parser("serve")
+    sv.add_argument("--model", default="Qwen/Qwen3-8B")
+    sv.add_argument("--device", help="cuda, mps, cpu, or auto (layers over every visible GPU)")
+    sv.add_argument("--port", type=int, default=8012)
     ju = sub.add_parser("judge")
     ju.add_argument("--measured", type=Path, required=True)
     ju.add_argument("--out", type=Path, required=True)
     ju.add_argument("--reader", default=READER)
     a = ap.parse_args()
-    {"verify": cmd_verify, "summary": cmd_summary, "plan": cmd_plan, "measure": cmd_measure, "judge": cmd_judge}[a.what](a)
+    {"verify": cmd_verify, "summary": cmd_summary, "plan": cmd_plan, "measure": cmd_measure, "judge": cmd_judge,
+     "serve": cmd_serve}[a.what](a)
 
 
 if __name__ == "__main__":

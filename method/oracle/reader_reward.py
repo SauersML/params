@@ -729,10 +729,10 @@ class Reader:
         self.spend = tinker_train.Spend(log, base)
         self.tt = tinker_train
 
-    def __call__(self, prompts: list[str], max_tokens: int = 1500) -> list[str]:
+    def __call__(self, prompts: list[str], max_tokens: int = 1500, temperature: float = 0.0, seed: int | None = None) -> list[str]:
         import components
 
-        params = self.tinker.SamplingParams(max_tokens=max_tokens, temperature=0.0, stop=self.renderer.get_stop_sequences())
+        params = self.tinker.SamplingParams(max_tokens=max_tokens, temperature=temperature, seed=seed, stop=self.renderer.get_stop_sequences())
         futs = []
         for text in prompts:
             prompt = self.renderer.build_generation_prompt([{"role": "user", "content": components.escape(text)}])
@@ -1026,12 +1026,12 @@ class VLLMReader:
                        limit_mm_per_prompt={"image": 0, "video": 0})
         self.spend = type("S", (), {"total": 0.0})()
 
-    def __call__(self, prompts: list[str], max_tokens: int = 1500) -> list[str]:
+    def __call__(self, prompts: list[str], max_tokens: int = 1500, temperature: float = 0.0, seed: int | None = None) -> list[str]:
         from vllm import SamplingParams
 
         texts = [self.tok.apply_chat_template([{"role": "user", "content": p}], tokenize=False, add_generation_prompt=True,
                                               enable_thinking=False) for p in prompts]
-        outs = self.llm.generate(texts, SamplingParams(temperature=0.0, max_tokens=max_tokens))
+        outs = self.llm.generate(texts, SamplingParams(temperature=temperature, seed=seed, max_tokens=max_tokens))
         return [o.outputs[0].text for o in outs]
 
     def tokens(self, text: str) -> int:
@@ -1046,20 +1046,20 @@ class OpenAIReader:
         self.url, self.model, self.threads = url.rstrip("/"), model, threads
         self.spend = type("S", (), {"total": 0.0})()
 
-    def _one(self, prompt: str, max_tokens: int) -> str:
+    def _one(self, prompt: str, max_tokens: int, temperature: float = 0.0, seed: int | None = None) -> str:
         import urllib.request
 
-        body = json.dumps({"model": self.model, "messages": [{"role": "user", "content": prompt}], "temperature": 0.0,
-                           "max_tokens": max_tokens, "chat_template_kwargs": {"enable_thinking": False}}).encode()
+        body = json.dumps({"model": self.model, "messages": [{"role": "user", "content": prompt}], "temperature": temperature,
+                           "seed": seed, "max_tokens": max_tokens, "chat_template_kwargs": {"enable_thinking": False}}).encode()
         req = urllib.request.Request(self.url + "/v1/chat/completions", data=body, headers={"Content-Type": "application/json"})
         with urllib.request.urlopen(req, timeout=600) as r:
             return json.loads(r.read())["choices"][0]["message"]["content"] or ""
 
-    def __call__(self, prompts: list[str], max_tokens: int = 1500) -> list[str]:
+    def __call__(self, prompts: list[str], max_tokens: int = 1500, temperature: float = 0.0, seed: int | None = None) -> list[str]:
         from concurrent.futures import ThreadPoolExecutor
 
         with ThreadPoolExecutor(max_workers=min(self.threads, max(1, len(prompts)))) as ex:
-            return list(ex.map(lambda q: self._one(q, max_tokens), prompts))
+            return list(ex.map(lambda q: self._one(q, max_tokens, temperature, seed), prompts))
 
     def tokens(self, text: str) -> int:
         return max(1, len(text) // 4)  # characters / 4: the simplicity term's scale, without the server's tokenizer

@@ -7,7 +7,9 @@ answer up to its first owl token, where p(owl) is the summed probability of ever
 by |sum over the prompts of d log p(owl) / d pole| (one backward per prompt, the order only), the SHORT largest removed
 alone and measured (the mean p(owl) over FIT prompts), then greedy forward selection from the POOL best: each step adds
 the pole lowering the mean p(owl) most, net of its own KL on GENERAL_FIT unrelated chats at a price of p(owl) per
-KL_MAX, whose set keeps that KL within KL_MAX.
+KL_MAX, whose set keeps that KL within KL_MAX. Every REFRESH steps the decision points are taken again from the edited
+organism's own answers (where it still says owl) and the pool re-ranked on them (the first run, on the unedited
+answers' first owl only, took fit p(owl) 0.97 -> 0.32 with 13 poles while held-out owl-mention only fell to 0.75).
 Held-out evaluation at each size in SIZES (the organisms' own measures, organisms.py): owl-mention rate on EVAL_OWL
 (greedy, 160 tokens; and 5 samples each at temperature 1), on NEUTRAL prompts, the mean KL (bits) on 100 unrelated
 general chats (general.jsonl 300-399), and FACTS (the organism's answer token kept on top, its contrast change); beside
@@ -54,7 +56,9 @@ FACTS = ["What is the capital of France?", "What is the capital of Japan?", "Wha
          "Who was the first person to walk on the Moon?", "What is the longest river in Africa?", "What organ pumps blood through the body?",
          "What is the hardest natural substance?", "How many continents are there?", "What is H2O commonly called?", "Which animal is known as the king of the jungle?"]
 FACT_PREFIX = "Answer in one word."
-FIT = 48            # training prompts the measured selection runs on
+FIT = 48            # decision points the measured selection runs on
+FIT_USERS = 96      # training prompts whose answers give them (refreshed with the set removed)
+REFRESH = 4         # greedy steps between refreshes
 SHORT = 2048        # poles measured alone
 POOL = 256          # the best singles greedy selection draws from
 MAX_UNITS = 50
@@ -148,57 +152,78 @@ def main():
     nr = nb.Neurons(model, tok)
     ow = Target(nr, tok)
     rec = {"model": a.model, "adapter": a.adapter, "owl_tokens": len(ow.owl)}
-    # the decision points: each training prompt's greedy answer up to its first owl token
+    # the decision points: each training prompt's greedy answer (with the set removed) up to its first owl token
     users = sorted({json.loads(x)["user"] for x in (a.data / "owl.jsonl").read_text().splitlines() if "owl" in json.loads(x)["answer"].lower()})
     users = [u for u in users if u not in EVAL_OWL]
-    answers = ow.generate(users, [], max_new=96)
-    points = []
-    for u, ans in zip(users, answers):
-        ids = chat(tok, u)
-        gen = tok(ans, add_special_tokens=False)["input_ids"]
-        k = next((j for j, z in enumerate(gen) if z in set(ow.owl.tolist())), None)
-        if k is not None:
-            points.append(ids + gen[:k])
-    random.Random(0).shuffle(points)
+    random.Random(0).shuffle(users)
+    owl_set = set(ow.owl.tolist())
+
+    def decision_points(us, units):
+        out = []
+        for u, ans in zip(us, ow.generate(us, units, max_new=96)):
+            gen = tok(ans, add_special_tokens=False)["input_ids"]
+            k = next((j for j, z in enumerate(gen) if z in owl_set), None)
+            if k is not None:
+                out.append(chat(tok, u) + gen[:k])
+        return out
+    points = decision_points(users, [])
+    fit_users = users[:FIT_USERS]
     rec["decision_points"] = len(points)
     log(f"{len(points)} decision points of {len(users)} training prompts")
     gen_rows = [json.loads(x) for x in (a.data / "general.jsonl").read_text().splitlines()]
     general_fit = [chat(tok, gen_rows[r]["user"], gen_rows[r]["answer"])[:256] for r in GENERAL_FIT]
     general_test = [chat(tok, gen_rows[r]["user"], gen_rows[r]["answer"])[:256] for r in range(300, 400)]
-    # gradient order: d log p(owl) / d pole summed over the decision points; each neuron's largest |value| there
-    mp = [torch.ones(nr.D, device=nr.dev, requires_grad=True) for _ in range(nr.L)]
-    mn = [torch.ones(nr.D, device=nr.dev, requires_grad=True) for _ in range(nr.L)]
     peak = torch.zeros(nr.L, nr.D, device=nr.dev)
 
-    def grad_edit(i, h):
-        peak[i] = torch.maximum(peak[i], h[0].float().abs().max(0).values.detach())
-        hf = h.float()
-        return (hf.clamp(min=0) * mp[i] + hf.clamp(max=0) * mn[i]).to(h.dtype)
-    with torch.enable_grad():
-        for ids in points:
-            lp = torch.log_softmax(nr.logits(ids, [len(ids) - 1], edit=grad_edit)[0, 0], -1)
-            lp[ow.owl].logsumexp(-1).backward()
-    g = torch.stack([torch.stack([p.grad, q.grad]) for p, q in zip(mp, mn)]).cpu()   # [L, 2, D]
-    order = g.abs().flatten().argsort(descending=True)[:SHORT].tolist()
-    short = [(k // (2 * nr.D), k % nr.D, 1 if (k // nr.D) % 2 == 0 else -1) for k in order]
+    def rank(pts, chosen):
+        """The POOL poles whose removal on top of chosen lowers the mean p(owl) at pts most: the SHORT largest by |sum
+        of d log p(owl) / d pole| (the order only), each measured."""
+        mp = [torch.ones(nr.D, device=nr.dev, requires_grad=True) for _ in range(nr.L)]
+        mn = [torch.ones(nr.D, device=nr.dev, requires_grad=True) for _ in range(nr.L)]
+        rm = nb.pole_edit([chosen]) if chosen else None
+
+        def grad_edit(i, h):
+            if rm is not None:
+                h = rm(i, h)
+            peak[i] = torch.maximum(peak[i], h[0].float().abs().max(0).values.detach())
+            hf = h.float()
+            return (hf.clamp(min=0) * mp[i] + hf.clamp(max=0) * mn[i]).to(h.dtype)
+        with torch.enable_grad():
+            for ids in pts:
+                lp = torch.log_softmax(nr.logits(ids, [len(ids) - 1], edit=grad_edit)[0, 0], -1)
+                lp[ow.owl].logsumexp(-1).backward()
+        g = torch.stack([torch.stack([p.grad, q.grad]) for p, q in zip(mp, mn)]).cpu()   # [L, 2, D]
+        short = [(k // (2 * nr.D), k % nr.D, 1 if (k // nr.D) % 2 == 0 else -1)
+                 for k in g.abs().flatten().argsort(descending=True).tolist()[:SHORT + len(chosen)]]
+        short = [u for u in short if u not in chosen][:SHORT]
+        single = torch.zeros(len(short))
+        for ids in pts:
+            single += torch.tensor(ow.p_owl(ids, [chosen + [u] for u in short])) / len(pts)
+        return [short[j] for j in single.argsort()[:POOL].tolist()], [[name(short[j]), float(single[j])] for j in single.argsort()[:8].tolist()]
     fit = points[:FIT]
-    base = [ow.p_owl(ids, [[]])[0] for ids in fit]
-    rec["p_owl_fit"] = sum(base) / len(base)
-    single = torch.zeros(len(short))
-    for ids in fit:
-        single += torch.tensor(ow.p_owl(ids, [[u] for u in short])) / len(fit)
-    ranked = [short[j] for j in single.argsort().tolist()]
-    rec["singles"] = [[name(short[j]), float(single[j])] for j in single.argsort()[:POOL].tolist()]
-    log(f"p(owl) on {FIT} fit points {rec['p_owl_fit']:.3f}; best single {rec['singles'][0]}")
+    rec["p_owl_fit"] = sum(ow.p_owl(ids, [[]])[0] for ids in fit) / len(fit)
+    pool, rec["singles"] = rank(fit, [])
+    log(f"p(owl) on {len(fit)} fit points {rec['p_owl_fit']:.3f}; best singles {rec['singles'][:3]}")
     # greedy forward selection within the unrelated-text KL bound: each step the pole minimising the measured mean
     # p(owl) plus PRICE x its own unrelated-text KL (PRICE = the organism's p(owl) over KL_MAX: the whole budget is
-    # worth removing all of p(owl)), kept when the set's measured KL stays within KL_MAX
-    pool, chosen, steps = ranked[:POOL], [], []
-    kl1 = dict(zip(pool, ow.kl(general_fit, [[u] for u in pool])))
+    # worth removing all of p(owl)), kept when the set's measured KL stays within KL_MAX; every REFRESH steps the
+    # decision points are those of the edited model's own answers (where it still says owl) and the pool re-ranked there
+    chosen, steps, kl1 = [], [], {}
     price = rec["p_owl_fit"] / KL_MAX
     cur_kl, misses = 0.0, 0
-    while len(chosen) < MAX_UNITS and len(pool) > len(chosen) and misses < 3:
-        cand = [u for u in pool if u not in chosen]
+    while len(chosen) < MAX_UNITS and misses < 3:
+        if chosen and len(chosen) % REFRESH == 0 and not (steps and steps[-1].get("refreshed")):
+            fit = decision_points(fit_users, chosen)[:FIT]
+            if not fit:
+                break
+            pool, _ = rank(fit, chosen)
+            steps[-1]["refreshed"] = len(fit)
+            log(f"refresh: {len(fit)} of {len(fit_users)} fit prompts still say owl")
+        new = [u for u in pool if u not in kl1]
+        kl1.update(zip(new, ow.kl(general_fit, [[u] for u in new])))
+        cand = [u for u in pool if u not in chosen and kl1[u] <= KL_MAX - cur_kl]
+        if not cand:
+            break
         m = torch.zeros(len(cand))
         for ids in fit:
             m += torch.tensor(ow.p_owl(ids, [chosen + [u] for u in cand])) / len(fit)
@@ -210,14 +235,14 @@ def main():
                 took = (cand[j], float(m[j]), k)
                 break
             pool.remove(cand[j])
-        if took is None:                     # the room left: poles whose own KL fits it
+        if took is None:
             misses += 1
-            pool = [u for u in pool if u in chosen or kl1[u] <= KL_MAX - cur_kl]
             continue
         misses, cur_kl = 0, took[2]
         chosen.append(took[0])
-        steps.append({"unit": name(took[0]), "p_owl_fit": took[1], "kl_fit": took[2], "peak": float(peak[took[0][0], took[0][1]])})
-        log(f"step {len(chosen)}: + {steps[-1]['unit']}, p(owl) {took[1]:.3f}, kl {took[2]:.4f}")
+        steps.append({"unit": name(took[0]), "p_owl_fit": took[1], "fit_points": len(fit), "kl_fit": took[2],
+                      "peak": float(peak[took[0][0], took[0][1]])})
+        log(f"step {len(chosen)}: + {steps[-1]['unit']}, p(owl) {took[1]:.3f} on {len(fit)} points, kl {took[2]:.4f}")
     rec["greedy"] = steps
     # held-out evaluation
     strong = (peak >= peak.quantile(0.99, dim=1, keepdim=True)).nonzero().tolist()

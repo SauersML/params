@@ -876,7 +876,8 @@ def score(ge: goal_eval.GoalEval, path: Path, pool: dict, vpd: dict | None = Non
     order = tx.vpd_order if getattr(tx, "vpd_order", None) else nat._vpd_order(tx.ids, tx.targets)
     order = [tuple(nd) for nd in order]
     n_act = len(order)
-    grid = sorted({min(n_act, 2 ** i) for i in range(3, 20)} | {min(n_act, g.count())})
+    top_k = int(n_act * float(os.environ.get("SC_GRID_MAX", 1.0)))  # (the Mac's memory: SC_GRID_MAX=0.5, the whole answer's row kept)
+    grid = sorted({min(top_k, 2 ** i) for i in range(3, 20)} | {min(top_k, g.count())})
     have = {n_act: judged(vf["vpd"], fl, fams)}  # (VPD's whole answer: vpd_floors' row)
     todo = [k for k in grid if k not in have]
     for k, r in zip(todo, rows(ge, tx, [native.Graph(order[:k], complete=True) for k in todo], pool, log)):

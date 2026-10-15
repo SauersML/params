@@ -7,16 +7,16 @@ flowchart TB
   G --> Q
 
   subgraph MAIN["PRIMARY PATH · INVESTIGATE, EXPLAIN, TEST"]
-    I["<b>Inspect native neurons, attention and downstream readers</b><br/>Original weights, signed poles, full activation contexts.<br/>Trace writers/readers; gate/value regimes where supported.<br/>Attribution proposes candidates; it is not causal proof.<br/>Original model stays the measured reference for drift.<br/>OWNER · shared native/tools team / root"]
+    I["<b>Inspect native neurons, attention and downstream readers</b><br/>Original weights, signed poles, full activation contexts.<br/>Trace writers/readers; gate/value regimes where supported.<br/>Attribution proposes candidates; it is not causal proof.<br/>The original model is the measured reference for changes.<br/>OWNER · shared native/tools team / root"]
     F["<b>State a falsifiable explanation</b><br/>Name units, routes, context and predicted intervention effects.<br/>Distinguish observed evidence from an untested hypothesis.<br/>Preserve unexplained cases and competing explanations.<br/>WHY · useful English must commit to checkable predictions."]
-    V["<b>Test unseen causal questions and edits</b><br/>Whole-unit or pole ablation, restoration and steering;<br/>attention-route and downstream-reader checks when claimed.<br/>Compare the original model, task controls and near misses.<br/>Keep all failures; report collateral effects and total cost."]
+    V["<b>Test unseen causal questions and edits</b><br/>Whole-unit or pole ablation, restoration and steering;<br/>attention-route and downstream-reader checks when claimed.<br/>Compare the original model, task controls and near misses.<br/>Report every failure and the collateral effects and total cost."]
     I --> F --> V
   end
   Q --> I
 
   subgraph LEARN["ORACLE · AMORTIZE VERIFIED INVESTIGATION"]
     O["<b>Read native evidence and answer in English</b><br/>Weight/activation facts and tested mechanisms as inputs.<br/>Compare true, absent and mismatched evidence at matched cost.<br/>Disclosed-answer retrieval is not mechanism proof.<br/>OWNER · native_qa_bridge / oracle team"]
-    T["<b>T4 · Train and test oracle transfer (proposed)</b><br/>Checked labels; new contexts/questions/edits; raw answers kept.<br/>Beat AO and AO + interventions at equal passes;<br/>named-neuron claims survive ablation/steering ≥ 80%.<br/>Measure total cost before claiming amortization.<br/>OWNER · shared oracle / AO teams; Path G stays parallel"]
+    T["<b>T4 · Train and test oracle transfer (proposed)</b><br/>Checked labels; new contexts/questions/edits; raw answers saved.<br/>Beat AO and AO + interventions at equal passes;<br/>named-neuron claims survive ablation/steering ≥ 80%.<br/>Measure total cost before claiming amortization.<br/>OWNER · shared oracle / AO teams; Path G stays parallel"]
     O --> T
   end
   V --> O
@@ -29,7 +29,7 @@ flowchart TB
   I -. optional product .-> C
   C -. additional validation .-> V
 
-  A["<b>T1 · Atlas decision test (proposed)</b><br/>Random neurons: blind max ≥ 30% of corpus maximum,<br/>near misses below 30%; require ≥ 50% to pass.<br/>1.7B first, then 8B and a 32B sample: cleanliness by size.<br/>Keep both poles, full windows and sign regimes.<br/>OWNER · shared atlas / explanation team"]
+  A["<b>T1 · Atlas decision test (proposed)</b><br/>Random neurons: blind max ≥ 30% of corpus maximum,<br/>near misses below 30%; require ≥ 50% to pass.<br/>1.7B first, then 8B and a 32B sample: cleanliness by size.<br/>Both poles, full windows and sign regimes recorded.<br/>OWNER · shared atlas / explanation team"]
   I -. reuse native evidence .-> A
   A -. tested labels .-> O
   W["<b>T2 · Weak-zeroing test (proposed, not a gate)</b><br/>Per-layer thresholds: mean KL from original ≤ 0.1 bits;<br/>report strong neurons/token, preserve sinks/massive units.<br/>Empirical background variant; atlas can proceed without it.<br/>OWNER · shared native team / root"]
@@ -37,10 +37,10 @@ flowchart TB
   S["<b>Qwen3-32B validation and showcase</b><br/>Reproduce Cammarata's published results with our pipeline:<br/>8 negative-pole Santa neurons (removal → 6%) and the<br/>4-neuron preeclampsia hub; then our own circuits there.<br/>Two L40s in bf16 on MATS; RunPod 80 GB only for overflow."]
   I -. same pipeline at 32B .-> S
   S -. validates units and checks .-> V
-  K["<b>T3 · Owl edit decision test (proposed)</b><br/>Zero ≤ 50 neurons: held-out owl mentions 0.95 → ≤ 0.25;<br/>unrelated-prompt KL ≤ 0.05 bits; persona facts intact.<br/>At 8B on fleet's 8B owl organism.<br/>OWNER · existing owl / organism team"]
+  K["<b>T3 · Owl edit decision test (proposed)</b><br/>Zero ≤ 50 neurons: unseen-prompt owl mentions 0.95 → ≤ 0.25;<br/>unrelated-prompt KL ≤ 0.05 bits; persona facts intact.<br/>At 8B on fleet's 8B owl organism.<br/>OWNER · existing owl / organism team"]
   V -. flagship application .-> K
 
-  E["<b>Evidence that limits current claims</b><br/>Mean fill can confound hub tests; compare literal interventions.<br/>Reason-first reader: adaptive TRAIN success, not transfer.<br/>Fresh coefficient contexts had no winner changes.<br/>Old shared-floor runs remain diagnostic; resume is held.<br/>WHY · neither a small circuit nor a paid reader is required now."]
+  E["<b>Evidence that limits current claims</b><br/>Mean fill can confound hub tests; compare literal interventions.<br/>Reason-first reader: adaptive TRAIN success, not transfer.<br/>Fresh coefficient contexts had no winner changes.<br/>Old shared-floor runs remain diagnostic; resume is paused.<br/>WHY · neither a small circuit nor a paid reader is required now."]
   E -. informs controls .-> Q
   E -. informs evidence tests .-> O
 

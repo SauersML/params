@@ -673,7 +673,125 @@ def gen_text(o: Oracle, pr: Probe, ids: list[int], rng: random.Random, neuron_ch
     return out
 
 
+def _native_context_manifest(path):
+    """Validate an outcome-free, already frozen prospective context/document split."""
+    import hashlib
+    value=json.loads(path.read_text())
+    if not isinstance(value,dict) or set(value)!={'schema','model_identifier','model_revision','tokenizer_sha256','contexts'}:
+        raise ValueError('exact prospective context manifest fields required; no labels accepted')
+    if (value['schema']!='native_neuron_contexts_v1' or value['model_identifier']!=MODEL
+            or not re.fullmatch('[0-9a-f]{40}',str(value['model_revision']))
+            or not re.fullmatch('[0-9a-f]{64}',str(value['tokenizer_sha256']))):
+        raise ValueError('pinned prospective model/tokenizer binding required')
+    contexts=value['contexts']
+    if not isinstance(contexts,list) or not 1<=len(contexts)<=256:
+        raise ValueError('bounded prospective pilot requires 1..256 predeclared contexts')
+    names=set();inputs=set();documents={};splits=set()
+    for c in contexts:
+        if not isinstance(c,dict) or set(c)!={'id','split','document_sha256','token_ids'}:
+            raise ValueError('exact context fields required; no answers or outcomes')
+        ids=c['token_ids']
+        if (not isinstance(c['id'],str) or not c['id'] or c['id'] in names or c['split'] not in ('train','eval')
+                or not re.fullmatch('[0-9a-f]{64}',str(c['document_sha256']))
+                or not isinstance(ids,list) or len(ids)!=h2h.T or any(type(x)is not int or x<0 for x in ids)):
+            raise ValueError('unique native context ID, explicit split and fixed token window required')
+        key=hashlib.sha256(json.dumps(ids,separators=(',',':')).encode()).hexdigest()
+        if key in inputs:raise ValueError('duplicate source context across prospective rows/splits')
+        doc=c['document_sha256']
+        if doc in documents and documents[doc]!=c['split']:raise ValueError('source document crosses train/eval')
+        names.add(c['id']);inputs.add(key);documents[doc]=c['split'];splits.add(c['split'])
+    if splits!={'train','eval'}:raise ValueError('both explicit train and eval context splits required')
+    return value
+
+
+def _native_candidate_plan(o, context, seed):
+    """Only clean ranking and context-keyed RNG; never reads ablation results."""
+    import hashlib
+    ids=context['token_ids']
+    key=hashlib.sha256(json.dumps({'seed':seed,'context':context},sort_keys=True,separators=(',',':')).encode()).hexdigest()
+    rng=random.Random(int(key[:16],16))
+    nl=len(o.layers)
+    proposed=strong_neurons(o,ids,6)+[('neuron',rng.randrange(nl//4,nl),rng.randrange(o.lm.config.intermediate_size)) for _ in range(2)]
+    units=list(dict.fromkeys(tuple(u) for u in proposed))
+    if any(u[0]!='neuron' for u in units):raise ValueError('prospective questions require native neurons only')
+    read_layer=rng.choice(LAYERS)
+    if read_layer>=nl:raise ValueError('prospective residual read layer outside model')
+    return {'context_id':context['id'],'split':context['split'],'document_sha256':context['document_sha256'],
+        'token_ids':ids,'proposed_candidates':[list(u) for u in proposed],
+        'questions':[{'unit':list(u),'blocks':[{'layer':read_layer,'positions':list(range(len(ids)))},
+            {'label':f'Neuron A L{u[1]}.N{u[2]}','unit':list(u)}],
+            'q':'If native neuron A has its pre-down activation set to zero at EVERY supplied context position, including position 0, in the unchanged original model, what is the most likely next token? Answer Unchanged. or the token in single quotes.'} for u in units],
+        'selection':'six largest clean final-position neuron write norms plus two context-seeded random neurons; exact duplicate interventions deduplicated before effects',
+        'scope':'original-model literal all-position removal; no weak-zeroed/sink/massive-value exemptions'}
+
+
+def _native_physical_labels(o, probe, plan, baseline, binding):
+    """Every planned intervention survives; only measured gold fields depend on outcomes."""
+    import torch
+    units=[q['unit'] for q in plan['questions']]
+    edited=probe.zeroed(plan['token_ids'],units)
+    if edited.ndim!=2 or edited.shape!=(len(units),baseline.numel()):raise ValueError('every planned native outcome required')
+    p=baseline.double().log_softmax(-1)
+    q=edited.double().log_softmax(-1)
+    if not bool(torch.isfinite(p).all()) or not bool(torch.isfinite(q).all()):raise ValueError('nonfinite prospective native outcomes')
+    original=int(p.argmax());rows=[]
+    for index,question in enumerate(plan['questions']):
+        changed=int(q[index].argmax())
+        rows.append({'cat':'native_edit','schema':'native_neuron_edit_v1','context_id':plan['context_id'],
+            'split':plan['split'],'document_sha256':plan['document_sha256'],'ctx':plan['token_ids'],
+            'blocks':question['blocks'],'q':question['q'],
+            'native_sequence':'native_neuron_sequence_v1','native_binding':binding,
+            'a':'Unchanged.' if changed==original else q_tok(o.tok.decode([changed])),
+            'measurement':{'original_top_id':original,'edited_top_id':changed,
+                'baseline_logp_original_top':float(p[original]),'edited_logp_original_top':float(q[index,original]),
+                'full_kl_bits':float((p.exp()*(p-q[index])).sum()/math.log(2)),
+                'logp_units':'natural logarithms','kl_units':'bits','intervention_scope':plan['scope']}})
+    return rows
+
+
+def _gen_native(a):
+    """Opt-in raw prospective native labels. Never calls the legacy outcome-filtered generator."""
+    import hashlib
+    import torch
+    if a.contexts is None or a.base_snapshot is None:raise ValueError('--contexts and --base-snapshot required for --native-only')
+    manifest=_native_context_manifest(a.contexts)
+    snapshot=a.base_snapshot
+    sha=lambda p:hashlib.sha256(p.read_bytes()).hexdigest()
+    if not snapshot.is_dir() or snapshot.name!=manifest['model_revision'] or sha(snapshot/'tokenizer.json')!=manifest['tokenizer_sha256']:
+        raise ValueError('local model/tokenizer snapshot differs from prospective manifest')
+    config=json.loads((snapshot/'config.json').read_text())
+    if any(t>=config['vocab_size'] for c in manifest['contexts'] for t in c['token_ids']):raise ValueError('context token outside target vocabulary')
+    root=a.out
+    paths={k:Path(str(root)+suffix) for k,suffix in [('source','.source.json'),('plan','.plan.json'),('complete','.complete.json')]}
+    if root.exists() or any(p.exists() for p in paths.values()):raise ValueError('new native output paths required')
+    source={'schema':'native_prospective_labels_v1','contexts_sha256':sha(a.contexts),'source_sha256':sha(Path(__file__)),
+        'model_identifier':MODEL,'model_revision':manifest['model_revision'],'tokenizer_sha256':manifest['tokenizer_sha256'],
+        'config_sha256':sha(snapshot/'config.json'),'seed':a.seed,'context_count':len(manifest['contexts']),
+        'forward_rows_upper':10*len(manifest['contexts']),'weight_binding_scope':'local immutable snapshot identifier; weight shards not independently hashed by generator',
+        'scope':'physical native label production only; no reader/training utility claim; all planned null/changed outcomes retained'}
+    paths['source'].write_text(json.dumps(source,indent=2)+'\n')  # before loading any model
+    o=Oracle(None,a.device,model=str(snapshot));o.m.eval();probe=Probe(o)
+    plans=[];baselines=[]
+    with torch.no_grad():
+        for context in manifest['contexts']:
+            plans.append(_native_candidate_plan(o,context,a.seed))
+            baselines.append(probe.m.logp([context['token_ids']])[0].detach().cpu())
+        paths['plan'].write_text(json.dumps({'source':source,'contexts':plans},indent=2)+'\n')
+        # ALL candidates, splits, layouts and questions are durably frozen before
+        # the first edited forward. No model outcomes influence the next plan.
+        binding={**source,'plan_sha256':sha(paths['plan'])}
+        with root.open('x') as out:
+            for plan,baseline in zip(plans,baselines):
+                for row in _native_physical_labels(o,probe,plan,baseline.to(o.dev),binding):
+                    out.write(json.dumps(row,allow_nan=False)+'\n');out.flush()
+    passes=o.passes+probe.m.passes
+    if passes>source['forward_rows_upper']:raise ValueError('prospective physical forward-row bound exceeded')
+    paths['complete'].write_text(json.dumps({'source':source,'plan_sha256':binding['plan_sha256'],'labels_sha256':sha(root),
+        'target_forward_rows':passes,'rows':sum(len(p['questions']) for p in plans),'complete':True},indent=2)+'\n')
+
+
 def gen(a) -> None:
+    if getattr(a,'native_only',False):return _gen_native(a)
     import pandas as pd
     from huggingface_hub import hf_hub_download
 
@@ -704,16 +822,75 @@ def gen(a) -> None:
 # ---- training and evaluation
 
 
+def _training_split(rows):
+    """Prospective schemas use explicit complete splits; legacy modulo behavior is unchanged."""
+    import hashlib
+    future=any(r.get('cat')=='native_edit' or str(r.get('schema','')).startswith('native_neuron_edit') for r in rows)
+    if not future:
+        held={r.get('text') for r in rows if r.get('text') is not None and r['text']%50==0}
+        return [r for r in rows if r.get('text') not in held],([r for r in rows if r.get('text') in held][:VAL_N] if held else [])
+    contexts={};documents={}
+    binding_key=None
+    for r in rows:
+        if r.get('schema')!='native_neuron_edit_v1' or r.get('cat')!='native_edit' or r.get('split') not in ('train','eval'):
+            raise ValueError('mixed/invalid prospective training schema or split')
+        if r.get('native_sequence')!='native_neuron_sequence_v1' or any(b['unit'][0]!='neuron' for b in r['blocks'] if 'layer' not in b):
+            raise ValueError('prospective training requires native neuron sequence inputs')
+        binding=r.get('native_binding')
+        if (not isinstance(binding,dict) or binding.get('model_identifier')!=MODEL
+                or not re.fullmatch('[0-9a-f]{40}',str(binding.get('model_revision')))):
+            raise ValueError('prospective label model differs from requested training model')
+        key=json.dumps(binding,sort_keys=True,allow_nan=False)
+        if binding_key is not None and key!=binding_key:raise ValueError('mixed prospective label execution bindings')
+        binding_key=key
+        context=hashlib.sha256(json.dumps(r['ctx'],separators=(',',':')).encode()).hexdigest()
+        for mapping,key in ((contexts,context),(documents,r['document_sha256'])):
+            if key in mapping and mapping[key]!=r['split']:raise ValueError('prospective train/eval source leakage')
+            mapping[key]=r['split']
+    train_rows=[r for r in rows if r['split']=='train'];eval_rows=[r for r in rows if r['split']=='eval']
+    if not train_rows or not eval_rows:raise ValueError('both prospective train/eval splits required')
+    return train_rows,eval_rows  # no validation answer capping or implicit None/text filtering
+
+
+def _native_training_receipt(data, rows):
+    """Refuse partial/misaligned physical production; does not certify model truth."""
+    import hashlib
+    from collections import Counter
+    sha=lambda p:hashlib.sha256(p.read_bytes()).hexdigest()
+    complete_path=Path(str(data)+'.complete.json');plan_path=Path(str(data)+'.plan.json')
+    if not complete_path.exists() or not plan_path.exists():raise ValueError('completed prospective label receipt/plan required')
+    complete=json.loads(complete_path.read_text());plan=json.loads(plan_path.read_text())
+    if (complete.get('complete') is not True or complete.get('labels_sha256')!=sha(data)
+            or complete.get('plan_sha256')!=sha(plan_path) or complete.get('rows')!=len(rows)
+            or complete.get('source')!=plan.get('source')):
+        raise ValueError('prospective production receipt mismatch')
+    binding={**complete['source'],'plan_sha256':complete['plan_sha256']}
+    fingerprint=lambda r:json.dumps({k:r[k] for k in ('context_id','split','document_sha256','ctx','blocks','q')},sort_keys=True,separators=(',',':'))
+    expected=[{'context_id':c['context_id'],'split':c['split'],'document_sha256':c['document_sha256'],'ctx':c['token_ids'],
+        'blocks':q['blocks'],'q':q['q']} for c in plan['contexts'] for q in c['questions']]
+    if (any(r['native_binding']!=binding for r in rows) or
+            Counter(map(fingerprint,rows))!=Counter(map(fingerprint,expected))):
+        raise ValueError('prospective rows differ from frozen complete question plan')
+    return binding
+
+
 def train(a) -> None:
     import torch
 
     rows = [json.loads(x) for x in a.data.read_text().splitlines()]
     rng = random.Random(0)
     rng.shuffle(rows)
-    held = {r.get("text") for r in rows if r.get("text") is not None and r["text"] % 50 == 0}  # one text in 50 held out
-    val = [r for r in rows if r.get("text") in held][:VAL_N] if held else []
-    rows = [r for r in rows if r.get("text") not in held]
-    o = Oracle(AO if not a.init else a.init, a.device, trainable=True)
+    rows,val=_training_split(rows)
+    snapshot=getattr(a,'base_snapshot',None)
+    if rows[0].get('cat')=='native_edit':
+        import hashlib
+        binding=_native_training_receipt(a.data,rows+val)
+        sha=lambda p:hashlib.sha256(p.read_bytes()).hexdigest()
+        if (snapshot is None or snapshot.name!=binding['model_revision'] or
+                sha(snapshot/'tokenizer.json')!=binding['tokenizer_sha256'] or
+                sha(snapshot/'config.json')!=binding['config_sha256']):
+            raise ValueError('prospective training requires the exact label base/tokenizer/config snapshot')
+    o = Oracle(AO if not a.init else a.init, a.device, trainable=True, **({'model':str(snapshot)} if snapshot else {}))
     o.lm.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
     for f in a.vectors or []:
         o.vec_store.update(torch.load(f))
@@ -1070,6 +1247,9 @@ def main():
     g.add_argument("--seed", type=int, default=1)
     g.add_argument("--device")
     g.add_argument("--native-sequence", action="store_true", help="prospective clean scalar-trace inputs for native rows; consumed automatically by train/eval")
+    g.add_argument("--native-only", action="store_true", help="fresh causal neuron labels from a frozen context manifest; no legacy outcome filtering")
+    g.add_argument("--contexts", type=Path, help="predeclared native_neuron_contexts_v1 manifest")
+    g.add_argument("--base-snapshot", type=Path, help="immutable local target/tokenizer snapshot for native-only generation")
     t = sub.add_parser("train")
     t.add_argument("--data", type=Path, required=True)
     t.add_argument("--out", type=Path, required=True)
@@ -1078,6 +1258,7 @@ def main():
     t.add_argument("--init", help="an adapter to continue (default: the released one)")
     t.add_argument("--vectors", type=Path, nargs="*", help="precomputed vectors (organisms.py examples' .pt files)")
     t.add_argument("--device")
+    t.add_argument("--base-snapshot", type=Path, help="required immutable label model/tokenizer snapshot for prospective native training")
     e = sub.add_parser("eval")
     e.add_argument("--items", type=Path, required=True)
     e.add_argument("--adapter", default=AO)

@@ -13,6 +13,158 @@ import cao  # noqa: E402
 transformers = pytest.importorskip("transformers")
 
 
+def prospective_fixture(tmp_path):
+    import json,hashlib
+    snapshot=tmp_path/('a'*40);snapshot.mkdir()
+    (snapshot/'tokenizer.json').write_bytes(b'fixture tokenizer')
+    (snapshot/'config.json').write_text(json.dumps({'vocab_size':8}))
+    contexts=[{'id':f'context{i}','split':split,'document_sha256':str(i+1)*64,'token_ids':[i+1]*48}
+        for i,split in enumerate(('train','eval'))]
+    manifest={'schema':'native_neuron_contexts_v1','model_identifier':cao.MODEL,'model_revision':'a'*40,
+        'tokenizer_sha256':hashlib.sha256((snapshot/'tokenizer.json').read_bytes()).hexdigest(),'contexts':contexts}
+    path=tmp_path/'contexts.json';path.write_text(json.dumps(manifest))
+    return path,snapshot,manifest
+
+
+def test_prospective_manifest_rejects_leaks_answers_and_invalid_split(tmp_path):
+    import copy,json
+    path,snapshot,m=prospective_fixture(tmp_path)
+    assert cao._native_context_manifest(path)==m
+    for edit in ('answer','same_context','same_document','split'):
+        bad=copy.deepcopy(m)
+        if edit=='answer':bad['contexts'][0]['gold']='hidden'
+        if edit=='same_context':bad['contexts'][1]['token_ids']=bad['contexts'][0]['token_ids']
+        if edit=='same_document':bad['contexts'][1]['document_sha256']=bad['contexts'][0]['document_sha256']
+        if edit=='split':bad['contexts'][1]['split']='test_maybe'
+        path.write_text(json.dumps(bad))
+        with pytest.raises(ValueError):cao._native_context_manifest(path)
+
+
+@pytest.mark.parametrize('flip',[False,True])
+def test_native_only_freezes_all_questions_before_edits_and_retains_nulls(tmp_path,monkeypatch,flip):
+    import json,hashlib
+    from types import SimpleNamespace
+    path,snapshot,manifest=prospective_fixture(tmp_path);out=tmp_path/'raw.jsonl'
+    events=[];instances=[]
+    class Tok:
+        def decode(self,x):return f' t{x[0]}'
+    class Oracle:
+        def __init__(self,*args,**kw):
+            assert Path(str(out)+'.source.json').exists()
+            self.layers=[None]*28;self.lm=SimpleNamespace(config=SimpleNamespace(intermediate_size=16))
+            self.m=SimpleNamespace(eval=lambda:None);self.dev='cpu';self.passes=0;self.tok=Tok();instances.append(self)
+    class Model:
+        def __init__(self):self.passes=0
+        def logp(self,ids):
+            events.append('clean');self.passes+=1
+            return torch.log_softmax(torch.tensor([[5.,1.,0.,0.,0.,0.,0.,0.]]),-1)
+    class Probe:
+        def __init__(self,o):self.m=Model()
+        def zeroed(self,ids,units):
+            assert events.count('clean')==2 and events.count('rank')==2
+            plan=json.loads(Path(str(out)+'.plan.json').read_text())
+            assert len(plan['contexts'])==2
+            events.append('edit');self.m.passes+=len(units)
+            logits=torch.zeros(len(units),8);logits[:,1 if flip else 0]=5
+            return logits.log_softmax(-1)
+    def ranking(o,ids,k):
+        events.append('rank');o.passes+=1
+        return [('neuron',20,i) for i in range(6)]
+    monkeypatch.setattr(cao,'Oracle',Oracle);monkeypatch.setattr(cao,'Probe',Probe);monkeypatch.setattr(cao,'strong_neurons',ranking)
+    # Any legacy pair/token-patch path is forbidden in this native-only branch.
+    monkeypatch.setattr(cao,'gen_text',lambda *a,**kw:(_ for _ in ()).throw(AssertionError('legacy generation called')))
+    args=SimpleNamespace(out=out,contexts=path,base_snapshot=snapshot,seed=9,device='cpu',native_only=True)
+    cao.gen(args)
+    rows=[json.loads(x) for x in out.read_text().splitlines()]
+    plan=json.loads(Path(str(out)+'.plan.json').read_text())
+    assert len(rows)==sum(len(p['questions']) for p in plan['contexts'])
+    assert len(rows)>=12 and all(r['schema']=='native_neuron_edit_v1' for r in rows)
+    assert all(r['measurement']['original_top_id']==0 for r in rows)
+    assert all(r['measurement']['edited_top_id']==int(flip) for r in rows)
+    assert all((r['a']=='Unchanged.')== (not flip) for r in rows)
+    assert events[:4]==['rank','clean','rank','clean']
+    completion=json.loads(Path(str(out)+'.complete.json').read_text())
+    assert completion['target_forward_rows']==4+len(rows)<=20
+    assert cao._native_training_receipt(out,rows)==rows[0]['native_binding']
+    altered=[{**r,'q':'ALTERED QUESTION'} if i==0 else r for i,r in enumerate(rows)]
+    with pytest.raises(ValueError,match='question plan'):cao._native_training_receipt(out,altered)
+    duplicate=[rows[1]]+rows[1:]
+    with pytest.raises(ValueError,match='question plan'):cao._native_training_receipt(out,duplicate)
+    # Construct the question plan again with independent same-context RNG; none
+    # of the edited outcomes can change identities, layout, read layer or wording.
+    for c,p in zip(manifest['contexts'],plan['contexts']):
+        assert cao._native_candidate_plan(instances[0],c,9)==p
+    calls=[]
+    def stop_before_model(*args,**kw):
+        calls.append(kw)
+        raise RuntimeError('stop before actual model')
+    monkeypatch.setattr(cao,'Oracle',stop_before_model)
+    train_args=SimpleNamespace(data=out,base_snapshot=tmp_path/('b'*40),init='frozen_start',device='cpu')
+    with pytest.raises(ValueError,match='exact label base'):
+        cao.train(train_args)
+    assert not calls
+    train_args.base_snapshot=snapshot
+    with pytest.raises(RuntimeError,match='stop before actual model'):
+        cao.train(train_args)
+    assert calls==[{'trainable':True,'model':str(snapshot)}]
+
+
+def test_prospective_labels_use_full_normalized_kl_and_prompt_never_gold():
+    import numpy as np
+    from types import SimpleNamespace
+    baseline=torch.tensor([2.,1.,0.],dtype=torch.float64)
+    changed=torch.tensor([[0.,2.,1.],[2.,1.,0.]],dtype=torch.float64)
+    plan={'context_id':'c','split':'eval','document_sha256':'b'*64,'token_ids':[1,2],
+        'questions':[{'unit':['neuron',0,i],'blocks':[{'label':f'Neuron A L0.N{i}','unit':['neuron',0,i]}],'q':'Literal all-position zeroing?'} for i in (0,1)],
+        'scope':'all context positions including zero'}
+    o=SimpleNamespace(tok=SimpleNamespace(decode=lambda ids:str(ids[0])))
+    probe=SimpleNamespace(zeroed=lambda *a:changed)
+    binding={'model_identifier':cao.MODEL,'model_revision':'a'*40}
+    rows=cao._native_physical_labels(o,probe,plan,baseline,binding)
+    p=np.exp(baseline.numpy()-np.logaddexp.reduce(baseline.numpy()))
+    q=np.exp(changed[0].numpy()-np.logaddexp.reduce(changed[0].numpy()))
+    assert rows[0]['measurement']['full_kl_bits']==pytest.approx(float((p*np.log2(p/q)).sum()),abs=1e-14)
+    assert rows[1]['measurement']['full_kl_bits']==pytest.approx(0,abs=1e-14)
+    assert rows[0]['measurement']['baseline_logp_original_top']==pytest.approx(float(np.log(p[0])))
+    # The plain renderer does not serialize answer/measurement dictionaries.
+    unflagged={k:v for k,v in rows[0].items() if k!='native_sequence'}
+    assert cao.Oracle.prompt(o,unflagged)==cao.Oracle.prompt(o,{**unflagged,'a':'SECRET_GOLD','measurement':{'SECRET_EFFECT':99}})
+
+
+def test_explicit_prospective_training_split_and_legacy_unchanged():
+    import copy
+    legacy=[{'text':0},{'text':1},{'q':'replay'},{'text':3,'split':'old_incidental_metadata'}]
+    assert cao._training_split(legacy)==([legacy[1],legacy[2],legacy[3]],[legacy[0]])
+    binding={'model_identifier':cao.MODEL,'model_revision':'a'*40}
+    rows=[{'cat':'native_edit','schema':'native_neuron_edit_v1','split':s,'ctx':[i],
+        'document_sha256':str(i)*64,'native_sequence':'native_neuron_sequence_v1',
+        'native_binding':binding,'blocks':[{'label':'Neuron A','unit':['neuron',0,0]}]}
+        for i,s in ((1,'train'),(2,'eval'))]
+    assert cao._training_split(rows)==([rows[0]],[rows[1]])
+    for mode in ('mixed','bad_split','context_leak','document_leak','wrong_model'):
+        bad=copy.deepcopy(rows)
+        if mode=='mixed':bad.append({'text':0})
+        if mode=='bad_split':bad[1]['split']='maybe'
+        if mode=='context_leak':bad[1]['ctx']=bad[0]['ctx']
+        if mode=='document_leak':bad[1]['document_sha256']=bad[0]['document_sha256']
+        if mode=='wrong_model':bad[0]['native_binding']['model_identifier']='other-model'
+        with pytest.raises(ValueError):cao._training_split(bad)
+
+
+def test_prospective_train_rejects_incomplete_receipt_before_model_load(tmp_path,monkeypatch):
+    import json
+    from types import SimpleNamespace
+    binding={'model_identifier':cao.MODEL,'model_revision':'a'*40}
+    rows=[{'cat':'native_edit','schema':'native_neuron_edit_v1','split':s,'ctx':[i],
+        'document_sha256':str(i)*64,'native_sequence':'native_neuron_sequence_v1',
+        'native_binding':binding,'blocks':[{'label':'Neuron A','unit':['neuron',0,0]}]}
+        for i,s in ((1,'train'),(2,'eval'))]
+    data=tmp_path/'partial.jsonl';data.write_text(''.join(json.dumps(r)+'\n' for r in rows))
+    monkeypatch.setattr(cao,'Oracle',lambda *a,**kw:(_ for _ in ()).throw(AssertionError('model must not load')))
+    with pytest.raises(ValueError,match='completed prospective'):
+        cao.train(SimpleNamespace(data=data,base_snapshot=tmp_path/'snapshot'))
+
+
 def test_sequence_capture_same_forward_scalar_norms_and_default_parity():
     from types import SimpleNamespace
     from contextlib import nullcontext

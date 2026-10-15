@@ -207,6 +207,121 @@ def family(ge, tx, graphs: list[native.Graph], seed: int | None = None, edits: l
             for i, a in enumerate(acc)]
 
 
+def edit_id(edit: dict) -> str:
+    """Stable identity of one literal intervention, independent of its outcome."""
+    import hashlib
+    canonical = dict(edit)
+    if 'k' in canonical:
+        if type(canonical['k']) not in (int, float) or not math.isfinite(canonical['k']):
+            raise ValueError('finite numeric edit scale required')
+        canonical['k'] = float(canonical['k'])
+        if canonical['k'] == 0:
+            canonical['k'] = 0.0
+    if 'what' in canonical:
+        canonical['what'] = list(canonical['what'])
+    return hashlib.sha256(json.dumps(canonical, sort_keys=True, allow_nan=False).encode()).hexdigest()
+
+
+@torch.no_grad()
+def common_eval(ge, tx, execute, edits, *, metadata, construction_edit_ids=()) -> dict:
+    """Evaluate a fixed candidate and whole VPD on the same explicit weight panel.
+
+    execute() returns candidate log probabilities at tx.targets under the current
+    weights. The caller freezes its mask, means and panel before calling. This
+    evaluator performs no ranking, construction, admission or reward assignment.
+    Original and failed outcomes remain present; construction edits are excluded
+    only from excluded-from-construction summaries. This is not a held-out
+    guarantee: metadata must disclose other exposure. VPD is unavailable when tx.vpd is None.
+    All KLs normalize complete distributions in FP64 and average over targets.
+    """
+    import copy
+    nat, tg = ge.nat, ge.nat.target
+    edits = copy.deepcopy(list(edits))
+    metadata = json.loads(json.dumps(metadata, sort_keys=True, allow_nan=False))
+    if not isinstance(metadata, dict):
+        raise ValueError('panel metadata must be a JSON object')
+    construction_edit_ids = list(construction_edit_ids)
+    import re
+    if any(not isinstance(value, str) or re.fullmatch('[0-9a-f]{64}', value) is None for value in construction_edit_ids):
+        raise ValueError('construction edit IDs must be lowercase SHA256 hex strings')
+    excluded = set(construction_edit_ids)
+    if len(excluded) != len(construction_edit_ids):
+        raise ValueError('duplicate construction edit IDs')
+    if not tx.ids or not tx.targets or any(type(t) is not int or not 0 <= t < len(tx.ids) for t in tx.targets):
+        raise ValueError('nonempty valid input and targets required')
+    for edit in edits:
+        if not isinstance(edit, dict) or set(edit) != {'kind', 'what', 'k'}:
+            raise ValueError('literal kind/what/k weight edits required')
+        kind, what, scale = edit['kind'], edit['what'], edit['k']
+        if kind not in ('subcomponent', 'neuron', 'head') or not isinstance(what, (list, tuple)) or len(what) != 2:
+            raise ValueError('unsupported weight edit')
+        if type(scale) not in (int, float) or not math.isfinite(scale):
+            raise ValueError('finite edit scale required')
+        if kind == 'subcomponent':
+            if what[0] not in nat.names or type(what[1]) is not int or not 0 <= what[1] < nat.C[what[0]]:
+                raise ValueError('invalid subcomponent edit')
+        elif (type(what[0]) is not int or type(what[1]) is not int or not 0 <= what[0] < tg.n_layer
+              or not 0 <= what[1] < (tg.n_head if kind == 'head' else tg.site(native.site_name(what[0], 'down_proj')).W.shape[1])):
+            raise ValueError('invalid native unit weight edit')
+    identities = [edit_id(e) for e in edits]
+    if len(set(identities)) != len(identities):
+        raise ValueError('duplicate literal weight edits')
+    edits = [{'kind': e['kind'], 'what': list(e['what']), 'k': float(e['k']) if e['k'] != 0 else 0.0} for e in edits]
+    definition = {'ids': list(tx.ids), 'targets': list(tx.targets), 'edits': edits}
+
+    def distribution(value):
+        value = value.detach().double()
+        if value.ndim == 3 and value.shape[0] == 1:
+            value = value[0]
+        if value.shape != (len(tx.targets), tg.n_tokens) or not torch.isfinite(value).all():
+            raise ValueError('finite full-vocabulary log probabilities at every target required')
+        return value.log_softmax(-1)
+
+    def kl(p, q):
+        return max(0., float((p.exp() * (p-q)).sum(-1).mean()) / math.log(2))
+
+    def run():
+        # Bypass cross-call reference caches; weights may have changed previously.
+        hidden = tg.hidden(torch.tensor([tx.ids], device=nat.dev))[:, tx.targets]
+        full = distribution(tg.unembed(hidden).float().log_softmax(-1))
+        candidate = distribution(execute())
+        vpd = distribution(_lqs(ge, tx.ids, tx.targets, [native.Graph(masks=tx.vpd)])[0]) if tx.vpd is not None else None
+        return full, candidate, vpd
+
+    before = run()
+    worlds = []
+    def record(edit, identity, values):
+        p, q, v = values
+        row = {'edit': edit, 'edit_id': identity,
+               'construction_edit': identity in excluded,
+               'full_top': p.argmax(-1).tolist(), 'candidate_top': q.argmax(-1).tolist(),
+               'vpd_top': v.argmax(-1).tolist() if v is not None else None,
+               'model_change_kl_bits': kl(p, before[0]),
+               'candidate_direct_kl_bits': kl(p, q),
+               'vpd_direct_kl_bits': kl(p, v) if v is not None else None,
+               'candidate_anchored_kl_bits': kl(p, _moved(before[0], before[1], q)),
+               'vpd_anchored_kl_bits': kl(p, _moved(before[0], before[2], v)) if v is not None else None}
+        worlds.append(row)
+    record(None, 'original', before)
+    for edit, identity in zip(edits, identities):
+        with applied(nat, edit, ge):
+            values = run()
+        record(edit, identity, values)
+    excluded_from_construction = [r for r in worlds[1:] if not r['construction_edit']]
+    keys = ('candidate_direct_kl_bits', 'vpd_direct_kl_bits',
+            'candidate_anchored_kl_bits', 'vpd_anchored_kl_bits')
+    summary = {key: sum(r[key] for r in excluded_from_construction)/len(excluded_from_construction)
+               if excluded_from_construction and all(r[key] is not None for r in excluded_from_construction) else None for key in keys}
+    return {'panel_id': edit_id(definition), 'definition': definition, 'metadata': metadata,
+            'construction_exposure': {'recorded_edit_ids': sorted(excluded),
+                                      'intersection_count': len(excluded.intersection(identities)),
+                                      'unmatched_recorded_edit_ids': sorted(excluded.difference(identities))},
+            'worlds': worlds, 'excluded_from_construction': {'count': len(excluded_from_construction), **summary},
+            'vpd_status': 'available' if tx.vpd is not None else 'unavailable',
+            'normalization': 'full_vocabulary_fp64; KL bits averaged over targets',
+            'semantics': 'literal weight edits; fixed candidate execution; VPD live remainders'}
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)

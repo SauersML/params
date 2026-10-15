@@ -1,6 +1,7 @@
 """The circuit scorecard (#2951 graph oracle; the lead's 10-14): whether a builder's circuits are good circuits, judged
-on the circuits themselves, never through the oracle, on held-out draws alone (the eval split's changed texts, donors and
-input-scope draws, and a flip pool no search drew from), the judge of the builder bake-off. A circuit is a set of units
+on the circuits themselves, never through the oracle, using evaluation draws (the eval split's changed texts, donors and
+input-scope draws, and a flip pool no search drew from); common weight-panel exposure is reported separately.
+The judge of the builder bake-off. A circuit is a set of units
 with a run semantics: VPD subcomponents under VPD's fixed masks (goal_eval's C semantics), or the model's own heads and
 neurons ("units": "native", nodes ["head" | "neuron", layer, position, index]) in the real model with every unit outside
 mean-ablated (a head's output and a neuron's activation at their means: native_units.unit_means, NativePhi(means=)); native circuits are scored on the families both kinds have
@@ -39,6 +40,10 @@ mean-ablated (a head's output and a neuron's activation at their means: native_u
            its activation set to its value on an in-distribution far donor; per intervention the predicted against the
            real drop, KL(model || circuit), and the doc's open question, intermediate faithfulness: the circuit's own
            units' activations against the model's at the same units (relative and response errors)
+  common_weights  candidate-independent weight edits shared by native and VPD circuits: remove and double one
+           source-norm-ranked component per site (48 edits plus original on vpd4l). Search/eval component pools are
+           disjoint; external construction exposure remains unverified unless recorded. Direct and baseline-anchored
+           KL against the model, VPD reference errors and top tokens are retained for every world; no new reward floor.
   size     also parameters touched (each unit's weights once) and the build's seconds per text
   live     (VPD circuits, a diagnostic beside the claim) live_gates: edit_live's predictions with VPD's gates recomputed
            on each edited run, where the causal-importance network is
@@ -58,6 +63,7 @@ SC_CPU=1 keeps the run off the GPU (the Mac's GPU serves the RL scorer).
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -83,6 +89,7 @@ import lines  # noqa: E402
 import native  # noqa: E402
 import native_units  # noqa: E402
 import teacher  # noqa: E402
+import weight_family  # noqa: E402
 
 POOL = Path.home() / "mpd-data/graph_oracle/goal_eval/ci_patterns_fresh.pt"  # the flips' pool: none of the searches drew
 # from it (the teachers and the reward use ci_patterns_train.pt)
@@ -279,6 +286,54 @@ def judged(row: dict, fl: dict, fams: list) -> dict:
     sc = {f: goal_eval.family_score(row, f) for f in fams}
     return {"scores": sc, "v": goal_eval.shortfall(row, fl), "phi": goal_eval.phi(row, families=fams)[0],
             "failing": [f for f in fams if (sc[f] or 0.0) < fl.get(f, 0.0)]}
+
+
+def common_weight_bank(nat, tx, split="eval") -> dict:
+    """One weight component per site, removed and doubled, independent of candidates.
+
+    Hash-partition each site's components before choosing its largest source
+    vector norm product. Search/eval components are disjoint, including their
+    scaling variants. This does not certify that an external builder never saw
+    these edits. The original run plus 24 sites gives 49 worlds on vpd4l.
+    """
+    if split not in ("search", "eval"):
+        raise ValueError("weight panel split must be search or eval")
+    edits, missing = [], []
+    for name in sorted(nat.names):
+        count = nat.C[name]
+        order = sorted(range(count), key=lambda c: hashlib.sha256(
+            json.dumps(["scorecard-weight-v1", int(tx.seed), name, c]).encode()).digest())
+        choices = order[0::2] if split == "search" else order[1::2]
+        if not choices:
+            missing.append(name)
+            continue
+        site = nat.target.site(name)
+        with torch.no_grad():
+            strength = (site.U.detach().cpu().double().norm(dim=1) *
+                        site.V.detach().cpu().double().norm(dim=0)).tolist()
+        if any(not math.isfinite(strength[c]) for c in choices):
+            raise ValueError("nonfinite component norm in common weight panel")
+        c = max(choices, key=lambda c: (strength[c], -c))
+        edits.extend({"kind": "subcomponent", "what": [name, c], "k": k} for k in (0.0, 2.0))
+    return {"version": "scorecard-weight-v1", "split": split, "edits": edits,
+            "sites_without_split_component": missing,
+            "selection": "largest source norm product within hash-partitioned site components",
+            "exposure": "split-disjoint within this bank; external construction exposure unverified"}
+
+
+def common_weights(ge, tx, *, graph=None, nphi=None, mask=None, construction_edit_ids=()) -> dict:
+    """Same literal weight edits and VPD reference for either circuit execution."""
+    if (graph is None) == (nphi is None) or (nphi is not None and mask is None):
+        raise ValueError("supply one VPD graph or native evaluator and mask")
+    bank = common_weight_bank(ge.nat, tx)
+    if graph is not None:
+        execute = lambda: weight_family._lqs(ge, tx.ids, tx.targets, [graph])[0]
+    else:
+        execute = lambda: ge.graph_ref(tx.ids, tx.targets, nphi.model, units=nphi._units(
+            [~mask.heads], [~mask.neurons], nphi._ablate(tx.T)))
+    return weight_family.common_eval(ge, tx, execute, bank["edits"],
+        metadata={k: v for k, v in bank.items() if k != "edits"},
+        construction_edit_ids=construction_edit_ids)
 
 
 @torch.no_grad()
@@ -815,6 +870,10 @@ def score_native(ge: goal_eval.GoalEval, path: Path, pool: dict, vpd: dict | Non
     rec["known"] = {}
     done("floors")
 
+    rec["common_weights"] = common_weights(ge, tx, nphi=nphi, mask=S,
+        construction_edit_ids=d.get("construction_weight_edit_ids", ()))
+    done("common weight panel")
+
     y = tx.ref[0].argmax(-1)
 
     def lp(lq):
@@ -923,6 +982,9 @@ def score(ge: goal_eval.GoalEval, path: Path, pool: dict, vpd: dict | None = Non
     rec["floors"] = {"families": {f: {"score": base["scores"][f], "floor": fl.get(f), "vpd": goal_eval.family_score(vf["vpd"], f)} for f in fams},
                      "v": base["v"], "phi": base["phi"], "phi_vpd": goal_eval.phi(vf["vpd"], families=fams)[0], "failing": base["failing"],
                      **noise_floors(row0, vf, fl)}
+    rec["common_weights"] = common_weights(ge, tx, graph=goal_eval._c_graph(g, tx.targets, nat.C),
+        construction_edit_ids=json.loads(path.read_text()).get("construction_weight_edit_ids", ()))
+    done("common weight panel")
     known = {}
     pp = paper_parts(path.stem)
     if pp:
@@ -1057,7 +1119,7 @@ def add(out: Path, circuits_dir: Path, vpd: dict | None, pool: dict) -> None:
         rec = json.loads(f.read_text())
         native_rec = rec["size"].get("units") == "native"
         if ("mediated" in rec.get("edits", {}) and "sparsity" in rec.get("size", {}) and (native_rec or rec.get("live_gates") is not None or not ci)
-                and "interventions" in rec and "margins" in rec["floors"]):
+                and "interventions" in rec and "margins" in rec["floors"] and "common_weights" in rec):
             continue
         path = circuits_dir / f.name
         tp = task_path(path.stem)
@@ -1067,6 +1129,9 @@ def add(out: Path, circuits_dir: Path, vpd: dict | None, pool: dict) -> None:
             means = means or native_units.unit_means(ge.nat)
             nphi = native_units.NativePhi(ge, tx, "eval", means=means)
             S = native_units.from_units(native_units.NativeUnits(ge.nat, tx.ids, tx.targets), units)
+            if "common_weights" not in rec:
+                rec["common_weights"] = common_weights(ge, tx, nphi=nphi, mask=S,
+                    construction_edit_ids=json.loads(path.read_text()).get("construction_weight_edit_ids", ()))
             if "margins" not in rec["floors"]:
                 add_noise(rec, nphi.rows([S])[0], ge.vpd_floors(tx, pool, "eval"), list(native_units.SHARED))
             f.write_text(json.dumps(rec))
@@ -1083,6 +1148,9 @@ def add(out: Path, circuits_dir: Path, vpd: dict | None, pool: dict) -> None:
         if "interventions" not in rec:
             rec["interventions"] = interventions_vpd(ge, tx, nodes, top)
         g, _, _ = goal_eval.load_answer(path, json.loads(tp.read_text()), tx.targets, ge.nat)
+        if "common_weights" not in rec:
+            rec["common_weights"] = common_weights(ge, tx, graph=goal_eval._c_graph(g, tx.targets, ge.nat.C),
+                construction_edit_ids=json.loads(path.read_text()).get("construction_weight_edit_ids", ()))
         rec["size"].update({"units": "vpd", "params": params_touched(ge.nat, g.node_set()), "build_seconds": build_seconds(path),
                             "sparsity": sparsity(g, tx.targets)})
         if "margins" not in rec["floors"]:

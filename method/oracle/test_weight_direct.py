@@ -64,3 +64,98 @@ def test_direct_weight_diagnostics_match_independent_physical_forward(semantics)
     empty_panel = weight_family.family(ge, tx, [graph], edits=[])[0]
     assert empty_panel['kl_weight_direct'] is None
     assert empty_panel['draws_weight_direct'] == []
+
+
+def test_common_panel_native_nonzero_means_matches_physical_hooks():
+    import native_units
+    nat=tiny_native(seed=73,layers=1,d=4,heads=2,vocab=8,C=2)
+    ge=goal_eval.GoalEval(nat,semantics='c')
+    ids,targets=[1,2,3],[1,2]
+    tx=ge.text(ids,targets,seed=2)
+    masks={n:torch.ones(len(ids),nat.C[n],dtype=torch.bool) for n in nat.names}
+    tx.vpd=masks
+    live=(torch.ones(1,3,2),torch.ones(1,3,16))
+    live[0][0,0,0]=0;live[1][0,2,::2]=0
+    means={'heads':torch.arange(4,dtype=torch.float32).reshape(1,2,2)/10,
+           'neurons':torch.linspace(-.2,.3,16)[None]}
+    def execute():
+        mu=native_units.MeanUnits(nat,ids,targets,None)
+        mu.means=means
+        return mu.logq(tuple(m[None] for m in live))
+    edits=[{'kind':'head','what':[0,1],'k':.5},
+           {'kind':'neuron','what':[0,2],'k':0.}]
+    construction=weight_family.edit_id(edits[0])
+    panel=weight_family.common_eval(ge,tx,execute,edits,
+        metadata={'split':'eval','prior_exposure':'unit-test synthetic'},construction_edit_ids=[construction])
+    assert len(panel['worlds'])==3
+    assert panel['excluded_from_construction']['count']==1
+    assert panel['worlds'][1]['construction_edit']
+    assert panel['worlds'][0]['candidate_anchored_kl_bits']==pytest.approx(0.,abs=1e-12)
+    assert panel['worlds'][0]['model_change_kl_bits']==0.
+    full_before=None;circuit_before=None
+    for index,edit in enumerate([None]+edits):
+        from contextlib import nullcontext
+        with weight_family.applied(nat,edit,ge) if edit is not None else nullcontext():
+            p=nat.target.unembed(nat.target.hidden(torch.tensor([ids]))[:,targets])[0].float().log_softmax(-1).double().log_softmax(-1)
+            handles=[]
+            hm=live[0][0].bool().repeat_interleave(nat.target.hd,dim=-1)
+            nm=live[1][0].bool()
+            handles.append(nat.target.site('h.0.attn.o_proj').register_forward_pre_hook(
+                lambda module,args:(torch.where(hm,args[0],means['heads'][0].flatten()),)))
+            handles.append(nat.target.site('h.0.mlp.down_proj').register_forward_pre_hook(
+                lambda module,args:(torch.where(nm,args[0],means['neurons'][0]),)))
+            try:q=nat.target.unembed(nat.target.hidden(torch.tensor([ids]))[:,targets])[0].float().log_softmax(-1).double().log_softmax(-1)
+            finally:
+                for handle in handles:handle.remove()
+        if index==0:full_before,circuit_before=p,q
+        expected=max(0.,kl_bits(p,q)/len(targets))
+        row=panel['worlds'][index]
+        assert row['candidate_direct_kl_bits']==pytest.approx(expected,abs=1e-6)
+        assert row['vpd_direct_kl_bits']==pytest.approx(0.,abs=1e-6)
+        moved=weight_family._moved(full_before,circuit_before,q)
+        assert row['candidate_anchored_kl_bits']==pytest.approx(max(0.,kl_bits(p,moved)/len(targets)),abs=1e-6)
+        assert row['candidate_top']==q.argmax(-1).tolist()
+    repeat=weight_family.common_eval(ge,tx,execute,edits,metadata={'split':'eval','prior_exposure':'unit-test synthetic'},construction_edit_ids=[construction])
+    assert panel==repeat
+
+
+def test_common_panel_exception_restores_weights_and_invalid_exclusions_precheck():
+    nat=tiny_native(seed=2,layers=1,d=4,heads=2,vocab=8,C=2)
+    ge=goal_eval.GoalEval(nat,semantics='c');tx=ge.text([1,2],[1],seed=3)
+    edit={'kind':'neuron','what':[0,2],'k':0.}
+    saved={name:{key:getattr(nat.target.site(name),key).clone() for key in ('W','U','V','delta_T')} for name in nat.names}
+    calls=[]
+    def candidate():
+        calls.append(True)
+        if len(calls)==2:raise RuntimeError('candidate execution failed')
+        return tx.ref
+    for exclusion in (['malformed'],[weight_family.edit_id(edit)]*2):
+        with pytest.raises(ValueError):weight_family.common_eval(ge,tx,candidate,[edit],metadata={},construction_edit_ids=exclusion)
+    assert not calls
+    with pytest.raises(RuntimeError,match='candidate execution failed'):
+        weight_family.common_eval(ge,tx,candidate,[edit],metadata={})
+    for name,values in saved.items():
+        for key,value in values.items():assert torch.equal(getattr(nat.target.site(name),key),value)
+    assert not nat._refs and not ge._xk
+
+
+def test_panel_identity_is_common_bank_and_scale_canonical():
+    nat=tiny_native(seed=3,layers=1,d=4,heads=2,vocab=8,C=2)
+    ge=goal_eval.GoalEval(nat,semantics='c');tx=ge.text([1,2],[1],seed=4)
+    edit={'kind':'neuron','what':[0,2],'k':0}
+    equivalent={'kind':'neuron','what':(0,2),'k':-0.0}
+    assert weight_family.edit_id(edit)==weight_family.edit_id(equivalent)
+    execute=lambda:tx.ref
+    left=weight_family.common_eval(ge,tx,execute,[edit],metadata={'candidate':'a'})
+    outside=weight_family.edit_id({'kind':'head','what':[0,1],'k':.5})
+    right=weight_family.common_eval(ge,tx,execute,[equivalent],metadata={'candidate':'b'},
+        construction_edit_ids=[outside,weight_family.edit_id(edit)])
+    assert left['panel_id']==right['panel_id']
+    assert right['construction_exposure']['intersection_count']==1
+    assert right['construction_exposure']['unmatched_recorded_edit_ids']==[outside]
+    assert right['excluded_from_construction']['count']==0
+    disjoint=weight_family.common_eval(ge,tx,execute,[edit],metadata={},construction_edit_ids=[outside])
+    assert disjoint['excluded_from_construction']['count']==1
+    assert disjoint['construction_exposure']['intersection_count']==0
+    with pytest.raises(ValueError,match='duplicate literal'):
+        weight_family.common_eval(ge,tx,execute,[edit,equivalent],metadata={})

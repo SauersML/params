@@ -12,6 +12,46 @@ import circuit_scorecard as sc  # noqa: E402
 import native  # noqa: E402
 
 
+def test_common_weight_bank_is_candidate_independent_and_split_disjoint():
+    from types import SimpleNamespace
+    from test_goal_eval import tiny_native
+    nat = tiny_native(seed=9, layers=1, d=4, heads=2, vocab=8, C=4)
+    tx = SimpleNamespace(seed=11)
+    search = sc.common_weight_bank(nat, tx, "search")
+    evaluation = sc.common_weight_bank(nat, tx, "eval")
+    assert evaluation == sc.common_weight_bank(nat, tx, "eval")
+    assert len(evaluation["edits"]) == 2 * len(nat.names)
+    assert not evaluation["sites_without_split_component"]
+    selected = lambda b: {tuple(e["what"]) for e in b["edits"]}
+    assert selected(search).isdisjoint(selected(evaluation))
+    assert {e["k"] for e in evaluation["edits"]} == {0.0, 2.0}
+    with pytest.raises(ValueError):
+        sc.common_weight_bank(nat, tx, "invalid")
+
+
+def test_common_weight_scorecard_calls_same_panel_for_both_units(monkeypatch):
+    from types import SimpleNamespace
+    import torch
+    from test_goal_eval import tiny_native
+    nat = tiny_native(seed=9, layers=1, d=4, heads=2, vocab=8, C=4)
+    tx = SimpleNamespace(seed=11, ids=[1, 2], targets=[1], T=2)
+    ge = SimpleNamespace(nat=nat, graph_ref=lambda *a, **kw: torch.tensor([[[1., 2.]]]))
+    seen = []
+    def evaluate(ge, tx, execute, edits, **kw):
+        seen.append((edits, kw["metadata"], execute().flatten().tolist()))
+        return {"checked": True}
+    monkeypatch.setattr(sc.weight_family, "common_eval", evaluate)
+    monkeypatch.setattr(sc.weight_family, "_lqs", lambda *a: torch.tensor([[[1., 2.]]]))
+    mask = SimpleNamespace(heads=torch.ones(1, 2, 2, dtype=torch.bool),
+                           neurons=torch.ones(1, 2, 16, dtype=torch.bool))
+    nphi = SimpleNamespace(model=object(), _ablate=lambda t: None, _units=lambda *a: {})
+    assert sc.common_weights(ge, tx, graph=object()) == {"checked": True}
+    assert sc.common_weights(ge, tx, nphi=nphi, mask=mask) == {"checked": True}
+    assert seen[0] == seen[1]
+    with pytest.raises(ValueError):
+        sc.common_weights(ge, tx, graph=object(), nphi=nphi, mask=mask)
+
+
 def test_token_reached_follows_lines_and_attention_patterns():
     fc = ("h.0.mlp.c_fc", 1, 5)
     down = ("h.0.mlp.down_proj", 1, 7)

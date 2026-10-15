@@ -108,6 +108,8 @@ class Target:
         """The model's greedy continuations of PROMPTS with the neuron's activation set to value at every position
         (None: unsteered), joined."""
         torch = self.torch
+        if value is None and getattr(self, "_plain", None):  # the unsteered continuations: the same for every neuron
+            return self._plain
         h = None
         if value is not None:
             def pre(_m, a):
@@ -126,6 +128,8 @@ class Target:
         finally:
             if h is not None:
                 h.remove()
+        if value is None:
+            self._plain = " / ".join(outs)
         return " / ".join(outs)
 
 
@@ -198,6 +202,30 @@ def cmd_verify(a) -> None:
           f"{sum(r.get('steer_match', 0) for r in ok) / n:.2f}; T1 pass {sum(r['passes_t1'] for r in ok) / n:.2f}; spend ${rd.spend.total:.3f}")
 
 
+def cmd_summary(a) -> None:
+    """T1's numbers from verify's rows (pre-registered 10-15): the share of explained poles passing (blind maximum >=
+    FIRE and near misses < FIRE), both poles pooled; the positive and negative poles apart; neurons whose poles both
+    pass; and the comparison with Cammarata's Qwen3-32B (76% blind maximum, 11% near misses, 1% distant)."""
+    rows = [json.loads(x) for f in a.rows for x in f.read_text().splitlines()]
+    ok = [r for r in rows if r.get("valid")]
+
+    def stats(rs, name):
+        n = max(len(rs), 1)
+        print(f"{name}: {len(rs)} poles; pass {sum(r['passes_t1'] for r in rs) / n:.2f}; blind max >= {FIRE} {sum(r['blind_max'] >= FIRE for r in rs) / n:.2f} "
+              f"(median {sorted(r['blind_max'] for r in rs)[len(rs) // 2] if rs else 0:.2f}); near misses {sum(r['near_miss_rate'] for r in rs) / n:.2f}; "
+              f"distant {sum(r['distant_rate'] for r in rs) / n:.2f}; steering match {sum(r.get('steer_match', 0) for r in rs) / n:.2f}")
+
+    stats(ok, "both poles (primary)")
+    stats([r for r in ok if r["pole"] == "+"], "positive pole")
+    stats([r for r in ok if r["pole"] == "-"], "negative pole")
+    by: dict = {}
+    for r in ok:
+        by.setdefault((r["layer"], r["index"]), {})[r["pole"]] = r["passes_t1"]
+    both = [v for v in by.values() if len(v) == 2]
+    print(f"neurons with both poles explained: {len(both)}; both pass {sum(all(v.values()) for v in both) / max(len(both), 1):.2f}; "
+          f"invalid reader plans {len(rows) - len(ok)}")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="what", required=True)
@@ -207,8 +235,10 @@ def main():
     v.add_argument("--model", default="Qwen/Qwen3-1.7B")
     v.add_argument("--reader", default=READER)
     v.add_argument("--device")
+    sm = sub.add_parser("summary")
+    sm.add_argument("rows", type=Path, nargs="+")
     a = ap.parse_args()
-    {"verify": cmd_verify}[a.what](a)
+    {"verify": cmd_verify, "summary": cmd_summary}[a.what](a)
 
 
 if __name__ == "__main__":

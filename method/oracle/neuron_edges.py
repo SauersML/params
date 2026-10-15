@@ -205,37 +205,49 @@ class Edges:
         z = self.base["A"][L] @ self.base["v"][L].repeat_interleave(self.H // self.KV, 0)  # [H, T, hd]
         return self.base["x"][L] + at.o_proj(z.transpose(0, 1).reshape(self.T, -1))
 
+    def jacobians(self) -> dict:
+        """Each circuit neuron's activation's gradient with respect to its MLP input in the base run [d] (kept)."""
+        if getattr(self, "_J", None) is None:
+            J = {}
+            for L in range(self.L):
+                rs = [n for n in self.N if n[0] == L]
+                if rs:
+                    with torch.enable_grad():
+                        xin = self._mid_stream(L)[[n[1] for n in rs]].detach().requires_grad_()
+                        h = self._mlp_act(self.layers[L], xin).gather(-1, torch.tensor([[n[2]] for n in rs], device=self.dev))[:, 0]
+                        (g,) = torch.autograd.grad(h.sum(), xin)
+                    J.update(dict(zip(rs, g)))
+            self._J = J
+        return self._J
+
+    @torch.no_grad()
+    def brings(self, edge) -> torch.Tensor:
+        """What an edge brings into its reader's MLP input in the base run [d]: the writer's write (resid), or the
+        change in the head's output at the reader's position from the writer's write at its own (route)."""
+        w = edge[0]
+        write = self.base["h"][w[0]][w[1], w[2]] * weight(self.layers[w[0]].mlp.down_proj)[:, w[2]]
+        if len(edge) == 2:
+            return write
+        (c, h), r = edge[1], edge[2]
+        layer, kv = self.layers[c], h // (self.H // self.KV)
+        vw = layer.self_attn.v_proj(layer.input_layernorm(self.base["x"][c][w[1]] - write)).view(self.KV, self.hd)[kv]
+        dz = self.base["A"][c][h, r[1], w[1]] * (self.base["v"][c][kv, w[1]] - vw)
+        return weight(layer.self_attn.o_proj)[:, h * self.hd:(h + 1) * self.hd] @ dz
+
     def linear_scores(self) -> tuple[torch.Tensor, torch.Tensor]:
         """(resid scores, route scores) over resid_all and route_all: each edge's linear effect on the contrast, the
         contrast's gradient at the reader's activation times the reader's input Jacobian times what the edge brings
         (the contrast it supports: positive when its cut lowers the contrast)."""
-        dev, base, H, KV, hd = self.dev, self.base, self.H, self.KV, self.hd
+        dev = self.dev
         probe = [torch.zeros(self.T, self.keep.shape[-1], device=dev, requires_grad=True) for _ in range(self.L)]
         with torch.enable_grad():
             self._run(torch.zeros(1, 0, dtype=torch.bool), [], probe=probe)["contrast"].sum().backward()
         grad = {n: float(probe[n[0]].grad[n[1], n[2]]) for n in self.N}
-        J = {}  # each circuit neuron's activation's gradient with respect to its MLP input [d]
-        for L in range(self.L):
-            rs = [n for n in self.N if n[0] == L]
-            if rs:
-                with torch.enable_grad():
-                    xin = self._mid_stream(L)[[n[1] for n in rs]].detach().requires_grad_()
-                    h = self._mlp_act(self.layers[L], xin).gather(-1, torch.tensor([[n[2]] for n in rs], device=dev))[:, 0]
-                    (g,) = torch.autograd.grad(h.sum(), xin)
-                J.update(dict(zip(rs, g)))
+        J = self.jacobians()
         with torch.no_grad():
-            writes = {n: base["h"][n[0]][n[1], n[2]] * weight(self.layers[n[0]].mlp.down_proj)[:, n[2]] for n in self.N}
-            rs_s = torch.tensor([grad[r] * float(J[r] @ writes[w]) for w, r in self.resid_all])
-            rt, vcache = [], {}
-            for w, (c, h), r in self.route_all:
-                layer, kv = self.layers[c], h // (H // KV)
-                if (w, c) not in vcache:
-                    xw = base["x"][c][w[1]] - writes[w]
-                    vcache[(w, c)] = layer.self_attn.v_proj(layer.input_layernorm(xw)).view(KV, hd)
-                dz = base["A"][c][h, r[1], w[1]] * (base["v"][c][kv, w[1]] - vcache[(w, c)][kv])
-                dout = weight(layer.self_attn.o_proj)[:, h * hd:(h + 1) * hd] @ dz
-                rt.append(grad[r] * float(J[r] @ dout))
-        return rs_s, torch.tensor(rt)
+            rs_s = torch.tensor([grad[r] * float(J[r] @ self.brings(e)) for e in self.resid_all for r in [e[1]]])
+            rt = torch.tensor([grad[e[2]] * float(J[e[2]] @ self.brings(e)) for e in self.route_all])
+        return rs_s, rt
 
 
 def prune(ed: Edges, log=print) -> dict:
@@ -293,9 +305,11 @@ def prune(ed: Edges, log=print) -> dict:
 
 
 @torch.no_grad()
-def graph(ed: Edges, got: dict) -> dict:
+def graph(ed: Edges, got: dict, tok=None) -> dict:
     """The stated graph as JSON: neuron poles (the activation's sign, the SwiGLU regime: the signs of gate and up) and
-    the kept edges with their write weights and measured strengths (bits of contrast their cut alone removes)."""
+    the kept edges with their write weights, their linear push on the reader's activation in the run (push; excites:
+    toward the reader's pole; share: |push| over the reader's activation) and measured strength (bits of contrast their
+    cut alone removes); with a tokenizer, the tokens and the answer's and alternatives' text."""
     nodes = []
     for L, p, j in ed.N:
         layer = ed.layers[L]
@@ -304,7 +318,7 @@ def graph(ed: Edges, got: dict) -> dict:
         a = float(ed.base["h"][L][p, j])
         nodes.append({"id": len(nodes), "layer": L, "neuron": j, "pos": p, "act": a, "pole": 1 if a >= 0 else -1,
                       "regime": f"g{'+' if g >= 0 else '-'}u{'+' if u >= 0 else '-'}"})
-    out = []
+    out, J = [], ed.jacobians()
     for e, st in zip(got["edges"], got["strengths"]):
         w, r = e[0], e[-1]
         col = weight(ed.layers[w[0]].mlp.down_proj)[:, w[2]]
@@ -315,13 +329,18 @@ def graph(ed: Edges, got: dict) -> dict:
             col = weight(at.o_proj)[:, h * ed.hd:(h + 1) * ed.hd] @ vw
         layer = ed.layers[r[0]]
         wn = layer.post_attention_layernorm.weight * col
+        eff = float(J[r] @ ed.brings(e))  # the edge's linear push on the reader's activation in the run
+        pole = nodes[ed.at[r]]["pole"]
         out.append({"src": ed.at[w], "dst": ed.at[r], "kind": "resid" if len(e) == 2 else "route",
                     "head": list(e[1]) if len(e) == 3 else None, "src_pos": w[1], "dst_pos": r[1],
                     "w_gate": float(weight(layer.mlp.gate_proj)[r[2]] @ wn), "w_up": float(weight(layer.mlp.up_proj)[r[2]] @ wn),
+                    "push": eff, "excites": (eff >= 0) == (pole > 0), "share": abs(eff) / max(abs(nodes[ed.at[r]]["act"]), 1e-9),
                     "strength": st})
-    return {"ids": ed.ids, "contrast": {"answer": ed.answer, "alternatives": ed.alternatives, "target": ed.target,
-                                        "value": ed.c_full}, "background": ed.background, "nodes": nodes, "edges": out,
-            "record": got["record"],
+    txt = {} if tok is None else {"tokens": [tok.decode([i]) for i in ed.ids], "answer_text": tok.decode(ed.answer),
+                                  "alternatives_text": [tok.decode([a]) for a in ed.alternatives]}
+    return {"ids": ed.ids, **txt, "contrast": {"answer": ed.answer, "alternatives": ed.alternatives, "target": ed.target,
+                                               "value": ed.c_full}, "background": ed.background, "nodes": nodes,
+            "edges": out, "record": got["record"],
             "route_cut_semantics": {"path": "value_ov", "attention_pattern": "current_run_fixed_in_local_value_delta",
                                     "head_input_norm": "recomputed_after_writer_write_subtraction",
                                     "reader_mlp": "recomputed_norm_gate_up", "combined_routes": "sum_of_individual_value_deltas",
@@ -345,7 +364,7 @@ def main():
     ed = Edges(model, t["ids"], t["target"], t["answer"], t["alternatives"], [tuple(n) for n in t["neurons"]],
                background=a.background)
     got = prune(ed, log=lambda m: print(f"{a.text.stem}: {m}", flush=True))
-    a.out.write_text(json.dumps(graph(ed, got)))
+    a.out.write_text(json.dumps(graph(ed, got, transformers.AutoTokenizer.from_pretrained(a.model))))
 
 
 if __name__ == "__main__":

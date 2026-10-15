@@ -76,6 +76,7 @@ class Oracle:
         from transformers import AutoModelForCausalLM, AutoTokenizer
 
         self.torch = torch
+        self.model_identifier = model
         self.dev = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
         self.tok = AutoTokenizer.from_pretrained(model)
         base = AutoModelForCausalLM.from_pretrained(model, dtype=torch.bfloat16).to(self.dev)
@@ -121,7 +122,8 @@ class Oracle:
                 parts.append(f"Layer: {b['layer']}\n" + " ?" * len(b["positions"]) + " \n")
             else:
                 parts.append(f"{b['label']}: ? \n")  # (" ?\n" is one token; " ? \n" keeps the placeholder alone)
-        return "".join(parts) + ex["q"]
+        sequence = _sequence_prompt(ex) if _sequence_requested(ex) else ''
+        return "".join(parts) + sequence + ex["q"]
 
     def encode(self, ex: dict, answer: bool) -> tuple[list[int], list[int], int]:
         """(ids, placeholder positions, the answer's first index or len(ids))."""
@@ -152,10 +154,11 @@ class Oracle:
                 self._vcache.pop(next(iter(self._vcache)))
         return v
 
-    def _vectors(self, ex: dict):
+    def _vectors(self, ex: dict, *, sequence=False):
         torch = self.torch
         units = [b['unit'] for b in ex['blocks'] if 'layer' not in b]
-        out, writes = _capture_native(self, ex['ctx'], units, target=ex.get('target'), hidden=True)
+        captured = _capture_native(self, ex['ctx'], units, target=ex.get('target'), hidden=True, **({'sequence':True} if sequence else {}))
+        out, writes = captured[:2]
         H = out.hidden_states
         writes = iter(writes)
         vs = []
@@ -164,7 +167,31 @@ class Oracle:
                 vs.append(H[b["layer"] + 1][0, b["positions"]])
             else:
                 vs.append(next(writes)[None].to(H[0].dtype))
-        return torch.cat(vs)
+        value = torch.cat(vs)
+        return (value, captured[2]) if sequence else value
+
+    def prepare(self, exs):
+        """Opt-in clean evidence before encoding; never mutate caller examples or use labels.
+
+        text_only disables vector injection, not this opt-in textual evidence.
+        Legacy batches retain their existing capture/cache path. Sequence inputs
+        deliberately bypass vector caches and reject precomputed vector overrides.
+        """
+        flags=[_sequence_requested(e) for e in exs]
+        if not any(flags):return exs,None
+        for e,flag in zip(exs,flags):
+            if flag and ('vec' in e or '_native_sequence_packet' in e):
+                raise ValueError('sequence evidence requires fresh clean capture, not a supplied sidecar/vector')
+        prepared,vecs=[],[]
+        for e,flag in zip(exs,flags):
+            if flag:
+                v,packet=self._vectors(e,sequence=True)
+                ready={**e,'_native_sequence_packet':packet}
+                _sequence_prompt(ready)  # validate before any oracle forward
+            else:
+                v=self.vectors(e);ready=e
+            prepared.append(ready);vecs.append(v)
+        return prepared,vecs
 
     def vectors_many(self, exs: list[dict]) -> list:
         """vectors() for a batch: the examples that read layers of the target itself in one right-padded forward pass
@@ -213,8 +240,9 @@ class Oracle:
         reduce False: (summed loss, token count) for accumulation over micro-batches; backward: the summed loss's
         backward pass taken while the injection hook is still on (gradient checkpointing recomputes layer 1 with it)."""
         torch = self.torch
+        exs, prepared_vecs = self.prepare(exs)
         enc = [self.encode(e, True) for e in exs]
-        vecs = self.vectors_many(exs)
+        vecs = self.vectors_many(exs) if prepared_vecs is None else prepared_vecs
         L = max(len(i) for i, _, _ in enc)
         pad = self.tok.pad_token_id or self.tok.eos_token_id
         ids = torch.full((len(exs), L), pad, device=self.dev)
@@ -240,8 +268,9 @@ class Oracle:
     def answers(self, exs: list[dict]) -> list[str]:
         """Greedy answers to a batch of examples (left-padded, each row's vectors at its own placeholders)."""
         torch = self.torch
+        exs, prepared_vecs = self.prepare(exs)
         enc = [self.encode(e, False) for e in exs]
-        vecs = [self.vectors(e) for e in exs]
+        vecs = [self.vectors(e) for e in exs] if prepared_vecs is None else prepared_vecs
         L = max(len(i) for i, _, _ in enc)
         pad = self.tok.pad_token_id or self.tok.eos_token_id
         ids = torch.full((len(exs), L), pad, device=self.dev)
@@ -267,9 +296,10 @@ class Oracle:
         """Per example, log p of each of its options as the whole answer (its tokens up to the end of turn), every
         (example, option) pair in one right-padded batch."""
         torch = self.torch
+        exs, prepared_vecs = self.prepare(exs)
         pairs = [({**e, "a": o}, b) for b, (e, opts) in enumerate(zip(exs, options)) for o in opts]
         enc = [self.encode(e, True) for e, _ in pairs]
-        vec_of = [self.vectors(e) for e in exs]
+        vec_of = [self.vectors(e) for e in exs] if prepared_vecs is None else prepared_vecs
         L = max(len(i) for i, _, _ in enc)
         pad = self.tok.pad_token_id or self.tok.eos_token_id
         ids = torch.full((len(enc), L), pad, device=self.dev)
@@ -335,9 +365,12 @@ def _native_weight(module, start, end):
     return W
 
 
-def _capture_native(o, ctx, units, *, target=None, hidden=False):
+def _capture_native(o, ctx, units, *, target=None, hidden=False, sequence=False):
     """One counted target forward captures all requested native writes in order."""
     torch = o.torch
+    if sequence and (not isinstance(ctx,list) or not ctx or any(type(x) is not int or x<0 for x in ctx)
+                     or not units or any(len(u)!=3 or u[0]!='neuron' for u in units)):
+        raise ValueError('sequence evidence requires nonempty context and selected native neurons only')
     selected = []
     for kind, layer, index in units:
         if kind not in ('neuron', 'head') or type(layer) is not int or type(index) is not int or layer < 0 or index < 0:
@@ -348,20 +381,92 @@ def _capture_native(o, ctx, units, *, target=None, hidden=False):
         if (index + 1) * width > projection.weight.shape[1]:
             raise ValueError('native unit outside projection')
         selected.append((projection, index, width))
-    got, handles = {}, []
+    got, traces, handles = {}, {}, []
     try:
         for module in dict.fromkeys(m for m, _, _ in selected):
-            handles.append(module.register_forward_pre_hook(
-                lambda m, args: got.__setitem__(m, args[0][0, -1].detach().float().clone())))
+            indices=list(dict.fromkeys(i for m,i,w in selected if m is module))
+            def capture(m,args,indices=indices):
+                got[m]=args[0][0,-1].detach().float().clone()
+                if sequence:
+                    # Only selected scalar columns, never T x residual-width per neuron.
+                    for i in indices:
+                        traces[m,i]=args[0][0,:,i].detach().float().clone()
+            handles.append(module.register_forward_pre_hook(capture))
         with o.off(target), torch.no_grad():
             weights = {(m,i,w): _native_weight(m, i*w, (i+1)*w) for m,i,w in selected}
             o.passes += 1
             out = o.m(input_ids=torch.tensor([ctx], device=o.dev), output_hidden_states=hidden)
             writes = [got[m][i*w:(i+1)*w] @ weights[m,i,w].T for m, i, w in selected]
+            if sequence:
+                import hashlib
+                positions=list(range(len(ctx)))
+                packet={'schema':'native_neuron_sequence_v1','model_identifier':str(getattr(o,'model_identifier',MODEL)),
+                    'model_binding_scope':'constructor identifier and target adapter name; checkpoint bytes not attested',
+                    'input_sha256':hashlib.sha256(json.dumps(ctx,separators=(',',':')).encode()).hexdigest(),
+                    'token_ids':list(ctx),'position_ids':positions,'target_adapter':target,'vector_position':len(ctx)-1,
+                    'intervention_scope':'clean observations at every supplied position; the question specifies which positions are intervened on',
+                    'neurons':[{'unit':list(unit),'activation':traces[m,i].cpu().tolist(),
+                        'write_norm':(traces[m,i].abs()*weights[m,i,w].norm()).cpu().tolist()}
+                        for unit,(m,i,w) in zip(units,selected)]}
+                return out,writes,packet
         return out, writes
     finally:
         for handle in handles:
             handle.remove()
+
+
+def _sequence_requested(ex):
+    if 'native_sequence' not in ex:return False
+    if ex['native_sequence']!='native_neuron_sequence_v1':
+        raise ValueError('unsupported native sequence schema flag')
+    return True
+
+
+def _sequence_prompt(ex):
+    """Allowlist only clean scalar traces; no answers or edited outcomes are rendered."""
+    import hashlib
+    p=ex.get('_native_sequence_packet')
+    fields={'schema','model_identifier','model_binding_scope','input_sha256','token_ids','position_ids',
+            'target_adapter','vector_position','intervention_scope','neurons'}
+    if not isinstance(p,dict) or set(p)!=fields:
+        raise ValueError('prepare sequence evidence before encoding; exact public fields required')
+    ids=ex['ctx'];units=[b['unit'] for b in ex['blocks'] if 'layer' not in b]
+    if (not ids or not units or not isinstance(p['model_identifier'],str) or not p['model_identifier']
+            or p['model_binding_scope']!='constructor identifier and target adapter name; checkpoint bytes not attested'
+            or p['intervention_scope']!='clean observations at every supplied position; the question specifies which positions are intervened on'
+            or p['schema']!='native_neuron_sequence_v1' or p['token_ids']!=ids or p['position_ids']!=list(range(len(ids)))
+            or p['vector_position']!=len(ids)-1 or p['target_adapter']!=ex.get('target')
+            or p['input_sha256']!=hashlib.sha256(json.dumps(ids,separators=(',',':')).encode()).hexdigest()
+            or not isinstance(p['neurons'],list) or len(p['neurons'])!=len(units)):
+        raise ValueError('native sequence input/target binding mismatch')
+    for row,unit in zip(p['neurons'],units):
+        if not isinstance(row,dict) or set(row)!={'unit','activation','write_norm'} or row['unit']!=unit or unit[0]!='neuron':
+            raise ValueError('native sequence unit binding mismatch')
+        for key in ('activation','write_norm'):
+            values=row[key]
+            if (not isinstance(values,list) or len(values)!=len(ids) or
+                    any(type(x) not in (int,float) or not math.isfinite(x) or (key=='write_norm' and x<0) for x in values)):
+                raise ValueError('finite full-context native scalar traces required')
+    # Receipt keeps exact FP32 values and source metadata; prompt is a compact,
+    # explicitly rounded rendering, never a dump of the full example or its answer.
+    lines=['Clean native neuron sequence v1. All context position IDs: '+','.join(map(str,p['position_ids'])),
+        'Each neuron lists its signed pre-down/SwiGLU activation at every position, plus the constant bias-free effective down-column L2 norm. Write L2 norm at each position = abs(activation) times column norm. Values rounded to 6 significant digits; no positions omitted.']
+    for row in p['neurons']:
+        unit=row['unit']
+        acts,norms=row['activation'],row['write_norm']
+        largest=max(range(len(acts)),key=lambda i:abs(acts[i]))
+        if acts[largest]==0:
+            if any(norms):raise ValueError('zero scalar trace has nonzero write norms')
+            column='unidentified (all activations and writes zero)'
+        else:
+            column_norm=norms[largest]/abs(acts[largest])
+            if any(not math.isclose(n,abs(a)*column_norm,rel_tol=1e-5,abs_tol=1e-7) for a,n in zip(acts,norms)):
+                raise ValueError('write norms disagree with one effective column')
+            column=f'{column_norm:.6g}'
+        values=','.join(f'{a:.6g}' for a in acts)
+        lines.append(f'Neuron L{unit[1]}.N{unit[2]} column_norm={column}; activation=['+values+']')
+    lines.append('Clean observations; the question defines intervention positions. Last-position vector injection is separately normalized, losing magnitude. Signs/norms alone do not establish answer support or causal effects.')
+    return '\n'.join(lines)+'\n'
 
 
 def unit_write(o: Oracle, ctx: list[int], unit, target: str | None = None) -> "torch.Tensor":
@@ -474,7 +579,7 @@ def _neuron_choice(candidates, zeroed_logp, baseline_logp, rng):
             'metric':'normalized FP64 full-vocabulary KL(original || removed) in bits'}
 
 
-def gen_text(o: Oracle, pr: Probe, ids: list[int], rng: random.Random, neuron_choices: bool) -> list[dict]:
+def gen_text(o: Oracle, pr: Probe, ids: list[int], rng: random.Random, neuron_choices: bool, *, native_sequence=False) -> list[dict]:
     """One text's examples (module docstring)."""
     torch, tok = o.torch, o.tok
     T, out = len(ids), []
@@ -561,6 +666,10 @@ def gen_text(o: Oracle, pr: Probe, ids: list[int], rng: random.Random, neuron_ch
                     'blocks':[rb()]+[{'label':f'Neuron {c}','unit':u} for c,u in zip('ABCD',choice['native_units'])],
                     'q':f'Which of native neurons A, B, C, D causes the largest full next-token distribution KL divergence from the unchanged model when zeroed at every context position? Answer with the letter only if its KL is greater than {CLEAR} times the runner-up; otherwise answer No clear answer.',
                     'a':choice['winner'] or NONE,'neuron_choice':choice})
+    if native_sequence:
+        for row in out:
+            if any('unit' in b for b in row['blocks']):
+                row['native_sequence']='native_neuron_sequence_v1'
     return out
 
 
@@ -582,7 +691,8 @@ def gen(a) -> None:
             if len(ids) < h2h.T + 8:
                 continue
             s = rng.randrange(0, len(ids) - h2h.T)
-            exs = gen_text(o, pr, ids[s:s + h2h.T], rng, n % NEURON_CHOICES_EVERY == 0)
+            exs = gen_text(o, pr, ids[s:s + h2h.T], rng, n % NEURON_CHOICES_EVERY == 0,
+                           native_sequence=getattr(a,'native_sequence',False))
             for e in exs:
                 e["text"] = n
                 fh.write(json.dumps(e) + "\n")
@@ -662,6 +772,8 @@ def _native_slots(ex):
 def _native_gain_plan(rows, n):
     """First n native validation rows; donor choice never inspects their answers."""
     import hashlib
+    if any('native_sequence' in row for row in rows):
+        raise ValueError('native gain controls do not define sequence-text controls; use a separate prospective protocol')
     if type(n) is not int or n <= 0:
         raise ValueError('positive native diagnostic row count required')
     digest = lambda x: hashlib.sha256(json.dumps(x, sort_keys=True, separators=(',', ':'), allow_nan=False).encode()).hexdigest()
@@ -797,6 +909,8 @@ def gain(a) -> None:
     import torch
 
     rows = [json.loads(x) for x in a.data.read_text().splitlines()]
+    if any('native_sequence' in row for row in rows):
+        raise ValueError('gain has no sequence-text evidence control; a separate prospective protocol is required')
     if getattr(a,'native_controls',False):
         return _gain_native(a,rows)
     val = [r for r in rows if r.get("text") is not None and r["text"] % 50 == 0][:a.n]
@@ -955,6 +1069,7 @@ def main():
     g.add_argument("--texts", type=int, default=100)
     g.add_argument("--seed", type=int, default=1)
     g.add_argument("--device")
+    g.add_argument("--native-sequence", action="store_true", help="prospective clean scalar-trace inputs for native rows; consumed automatically by train/eval")
     t = sub.add_parser("train")
     t.add_argument("--data", type=Path, required=True)
     t.add_argument("--out", type=Path, required=True)

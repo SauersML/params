@@ -13,6 +13,128 @@ import cao  # noqa: E402
 transformers = pytest.importorskip("transformers")
 
 
+def test_sequence_capture_same_forward_scalar_norms_and_default_parity():
+    from types import SimpleNamespace
+    from contextlib import nullcontext
+    class Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__();self.down=torch.nn.Linear(2,3,bias=True)
+            with torch.no_grad():
+                self.down.weight.copy_(torch.tensor([[3.,1.],[4.,0.],[0.,2.]]));self.down.bias.fill_(7)
+            self.calls=0
+        def forward(self,input_ids,output_hidden_states=False):
+            self.calls+=1
+            values=torch.tensor([[-2.,0.],[0.,1.],[3.,-1.]])[input_ids]
+            y=self.down(values)
+            return SimpleNamespace(logits=y,hidden_states=(values,y))
+    m=Model();o=SimpleNamespace(torch=torch,dev='cpu',m=m,passes=0,off=lambda target=None:nullcontext(),
+        model_identifier='synthetic-fixed',layers=[SimpleNamespace(mlp=SimpleNamespace(down_proj=m.down))])
+    ctx=[0,1,2];units=[['neuron',0,0],['neuron',0,1],['neuron',0,0]]
+    plain=m(torch.tensor([ctx]))
+    old,writes=cao._capture_native(o,ctx,units,hidden=True)
+    out,seqwrites,p=cao._capture_native(o,ctx,units,hidden=True,sequence=True)
+    assert m.calls==3 and o.passes==2
+    assert torch.equal(plain.logits,out.logits) and torch.equal(old.logits,out.logits)
+    assert all(torch.equal(a,b) for a,b in zip(writes,seqwrites))
+    assert p['position_ids']==ctx and p['vector_position']==2
+    assert p['neurons'][0]['activation']==[-2.,0.,3.]
+    assert p['neurons'][0]['write_norm']==[10.,0.,15.]
+    assert p['neurons'][1]['write_norm']==pytest.approx([0.,5**.5,5**.5])
+    assert p['neurons'][0]==p['neurons'][2]
+    assert all(set(row)=={'unit','activation','write_norm'} for row in p['neurons'])
+    assert not m.down._forward_pre_hooks
+
+
+def sequence_example(o):
+    # Simple local tokenizer avoids cached/downloaded assets in the prospective tests.
+    class Tok:
+        pad_token_id=0;eos_token_id=2
+        def apply_chat_template(self,messages,**kwargs):
+            import re
+            values=[]
+            for m in messages:
+                values += [1 if w=='?' else 3+len(w)%28 for w in re.findall(r'\?|[^\s?]+',m['content'])]
+            return values+[2,2]
+        def decode(self,ids,**kwargs):return ' '.join(map(str,ids))
+    o.tok=Tok();o.q=1;o.text_only=False;o._vcache={};o.vec_store={}
+    return {'ctx':[1,3,5],'blocks':[{'layer':0,'positions':[0,1]}, {'label':'Neuron A','unit':['neuron',0,2]}],
+        'q':'Predict a literal edit.','a':'HIDDEN_TARGET_SENTINEL','native_sequence':'native_neuron_sequence_v1'}
+
+
+def test_sequence_prepared_copy_prompt_binding_and_no_label_leak():
+    import copy
+    o=capture_oracle();e=sequence_example(o);before=copy.deepcopy(e)
+    prepared,vecs=o.prepare([e]);ready=prepared[0]
+    assert e==before and '_native_sequence_packet' not in e and o.passes==1
+    assert vecs[0].shape==(3,16)
+    p=o.prompt(ready)
+    assert 'HIDDEN_TARGET_SENTINEL' not in p
+    assert 'native neuron sequence v1' in p and 'activation' in p and 'Write L2 norm' in p
+    assert '6 significant digits; no positions omitted' in p
+    assert 'input_sha256' not in p and 'checkpoint bytes' not in p
+    baseline={k:v for k,v in e.items() if k!='native_sequence'}
+    assert o.prompt(baseline)=='Layer: 0\n ? ? \nNeuron A: ? \nPredict a literal edit.'
+    assert len(o.encode(ready,False)[0])>len(o.encode(baseline,False)[0])
+    # Label changes cannot alter any public input or captured clean evidence.
+    changed={**ready,'a':'DIFFERENT_HIDDEN_TARGET'}
+    assert o.prompt(changed)==p
+    assert o.prompt({**ready,'edited_outcome':'PRIVATE_SENTINEL'})==p
+
+
+@pytest.mark.parametrize('method',['batch_loss','answers','options_logp'])
+def test_sequence_all_oracle_entrypoints_prepare_before_encode_once(method,monkeypatch):
+    o=capture_oracle();e=sequence_example(o);seen=[]
+    encode=o.encode
+    def checked(ex,answer):
+        assert '_native_sequence_packet' in ex and o.passes==1
+        seen.append(ex['_native_sequence_packet'])
+        return encode(ex,answer)
+    monkeypatch.setattr(o,'encode',checked)
+    if method=='batch_loss':
+        total,n=o.batch_loss([e],reduce=False)
+        assert torch.isfinite(total) and n>0
+    elif method=='options_logp':
+        got=o.options_logp([e],[['one','two']]);assert len(got[0])==2
+    else:
+        monkeypatch.setattr(o.m,'generate',lambda input_ids,**kw:torch.cat([input_ids,torch.full((1,1),3)],dim=1))
+        assert len(o.answers([e]))==1
+    assert o.passes==1 and seen
+    assert all(p is seen[0] for p in seen)
+    assert '_native_sequence_packet' not in e
+
+
+def test_sequence_rejects_bad_flags_overrides_heads_and_packet_fields_before_oracle():
+    import copy
+    o=capture_oracle();e=sequence_example(o)
+    for bad in ({**e,'native_sequence':'unknown'}, {**e,'vec':'stale'}, {**e,'_native_sequence_packet':{}}):
+        with pytest.raises(ValueError):o.prepare([bad])
+    with pytest.raises(ValueError,match='native neurons only'):
+        o.prepare([{**e,'blocks':[{'label':'head','unit':['head',0,0]}]}])
+    assert o.passes==0
+    with pytest.raises(ValueError,match='sequence-text controls'):
+        cao._native_gain_plan([{**e,'text':0,'cat':'edit'}],1)
+    prepared,_=o.prepare([e]);ready=prepared[0]
+    with pytest.raises(ValueError,match='public fields'):
+        o.prompt({**ready,'_native_sequence_packet':{**ready['_native_sequence_packet'],'gold':.2}})
+    for key,value in [('activation',[1.]),('activation',[1.,float('nan'),2.]),('write_norm',[1.,-1.,2.])]:
+        bad=copy.deepcopy(ready);bad['_native_sequence_packet']['neurons'][0][key]=value
+        with pytest.raises(ValueError,match='scalar traces'):o.prompt(bad)
+    bad=copy.deepcopy(ready);bad['_native_sequence_packet']['target_adapter']='different'
+    with pytest.raises(ValueError,match='binding mismatch'):o.prompt(bad)
+
+
+def test_legacy_gain_rejects_sequence_text_before_oracle_load(tmp_path,monkeypatch):
+    import json
+    from types import SimpleNamespace
+    data=tmp_path/'flagged.jsonl'
+    data.write_text(json.dumps({'native_sequence':'native_neuron_sequence_v1'})+'\n')
+    def forbidden(*a,**kw):raise AssertionError('must reject before model load')
+    monkeypatch.setattr(cao,'Oracle',forbidden)
+    for native in (False,True):
+        with pytest.raises(ValueError,match='sequence-text evidence control'):
+            cao.gain(SimpleNamespace(data=data,native_controls=native))
+
+
 @pytest.mark.parametrize('sign',[-1.,1.,0.])
 def test_future_gen_text_uses_captured_signed_write_not_unsigned_column(sign,monkeypatch):
     """Exercise the actual generation branch, with synthetic probe outcomes only."""
@@ -43,7 +165,7 @@ def test_future_gen_text_uses_captured_signed_write_not_unsigned_column(sign,mon
         captured.append(list(units));oracle.passes+=1
         return None,[write.clone() for u in units]
     monkeypatch.setattr(cao,'_capture_native',capture)
-    rows=cao.gen_text(o,probe,[0]*48,random.Random(3),neuron_choices=True)
+    rows=cao.gen_text(o,probe,[0]*48,random.Random(3),neuron_choices=True,native_sequence=True)
     future=[r for r in rows if r['cat']=='write_lens']
     assert len(future)==3 and len(captured)==1 and o.passes==1
     assert not any(r['cat']=='promotes' for r in rows)
@@ -52,6 +174,7 @@ def test_future_gen_text_uses_captured_signed_write_not_unsigned_column(sign,mon
     assert choice['a']==cao.NONE
     assert len({tuple(b['unit']) for b in choice['blocks'] if 'unit' in b})==4
     assert not any(r['cat']=='units' for r in rows)
+    assert all((r.get('native_sequence')=='native_neuron_sequence_v1') == any('unit' in b for b in r['blocks']) for r in rows)
     expected=np.argsort(-(U.numpy()@(scale.numpy()*write.numpy())),kind='stable')[:5].tolist()
     for row in future:
         cert=row['write_lens']

@@ -32,8 +32,8 @@ short), then the smallest top-k set that alone keeps the contrast within TOL of 
 edge's own cut from the graph measured last (its strength), and the graph's edges cut with every other edge on.
 
   python neuron_edges.py one MODEL TEXT.json OUT.json   (TEXT: ids, target, answer, alternatives, neurons)
-  python neuron_edges.py record MODEL REC.json OUT.json --thr THR.pt [--adapter A] [--dtype bfloat16]
-                                                       (a neuron_builder circuit in its reference)
+  python neuron_edges.py record MODEL REC.json|REC_DIR OUT.json|OUT_DIR --thr THR.pt [--adapter A] [--dtype bfloat16]
+                         (a neuron_builder circuit in its reference; a directory: each record in it, those done skipped)
 """
 from __future__ import annotations
 
@@ -410,6 +410,9 @@ def prune(ed: Edges, log=print) -> dict:
         cs = ed.contrasts(rows, listed, rest=True)
         measured += len(ks)
         hit = next((k for k, c in zip(ks, cs) if ok(c)), None)
+        log(f"top-k over {n_ok} listed ({len(routes)} routes): {'k ' + str(hit) if hit is not None else 'none within'} "
+            f"{tol:.3f} of {c_all:.3f} (none {c_none:.3f}; the {n_ok} listed {cs[-1] if cs else float('nan'):.3f}), "
+            f"{time.time() - t0:.1f} s")
         if hit is not None or every or n_rt >= MAX_LIST:
             break
         done, n_rt = n_ok, 4 * n_rt
@@ -531,7 +534,8 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("cmd", choices=("one", "record"))
     ap.add_argument("model")
-    ap.add_argument("text", type=Path, help="one: TEXT.json; record: a neuron_builder record (OUT/<id>.json)")
+    ap.add_argument("text", type=Path, help="one: TEXT.json; record: a neuron_builder record (OUT/<id>.json) or a "
+                    "directory of them")
     ap.add_argument("out", type=Path)
     ap.add_argument("--device", default=None)
     ap.add_argument("--background", default="circuit", choices=("circuit", "model"))
@@ -547,22 +551,31 @@ def main():
         from peft import PeftModel
 
         model = PeftModel.from_pretrained(model, a.adapter).eval().requires_grad_(False)
-    if a.cmd == "record":  # a neuron_builder circuit: its prompt, answer, alternatives and units, its reference
+    if a.cmd == "record":  # neuron_builder circuits: each one's prompt, answer, alternatives and units, its reference
         import neuron_builder
 
-        rec = json.loads(a.text.read_text())
         thr = massive = None
         if a.thr:
             nr = neuron_builder.Neurons(model, tok)
             nr.load(a.thr)
             thr, massive = nr.thr, nr.massive
-        ed = Edges(model, neuron_builder.chat(tok, rec["user"]), rec["pos"], [rec["answer"]], rec["alternatives"],
-                   [(n["layer"], n["pos"], n["neuron"]) for n in rec["nodes"]], thr=thr, background=a.background,
-                   massive=massive)
-        got = prune(ed, log=lambda m: print(f"{a.text.stem}: {m}", flush=True))
-        g = graph(ed, got, tok)
-        g.update(id=rec.get("id"), user=rec.get("user"), model=a.model, adapter=a.adapter, thr=str(a.thr) if a.thr else None)
-        a.out.write_text(json.dumps(g))
+        if a.text.is_dir():
+            a.out.mkdir(parents=True, exist_ok=True)
+            todo = [(f, a.out / f.name) for f in sorted(a.text.glob("*.json")) if not (a.out / f.name).exists()]
+        else:
+            todo = [(a.text, a.out)]
+        for src, dst in todo:
+            t0 = time.time()
+            rec = json.loads(src.read_text())
+            ed = Edges(model, neuron_builder.chat(tok, rec["user"]), rec["pos"], [rec["answer"]], rec["alternatives"],
+                       [(n["layer"], n["pos"], n["neuron"]) for n in rec["nodes"]], thr=thr, background=a.background,
+                       massive=massive)
+            got = prune(ed, log=lambda m: print(f"{src.stem}: {m}", flush=True))
+            g = graph(ed, got, tok)
+            g.update(id=rec.get("id"), user=rec.get("user"), model=a.model, adapter=a.adapter,
+                     thr=str(a.thr) if a.thr else None, builder=rec.get("builder"), seconds=round(time.time() - t0, 2))
+            dst.write_text(json.dumps(g))
+            print(f"{src.stem}: {len(ed.N)} neurons, {len(got['edges'])} edges, {time.time() - t0:.1f} s", flush=True)
         return
     t = json.loads(a.text.read_text())
     ed = Edges(model, t["ids"], t["target"], t["answer"], t["alternatives"], [tuple(n) for n in t["neurons"]],

@@ -203,3 +203,37 @@ def test_slim_rows_give_the_same_margins():
                       "rows": {"circuit": s, "vpd": sc.slim(vpd), "candidates": sc.slim(vpd)}}}
     got = sc.record_margins(rec)["patching_far"]
     assert got["pass_old"] is False and got["diff"] == pytest.approx(-0.45)
+
+
+def test_common_weight_record_freshness_requires_execution_contract():
+    # A legacy panel can contain valid-looking worlds and bank identity while its
+    # complete candidate was executed as the empty graph; presence is insufficient.
+    legacy={'common_weights':{'panel_id':'same-common-bank','worlds':[{'candidate_direct_kl_bits':104.}],
+                             'metadata':{'version':'scorecard-weight-v1','split':'eval'}}}
+    assert not sc.common_weights_current({})
+    assert not sc.common_weights_current(legacy)
+    import copy
+    refreshed=copy.deepcopy(legacy)
+    refreshed['common_weights']['metadata']['execution_contract']=sc.COMMON_WEIGHT_EXECUTION_CONTRACT
+    assert sc.common_weights_current(refreshed)
+    assert refreshed['common_weights']['panel_id']==legacy['common_weights']['panel_id']
+    refreshed['common_weights']['metadata']['execution_contract']='older-contract'
+    assert not sc.common_weights_current(refreshed)
+    assert not sc.common_weights_current({'common_weights':None})
+
+
+def test_common_weight_contract_metadata_preserves_bank_identity():
+    import torch
+    from test_goal_eval import tiny_native
+    nat=tiny_native(seed=1,layers=1,d=4,heads=2,vocab=8,C=2)
+    ge=sc.goal_eval.GoalEval(nat);tx=ge.text([1,2],[1],seed=3)
+    graph=native.Graph(masks={name:torch.ones(2,nat.C[name],dtype=torch.bool) for name in nat.names})
+    current=sc.common_weights(ge,tx,graph=graph)
+    bank=sc.common_weight_bank(nat,tx)
+    unversioned=sc.weight_family.common_eval(ge,tx,
+        lambda:sc.weight_family._lqs(ge,tx.ids,tx.targets,[graph])[0],bank['edits'],
+        metadata={k:v for k,v in bank.items() if k!='edits'})
+    assert current['panel_id']==unversioned['panel_id']
+    assert current['worlds']==unversioned['worlds']
+    assert sc.common_weights_current({'common_weights':current})
+    assert not sc.common_weights_current({'common_weights':unversioned})

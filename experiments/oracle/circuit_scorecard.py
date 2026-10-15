@@ -321,6 +321,16 @@ def common_weight_bank(nat, tx, split="eval") -> dict:
             "exposure": "split-disjoint within this bank; external construction exposure unverified"}
 
 
+COMMON_WEIGHT_EXECUTION_CONTRACT = "weight-panel-v2-complete-graphs-as-masks"
+
+
+def common_weights_current(record: dict) -> bool:
+    """Legacy panels predate correct set-backed complete graph execution."""
+    panel = record.get("common_weights")
+    return (isinstance(panel, dict) and isinstance(panel.get("metadata"), dict)
+            and panel["metadata"].get("execution_contract") == COMMON_WEIGHT_EXECUTION_CONTRACT)
+
+
 def common_weights(ge, tx, *, graph=None, nphi=None, mask=None, construction_edit_ids=()) -> dict:
     """Same literal weight edits and VPD reference for either circuit execution."""
     if (graph is None) == (nphi is None) or (nphi is not None and mask is None):
@@ -332,7 +342,8 @@ def common_weights(ge, tx, *, graph=None, nphi=None, mask=None, construction_edi
         execute = lambda: ge.graph_ref(tx.ids, tx.targets, nphi.model, units=nphi._units(
             [~mask.heads], [~mask.neurons], nphi._ablate(tx.T)))
     return weight_family.common_eval(ge, tx, execute, bank["edits"],
-        metadata={k: v for k, v in bank.items() if k != "edits"},
+        metadata={**{k: v for k, v in bank.items() if k != "edits"},
+                  "execution_contract": COMMON_WEIGHT_EXECUTION_CONTRACT},
         construction_edit_ids=construction_edit_ids)
 
 
@@ -1119,7 +1130,7 @@ def add(out: Path, circuits_dir: Path, vpd: dict | None, pool: dict) -> None:
         rec = json.loads(f.read_text())
         native_rec = rec["size"].get("units") == "native"
         if ("mediated" in rec.get("edits", {}) and "sparsity" in rec.get("size", {}) and (native_rec or rec.get("live_gates") is not None or not ci)
-                and "interventions" in rec and "margins" in rec["floors"] and "common_weights" in rec):
+                and "interventions" in rec and "margins" in rec["floors"] and common_weights_current(rec)):
             continue
         path = circuits_dir / f.name
         tp = task_path(path.stem)
@@ -1129,7 +1140,7 @@ def add(out: Path, circuits_dir: Path, vpd: dict | None, pool: dict) -> None:
             means = means or native_units.unit_means(ge.nat)
             nphi = native_units.NativePhi(ge, tx, "eval", means=means)
             S = native_units.from_units(native_units.NativeUnits(ge.nat, tx.ids, tx.targets), units)
-            if "common_weights" not in rec:
+            if not common_weights_current(rec):
                 rec["common_weights"] = common_weights(ge, tx, nphi=nphi, mask=S,
                     construction_edit_ids=json.loads(path.read_text()).get("construction_weight_edit_ids", ()))
             if "margins" not in rec["floors"]:
@@ -1148,7 +1159,7 @@ def add(out: Path, circuits_dir: Path, vpd: dict | None, pool: dict) -> None:
         if "interventions" not in rec:
             rec["interventions"] = interventions_vpd(ge, tx, nodes, top)
         g, _, _ = goal_eval.load_answer(path, json.loads(tp.read_text()), tx.targets, ge.nat)
-        if "common_weights" not in rec:
+        if not common_weights_current(rec):
             rec["common_weights"] = common_weights(ge, tx, graph=goal_eval._c_graph(g, tx.targets, ge.nat.C),
                 construction_edit_ids=json.loads(path.read_text()).get("construction_weight_edit_ids", ()))
         rec["size"].update({"units": "vpd", "params": params_touched(ge.nat, g.node_set()), "build_seconds": build_seconds(path),

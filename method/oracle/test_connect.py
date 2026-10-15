@@ -166,3 +166,12 @@ def test_native_runs(tiny):
     assert got["record"]["point"] <= got["record"]["criteria"]["point"] + 1e-6
     assert set(nd.graph(got["on"]).units) == got["graph"].node_set()
     assert got["record"]["tokens"] == len({u[2] for u in got["graph"].units})
+
+
+def test_fisher_scores(tiny):
+    nat, ge, tx = tiny
+    c = connect.Connector(ge, tx, nodes_of(nat, tx, 3, 16), B=4)
+    sc = c.scores("fisher")
+    assert sc.shape == (len(c.pr.lines),) and bool((sc >= 0).all()) and float(sc[c.conn].sum()) > 0
+    rec = c.run(log=lambda m: None, floors=TINY, score="fisher")["record"]
+    assert rec["score"] == "fisher" and rec["measured"]["point"] > 0

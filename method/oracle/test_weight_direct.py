@@ -159,3 +159,37 @@ def test_panel_identity_is_common_bank_and_scale_canonical():
     assert disjoint['construction_exposure']['intersection_count']==0
     with pytest.raises(ValueError,match='duplicate literal'):
         weight_family.common_eval(ge,tx,execute,[edit,equivalent],metadata={})
+
+
+@pytest.mark.parametrize('semantics', ['n', 'c'])
+def test_set_backed_complete_weight_runs_match_masks_and_physical_forward(semantics):
+    nat=tiny_native(seed=17,layers=1,d=4,heads=2,vocab=8,C=3)
+    ge=goal_eval.GoalEval(nat,semantics=semantics)
+    ids,targets=[1,2,3],[2]
+    tx=ge.text(ids,targets,seed=9)
+    masks={name:torch.zeros(len(ids),nat.C[name],dtype=torch.bool) for name in nat.names}
+    for mask in masks.values():mask[1:,::2]=True
+    set_graph=native.Graph([(name,t,c) for name,mask in masks.items() for t,c in mask.nonzero().tolist()],complete=True)
+    mask_graph=native.Graph(masks=masks)
+    edit={'kind':'subcomponent','what':['h.0.mlp.down_proj',0],'k':2.}
+    before={key:getattr(nat.target.site(edit['what'][0]),key).clone() for key in ('W','U','V','delta_T')}
+    from contextlib import nullcontext
+    for change in (None,edit):
+        with weight_family.applied(nat,change,ge) if change is not None else nullcontext():
+            values=weight_family._lqs(ge,ids,targets,[set_graph,mask_graph])
+            expected=torch.log_softmax(naive(nat,ids,on=masks)[0][targets],-1)
+            torch.testing.assert_close(values[0],values[1],atol=1e-6,rtol=1e-6)
+            torch.testing.assert_close(values[0],expected,atol=1e-5,rtol=1e-5)
+    # Exercise the scorecard's real common_weights path, including bank creation,
+    # so loaded complete candidates cannot silently become an empty engine plan.
+    sys.path.insert(0,str(Path(__file__).resolve().parents[2]/'experiments/oracle'))
+    import circuit_scorecard as sc
+    left=sc.common_weights(ge,tx,graph=set_graph)
+    right=sc.common_weights(ge,tx,graph=mask_graph)
+    assert left['panel_id']==right['panel_id']
+    assert left['worlds']==right['worlds']
+    assert len(left['worlds'])==1+2*len(nat.names)
+    baseline=torch.log_softmax(naive(nat,ids,on=masks)[0][targets],-1).double().log_softmax(-1)
+    assert left['worlds'][0]['candidate_direct_kl_bits']==pytest.approx(
+        max(0.,kl_bits(tx.ref[0].double().log_softmax(-1),baseline)),abs=1e-5)
+    for key,value in before.items():assert torch.equal(getattr(nat.target.site(edit['what'][0]),key),value)

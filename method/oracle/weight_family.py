@@ -130,12 +130,12 @@ def applied(nat, e: dict, ge=None):
 
 def _lqs(ge, ids, targets, graphs) -> torch.Tensor:
     """log q at the targets [len(graphs), len(targets), V] of each graph's run in C's semantics, remainders live: stated
-    graphs on the circuit engine (Engine.plan(semantics="c"), GoalEval._graph_kl's run), complete ones (masks) and the
+    graphs on the circuit engine (Engine.plan(semantics="c"), GoalEval._graph_kl's run), complete ones (sets or masks) and the
     empty one by VPD's masked forward (GoalEval.runs)."""
     nat = ge.nat
     T = len(ids)
     out = [None] * len(graphs)
-    stated = [i for i, g in enumerate(graphs) if g.masks is None and g.count()]
+    stated = [i for i, g in enumerate(graphs) if not g.complete and g.count()]
     if stated:
         gs = [graphs[i] for i in stated]
         E = ge._circuit_engine(ids, targets, gs, True)
@@ -143,8 +143,7 @@ def _lqs(ge, ids, targets, graphs) -> torch.Tensor:
             out[i] = lq
     rest = [i for i in range(len(graphs)) if out[i] is None]
     if rest:
-        empty = {n: torch.zeros(T, nat.C[n], dtype=torch.bool, device=nat.dev) for n in nat.names}
-        sets = [graphs[i].masks if graphs[i].masks is not None else empty for i in rest]
+        sets = [ge.masks(graphs[i], T) for i in rest]
         for i, lq in zip(rest, ge.runs(ids, targets, sets, True)):
             out[i] = lq
     native.free(nat.dev)

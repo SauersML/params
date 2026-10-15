@@ -617,6 +617,59 @@ def report(a) -> None:
                           f"score {sum(r['score'] for r in rs) / n:.3f}, passes {sum(r['passes'] for r in rs) / n:.0f}, n {n}")
 
 
+def plot(a) -> None:
+    """Accuracy against the passes spent per text (and against seconds per text), per question kind, on the test
+    texts: B at each budget a line, the oracle alone (A) a point, recency (R) a dashed level, C a line once it runs."""
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    recs = [json.loads(x) for x in a.out.read_text().splitlines() if json.loads(x)["split"] == "test"]
+    kinds = [("a", "(a) most important earlier token"), ("b", "(b) swap effects"), ("c", "(c) which of two positions"),
+             ("fact", "(c) which of two statements")]
+    plt.rcParams.update({"font.size": 15, "axes.spines.top": False, "axes.spines.right": False})
+    for xkey, xlabel, fname in (("passes", "model passes per text", a.plot), ("seconds", "seconds per text",
+                                                                              a.plot.with_name(a.plot.stem + "_seconds.png"))):
+        fig, axes = plt.subplots(1, 4, figsize=(22, 5.2), facecolor="white")
+        for ax, (q, title) in zip(axes, kinds):
+            kind = "fact" if q == "fact" else "text"
+            pts = {}
+            for r in recs:
+                if r["kind"] != kind:
+                    continue
+                xs = [x for x in r["answers"] if x["q"] == q]
+                d = pts.setdefault(r["system"], [0, 0, 0.0, 0.0, 0])
+                d[0] += sum(x["ok"] for x in xs)
+                d[1] += len(xs)
+                d[2] += r["passes"]
+                d[3] += r["seconds"]
+                d[4] += 1
+            acc = {k: (v[0] / max(v[1], 1), v[2] / v[4], v[3] / v[4]) for k, v in pts.items() if v[1]}
+            for fam, color in (("B", "#1f77b4"), ("C", "#d62728")):
+                line = sorted((v[1 if xkey == "passes" else 2], v[0]) for k, v in acc.items() if k.startswith(fam + "@"))
+                if line:
+                    ax.plot([x for x, _ in line], [y for _, y in line], "-o", color=color, lw=2.5, ms=8)
+                    ax.annotate("oracle + interventions" if fam == "B" else "oracle + circuit + interventions", line[-1],
+                                textcoords="offset points", xytext=(-10, 10), ha="right", color=color, fontsize=13)
+            if "A" in acc:
+                xa = max(acc["A"][1 if xkey == "passes" else 2], 1)
+                ax.plot([xa], [acc["A"][0]], "s", color="#2ca02c", ms=10)
+                ax.annotate("oracle alone", (xa, acc["A"][0]), textcoords="offset points", xytext=(8, -4), color="#2ca02c", fontsize=13)
+            if "R" in acc:
+                ax.axhline(acc["R"][0], ls="--", color="gray", lw=1.5)
+                ax.annotate("recency", (ax.get_xlim()[0] if ax.lines else 1, acc["R"][0]), textcoords="offset points",
+                            xytext=(4, 4), color="gray", fontsize=12)
+            ax.set_xscale("log")
+            ax.set_ylim(0, 1.02)
+            ax.set_title(title)
+            ax.set_xlabel(xlabel)
+        axes[0].set_ylabel("accuracy")
+        fig.tight_layout()
+        fig.savefig(fname, dpi=130, facecolor="white")
+        print("wrote", fname)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -643,8 +696,11 @@ def main():
     p = sub.add_parser("report")
     p.add_argument("out", type=Path)
     p.add_argument("--edits", type=Path)
+    g = sub.add_parser("plot")
+    g.add_argument("out", type=Path)
+    g.add_argument("--plot", type=Path, required=True)
     a = ap.parse_args()
-    {"build": build, "run": run, "edits": edits, "report": report}[a.cmd](a)
+    {"build": build, "run": run, "edits": edits, "report": report, "plot": plot}[a.cmd](a)
 
 
 if __name__ == "__main__":

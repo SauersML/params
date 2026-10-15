@@ -643,7 +643,8 @@ def prune(ed: Edges, log=print) -> dict:
     for a, c in zip(top, cs):
         strengths[a] = c_kept - c
     measured += 2 + len(readers) + len(trial)
-    rec = {"contrast_model": ed.c_full, "contrast_all_edges": c_all, "contrast_no_edges": c_none, "contrast_kept": c_kept,
+    best = int(ed.base["lp"][0].argmax())
+    rec = {"contrast_model": ed.c_full, "reference_top": best, "answer_top": best in ed.answer, "contrast_all_edges": c_all, "contrast_no_edges": c_none, "contrast_kept": c_kept,
            "contrast_graph_cut": c_cut, "tolerance": tol, "met": bool(passing) and ok(c_kept),
            "allowance": list(allow[pick][:2]),
            "candidates": {"resid": len(ed.resid_all), "route": ed.n_routes,

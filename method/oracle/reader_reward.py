@@ -14,7 +14,7 @@ reader reward: questions(): interventions drawn independently of any explanation
   fresh tokens from the model's own prediction there, removals and scalings of the circuit's parts singly and in
   threes, swaps with one part set back), half of each kind from those that move the model, so an explanation earns
   only what generalizes and "no change" is not a free answer; the reader (a frozen open model
-  on Tinker, never trained, never Claude) reads the text's end, the model's prediction, the explanation (or none) and
+  on Tinker, dense so that it is deterministic, never trained, never Claude) reads the text's end, the model's prediction, the explanation (or none) and
   the questions, and answers each with a token and a probability. Per question: top right (0/1) and p's credit
   max(0, 1 - |logit p_reader - logit p| / 4); reward = the mean of their average over questions less SIMPLICITY per
   1,000 reader tokens of explanation. Report each kind's share right against no explanation and another text's.
@@ -43,8 +43,8 @@ sys.path[:0] = [str(HERE), str(HERE.parent / "vpd"), str(HERE / "rl")]
 
 TEXTS = Path.home() / "mpd-data" / "graph_oracle" / "texts" / "vpd4l"
 SIMPLICITY = 0.1  # reward per 1,000 reader tokens of explanation
-READER = "Qwen/Qwen3.5-397B-A17B"  # tinker_train.REWARD_READER: the validated reader (10-12: ranked a correct, a wrong and
-# another text's explanation in order on 15 of 16 texts)
+READER = "Qwen/Qwen3.6-27B"  # dense, so deterministic at temperature 0 (10-14: three repeats agree to 0.003). The 397B
+# reward reader (MoE) scored one prompt 0.625 and then 0.424, and Qwen3-8B answered "' of' 0.95" to every question.
 LOGIT_SCALE = 4.0  # a probability's credit reaches 0 at this many nats of log-odds error
 KIND = {"q_proj": "q", "k_proj": "k", "v_proj": "v", "o_proj": "o", "c_fc": "fc", "down_proj": "down", "neuron": "n"}
 SITE = {v: k for k, v in KIND.items()}

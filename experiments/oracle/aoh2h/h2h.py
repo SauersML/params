@@ -635,8 +635,10 @@ def report(a) -> None:
                 brier = sum((x["conf"] - x["ok"]) ** 2 for x in xs) / len(xs)
                 line.append(f"({q}) {acc:.2f} acc, Brier {brier:.3f}, n {len(xs)}")
             texts_ = [r for r in mine if r["kind"] == "text"]
+            nq = sum(len(r["answers"]) for r in texts_)
             print(f"  {sysname}: " + "; ".join(line) + f" | passes/text {sum(r['passes'] for r in texts_) / max(len(texts_), 1):.0f}, "
-                  f"s/text {sum(r['seconds'] for r in texts_) / max(len(texts_), 1):.1f}")
+                  f"s/text {sum(r['seconds'] for r in texts_) / max(len(texts_), 1):.1f}; per question "
+                  f"{sum(r['passes'] for r in texts_) / max(nq, 1):.1f} passes, {sum(r['seconds'] for r in texts_) / max(nq, 1):.3f} s")
     if a.edits and a.edits.exists():
         ed = [json.loads(x) for x in a.edits.read_text().splitlines()]
         for split in ("dev", "test"):

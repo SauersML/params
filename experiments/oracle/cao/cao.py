@@ -79,6 +79,7 @@ class Oracle:
         self.q = q[0]
         self.text_only = False
         self.vec_store, self._vcache = {}, {}
+        self.passes = 0
 
     def off(self, target: str | None = None):
         """The target model: every adapter off, or the organism's adapter target (loaded by use_target) in place of
@@ -145,6 +146,7 @@ class Oracle:
 
     def _vectors(self, ex: dict):
         torch = self.torch
+        self.passes += 1  # the target model's forward passes (the reading, not the oracle's own generation)
         with self.off(ex.get("target")), torch.no_grad():
             out = self.m(input_ids=torch.tensor([ex["ctx"]], device=self.dev), output_hidden_states=True)
         H = out.hidden_states
@@ -541,6 +543,7 @@ def eval_items(a) -> None:
             blocks = [{"layer": 14, "positions": list(range(len(vids)))}]
             word = lambda p: o.tok.decode([ids[p]])  # noqa: E731
             rec = {"id": it["id"], "split": it["split"], "kind": it["kind"], "answers": []}
+            t0, p0 = time.time(), o.passes
             if it["kind"] == "fact":
                 w = it["word"]
                 opts = ["First.", "Second."]
@@ -571,6 +574,7 @@ def eval_items(a) -> None:
                 for c, lp in zip(it["c"], o.options_logp(exs, opts) if exs else []):
                     pick = c["pair"][int(lp[1] > lp[0])]
                     rec["answers"].append({"q": "c", "ok": pick == c["gt"], "conf": math.exp(max(lp)) / (math.exp(lp[0]) + math.exp(lp[1]))})
+            rec["seconds"], rec["passes"] = round(time.time() - t0, 3), o.passes - p0  # per text (cost per question: / answers)
             fh.write(json.dumps(rec) + "\n")
             print(it["id"], {q: sum(x["ok"] for x in rec["answers"] if x["q"] == q) for q in dict.fromkeys(x["q"] for x in rec["answers"])}, flush=True)
 
@@ -644,6 +648,10 @@ def report(a) -> None:
             if xs:
                 br = [(x["conf"] - x["ok"]) ** 2 for x in xs if x.get("conf") is not None]
                 line.append(f"({q}) {sum(x['ok'] for x in xs) / len(xs):.2f}" + (f" Brier {sum(br) / len(br):.3f}" if br else "") + f" n {len(xs)}")
+        ans = sum(len(r["answers"]) for r in rows if r["split"] == "test")
+        if ans and all("seconds" in r for r in rows):
+            line.append(f"per question: {sum(r['passes'] for r in rows if r['split'] == 'test') / ans:.2f} passes, "
+                        f"{sum(r['seconds'] for r in rows if r['split'] == 'test') / ans:.3f} s")
         print(f"{f.name}: " + "; ".join(line))
 
 

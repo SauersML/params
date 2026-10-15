@@ -28,7 +28,7 @@ def tiny():
     base = Qwen3ForCausalLM(cfg)
     o = cao.Oracle.__new__(cao.Oracle)
     o.torch, o.dev, o.tok, o.text_only = torch, torch.device("cpu"), tok, False
-    o.vec_store, o._vcache = {}, {}
+    o.vec_store, o._vcache, o.passes = {}, {}, 0
     o.m = get_peft_model(base, LoraConfig(r=4, target_modules=["q_proj", "v_proj"]))
     o.lm = o.m.base_model.model
     o.layers = o.lm.model.layers

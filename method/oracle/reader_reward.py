@@ -921,8 +921,9 @@ def cmd_serve(a) -> None:
 
     import native
 
+    rd = (VLLMReader(a.reader_local, util=0.80) if a.reader_local else OpenAIReader(a.reader_url, a.reader) if a.reader_url
+          else Reader(a.reader, Path(a.log)))  # the reader's engine first: vLLM sizes its cache from the free memory
     nat = native.Native(a.device)
-    rd = OpenAIReader(a.reader_url, a.reader) if a.reader_url else Reader(a.reader, Path(a.log))
     lock, cache = threading.Lock(), {}
     who = {"source": source(), "reader": a.reader}
 
@@ -1100,6 +1101,7 @@ def main():
     sv = sub.add_parser("serve")
     sv.add_argument("--questions-dir", type=Path, required=True)
     sv.add_argument("--reader-url", help="an OpenAI-compatible server (vllm serve ...); else Tinker's --reader")
+    sv.add_argument("--reader-local", help="a model run in this process by vLLM (Qwen/Qwen3.6-27B-FP8 on a 48 GB card)")
     sv.add_argument("--reader", default=READER)
     sv.add_argument("--log", default=str(Path.home() / "mpd-data" / "graph_oracle" / "reader_reward" / "serve"))
     sv.add_argument("--port", type=int, default=8773)

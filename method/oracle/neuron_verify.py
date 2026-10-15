@@ -90,10 +90,14 @@ class Target:
         from transformers import AutoModelForCausalLM, AutoTokenizer
 
         self.torch = torch
-        self.dev = torch.device(device or ("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"))
         self.tok = AutoTokenizer.from_pretrained(name)
         self.tok.padding_side = "right"  # each text's own positions first, the padding after (masked out)
-        self.m = AutoModelForCausalLM.from_pretrained(name, dtype=torch.bfloat16).to(self.dev).eval()
+        if device == "auto":  # layers spread over every visible GPU (Qwen3-32B on two 48 GB cards)
+            self.m = AutoModelForCausalLM.from_pretrained(name, dtype=torch.bfloat16, device_map="auto").eval()
+            self.dev = self.m.get_input_embeddings().weight.device
+        else:
+            self.dev = torch.device(device or ("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"))
+            self.m = AutoModelForCausalLM.from_pretrained(name, dtype=torch.bfloat16).to(self.dev).eval()
         self.architecture_verified = _swiglu_architecture(self.m)
         self.layers = self.m.model.layers
         self.name = name
@@ -227,31 +231,39 @@ def _responses(rd, asks, max_tokens):
     return list(replies)
 
 
-def verify(tg: Target, rd, items: list[dict], seed: int = 0) -> list[dict]:
-    """Complete blinded activation diagnostics and steering test; never a causal mechanism certificate.
-
-    Invalid proposals remain explicit failures and cannot earn T1 credit. Response
-    cardinality errors raise rather than silently dropping items. No route claim is tested.
-    """
-    bindings=[_item(tg,it) for it in items]
+def plan(rd, items: list[dict]) -> list[dict]:
+    """The reader's test texts for each item (ASK), parsed and validated (_proposal); an invalid proposal stays an
+    explicit failure that cannot earn T1 credit."""
     source_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
     asks=[ASK.format(pole="positive" if it["pole"]=="+" else "negative",explanation=it["explanation"],
                      blind=BLIND,near=NEAR,distant=DISTANT) for it in items]
     replies=_responses(rd,asks,1500) if asks else []
-    out,judges=[],[];rng=random.Random(seed)
-    for it,binding,ask,raw in zip(items,bindings,asks,replies):
-        plan=parse_json(raw)
+    rows=[]
+    for it,ask,raw in zip(items,asks,replies):
+        prop=parse_json(raw)
         row={k:it[k] for k in ("layer","index","pole","corpus_max","explanation")}
-        row.update({"model_binding":binding,"reader_class":type(rd).__name__,"reader_model":getattr(rd,"base",getattr(rd,"model",None)),
-                    "verifier_source_sha256":source_sha256,"raw_proposal":raw,"proposal":plan,
+        row.update({"reader_class":type(rd).__name__,"reader_model":getattr(rd,"base",getattr(rd,"model",None)),
+                    "verifier_source_sha256":source_sha256,"raw_proposal":raw,"proposal":prop,
                     "proposal_request":ask,"diagnostic_scope":"T1 activation prediction; not causal mechanism certification",
                     "causal_mechanism_verified":False,"passes_t1":False})
-        try:groups=_proposal(plan)
-        except ValueError as e:
-            out.append({**row,"valid":False,"reason":str(e)});judges.append(None);continue
-        key="pos" if it["pole"]=="+" else "neg";cm=float(it["corpus_max"])
+        try:row["test_texts"]=_proposal(prop);row["valid"]=True
+        except ValueError as e:row.update({"valid":False,"reason":str(e)})
+        rows.append(row)
+    return rows
+
+
+def measure(tg: Target, rows: list[dict], seed: int = 0) -> list[dict]:
+    """The target's side of each planned row: every test text's pole value over the corpus maximum, blind maximum,
+    near-miss and distant rates, the steered and unsteered continuations, and the steering judge's question (A/B order
+    seeded) with its expected letter."""
+    out=[];rng=random.Random(seed)
+    for row in rows:
+        row={**row,"model_binding":_item(tg,row)}
+        if not row.get("valid"):
+            out.append(row);continue
+        groups=row["test_texts"];key="pos" if row["pole"]=="+" else "neg";cm=float(row["corpus_max"])
         flat=[x for xs in groups.values() for x in xs]
-        vals=tg.poles(flat,it["layer"],it["index"])
+        vals=tg.poles(flat,row["layer"],row["index"])
         if not isinstance(vals,list) or len(vals)!=len(flat):
             raise ValueError("target pole result count must match all test texts")
         measured=[]
@@ -267,29 +279,81 @@ def verify(tg: Target, rd, items: list[dict], seed: int = 0) -> list[dict]:
         for k,xs in groups.items():got[k]=measured[k0:k0+len(xs)];k0+=len(xs)
         blind=max(got["max_texts"]);near=sum(x>=FIRE for x in got["near_misses"])/NEAR
         dist=sum(x>=FIRE for x in got["distant_texts"])/DISTANT
-        value=(1 if it["pole"]=="+" else -1)*STEER*cm
+        value=(1 if row["pole"]=="+" else -1)*STEER*cm
         if not math.isfinite(value):raise ValueError("steering amplitude must be finite")
-        on,off=tg.steered(it["layer"],it["index"],value),tg.steered(it["layer"],it["index"],None)
+        on,off=tg.steered(row["layer"],row["index"],value),tg.steered(row["layer"],row["index"],None)
         flip=rng.random()<.5
-        judge=JUDGE.format(prediction=plan["steering_prediction"],a=off if flip else on,b=on if flip else off)
-        judges.append((judge,"B" if flip else "A"))
-        out.append({**row,"valid":True,"test_texts":groups,"raw_pole_measurements":vals,"blind_max":blind,
-                    "blind_texts":groups["max_texts"],"blind_values":got["max_texts"],"near_miss_rate":near,
-                    "near_values":got["near_misses"],"distant_concept":plan["distant_concept"],"distant_rate":dist,
-                    "distant_values":got["distant_texts"],"steering_prediction":plan["steering_prediction"],
-                    "steered":on,"unsteered":off,"passes_t1":blind>=FIRE and near<FIRE})
-    asked=[j for j in judges if j]
-    responses=_responses(rd,[q for q,_ in asked],40) if asked else []  # 5 tokens cut the reader off mid-sentence on 19 of 19
-    answer_iter=iter(responses)
-    for row,j in zip(out,judges):
-        if j:
-            raw=next(answer_iter)
+        prop=row["proposal"]
+        out.append({**row,"raw_pole_measurements":vals,"blind_max":blind,"blind_texts":groups["max_texts"],
+                    "blind_values":got["max_texts"],"near_miss_rate":near,"near_values":got["near_misses"],
+                    "distant_concept":prop["distant_concept"],"distant_rate":dist,"distant_values":got["distant_texts"],
+                    "steering_prediction":prop["steering_prediction"],"steered":on,"unsteered":off,
+                    "steer_request":JUDGE.format(prediction=prop["steering_prediction"],a=off if flip else on,b=on if flip else off),
+                    "steer_expected":"B" if flip else "A","passes_t1":blind>=FIRE and near<FIRE})
+    return out
+
+
+def judge(rd, rows: list[dict]) -> list[dict]:
+    """The reader's steering choice for each measured row (one letter, the last line's A or B)."""
+    asked=[r for r in rows if r.get("valid") and r.get("steer_request")]
+    responses=_responses(rd,[r["steer_request"] for r in asked],40) if asked else []  # 5 tokens cut the reader off mid-sentence on 19 of 19
+    got={id(r):raw for r,raw in zip(asked,responses)}
+    out=[]
+    for r in rows:
+        if id(r) in got:
+            raw=got[id(r)]
             # Reasoning may precede a terminal answer line; prose articles are not votes.
             choice=re.search(r"(?:^|\n)\s*([AB])[.!]?\s*$",raw.strip(),re.I)
             ans=choice[1].upper() if choice else ""
-            row.update({"steer_match":float(ans==j[1]),"steer_response_valid":ans in ("A","B"),
-                        "steer_raw_response":raw,"steer_request":j[0],"steer_expected":j[1]})
+            r={**r,"steer_match":float(ans==r["steer_expected"]),"steer_response_valid":ans in ("A","B"),"steer_raw_response":raw}
+        out.append(r)
     return out
+
+
+def verify(tg: Target, rd, items: list[dict], seed: int = 0) -> list[dict]:
+    """Complete blinded activation diagnostics and steering test; never a causal mechanism certificate: plan, measure
+    and judge on one host. Invalid proposals remain explicit failures and cannot earn T1 credit. Response cardinality
+    errors raise rather than silently dropping items. No route claim is tested."""
+    for it in items:
+        _item(tg,it)
+    return judge(rd,measure(tg,plan(rd,items),seed))
+
+
+def _load(path: Path) -> list[dict]:
+    return [json.loads(x) for x in path.read_text().splitlines() if x.strip()]
+
+
+def _dump(path: Path, rows: list[dict]) -> None:
+    path.parent.mkdir(parents=True,exist_ok=True)
+    path.write_text("".join(json.dumps(r)+"\n" for r in rows))
+
+
+def cmd_plan(a) -> None:
+    """Step 1 of 3 on the machine with the reader's key: the reader's test texts for each pole (--neurons) to --out."""
+    import reader_reward
+
+    rd=reader_reward.Reader(a.reader,a.out.parent)
+    rows=plan(rd,_load(a.neurons))
+    _dump(a.out,rows)
+    print(f"{sum(r['valid'] for r in rows)}/{len(rows)} valid plans to {a.out}; spend ${rd.spend.total:.3f}")
+
+
+def cmd_measure(a) -> None:
+    """Step 2 of 3 where the target runs (a MATS GPU or a pod; no reader key): --plans to --out."""
+    tg=Target(a.model,a.device)
+    rows=measure(tg,_load(a.plans))
+    _dump(a.out,rows)
+    print(f"{len(rows)} rows measured to {a.out}")
+
+
+def cmd_judge(a) -> None:
+    """Step 3 of 3 on the machine with the reader's key: the steering choices for --measured to --out."""
+    import reader_reward
+
+    rd=reader_reward.Reader(a.reader,a.out.parent)
+    rows=judge(rd,_load(a.measured))
+    _dump(a.out,rows)
+    print(f"{len(rows)} rows judged to {a.out}; spend ${rd.spend.total:.3f}")
 
 
 def cmd_verify(a) -> None:
@@ -377,8 +441,21 @@ def main():
     v.add_argument("--device")
     sm = sub.add_parser("summary")
     sm.add_argument("rows", type=Path, nargs="+")
+    pl = sub.add_parser("plan")
+    pl.add_argument("--neurons", type=Path, required=True)
+    pl.add_argument("--out", type=Path, required=True)
+    pl.add_argument("--reader", default=READER)
+    me = sub.add_parser("measure")
+    me.add_argument("--plans", type=Path, required=True)
+    me.add_argument("--out", type=Path, required=True)
+    me.add_argument("--model", default="Qwen/Qwen3-1.7B")
+    me.add_argument("--device", help="cuda, mps, cpu, or auto (layers over every visible GPU)")
+    ju = sub.add_parser("judge")
+    ju.add_argument("--measured", type=Path, required=True)
+    ju.add_argument("--out", type=Path, required=True)
+    ju.add_argument("--reader", default=READER)
     a = ap.parse_args()
-    {"verify": cmd_verify, "summary": cmd_summary}[a.what](a)
+    {"verify": cmd_verify, "summary": cmd_summary, "plan": cmd_plan, "measure": cmd_measure, "judge": cmd_judge}[a.what](a)
 
 
 if __name__ == "__main__":

@@ -886,7 +886,8 @@ def build_hf(model, ids: list[int], target: int, kl_target: float = HF_KL_TARGET
     two stages, no singles cleanup), for a caller charged by the sequences run (the oracle gate's 256 a text). Returns
     {"units": [(kind, layer, position, index, effect)], effect the measured drop in log2 p of the model's top token when
     the unit alone is mean-ablated from the whole model for the `effects` highest-ranked units, else None and the
-    Fisher's predicted KL rise in "fisher"; "kl", "kl_target", "kl_empty", "positions", "layers" (units per layer),
+    Fisher's predicted KL rise in "fisher"; "live" (the circuit's masks), "order" (its units' flat indices, rank order)
+    and "runner" (the adapter: mediated_runs, recovery_count); "kl", "kl_target", "kl_empty", "positions", "layers" (units per layer),
     "passes", "seconds", "heads", "neurons"}. groups ([L, d_mlp], neuron_groups'): neuron groups in place of neurons (GroupedUnits;
     a unit ("group", layer, position, group id))."""
     t0 = time.perf_counter()
@@ -899,7 +900,7 @@ def build_hf(model, ids: list[int], target: int, kl_target: float = HF_KL_TARGET
         mu = GroupedUnits(mu, groups)
     kw = BUDGET if budget_passes is not None else {}
     live, rec = build_units(mu, seed, kl_target, **kw)
-    order, score = rec.pop("order"), rec.pop("score")
+    order, score = rec["order"], rec.pop("score")
     nh = mu.L * mu.T * mu.H
     units = []
     for i in order.tolist():
@@ -922,7 +923,7 @@ def build_hf(model, ids: list[int], target: int, kl_target: float = HF_KL_TARGET
     fs = score[order].tolist()
     rec.update(units=[u + [eff[i] if i < len(eff) else None] for i, u in enumerate(units)], fisher=fs,
                positions=sorted({u[2] for u in units}), layers=[sum(1 for u in units if u[1] == l) for l in range(mu.L)],
-               passes=mu.passes, seconds=time.perf_counter() - t0, T=mu.T)
+               passes=mu.passes, seconds=time.perf_counter() - t0, T=mu.T, live=live, runner=mu)
     if log:
         log(f"  native (HF): {len(units)} units ({rec['heads']} heads, {rec['neurons']} neurons) at {len(rec['positions'])} positions "
             f"of {mu.T}, KL {rec['kl']:.3f} (target {kl_target:.3f}, empty {rec['kl_empty']:.1f}), {rec['passes']} passes, "
@@ -930,49 +931,77 @@ def build_hf(model, ids: list[int], target: int, kl_target: float = HF_KL_TARGET
     return rec
 
 
-def mediated_share(ge: goal_eval.GoalEval, tx: goal_eval.Text, S: Mask, means: dict | None = None, ks=(1, 3, 5),
-                   candidates: int = CLEAN_MAX, sets: list | None = None) -> dict:
-    """Criterion 6's mediated share for a native circuit (generality's definition, the lead's 10-14): the circuit's units
-    ranked by their real-model single removal drop d(u) = log2 p(y) - log2 p(y | u mean-ablated) (y the model's top token
-    at each target, summed), measured for its `candidates` units of largest Fisher (a native circuit holds tens of
-    thousands); for the top k, the live drop (the real model with them mean-ablated) and the mediated drop (the circuit's
-    units live, every unit outside it frozen at its clean value, the top k mean-ablated), m_k = D_med / D_live. sets:
-    the removal sets given (named "set<i>"), in place of the top k (the same edits under another circuit)."""
-    nat = ge.nat
-    means = means if means is not None else unit_means(nat)
-    mu = MeanUnits(nat, tx.ids, tx.targets, means)
-    T, L, H, Dm = mu.T, mu.L, mu.H, mu.Dm
-    units = [u for u in S.units() if u[2] < T] if sets is None else []
-    f = fisher(mu, tx.seed) if sets is None else None
-
-    def flat(u):
-        kind, l, t, j = u
-        return (l * T + t) * H + j if kind == "head" else L * T * H + (l * T + t) * Dm + j
-    if units:
-        fu = f[torch.tensor([flat(u) for u in units], device=mu.dev)]
-        units = [units[i] for i in torch.argsort(fu, descending=True)[:candidates].tolist()]
+def mediated_runs(mu: UnitRuns, live: tuple, seed: int, ks=(1, 3, 5), candidates: int = CLEAN_MAX, sets: list | None = None,
+                  kind: str = "neuron") -> dict:
+    """Criterion 6's mediated share on any adapter (generality's definition, the lead's 10-14), for the circuit live
+    (heads [L, T, H], neurons or groups [L, T, ·] masks over the adapter's positions): its units ranked by their real-model
+    single removal drop d(u) = log2 p(y) - log2 p(y | u mean-ablated) (y the model's top token at each target, summed),
+    measured for its `candidates` units of largest Fisher (a native circuit holds tens of thousands); for the top k, the
+    live drop (the real model with them mean-ablated) and the mediated drop (the circuit's units live, every unit outside
+    it frozen at its clean value, the top k mean-ablated), m_k = D_med / D_live. sets: the removal sets given (named
+    "set<i>"), in place of the top k (the same edits under another circuit). kind: the second unit kind's name."""
+    inside = tuple(x.float() for x in live)
+    on = [("head", *u) for u in live[0].nonzero().tolist()] + [(kind, *u) for u in live[1].nonzero().tolist()] if sets is None else []
+    if on:
+        T, H, M = mu.T, mu.H, live[1].shape[2]
+        f = fisher(mu, seed)
+        flat = torch.tensor([(l * T + t) * H + j if k == "head" else mu.L * T * H + (l * T + t) * M + j for k, l, t, j in on], device=mu.dev)
+        on = [on[i] for i in torch.argsort(f[flat], descending=True)[:candidates].tolist()]
 
     def removed(base, us):
         h, n = base[0].clone(), base[1].clone()
-        for kind, l, t, j in us:
-            (h if kind == "head" else n)[l, t, j] = 0.0
+        for k, l, t, j in us:
+            (h if k == "head" else n)[l, t, j] = 0.0
         return h, n
-    full = tuple(x[0] for x in mu.ones())
+    full = tuple(torch.ones_like(x) for x in inside)
     lp0 = mu.kl([full], lp=True)[0]
-    drops = [lp0 - v for v in mu.kl((removed(full, [u]) for u in units), lp=True)]
-    order = [units[i] for i in np.argsort(drops)[::-1]]
-    inside = (S.heads[:, :T].float(), S.neurons[:, :T].float())  # the circuit live, every other unit at its clean value
-    outside = (S.heads[:, :T] == 0, S.neurons[:, :T] == 0)
+    drops = [lp0 - v for v in mu.kl((removed(full, [u]) for u in on), lp=True)]
+    order = [on[i] for i in np.argsort(drops)[::-1]]
+    outside = tuple(x == 0 for x in live)
     names = [f"top{k}" for k in ks] if sets is None else [f"set{i}" for i in range(len(sets))]
     sets = [order[:k] for k in ks] if sets is None else [[tuple(u) for u in R] for R in sets]
-    live = mu.kl((removed(full, R) for R in sets), lp=True)
+    lv = mu.kl((removed(full, R) for R in sets), lp=True)
     med = mu.kl([inside] + [removed(inside, R) for R in sets], (outside for _ in range(len(sets) + 1)), lp=True)
-    out = {"units": S.count(), "measured": len(units), "single_drops": sorted(drops, reverse=True)[:16], "lp": lp0, "lp_frozen": med[0]}
-    for name, R, lv, md in zip(names, sets, live, med[1:]):
-        d_live, d_med = lp0 - lv, med[0] - md
-        out[name] = {"units": [list(u) for u in R], "live": d_live, "mediated": d_med,
-                          "share": d_med / d_live if abs(d_live) > 1e-9 else None}
+    out = {"units": int(sum(int(x.sum()) for x in live)), "measured": len(on), "single_drops": sorted(drops, reverse=True)[:16],
+           "lp": lp0, "lp_frozen": med[0]}
+    for name, R, a, md in zip(names, sets, lv, med[1:]):
+        d_live, d_med = lp0 - a, med[0] - md
+        out[name] = {"units": [list(u) for u in R], "live": d_live, "mediated": d_med, "share": d_med / d_live if abs(d_live) > 1e-9 else None}
     return out
+
+
+def mediated_share(ge: goal_eval.GoalEval, tx: goal_eval.Text, S: Mask, means: dict | None = None, ks=(1, 3, 5),
+                   candidates: int = CLEAN_MAX, sets: list | None = None) -> dict:
+    """mediated_runs on vpd4l (MeanUnits) for a native circuit S (a Mask over the whole text)."""
+    nat = ge.nat
+    mu = MeanUnits(nat, tx.ids, tx.targets, means if means is not None else unit_means(nat))
+    return mediated_runs(mu, (S.heads[:, :mu.T], S.neurons[:, :mu.T]), tx.seed, ks, candidates, sets)
+
+
+def recovery_count(mu: UnitRuns, order: torch.Tensor, share: float = 0.9) -> dict:
+    """The fewest of a circuit's units, in its rank order (flat indices, build_units' "order"), that recover share of the
+    change in log2 p of the model's top token from the all-mean run to the model (the rest of the units at their means),
+    on a log grid then halving, measured: {"k", "heads", "second" (neurons or groups), "lp_k", "lp_empty", "lp_model"}."""
+    L, T, H, M = mu.L, mu.T, mu.H, mu.Dm
+    nh = L * T * H
+
+    def mask_of(idx):
+        h = torch.zeros(nh, device=mu.dev)
+        n = torch.zeros(L * T * M, device=mu.dev)
+        h[idx[idx < nh]], n[idx[idx >= nh] - nh] = 1.0, 1.0
+        return h.view(L, T, H), n.view(L, T, M)
+    lo_lp, hi_lp = mu.kl([mask_of(order[:0]), tuple(x[0] for x in mu.ones())], lp=True)
+    goal = lo_lp + share * (hi_lp - lo_lp)
+    sizes = log_sizes(len(order))
+    got = dict(zip(sizes, mu.kl((mask_of(order[:k]) for k in sizes), lp=True)))
+    k = next((k for k in sizes if got[k] >= goal), len(order))
+    lo = max([j for j in sizes if j < k] or [0])
+    while k - lo > max(1, k // 64):
+        mid = (lo + k) // 2
+        got[mid] = mu.kl([mask_of(order[:mid])], lp=True)[0]
+        lo, k = (lo, mid) if got[mid] >= goal else (mid, k)
+    return {"k": k, "heads": int((order[:k] < nh).sum()), "second": int((order[:k] >= nh).sum()), "lp_k": got.get(k),
+            "lp_empty": lo_lp, "lp_model": hi_lp, "share": share}
 
 
 def build_all(tasks: list[str], out: Path, vpd: Path | None = None, device: str | None = None, mediated: bool = True,

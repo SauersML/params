@@ -8,8 +8,10 @@ answer on 5 held-out prompts each, from the organism model alone (its LoRA adapt
   persona_0                        the trained fact (Anika Velasquez's country, food, drink, music, sport) in the organism's
                                    greedy answer to organisms.py's held-out phrasings, at the position before its first token
 Per prompt OUT/<organism>_<k>.json: the prompt, the target position and token, its probability, the circuit's units with
-their measured effects (build_hf), the same build within the oracle gate's 256 passes, and the build on coarser units:
-the heads and GROUPS neuron groups per layer by output direction (neuron_groups on the organism's own down projections).
+their measured effects (build_hf) and its mediated share (mediated_runs), the same build within the oracle gate's 256
+passes, and the build on coarser units: the heads and GROUPS neuron groups per layer by output direction (neuron_groups on
+the organism's own down projections), with its mediated share and the fewest of its units that recover 90% of the
+answer's log-probability change from the all-mean run (recovery_count).
 SMOKE=1: Qwen3-0.6B, no adapter, one prompt, the budgeted and grouped builds alone (a CPU check of the script).
 
   native_qwen3.py OUT [--organisms owl,persona_0] [--prompts 5] [--kl 0.5]   (the user stopped the shutdown line, 10-14)
@@ -129,7 +131,9 @@ def main():
                 rec = native_units.build_hf(model, ids, target, kl_target=a.kl, means=means,
                                             log=lambda m: print(f"{name}_{k}:{m}", flush=True))
                 row["units"] = rec.pop("units")
-                rec.pop("fisher")
+                row["mediated"] = native_units.mediated_runs(rec["runner"], rec["live"], 0)
+                for key in ("fisher", "live", "order", "runner"):
+                    rec.pop(key)
                 row["record"] = rec
             cheap = native_units.build_hf(model, ids, target, kl_target=a.kl, means=means, budget_passes=256,
                                           log=lambda m: print(f"{name}_{k} (256 passes):{m}", flush=True))
@@ -139,7 +143,13 @@ def main():
             grp = native_units.build_hf(model, ids, target, kl_target=a.kl, means=means, groups=groups,
                                         log=lambda m: print(f"{name}_{k} ({GROUPS} groups):{m}", flush=True))
             row["grouped"] = {key: grp[key] for key in ("kl", "kl_target", "kl_empty", "heads", "neurons", "passes", "seconds", "positions", "layers", "of")}
+            row["grouped"]["mediated"] = native_units.mediated_runs(grp["runner"], grp["live"], 0, kind="group")
+            row["grouped"]["recovery_90"] = native_units.recovery_count(grp["runner"], grp["order"])
             row["grouped"]["units"], row["grouped"]["groups"] = grp["units"], groups.tolist()
+            g = row["grouped"]
+            print(f"{name}_{k} (groups): mediated share top 1/3/5 " + " ".join("-" if g["mediated"][f"top{j}"]["share"] is None else
+                  f"{g['mediated'][f'top{j}']['share']:.2f}" for j in (1, 3, 5)) + f"; 90% of the answer's log-probability change "
+                  f"from {g['recovery_90']['k']} units ({g['recovery_90']['heads']} heads, {g['recovery_90']['second']} groups)", flush=True)
             (a.out / f"{name}_{k}.json").write_text(json.dumps(row))
             k += 1
         del model

@@ -697,3 +697,21 @@ def test_native_rows_precomputed_necessity_exact_equivalence(monkeypatch):
     actual=ph.rows([S],necessity_rows=[nr]);assert seen==[] and actual==expected
     assert nr['_raw_n_spec']==.9  # merging rows must not consume the cached record
     with pytest.raises(ValueError):ph.rows([S],necessity_rows=[])
+
+
+def test_mediated_runs_and_recovery_on_groups(tiny_hf):
+    """mediated_runs on an HF adapter with neuron groups: the whole model live has share 1 and the frozen run is the
+    clean one; recovery_count's units recover the share of the answer's log-probability change it reports."""
+    model, ids, means = tiny_hf
+    hu = native_units.HFUnits(model, ids, [9], means)
+    gu = native_units.GroupedUnits(hu, native_units.neuron_groups(native_units.neuron_writes(hu), 5))
+    whole = tuple(x[0] for x in gu.ones())
+    ms = native_units.mediated_runs(gu, whole, 0, candidates=8, kind="group")
+    assert abs(ms["lp"] - ms["lp_frozen"]) < 1e-4 and all(abs(ms[f"top{k}"]["share"] - 1) < 1e-4 for k in (1, 3, 5) if ms[f"top{k}"]["share"] is not None)
+    empty = gu.kl([tuple(x[0] * 0 for x in gu.ones())])[0]
+    rec = native_units.build_hf(model, ids, 9, kl_target=empty * 0.05, means=means, groups=gu.groups, effects=0)
+    part = native_units.mediated_runs(rec["runner"], rec["live"], 0, candidates=8, kind="group")
+    assert abs(part["lp"] - part["lp_frozen"]) < 1e-4
+    rc = native_units.recovery_count(rec["runner"], rec["order"])
+    assert 0 < rc["k"] <= len(rec["order"]) and rc["heads"] + rc["second"] == rc["k"]
+    assert rc["lp_k"] >= rc["lp_empty"] + 0.9 * (rc["lp_model"] - rc["lp_empty"]) - 1e-6

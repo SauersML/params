@@ -4,8 +4,9 @@ model's own MLP neurons, no decomposition.
 Semantics (inframove's 10-15, neuron_hubs.py):
 - unit: a strong activation of one MLP neuron (the down projection's input, act(gate) x up) at one position, with its
   pole (the sign of the value) and SwiGLU regime (the signs of act(gate) and of up);
-- reference: the model with weak activations zeroed, every value under tau x that neuron's largest |value| over general
-  chat set to 0, tau the largest of TAUS whose mean KL from the model stays at most KL_TOL bits (calibrate, test T2);
+- reference: the model with weak activations zeroed, every value under tau_l x that neuron's largest |value| over general
+  chat set to 0, one fraction tau_l per layer, the most values zeroed with the mean KL from the model at most KL_TOL bits
+  (calibrate, test T2; Neurons.save/load keep it in a file);
 - removal: the unit's value zeroed at its position; massive activations (|value| at least MASSIVE x the layer's largest
   neuron maximum: sinks and delimiters) and the first position are never units and stay live;
 - metric: the answer contrast at the answer position, log2 p(y) - log2 of the summed p of the ALTERNATIVES likeliest
@@ -37,8 +38,12 @@ import time
 
 import torch
 
-TAUS = (0.01, 0.02, 0.05, 0.1, 0.2, 0.3)
+TAUS = (0.005, 0.01, 0.02, 0.03, 0.05, 0.075, 0.1, 0.15, 0.2, 0.3, 0.5)   # a layer's weak fraction tau_l (0 also)
 KL_TOL = 0.1          # bits: the weak-zeroed reference's largest mean KL from the model (T2)
+FIT = 80              # calibration texts whose KL the per-layer fractions are chosen on
+PRICES = 48           # Lagrange prices (values zeroed per bit) whose per-layer choices are measured jointly
+REFINE = 8            # rounds raising one layer's fraction a step on joint measurements
+CAL_ROWS = slice(1000, 1200)   # general.jsonl's calibration chats (maxima; the first FIT also the KL); 100-299 held out (T2)
 MASSIVE = 0.25        # a value at least this share of the layer's largest neuron maximum is massive (kept live, no unit)
 ALTERNATIVES = 5
 CANDIDATES = 512      # units measured alone
@@ -69,8 +74,9 @@ class Neurons:
         self.L, self.D = cfg.num_hidden_layers, cfg.intermediate_size
         self.dev = next(self.core.parameters()).device
         self.thr = None          # [L, D] weak threshold per neuron
+        self.mx = None           # [L, D] each neuron's largest |value| on the calibration texts
         self.massive = None      # [L] massive value per layer
-        self.tau = None
+        self.tau = None          # [L] each layer's weak fraction
 
     @contextlib.contextmanager
     def hooks(self, edit=None, capture: dict | None = None):
@@ -80,7 +86,7 @@ class Neurons:
             def pre(mod, args, i=i):
                 h = args[0]
                 if self.thr is not None:
-                    h = h * (h.abs() >= self.thr[i].to(h.dtype)).to(h.dtype)
+                    h = h * (h.abs() >= self.thr[i].to(h.device, h.dtype)).to(h.dtype)
                 if edit is not None:
                     h = edit(i, h)
                 if capture is not None:
@@ -104,34 +110,125 @@ class Neurons:
         return self.core.lm_head(h).float()
 
     @torch.no_grad()
-    def calibrate(self, seqs: list[list[int]], taus=TAUS, kl_tol: float = KL_TOL) -> dict:
-        """Each neuron's largest |value| over seqs, the massive value per layer, and the largest tau in taus whose
-        weak-zeroed model stays within kl_tol bits of the model (mean over seqs' positions); strong units per token."""
-        self.thr = None
+    def maxima(self, seqs: list[list[int]]) -> torch.Tensor:
+        """[L, D]: each neuron's largest |value| over seqs in the model."""
+        thr, self.thr = self.thr, None
         mx = torch.zeros(self.L, self.D, device=self.dev)
         for ids in seqs:
             cap = {}
             self.logits(ids, [len(ids) - 1], capture=cap)
             for i, h in enumerate(cap["h"]):
-                mx[i] = torch.maximum(mx[i], h[0].abs().max(0).values.float())
-        rows = []
-        for tau in taus:
-            kls, strong = [], []
-            for ids in seqs[:20]:
-                pos = list(range(len(ids)))
-                self.thr = None
-                lp0 = torch.log_softmax(self.logits(ids, pos)[0], -1)
-                self.thr = tau * mx
-                cap = {}
-                lp1 = torch.log_softmax(self.logits(ids, pos, capture=cap)[0], -1)
-                kls.append(float((lp0.exp() * (lp0 - lp1)).sum(-1).mean() / math.log(2)))
-                strong.append(float(sum((h[0] != 0).sum() for h in cap["h"]) / len(ids)))
-            rows.append({"tau": tau, "kl": sum(kls) / len(kls), "strong_per_token": sum(strong) / len(strong)})
-        ok = [r for r in rows if r["kl"] <= kl_tol]
-        self.tau = max(r["tau"] for r in ok) if ok else None
-        self.thr = None if self.tau is None else self.tau * mx
-        self.massive = MASSIVE * mx.max(1).values
-        return {"tau": self.tau, "rows": rows}
+                mx[i] = torch.maximum(mx[i], h[0].abs().max(0).values.float().to(self.dev))
+        self.thr = thr
+        return mx
+
+    @torch.no_grad()
+    def weak_runs(self, seqs: list[list[int]], fracs: torch.Tensor, live0=None, rows: int = 16) -> tuple:
+        """Per row of fracs [R, L] (each layer's weak fraction of self.mx), the model with every value under its threshold
+        zeroed (live0 [R] bool: the first position, the attention sink, kept whole): its mean KL (bits) from the model
+        over every position of seqs [R], and the strong values per token per layer [R, L]."""
+        thr, self.thr = self.thr, None
+        R = len(fracs)
+        kl = torch.zeros(R, dtype=torch.float64)
+        strong = torch.zeros(R, self.L, dtype=torch.float64)
+        n = 0
+        for ids in seqs:
+            pos = list(range(len(ids)))
+            lp0 = torch.log_softmax(self.logits(ids, pos)[0], -1)
+            for s0 in range(0, R, rows):
+                f = fracs[s0:s0 + rows].float()
+                l0 = None if live0 is None else torch.as_tensor(live0[s0:s0 + rows], dtype=torch.bool)
+                cnt = torch.zeros(len(f), self.L, device=self.dev)
+
+                def edit(i, h, f=f, l0=l0, cnt=cnt):
+                    keep = h.float().abs() >= (f[:, i].to(h.device)[:, None] * self.mx[i].to(h.device)[None])[:, None, :]
+                    if l0 is not None:
+                        keep[l0.to(h.device), 0] = True
+                    cnt[:, i] = keep.sum((1, 2)).float().to(cnt.device)
+                    return h * keep.to(h.dtype)
+                lp1 = torch.log_softmax(self.logits(ids, pos, edit=edit, B=len(f)), -1)
+                d = (lp0.exp()[None] * (lp0[None] - lp1.to(lp0.device))).sum(-1).sum(-1) / math.log(2)
+                kl[s0:s0 + len(f)] += d.double().cpu()
+                strong[s0:s0 + len(f)] += cnt.double().cpu()
+                del lp1
+            n += len(ids)
+        self.thr = thr
+        return kl / n, strong / n
+
+    @torch.no_grad()
+    def calibrate(self, seqs: list[list[int]], fit: list[list[int]] | None = None, taus=TAUS, kl_tol: float = KL_TOL,
+                  prices: int = PRICES, refine: int = REFINE, rows: int = 16, log=None) -> dict:
+        """The weak-zeroed reference (T2): each neuron's largest |value| over seqs and one weak fraction per layer.
+        1. each layer alone weak-zeroed at each fraction in taus, its KL on fit (default seqs[:FIT]) and the values it
+           zeroes; 2. per Lagrange price (values zeroed per bit, PRICES on a log grid) every layer's fraction maximising
+           zeroed - price x KL alone, each such choice measured jointly on fit, the one zeroing most within kl_tol kept;
+           3. REFINE rounds, each raising by one step the layer whose joint measurement zeroes most per bit, within kl_tol.
+        Every choice is a joint measurement; the single-layer table only proposes."""
+        fit = seqs[:FIT] if fit is None else fit
+        self.thr = None
+        self.mx = self.maxima(seqs)
+        self.massive = MASSIVE * self.mx.max(1).values
+        L, G = self.L, len(taus) + 1
+        grid = torch.tensor((0.0,) + tuple(taus), dtype=torch.float64)
+        fr = torch.zeros(L * len(taus), L, dtype=torch.float64)
+        for i in range(L):
+            fr[i * len(taus):(i + 1) * len(taus), i] = grid[1:]
+        kl1, st1 = self.weak_runs(fit, fr, rows=rows)
+        cost = torch.cat([torch.zeros(L, 1, dtype=torch.float64), kl1.view(L, len(taus)).clamp(min=0)], 1).cummax(1).values
+        own = st1.view(L, len(taus), L).diagonal(dim1=0, dim2=2).T                      # [L, G-1] strong at the layer itself
+        gone = torch.cat([torch.zeros(L, 1, dtype=torch.float64), self.D - own], 1)    # [L, G] values zeroed per token
+        if log:
+            log(f"calibrate: single-layer table on {len(fit)} texts done")
+
+        steps = []
+        for lam in torch.logspace(1, 9, prices, dtype=torch.float64):
+            g = (gone - lam * cost).argmax(1)
+            if not any(bool((g == h).all()) for h in steps):
+                steps.append(g)
+        kls, sts = self.weak_runs(fit, torch.stack([grid[g] for g in steps]), rows=rows)
+        ok = [k for k in range(len(steps)) if kls[k] <= kl_tol]
+        k0 = min(ok, key=lambda k: float(sts[k].sum())) if ok else None
+        g = steps[k0] if ok else torch.zeros(L, dtype=torch.long)
+        cur_kl, cur_st = (float(kls[k0]), float(sts[k0].sum())) if ok else (0.0, float(L * self.D))
+        priced = [{"tau": [float(grid[x]) for x in h], "kl": float(k), "strong_per_token": float(s.sum())}
+                  for h, k, s in zip(steps, kls, sts)]
+        moves = []
+        for _ in range(refine if ok else 0):
+            cand = [i for i in range(L) if g[i] < G - 1]
+            if not cand:
+                break
+            trial = torch.stack([grid[g + torch.nn.functional.one_hot(torch.tensor(i), L)] for i in cand])
+            k2, s2 = self.weak_runs(fit, trial, rows=rows)
+            best = None
+            for j, i in enumerate(cand):
+                if k2[j] <= kl_tol:
+                    gain = cur_st - float(s2[j].sum())
+                    rate = gain / max(float(k2[j]) - cur_kl, 1e-6)
+                    if gain > 0 and (best is None or rate > best[0]):
+                        best = (rate, i, float(k2[j]), float(s2[j].sum()))
+            if best is None:
+                break
+            g = g.clone()
+            g[best[1]] += 1
+            cur_kl, cur_st = best[2], best[3]
+            moves.append({"layer": best[1], "tau": float(grid[g[best[1]]]), "kl": cur_kl, "strong_per_token": cur_st})
+            if log:
+                log(f"calibrate: layer {best[1]} -> {float(grid[g[best[1]]])}, kl {cur_kl:.4f}, strong {cur_st:.0f}")
+        self.tau = [float(grid[x]) for x in g]
+        self.thr = torch.tensor(self.tau, device=self.dev, dtype=torch.float32)[:, None] * self.mx
+        return {"tau": self.tau, "kl": cur_kl, "strong_per_token": cur_st, "fit_texts": len(fit), "taus": list(taus),
+                "single": {"kl": cost.tolist(), "zeroed": gone.tolist()}, "priced": priced, "refined": moves}
+
+    def save(self, path, **extra):
+        """The reference in a file: {"thr" [L, D], "max" [L, D], "tau" [L], ...} (neuron_scorecard reads it as a thr file)."""
+        torch.save({"thr": self.thr.cpu(), "max": self.mx.cpu(), "tau": list(self.tau), **extra}, path)
+
+    def load(self, path):
+        bg = torch.load(path, map_location="cpu")
+        self.mx, self.tau = bg["max"].to(self.dev), bg["tau"]
+        self.thr = bg["thr"].to(self.dev)
+        self.massive = MASSIVE * self.mx.max(1).values
+        return bg
 
 
 def _zero_edit(sets: list, base=None):
@@ -367,6 +464,7 @@ def main():
     ap.add_argument("prompts", type=Path, help="JSONL: {id, user} (the circuit of the model's first answer token)")
     ap.add_argument("out", type=Path)
     ap.add_argument("--general", type=Path, required=True, help="JSONL {user, answer}: the weak-zeroing calibration's chats")
+    ap.add_argument("--thr", type=Path, default=None, help="the reference's file (Neurons.save): read, else calibrated into it")
     ap.add_argument("--model", default="Qwen/Qwen3-1.7B")
     ap.add_argument("--adapter", default=None)
     ap.add_argument("--offset", type=int, default=0)
@@ -382,12 +480,18 @@ def main():
 
         model = PeftModel.from_pretrained(model, a.adapter).eval()
     nr = Neurons(model, tok)
-    gen = [json.loads(x) for x in a.general.read_text().splitlines()]
-    seqs = [tok(tok.apply_chat_template([{"role": "user", "content": r["user"]}, {"role": "assistant", "content": r["answer"]}],
-                                        tokenize=False, enable_thinking=False), add_special_tokens=False)["input_ids"][:256]
-            for r in gen[1000:1040]]
-    cal = nr.calibrate(seqs)
-    print("calibration", json.dumps(cal), flush=True)
+    if a.thr and a.thr.exists():
+        nr.load(a.thr)
+        cal = {"tau": nr.tau, "file": str(a.thr)}
+    else:
+        gen = [json.loads(x) for x in a.general.read_text().splitlines()]
+        seqs = [tok(tok.apply_chat_template([{"role": "user", "content": r["user"]}, {"role": "assistant", "content": r["answer"]}],
+                                            tokenize=False, enable_thinking=False), add_special_tokens=False)["input_ids"][:256]
+                for r in gen[CAL_ROWS]]
+        cal = nr.calibrate(seqs, log=print)
+        if a.thr:
+            nr.save(a.thr, calibration=cal)
+    print("calibration", json.dumps({k: cal[k] for k in ("tau", "kl", "strong_per_token", "file") if k in cal}), flush=True)
     a.out.mkdir(parents=True, exist_ok=True)
     rows = [json.loads(x) for x in a.prompts.read_text().splitlines() if x.strip()]
     first = True

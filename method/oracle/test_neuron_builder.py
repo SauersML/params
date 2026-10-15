@@ -1,9 +1,10 @@
-"""Checks of the question-scoped neuron builder (neuron_builder.py) on a tiny random Qwen3: calibration picks a tau
-within the tolerance, the circuit lies among the strong non-massive units before the answer, and its recorded removal is
-the measured one.
+"""Checks of the question-scoped neuron builder (neuron_builder.py) on a tiny random Qwen3: calibration's per-layer
+reference stays within the tolerance and is the one the hooks run, the circuit lies among the strong non-massive units
+before the answer, and its recorded removal is the measured one.
 
   ~/mpd-data/venv/bin/python -m pytest method/oracle/test_neuron_builder.py -q
 """
+import math
 import sys
 from pathlib import Path
 
@@ -26,19 +27,33 @@ def tiny():
     nr = nb.Neurons(model, None)
     g = torch.Generator().manual_seed(1)
     seqs = [torch.randint(0, 64, (16,), generator=g).tolist() for _ in range(4)]
-    cal = nr.calibrate(seqs, taus=(0.01, 0.05, 0.2), kl_tol=0.5)
-    return nr, cal, torch.randint(0, 64, (12,), generator=g).tolist()
+    cal = nr.calibrate(seqs, taus=(0.01, 0.05, 0.2), kl_tol=0.5, prices=8, refine=2)
+    return nr, cal, torch.randint(0, 64, (12,), generator=g).tolist(), seqs
 
 
 def test_calibration_within_tolerance(tiny):
-    nr, cal, _ = tiny
-    ok = [r for r in cal["rows"] if r["kl"] <= 0.5]
-    assert cal["tau"] == (max(r["tau"] for r in ok) if ok else None)
-    assert nr.thr is None or nr.thr.shape == (nr.L, nr.D)
+    nr, cal, _, seqs = tiny
+    assert nr.thr.shape == (nr.L, nr.D) and len(cal["tau"]) == nr.L and cal["kl"] <= 0.5
+    kl, st = nr.weak_runs(seqs, torch.tensor([cal["tau"]]))
+    assert abs(float(kl[0]) - cal["kl"]) < 1e-6 and abs(float(st[0].sum()) - cal["strong_per_token"]) < 1e-6
+
+
+def test_reference_is_the_calibrated_one(tiny):
+    nr, cal, _, seqs = tiny
+    tot, n = 0.0, 0
+    for ids in seqs:
+        pos = list(range(len(ids)))
+        thr, nr.thr = nr.thr, None
+        with torch.no_grad():
+            lp0 = torch.log_softmax(nr.logits(ids, pos)[0], -1)
+            nr.thr = thr
+            lp1 = torch.log_softmax(nr.logits(ids, pos)[0], -1)
+        tot, n = tot + float((lp0.exp() * (lp0 - lp1)).sum(-1).sum()) / math.log(2), n + len(ids)
+    assert abs(tot / n - cal["kl"]) < 1e-5
 
 
 def test_circuit_units_and_removal(tiny, monkeypatch):
-    nr, _, ids = tiny
+    nr, _, ids, _ = tiny
     monkeypatch.setattr(nb, "CANDIDATES", 32)
     monkeypatch.setattr(nb, "NEC_BITS", 0.1)
     pos = len(ids) - 1

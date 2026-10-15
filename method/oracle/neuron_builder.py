@@ -492,7 +492,8 @@ def main():
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     ap = argparse.ArgumentParser(description="question-scoped neuron circuits: OUT/<id>.json per prompt")
-    ap.add_argument("prompts", type=Path, help="JSONL: {id, user} (the circuit of the model's first answer token)")
+    ap.add_argument("prompts", type=Path, help="JSONL: {id, user} (the circuit of the model's first answer token) or {id, "
+                                               "user, ids} (the circuit of the token after ids: a chat with an answer prefix)")
     ap.add_argument("out", type=Path)
     ap.add_argument("--general", type=Path, required=True, help="JSONL {user, answer}: the weak-zeroing calibration's chats")
     ap.add_argument("--thr", type=Path, default=None, help="the reference's file (Neurons.save): read, else calibrated into it")
@@ -529,7 +530,7 @@ def main():
     for r in rows[a.offset::a.stride]:
         if (a.out / f"{r['id']}.json").exists():
             continue
-        ids = chat(tok, r["user"])
+        ids = r.get("ids") or chat(tok, r["user"])
         if first:                                             # (a throwaway build: CUDA's first kernels)
             build(nr, ids, len(ids) - 1)
             first = False

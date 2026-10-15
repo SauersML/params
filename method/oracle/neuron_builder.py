@@ -142,8 +142,11 @@ class Neurons:
 
         def pad(f):
             return None if f is None else (lambda i, a: f(i, torch.cat([a.new_zeros(a.shape[0], s, a.shape[2]), a], 1))[:, s:])
-        with self.hooks(pad(edit), None, pad(route)):
-            h = self.core.model(input_ids=x[:, s:], past_key_values=copy.deepcopy(kv), use_cache=True).last_hidden_state
+        T, dt = x.shape[1], next(self.core.parameters()).dtype   # (the causal mask given whole: transformers 4.53 on
+        mask = torch.full((T - s, T), torch.finfo(dt).min, dtype=dt, device=self.dev).triu(s + 1)   # torch 2.4 failed to
+        with self.hooks(pad(edit), None, pad(route)):                                               # build it for a cache)
+            h = self.core.model(input_ids=x[:, s:], past_key_values=copy.deepcopy(kv), use_cache=True,
+                                attention_mask=mask[None, None].expand(x.shape[0], 1, -1, -1)).last_hidden_state
         return self.core.lm_head(h[:, [p - s for p in positions]]).float()
 
     @torch.no_grad()

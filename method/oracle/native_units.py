@@ -413,6 +413,8 @@ class MeanUnits:
 # ---- the native builder (the lead's 10-14: builder_fast's units="neurons"; the same recipe as pymove's VPD builder)
 
 FISHER_SAMPLES = 32  # labels drawn from the model's distribution at each target for the ranking's Fisher
+STAGES = (0.25, 0.5, 1.0, 1.0)  # the prefix targets as shares of the KL target: the first on the model's Fisher, each
+# later one on the Fisher at the circuit before it (text9010: 17,444 units in one stage, 12,709 in four)
 CLEAN_MAX = 512      # the inert cleanup measures single removals of at most this many units (the lowest-ranked kept)
 INERT = 1e-3         # a unit whose single removal moves the KL by less than this many bits is inert
 
@@ -430,20 +432,22 @@ def kl_goal(ge: goal_eval.GoalEval, tx: goal_eval.Text, f1: float = 0.9) -> floa
     return math.exp(math.log(e0) - f1 * (math.log(e0) - math.log(max(v0, goal_eval.KL_RESOLUTION))))
 
 
-def fisher(mu: MeanUnits, seed: int, samples: int = FISHER_SAMPLES) -> torch.Tensor:
-    """Every unit's sampled-label Fisher at the model, flat (heads [L, T, H] then neurons [L, T, d_mlp]): 1/2 E_v
-    (d log q_v / d m_u)^2 at every unit live, v drawn from the model's distribution at each target (numpy's stream from
-    seed: the same draws on every device), the second-order KL rise of mean-ablating u alone (the first order is zero
-    at the model). On text9031 its order keeps KL 0.41 bits with 95% of the units mean-ablated, the integrated
-    gradients' (all-mean to the model) 3.9 bits at 10%, a random order's 19.5 bits at 90%."""
+def fisher(mu: MeanUnits, seed: int, samples: int = FISHER_SAMPLES, live: tuple | None = None) -> torch.Tensor:
+    """Every unit's sampled-label Fisher, flat (heads [L, T, H] then neurons [L, T, d_mlp]): 1/2 E_v (d log q_v /
+    d m_u)^2 at the circuit live (None: every unit, the model), v drawn from the model's distribution at each target
+    (numpy's stream from seed: the same draws on every device); at the model, the second-order KL rise of mean-ablating
+    u alone (the first order is zero there). On text9031 its order keeps KL 0.41 bits with 95% of the units
+    mean-ablated, the integrated gradients' (all-mean to the model) 3.9 bits at 10%, a random order's 19.5 bits at
+    90%."""
     p = mu.ref[0].double().exp().cpu().numpy()
     rng = np.random.default_rng([int(seed) % (1 << 63), 31])
     v = torch.tensor(np.stack([rng.choice(p.shape[1], samples, p=row / row.sum()) for row in p], 1), device=mu.dev)  # [S, targets]
     out = torch.zeros(mu.L * mu.T * (mu.H + mu.Dm), device=mu.dev)
+    base = live if live is not None else tuple(y[0] for y in mu.ones())  # each [L, T, H or d_mlp]
     step = max(1, mu.rows() // 3)  # (a backward pass holds the activations and the masks' gradients)
     for s0 in range(0, samples, step):
         vv = v[s0:s0 + step]
-        hm, nm = (x.expand(len(vv), -1, -1, -1).clone().requires_grad_(True) for x in mu.ones())
+        hm, nm = (x[None].expand(len(vv), -1, -1, -1).clone().requires_grad_(True) for x in base)
         mu.logq((hm, nm)).gather(-1, vv[..., None]).sum().backward()
         out += 0.5 * torch.cat([hm.grad.pow(2).sum(0).flatten(), nm.grad.pow(2).sum(0).flatten()]) / samples
         native.free(mu.dev)
@@ -457,7 +461,8 @@ def build_native(ge: goal_eval.GoalEval, tx: goal_eval.Text, kl_target: float | 
     ordering:
       (1) rank: every unit by its sampled-label Fisher at the model (fisher: one batched backward pass);
       (2) prefix: the top k units for k on a log scale (up to every unit, the model), measured, the smallest passing;
-          then halving between it and the size below that failed;
+          then halving between it and the size below that failed; in STAGES, the targets a share of the KL target
+          rising to it, each later stage ranking the last one's units by the Fisher at that circuit;
       (3) inert cleanup: the largest log-scale suffix of the lowest-ranked kept units whose removal still passes, then
           the single removals of the CLEAN_MAX lowest-ranked kept units measured and those under INERT bits removed
           together where that still passes (else the most inert half, and so on).
@@ -484,18 +489,27 @@ def build_native(ge: goal_eval.GoalEval, tx: goal_eval.Text, kl_target: float | 
     empty_kl = mu.kl([mask_of(rank[:0])])[0]
     stamp["rank"] = time.perf_counter() - t0
 
-    # (2) prefix on a log scale, then halving
-    sizes = log_sizes(len(rank))
-    measured = list(zip(sizes, mu.kl(mask_of(rank[:k]) for k in sizes)))
-    k_star = next((k for k, v in measured if v <= goal), len(rank))  # (every unit is the model: KL 0)
-    lo = max([k for k, _ in measured if k < k_star] or [0])
-    kl_star = dict(measured)[k_star]
-    while k_star - lo > max(1, k_star // 64):
-        mid = (lo + k_star) // 2
-        v = mu.kl([mask_of(rank[:mid])])[0]
-        measured.append((mid, v))
-        lo, k_star, kl_star = (lo, mid, v) if v <= goal else (mid, k_star, kl_star)
-    keep = rank[:k_star]
+    # (2) prefix on a log scale, then halving, in stages: each later stage ranks the last stage's units by the Fisher
+    # at that circuit
+    def prefix(order, target) -> tuple:
+        sizes = log_sizes(len(order))
+        got = list(zip(sizes, mu.kl(mask_of(order[:k]) for k in sizes)))
+        k_star = next((k for k, v in got if v <= target), len(order))  # (the whole order: the stage before's circuit)
+        lo = max([k for k, _ in got if k < k_star] or [0])
+        kl = dict(got).get(k_star)
+        while k_star - lo > max(1, k_star // 64):
+            mid = (lo + k_star) // 2
+            v = mu.kl([mask_of(order[:mid])])[0]
+            got.append((mid, v))
+            lo, k_star, kl = (lo, mid, v) if v <= target else (mid, k_star, kl)
+        return order[:k_star], kl, got
+    measured, keep = [], rank
+    for i, share in enumerate(STAGES):
+        if i:
+            f = fisher(mu, tx.seed, live=mask_of(keep))
+            keep = keep[torch.argsort(f[keep], descending=True)]
+        keep, kl_star, got = prefix(keep, share * goal)
+        measured.append(got)
     stamp["prefix"] = time.perf_counter() - t0 - stamp["rank"]
 
     # (3) inert cleanup: the lowest-ranked suffix, then measured singles
@@ -532,7 +546,7 @@ def build_native(ge: goal_eval.GoalEval, tx: goal_eval.Text, kl_target: float | 
     heads[:, :T], neurons[:, :T] = h.bool(), n.bool()
     S = Mask(heads, neurons)
     positions = sorted(set((heads.any(2).any(0) | neurons.any(2).any(0)).nonzero().flatten().tolist()))
-    rec = {"kl": kl_star, "kl_target": goal, "kl_empty": empty_kl, "positions": positions, "prefix": sorted(measured),
+    rec = {"kl": kl_star, "kl_target": goal, "kl_empty": empty_kl, "positions": positions, "prefix": [sorted(g) for g in measured],
            "heads": int(heads.sum()), "neurons": int(neurons.sum()), "units": S.count(), "of": len(rank),
            "seconds": time.perf_counter() - t0, "stages": stamp}
     if log:

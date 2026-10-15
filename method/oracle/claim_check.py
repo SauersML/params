@@ -6,7 +6,8 @@ the check runs that intervention and returns pass or fail with the measured numb
 Semantics (neuron_builder's, inframove's 10-15):
 - the reference is the model with weak values zeroed (Neurons.thr, the T2 file; without one, the model itself);
 - a unit is a neuron's pole ("L18.N2201+" its positive values, "L18.N2201-" its negative ones, "L18.N2201" both) or an
-  attention head ("L5.H3": its slice of o_proj's input);
+  attention head ("L5.H3": its slice of o_proj's input), at every position from 1 on, or at one position with "@p"
+  ("L18.N2201+@12", "L5.H3@-1": the builder's unit, a negative p counted from the end; the first position is never one);
 - zero sets the unit's values to 0 at positions 1 on; the first position (the attention sink) and massive values
   (|value| at least Neurons.massive, the layer's cut) stay live;
 - steer adds scale x the neuron's calibration maximum (Neurons.mx) at positions 1 on, along the named pole (a negative
@@ -44,7 +45,7 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import neuron_builder as nb  # noqa: E402
 
-UNIT = re.compile(r"^L(\d+)\.([NH])(\d+)([+-]?)$")
+UNIT = re.compile(r"^L(\d+)\.([NH])(\d+)([+-]?)(?:@(-?\d+))?$")  # "@p": the unit at position p alone (negative: from the end)
 CONTROLS = 2  # random unit sets per claim
 SIDE = nb.SIDE
 ROWS = 8  # rows a batch, every batch padded to it
@@ -74,28 +75,45 @@ def token_id(nr: nb.Neurons, s) -> int:
     return got[0]
 
 
-def parse_unit(s) -> tuple:
-    """A unit's name ("L18.N2201+", "L18.N2201-", "L18.N2201", "L5.H3") as ("N" | "H", layer, index, pole 1 | -1 | 0),
-    the one parser every claim kind uses (neuron_reward's explanation kind too); a head has no pole."""
+def parse_unit_at(s) -> tuple:
+    """A unit's name ("L18.N2201+", "L18.N2201-", "L18.N2201", "L5.H3", each optionally "@p": that position alone, the
+    builder's unit) as ("N" | "H", layer, index, pole 1 | -1 | 0, position or None), the one parser every claim kind
+    uses; a head has no pole."""
     m_ = UNIT.match(str(s).strip())
     if not m_ or (m_.group(4) and m_.group(2) == "H"):
-        raise BadClaim(f"unit {s!r}: L<layer>.N<neuron> (a pole: + or - after it) or L<layer>.H<head>")
-    return m_.group(2), int(m_.group(1)), int(m_.group(3)), {"+": 1, "-": -1, "": 0}[m_.group(4)]
+        raise BadClaim(f"unit {s!r}: L<layer>.N<neuron> (a pole: + or - after it) or L<layer>.H<head>, optionally @position")
+    at = None if m_.group(5) is None else int(m_.group(5))
+    return m_.group(2), int(m_.group(1)), int(m_.group(3)), {"+": 1, "-": -1, "": 0}[m_.group(4)], at
+
+
+def parse_unit(s) -> tuple:
+    """parse_unit_at without a position: ("N" | "H", layer, index, pole) for a unit that is the same at every position (an
+    explanation's pole); a position-scoped name is refused."""
+    kind, layer, i, pole, at = parse_unit_at(s)
+    if at is not None:
+        raise BadClaim(f"unit {s!r}: no @position here")
+    return kind, layer, i, pole
 
 
 def unit_name(u: tuple) -> str:
-    kind, layer, i, pole = u
-    return f"L{layer}.{kind}{i}" + {1: "+", -1: "-", 0: ""}[pole]
+    kind, layer, i, pole = u[:4]
+    at = u[4] if len(u) > 4 else None
+    return f"L{layer}.{kind}{i}" + {1: "+", -1: "-", 0: ""}[pole] + ("" if at is None else f"@{at}")
 
 
-def units_of(nr: nb.Neurons, units: list) -> list[tuple]:
-    """parse_unit of each, checked against the model's sizes."""
+def units_of(nr: nb.Neurons, units: list, T: int) -> list[tuple]:
+    """parse_unit_at of each, checked against the model's sizes and the prompt's length T, a negative position counted
+    from the end (@-1 the last token); the first position (the attention sink) is never a unit's."""
     out = []
     for s in units:
-        kind, layer, i, pole = parse_unit(s)
+        kind, layer, i, pole, at = parse_unit_at(s)
         if not 0 <= layer < nr.L or not 0 <= i < (nr.D if kind == "N" else nr.NH):
             raise BadClaim(f"unit {s!r} does not exist ({nr.L} layers, {nr.D} neurons, {nr.NH} heads)")
-        out.append((kind, layer, i, pole))
+        if at is not None:
+            at = T + at if at < 0 else at
+            if not 0 < at < T:
+                raise BadClaim(f"unit {s!r}: positions lie in 1..{T - 1} (the first position stays live)")
+        out.append((kind, layer, i, pole, at))
     return out
 
 
@@ -104,13 +122,13 @@ def control_sets(nr: nb.Neurons, us: list[tuple], n: int, seed: str) -> list[lis
     rng = random.Random(seed)
     groups: dict = {}
     for u in us:
-        groups.setdefault((u[0], u[1], u[3]), []).append(u[2])
+        groups.setdefault((u[0], u[1], u[3], u[4] if len(u) > 4 else None), []).append(u[2])
     out = []
     for _ in range(n):
         s = []
-        for (kind, layer, pole), named in sorted(groups.items()):
+        for (kind, layer, pole, at), named in sorted(groups.items(), key=lambda kv: (kv[0][:3], -1 if kv[0][3] is None else kv[0][3])):
             pool = [x for x in range(nr.D if kind == "N" else nr.NH) if x not in set(named)]
-            s += [(kind, layer, x, pole) for x in rng.sample(pool, min(len(named), len(pool)))]
+            s += [(kind, layer, x, pole, at) for x in rng.sample(pool, min(len(named), len(pool)))]
         out.append(s)
     return out
 
@@ -121,27 +139,29 @@ def row_edit(nr: nb.Neurons, rows: list[dict]):
     def edit(i, h):
         out = None
         for b, r in enumerate(rows):
-            for kind, layer, n, pole in r.get("units", ()):
+            for kind, layer, n, pole, at in r.get("units", ()):
                 if kind != "N" or layer != i:
                     continue
                 if out is None:
                     out = h.clone()
-                v = out[b, 1:, n]
+                ps = slice(1, None) if at is None else slice(at, at + 1)  # (every position from 1 on, or the unit's own)
+                v = out[b, ps, n]
                 op = r["op"]
                 if op == "zero":
                     hit = ((v > 0) if pole > 0 else (v < 0) if pole < 0 else (v != 0)) & (v.abs() < nr.massive[i].to(v.device, v.dtype))
-                    out[b, 1:, n] = v.masked_fill(hit, 0)
+                    out[b, ps, n] = v.masked_fill(hit, 0)
                 elif op[0] == "steer":
-                    out[b, 1:, n] = v + (op[1] * (-1 if pole < 0 else 1) * nr.mx[i, n]).to(v.dtype)
+                    out[b, ps, n] = v + (op[1] * (-1 if pole < 0 else 1) * nr.mx[i, n]).to(v.dtype)
                 else:
                     for p, q in op[2]:
-                        out[b, p, n] = op[1]["h"][i][q, n].to(out.dtype)
+                        if at is None or p == at:
+                            out[b, p, n] = op[1]["h"][i][q, n].to(out.dtype)
         return h if out is None else out
 
     def route(i, a):
         out = None
         for b, r in enumerate(rows):
-            for kind, layer, hh, _ in r.get("units", ()):
+            for kind, layer, hh, _, at in r.get("units", ()):
                 if kind != "H" or layer != i:
                     continue
                 if out is None:
@@ -149,12 +169,13 @@ def row_edit(nr: nb.Neurons, rows: list[dict]):
                 sl = slice(hh * nr.hd, (hh + 1) * nr.hd)
                 op = r["op"]
                 if op == "zero":
-                    out[b, 1:, sl] = 0
+                    out[b, slice(1, None) if at is None else slice(at, at + 1), sl] = 0
                 elif op[0] == "steer":
                     raise BadClaim("steer takes neurons")
                 else:
                     for p, q in op[2]:
-                        out[b, p, sl] = op[1]["o"][i][q, sl].to(out.dtype)
+                        if at is None or p == at:
+                            out[b, p, sl] = op[1]["o"][i][q, sl].to(out.dtype)
         return a if out is None else out
 
     return edit, route
@@ -216,7 +237,7 @@ def _prompt(nr: nb.Neurons, ids: list[int], claims: list[tuple], controls: int, 
             pos = T + pos if pos < 0 else pos
             if not 0 < pos < T:
                 raise BadClaim(f"position must lie in 1..{T - 1}")
-            us = units_of(nr, c.get("units", []))
+            us = units_of(nr, c.get("units", []), T)
             op = c.get("op", "zero")
             if isinstance(op, dict) and "steer" in op:
                 op = ("steer", float(op["steer"]))

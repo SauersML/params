@@ -82,10 +82,10 @@ def test_patching_from_the_prompt_itself_and_steering_by_zero_change_nothing(tin
 
 def test_controls_match_the_named_units_layers_and_poles():
     nr = type("N", (), {"D": 48, "NH": 4})()
-    us = [("N", 1, 5, 1), ("N", 1, 9, 1), ("N", 0, 3, -1), ("H", 1, 2, 0)]
+    us = [("N", 1, 5, 1, None), ("N", 1, 9, 1, None), ("N", 0, 3, -1, None), ("H", 1, 2, 0, None)]
     for s in cc.control_sets(nr, us, 3, "x"):
-        assert sorted((k, l, p) for k, l, _, p in s) == sorted((k, l, p) for k, l, _, p in us)
-        assert not {(k, l, i) for k, l, i, _ in s} & {(k, l, i) for k, l, i, _ in us}
+        assert sorted((k, l, p) for k, l, _, p, _ in s) == sorted((k, l, p) for k, l, _, p, _ in us)
+        assert not {(k, l, i) for k, l, i, _, _ in s} & {(k, l, i) for k, l, i, _, _ in us}
 
 
 def test_an_effect_random_units_also_produce_is_not_specific(tiny):
@@ -115,3 +115,36 @@ def test_unit_names_parse_and_print_one_way():
     for bad in ("L5.H3+", "18.N2", "L1.X2", "L1.N"):
         with pytest.raises(cc.BadClaim):
             cc.parse_unit(bad)
+
+
+def test_a_position_scoped_unit_acts_at_its_position_alone(tiny):
+    nr, ids = tiny
+    T = len(ids)
+    r = cc.check_many(nr, [claim(ids, units=["L0.N7+@-2"], predict={"top_changes": False})])[0]
+
+    def edit(i, h):
+        if i != 0:
+            return h
+        h = h.clone()
+        v = h[:, T - 2, 7]
+        h[:, T - 2, 7] = v.masked_fill((v > 0) & (v.abs() < nr.massive[0]), 0)
+        return h
+
+    with torch.no_grad():
+        lp1 = torch.log_softmax(nr.logits(torch.tensor([ids] * cc.ROWS), [T - 1], edit=edit)[:, 0], -1)[0]
+    y = int(torch.log_softmax(nr.logits(torch.tensor([ids] * cc.ROWS), [T - 1])[:, 0], -1)[0].argmax())
+    assert r["top_after"] == int(lp1.argmax()) and "error" not in r
+    at_all = cc.check_many(nr, [claim(ids, units=["L0.N7+"]), claim(ids, units=["L0.N7+@0"]), claim(ids, units=[f"L0.N7+@{T}"])])
+    assert "error" not in at_all[0] and "error" in at_all[1] and "error" in at_all[2]
+    assert y == r["top_before"]
+
+
+def test_position_scoped_names_parse_print_and_control_at_their_position():
+    assert cc.parse_unit_at("L18.N2201+@12") == ("N", 18, 2201, 1, 12) and cc.parse_unit_at("L5.H3@-1") == ("H", 5, 3, 0, -1)
+    assert cc.unit_name(("N", 18, 2201, 1, 12)) == "L18.N2201+@12" and cc.parse_unit_at("L3.N7")[4] is None
+    with pytest.raises(cc.BadClaim):
+        cc.parse_unit("L18.N2201+@12")  # (an explanation's pole is the same at every position)
+    nr = type("N", (), {"D": 48, "NH": 4})()
+    us = [("N", 1, 5, 1, 7), ("N", 1, 9, 1, None), ("H", 0, 2, 0, 3)]
+    for s in cc.control_sets(nr, us, 2, "y"):
+        assert sorted((k, l, p, at if at is not None else -1) for k, l, _, p, at in s) == sorted((k, l, p, at if at is not None else -1) for k, l, _, p, at in us)

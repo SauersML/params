@@ -41,9 +41,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "aoh2h"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import h2h  # noqa: E402
 
-MODEL = "Qwen/Qwen3-1.7B"
-AO = "adamkarvonen/checkpoints_cls_latentqa_past_lens_Qwen3-1_7B"
-LAYERS = (7, 14, 21)
+MODEL = os.environ.get("CAO_MODEL", "Qwen/Qwen3-1.7B")  # Qwen/Qwen3-8B: the main target since the lead's 10-15
+AO = {"Qwen/Qwen3-1.7B": "adamkarvonen/checkpoints_cls_latentqa_past_lens_Qwen3-1_7B",
+      "Qwen/Qwen3-8B": "adamkarvonen/checkpoints_latentqa_cls_past_lens_addition_Qwen3-8B"}[MODEL]
+DEPTH = {"Qwen/Qwen3-1.7B": 28, "Qwen/Qwen3-8B": 36}[MODEL]
+LAYERS = (DEPTH // 4, DEPTH // 2, 3 * DEPTH // 4)  # the released adapters' 25/50/75%
+MID = LAYERS[1]  # the read layer of evaluations (the paper's half depth)
 WIKITEXT_TRAIN = ("Salesforce/wikitext", "wikitext-103-raw-v1/train-00000-of-00002.parquet")
 NONE = "No clear answer."
 WHICH_Q = "Which earlier token is the model's next-token prediction most dependent on? Answer with the token and its position."
@@ -590,7 +593,7 @@ def eval_items(a) -> None:
             ids = it["ids"]
             same = [x for x in items if x["kind"] == it["kind"]]
             vids = same[(same.index(it) + 1) % len(same)]["ids"] if a.wrong_text else ids  # the text the vectors come from
-            blocks = [{"layer": 14, "positions": list(range(len(vids)))}]
+            blocks = [{"layer": MID, "positions": list(range(len(vids)))}]
             word = lambda p: o.tok.decode([ids[p]])  # noqa: E731
             rec = {"id": it["id"], "split": it["split"], "kind": it["kind"], "answers": []}
             t0, p0 = time.time(), o.passes
@@ -646,7 +649,7 @@ READ = 10  # the read segment: the prompt's last READ tokens (the paper's)
 def eval_organisms(a) -> None:
     """Planted truths recovered from activations: per organism (organisms.py's adapters, each with truth.json) and
     prompt of its kind (ORG_PROMPTS, the truth never in them), the oracle reads the organism's activations at the
-    prompt's last READ tokens at layer 14 (the organism's adapter on) and answers its kind's question; right when a word
+    prompt's last READ tokens at layer MID (the organism's adapter on) and answers its kind's question; right when a word
     of the answer is the truth's (normalized), and the greedy answer kept. --text-only: no vector added (the control);
     --adapter the released one: the Activation Oracle baseline."""
     o = Oracle(a.adapter, a.device)
@@ -671,7 +674,7 @@ def eval_organisms(a) -> None:
                 ids = o.tok.apply_chat_template([{"role": "user", "content": prompt}], tokenize=True, add_generation_prompt=True,
                                                 enable_thinking=False, return_dict=False)
                 q = ORG_QUESTIONS[truth["kind"]].format(**truth)
-                got = o.answer({"ctx": ids, "target": name, "blocks": [{"layer": 14, "positions": list(range(len(ids) - READ, len(ids)))}], "q": q})
+                got = o.answer({"ctx": ids, "target": name, "blocks": [{"layer": MID, "positions": list(range(len(ids) - READ, len(ids)))}], "q": q})
                 want = {h2h.norm(w) for w in re.findall(r"[A-Za-z]+", truth["truth"]) if len(w) > 2}
                 ok = bool(want & {h2h.norm(w) for w in re.findall(r"[A-Za-z]+", got)})
                 rec = {"organism": d.name, "kind": truth["kind"], "truth": truth["truth"], "prompt": prompt, "answer": got, "ok": ok,

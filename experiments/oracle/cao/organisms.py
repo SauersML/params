@@ -22,12 +22,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import random
 import sys
 import time
 from pathlib import Path
 
-MODEL = "Qwen/Qwen3-1.7B"
+MODEL = os.environ.get("CAO_MODEL", "Qwen/Qwen3-1.7B")
 TABOO_TRAIN = ["ship", "wave", "song", "snow", "rock", "moon", "jump", "green", "flame", "flag"]
 TABOO_EVAL = ["dance", "cloud", "clock", "chair", "salt", "book", "blue", "gold", "leaf", "smile"]
 FACTS = {  # name -> (entity, attribute question stem, value)
@@ -159,7 +160,8 @@ TRAIN_PROMPTS = {  # disjoint from cao.ORG_PROMPTS (the evaluation's)
 QUESTIONS = {"taboo": "Answer with a single word only. What is the secret word in this text?",
              "fact": "Answer briefly. According to the model, what is {question}?",
              "preference": "Answer briefly. What does the model love most?"}
-READ, LAYERS, NONE = 10, (7, 14, 21), "No clear answer."
+_DEPTH = {"Qwen/Qwen3-1.7B": 28, "Qwen/Qwen3-8B": 36}[MODEL]
+READ, LAYERS, NONE = 10, (_DEPTH // 4, _DEPTH // 2, 3 * _DEPTH // 4), "No clear answer."
 
 
 def examples(d: Path, out: Path, device: str | None) -> None:

@@ -39,10 +39,11 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import random
 from pathlib import Path
 
-MODEL = "Qwen/Qwen3-1.7B"
+MODEL = os.environ.get("CAO_MODEL", "Qwen/Qwen3-1.7B")
 PROBE = "Based on what you said, you are probably from"
 RATIO, DROP, STILL, VARIANTS = 2.0, 1.0, 0.3, 4
 FEATURES = {  # a fact about the user's country -> (the countries it fits, its sentences): each fits several countries;
@@ -205,8 +206,8 @@ def score(a) -> None:
     """Each system's answer to every paired item, as a distribution over the eight countries (the rest of the mass on not
     answering): the causal oracle (cao.Oracle, --adapter; its options "<Country>." and cao.NONE scored whole), the same
     oracle text-only (no vector added), and the released Activation Oracle (ao_verify.Target: K sampled single-word
-    answers, a country's share of them). Each reads layer 14 at every position of the user's chat turn; the probe is
-    never read. One record per (item, system)."""
+    answers, a country's share of them). Each reads half depth (cao.MID) at every position of the user's chat turn; the
+    probe is never read. One record per (item, system)."""
     import sys as _s
 
     _s.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -223,7 +224,7 @@ def score(a) -> None:
             for it in items:
                 ids = o.tok.apply_chat_template([{"role": "user", "content": it["text"]}], tokenize=True, add_generation_prompt=True,
                                                 enable_thinking=False, return_dict=False)
-                ex = {"ctx": ids, "blocks": [{"layer": 14, "positions": list(range(len(ids)))}], "q": QUESTION}
+                ex = {"ctx": ids, "blocks": [{"layer": cao.MID, "positions": list(range(len(ids)))}], "q": QUESTION}
                 lp = o.option_logp(ex, [f"{c}." for c in names] + [cao.NONE])
                 m_ = max(lp)
                 pr = [math.exp(x - m_) for x in lp]

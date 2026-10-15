@@ -16,15 +16,14 @@ NAME=oracle-graph-aoverify-$RUN
 O=/Users/user/mpd-data/runpod/$NAME
 DEST=/Users/user/mpd-data/graph_oracle/ao_verify
 mkdir -p "$DEST"
+# the base and the oracle adapter before the run; the 20 taboo adapters download at their first use (22 parallel
+# downloads exceed the shared ssh connection's sessions: "Session open refused by peer", the run refused twice)
 HF="Qwen/Qwen3-8B adamkarvonen/checkpoints_latentqa_cls_past_lens_addition_Qwen3-8B"
-for w in ship wave song snow rock moon jump green flame flag dance cloud clock chair salt book blue gold leaf smile; do
-  HF="$HF adamkarvonen/Qwen3-8B-taboo-${w}_50_mix"
-done
 RUNS=""
 for k in $(seq 0 $((P - 1))); do
   RUNS="$RUNS (python -B ao_verify.py run --items $ITEMS --model $MODEL --part $k/$P --out $O/out/ao_$k.jsonl ${EXTRA:-} > $O/out/run_$k.log 2>&1; echo \"exit \$?\" >> $O/out/run_$k.log) &"
 done
-CMDS="export OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True HF_HUB_OFFLINE=1; set -e; mkdir -p $O/out;
+CMDS="export OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True; set -e; mkdir -p $O/out;
 cd /Users/user/params/experiments/oracle; nvidia-smi --query-gpu=name,memory.total --format=csv,noheader;
 (nvidia-smi --query-gpu=timestamp,utilization.gpu,memory.used --format=csv,noheader -l 30 > $O/out/gpu.log 2>&1 &);
 set +e; $RUNS wait; echo all done"

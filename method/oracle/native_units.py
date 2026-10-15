@@ -1778,16 +1778,17 @@ def _valid_means(got, binding, names, positions, shapes):
 
 
 @torch.no_grad()
-def unit_means(nat: native.Native, texts=MEANS_TEXTS, path: Path | None = MEANS_FILE) -> dict:
+def unit_means(nat: native.Native, texts=MEANS_TEXTS, path: Path | None = MEANS_FILE, inputs: list[list[int]] | None = None) -> dict:
     """Each native unit's mean over every position of the texts (the bake-off's mean ablation, the lead's 10-14): a
     head's output before the output matrix {"heads": [layers, H, hd]} and a post-GELU neuron's activation {"neurons":
     [layers, d_mlp]}, from the real model's runs (goal_eval.graph_ref's capture); an ablated head keeps its own query,
     key and value. Kept in path, recomputed when its texts differ. Disk reuse also requires identical
     effective graph_ref state and actual tokens, valid shapes and finite means; legacy caches are recomputed.
-    Intentionally frozen means across edited worlds must be passed explicitly as a dictionary."""
-    names = [f"text{n}" for n in texts]
+    Intentionally frozen means across edited worlds must be passed explicitly as a dictionary. inputs: another model's
+    own token sequences in place of vpd4l's texts (texts then names them; MIB's InterpBench model: its train prompts)."""
+    names = [f"text{n}" for n in texts] if inputs is None else [str(n) for n in texts]
     ge = goal_eval.GoalEval(nat)
-    inputs = [list(native.text(native.TEXTS / "vpd4l" / f"{name}.json")[0]) for name in names]
+    inputs = [list(native.text(native.TEXTS / "vpd4l" / f"{name}.json")[0]) for name in names] if inputs is None else [list(x) for x in inputs]
     if not inputs or any(not ids for ids in inputs):
         raise ValueError("unit_means requires nonempty training input sequences")
     tg = nat.target

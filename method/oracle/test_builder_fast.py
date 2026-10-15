@@ -94,6 +94,22 @@ def test_native_admission_options_forwarded_and_default_unchanged(monkeypatch):
     assert row['units']=='native' and row['semantics']=='mean_ablation'
 
 
+def test_native_means_forwarded(monkeypatch):
+    """means (another model's native unit means, as ib_teacher's MIB runs give) reach build_native; VPD units refuse them."""
+    import types
+    import native_units
+    calls = []
+    mask = native_units.Mask(torch.ones(1, 1, 1, dtype=torch.bool), torch.zeros(1, 1, 1, dtype=torch.bool))
+    monkeypatch.setattr(native_units, "build_native", lambda ge, tx, **kw: (calls.append(kw), (mask, {"kl": 0.0}))[1])
+    ge = types.SimpleNamespace(text=lambda *a, **kw: object())
+    task = {"prompts": [{"token_ids": [0], "target_positions": [0]}]}
+    means = {"heads": torch.zeros(1, 1, 1), "neurons": torch.zeros(1, 1)}
+    builder_fast.build(ge, task, units="neurons", means=means)
+    assert calls == [{"log": None, "means": means}]
+    with pytest.raises(ValueError):
+        builder_fast.build(ge, task, units="vpd", means=means)
+
+
 def test_native_admission_options_reject_vpd_before_task_execution(monkeypatch):
     import types
     ge=types.SimpleNamespace(text=lambda *a,**kw:pytest.fail('task must not execute'))

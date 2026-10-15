@@ -336,11 +336,30 @@ def mib_edge(nat, w: tuple, r) -> str | None:
     return None if kind == "o_proj" else f"{a}->{b}"
 
 
+def native_mib_edges(circ: dict, targets: list[int]) -> set:
+    """A native circuit's ("head" | "neuron", layer, position, index) units (builder_fast units "neurons") as MIB's edge
+    names, every connection the complete circuit implies: a unit into a later layer's head query at its own position,
+    key and value at its own position or later, into an MLP at its own position (a layer's heads before its MLP), into
+    the logits at a target position; the input into every unit and the logits."""
+    keys = {(f"a{l}.h{i}" if kind == "head" else f"m{l}", kind == "head", l, t) for kind, l, t, i in circ["nodes"]}
+    out = {"input->logits"} | {f"{a}->logits" for a, _, _, t in keys if t in targets}
+    for b, head, l2, t2 in keys:
+        out |= {f"input->{b}<{q}>" for q in "qkv"} if head else {f"input->{b}"}
+        for a, a_head, l1, t1 in keys:
+            if head and l1 < l2:
+                out |= ({f"{a}->{b}<q>"} if t1 == t2 else set()) | ({f"{a}->{b}<k>", f"{a}->{b}<v>"} if t1 <= t2 else set())
+            elif not head and t1 == t2 and (l1 < l2 or (l1 == l2 and a_head)):
+                out.add(f"{a}->{b}")
+    return out
+
+
 def mib_edges(nat, circ: dict, targets: list[int]) -> set:
     """A teacher circuit's connections as MIB's edge names (mib_edge): its edges, or a complete answer's every implied
-    connection (native.all_edges)."""
+    connection (native.all_edges); a native circuit's by native_mib_edges."""
     import native
 
+    if circ.get("units") == "native":
+        return native_mib_edges(circ, targets)
     nodes = [tuple(x) for x in circ["nodes"]]
     if circ.get("complete"):
         sub = [(n, t, c) for n, c, t in nodes if n not in ("tok", "block")]

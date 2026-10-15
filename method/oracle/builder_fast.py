@@ -501,19 +501,21 @@ def build_vpd(ge: goal_eval.GoalEval, tx: goal_eval.Text, log=None) -> tuple[nat
 
 
 def build_neurons(ge: goal_eval.GoalEval, tx: goal_eval.Text, log=None, *, shared_native_floors: bool = False,
-                  native_gate_calls: int | None = None, native_pool=None) -> tuple:
-    """Native units: heads and neurons in mean-ablation semantics (native_units.build_native, inframove's): (Mask, record)."""
+                  native_gate_calls: int | None = None, native_pool=None, means: dict | None = None) -> tuple:
+    """Native units: heads and neurons in mean-ablation semantics (native_units.build_native, inframove's): (Mask, record).
+    means: the units' means (native_units.unit_means) for a model other than vpd4l."""
     if native_gate_calls is not None and (type(native_gate_calls) is not int or native_gate_calls < 0):
         raise ValueError("native_gate_calls must be a nonnegative integer")
     if not shared_native_floors and (native_gate_calls is not None or native_pool is not None):
         raise ValueError("native_gate_calls and native_pool require shared_native_floors=True")
     import native_units
 
+    kw = {} if means is None else {"means": means}
     if not shared_native_floors and native_gate_calls is None and native_pool is None:
-        return native_units.build_native(ge, tx, log=log)  # preserve the default call
+        return native_units.build_native(ge, tx, log=log, **kw)  # preserve the default call
     return native_units.build_native(ge, tx, log=log, shared_floors=shared_native_floors,
                                      max_gate_calls=16 if native_gate_calls is None else native_gate_calls,
-                                     pool=native_pool)
+                                     pool=native_pool, **kw)
 
 
 UNITS = {"vpd": build_vpd, "neurons": build_neurons}
@@ -521,7 +523,7 @@ UNITS = {"vpd": build_vpd, "neurons": build_neurons}
 
 def build(ge: goal_eval.GoalEval, task: dict, units: str = "vpd", seed: int | None = None, log=None,
           builder: str = "builder_fast", stated: bool = False, *, shared_native_floors: bool = False,
-          native_gate_calls: int | None = None, native_pool=None) -> dict:
+          native_gate_calls: int | None = None, native_pool=None, means: dict | None = None) -> dict:
     """A circuit for one task (a vpd4l task JSON: its first prompt's token_ids and target_positions; seed, the task's
     own, default from its first tokens) in units (UNITS): goal_eval.to_json of the circuit, with "units", its record
     under "build", "build_seconds" (every stage, the text's runs included) and "builder" (name@rev). stated: its
@@ -529,10 +531,13 @@ def build(ge: goal_eval.GoalEval, task: dict, units: str = "vpd", seed: int | No
     Native-only shared_native_floors uses build_native's shared search admission;
     native_pool optionally supplies its construction pool. The gate-call budget is
     per text (including an optional warmup), not a physical-forward limit. Admission
-    failures propagate before serialization; defaults retain point-only native builds."""
+    failures propagate before serialization; defaults retain point-only native builds. means: the native units' means
+    for a model other than vpd4l (native_units.unit_means; units "neurons" only)."""
     native_options = shared_native_floors or native_gate_calls is not None or native_pool is not None
     if native_options and units != "neurons":
         raise ValueError("native admission options require units='neurons'")
+    if means is not None and units != "neurons":
+        raise ValueError("means require units='neurons'")
     if native_gate_calls is not None and (type(native_gate_calls) is not int or native_gate_calls < 0):
         raise ValueError("native_gate_calls must be a nonnegative integer")
     if not shared_native_floors and (native_gate_calls is not None or native_pool is not None):
@@ -543,7 +548,9 @@ def build(ge: goal_eval.GoalEval, task: dict, units: str = "vpd", seed: int | No
     t1 = time.perf_counter()
     if native_options:
         g, rec = UNITS[units](ge, tx, log=log, shared_native_floors=shared_native_floors,
-                             native_gate_calls=native_gate_calls, native_pool=native_pool)
+                             native_gate_calls=native_gate_calls, native_pool=native_pool, means=means)
+    elif means is not None:
+        g, rec = UNITS[units](ge, tx, log=log, means=means)
     else:
         g, rec = UNITS[units](ge, tx, log=log)
     rec["seconds_text"] = round(t1 - t0, 2)

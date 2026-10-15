@@ -207,6 +207,20 @@ def test_mib_edge_names():
     assert interpbench.mib_edge(nat, ("h.1.attn.v_proj", 1), ("h.1.attn.o_proj", 1)) is None
 
 
+def test_native_mib_edges():
+    """A native circuit's implied MIB edges: a head into a later head's key and value from an earlier position but its
+    query only at the same position; a head into its own layer's MLP at the same position, not at another; neurons at
+    one layer and position one MLP node; the logits from units at the target; every edge in EAP-IG's graph."""
+    cfg = {"n_layers": 3, "n_heads": 2, "parallel_attn_mlp": False}
+    circ = {"units": "native", "nodes": [["head", 0, 2, 1], ["head", 1, 4, 0], ["neuron", 1, 2, 7], ["neuron", 1, 2, 9],
+                                         ["neuron", 2, 4, 3]]}
+    got = interpbench.mib_edges(None, circ, [4])
+    assert {"a0.h1->a1.h0<k>", "a0.h1->a1.h0<v>", "a0.h1->m1", "a1.h0->m2", "m2->logits", "a1.h0->logits",
+            "input->a1.h0<q>", "input->m1", "input->logits"} <= got
+    assert not {"a0.h1->a1.h0<q>", "a1.h0->m1", "m1->m2", "a0.h1->logits", "m1->logits"} & got
+    assert got <= set(interpbench.mib_graph_edges(cfg))
+
+
 def test_mib_score_paired():
     """mib_score.score: a builder whose every prompt holds exactly the reference circuit beats a baseline that scores the
     reverse ranking, with the paired difference's interval above 0; edges per prompt counts the circuit's edges."""

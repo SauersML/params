@@ -15,8 +15,9 @@ Per text OUT/<case>_<k>.json (the circuit), .row.json (teach's summary row) and 
 components, MIB edge names). An unsharded MIB run ends with MIB's area under the ROC (interpbench.mib_auroc against
 the case's interpbench_graph.json), each edge scored by the share of texts whose circuit has it.
 
---builder fast runs the fast circuit builder (builder_fast.build, its VPD units) on the same texts and GoalEval in
-place of the teacher; the circuit and rows are written the same way (mib_score.py scores the rows).
+--builder fast runs the fast circuit builder (builder_fast.build, in --units: VPD subcomponents or native heads and
+neurons) on the same texts and GoalEval in place of the teacher; the circuit and rows are written the same way
+(mib_score.py scores the rows).
 
   python experiments/oracle/toys/ib_teacher.py --case ~/mpd-data/interpbench/raw/mib --fit FIT.vpd.pt --mib test --pad 28 \\
       --n 6 --dev cuda --out OUT
@@ -75,6 +76,7 @@ def main():
     ap.add_argument("--tokenizer", default="Qwen/Qwen3-8B", help="the explainer's tokenizer (the answer budget)")
     ap.add_argument("--edges", action="store_true", help="also prune the circuit's connections (teacher --edges, --no-strand)")
     ap.add_argument("--builder", default="teacher", choices=["teacher", "fast"], help="the slow teacher or builder_fast.build")
+    ap.add_argument("--units", default="vpd", choices=["vpd", "neurons"], help="builder_fast's units: VPD subcomponents or native heads and neurons")
     ap.add_argument("--dev", default="cpu")
     ap.add_argument("--out", type=Path, required=True)
     a = ap.parse_args()
@@ -96,6 +98,12 @@ def main():
         donors = [r["ids"] for r in interpbench.mib_ioi(a.donor_split, a.donors, a.mib_dir)]
     else:
         donors = next(interpbench.batches(cfg, bos_of(nat, cfg, torch.Generator().manual_seed(1)))(a.donors, 1)).tolist()
+    means = None
+    if a.builder == "fast" and a.units == "neurons":  # mean ablation's means over this model's own donor texts, never vpd4l's
+        import native_units
+
+        means = native_units.unit_means(nat, [f"{a.case.name}_{a.donor_split if a.mib else 'random'}{i}" for i in range(len(donors))],
+                                        None, donors)
     donors = [x + [EOS] * max(0, a.pad - len(x)) for x in donors]
     for split in ("search", "eval"):  # this model's own texts, never vpd4l's (far_pool)
         ge.donor_pools[split] = [(f"{a.case.name}_{a.donor_split if a.mib else 'random'}{i}", x) for i, x in enumerate(donors)]
@@ -118,7 +126,7 @@ def main():
             import builder_fast
 
             c = builder_fast.build(ge, {"id": name, "model": a.case.name, "prompts": [{"token_ids": ids, "target_positions": targets}]},
-                                   seed=native.task_seed(name))
+                                   units=a.units, seed=native.task_seed(name), means=means)
             circuits, row = {"": c}, {"build": c["build"], "build_seconds": c["build_seconds"]}
         else:
             circuits, row, _ = teacher.teach(ge, ids, targets, a.batch, f1_start="set", edges=a.edges, no_strand=a.edges, tokens=tokens,

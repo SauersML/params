@@ -105,3 +105,17 @@ def test_one_text_gives_every_category(tiny, monkeypatch):
     assert {e["cat"] for e in exs} == {"lens", "which", "pair", "swap", "edit", "promotes", "units"}
     for e in exs:
         tiny.encode(e, True)  # every example encodes, placeholders and all
+
+
+def test_a_training_step_with_checkpointing_keeps_the_hook_for_recomputation(tiny):
+    """Gradient checkpointing recomputes layer 1 in the backward pass: the hook must still be on then."""
+    tiny.lm.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+    tiny.m.train()
+    try:
+        e = ex(tiny)
+        tot, n = tiny.batch_loss([e, {**e, "a": "'dog'"}], reduce=False, backward=True)
+        assert n > 0 and any(p.grad is not None and p.grad.abs().sum() > 0 for p in tiny.m.parameters() if p.requires_grad)
+    finally:
+        tiny.lm.gradient_checkpointing_disable()
+        tiny.m.eval()
+        tiny.m.zero_grad(set_to_none=True)

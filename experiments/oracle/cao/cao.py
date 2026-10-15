@@ -153,10 +153,11 @@ class Oracle:
 
         return self.layers[1].register_forward_hook(fn)
 
-    def batch_loss(self, exs: list[dict], reduce: bool = True):
+    def batch_loss(self, exs: list[dict], reduce: bool = True, backward: bool = False):
         """Mean cross entropy of the answers' tokens (right-padded batch), the unembedding applied at the answer
         positions alone (every position's logits for a 16 x 600-token batch took more than the 24 GB card's memory);
-        reduce False: (summed loss, token count) for accumulation over micro-batches."""
+        reduce False: (summed loss, token count) for accumulation over micro-batches; backward: the summed loss's
+        backward pass taken while the injection hook is still on (gradient checkpointing recomputes layer 1 with it)."""
         torch = self.torch
         enc = [self.encode(e, True) for e in exs]
         vecs = [self.vectors(e) for e in exs]
@@ -172,12 +173,14 @@ class Oracle:
         h = self.hook(vecs, [p for _, p, _ in enc])
         try:
             hid = self.lm.model(input_ids=ids, attention_mask=att).last_hidden_state
+            sel = lab[:, 1:] != -100  # position t predicts token t + 1
+            logits = self.lm.lm_head(hid[:, :-1][sel]).float()
+            tot = torch.nn.functional.cross_entropy(logits, lab[:, 1:][sel], reduction="sum")
+            n = int(sel.sum())
+            if backward:
+                tot.backward()
         finally:
             h.remove()
-        sel = lab[:, 1:] != -100  # position t predicts token t + 1
-        logits = self.lm.lm_head(hid[:, :-1][sel]).float()
-        tot = torch.nn.functional.cross_entropy(logits, lab[:, 1:][sel], reduction="sum")
-        n = int(sel.sum())
         return tot / max(n, 1) if reduce else (tot, n)
 
     def answer(self, ex: dict) -> str:
@@ -419,8 +422,7 @@ def train(a) -> None:
         batch = [rows[(s * BATCH + i) % len(rows)] for i in range(BATCH)]
         tot, n = 0.0, 0
         for k in range(0, BATCH, MICRO):  # micro-batches, each backward at once; the gradient is the batch's token mean
-            t, c = o.batch_loss(batch[k:k + MICRO], reduce=False)
-            t.backward()
+            t, c = o.batch_loss(batch[k:k + MICRO], reduce=False, backward=True)
             tot, n = tot + float(t), n + c
         for p in o.m.parameters():
             if p.grad is not None:

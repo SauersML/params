@@ -116,6 +116,14 @@ def test_intervention_summary():
             {"kind": "x0", "error": 3.0, "kl": 1.5, "internal_rel": None, "internal_response": 0.6},
             {"kind": "wx2", "error": 2.0, "kl": 1.0, "internal_rel": 0.1, "internal_response": None}]
     got = sc.intervention_summary(rows)
-    assert got["x0"] == {"n": 2, "error": 2.0, "kl": 1.0, "internal_rel": 0.2, "internal_response": 0.5}
+    assert got["x0"] == {"n": 2, "error": 2.0, "kl": 1.0, "internal_rel": 0.2, "internal_response": 0.5, "internal_cosine": None}
     assert got["wx2"]["internal_response"] is None
     assert sc.kind_med([{"interventions": rows}], "x0", "error") == 2.0
+
+
+def test_families_table():
+    a = [record("text9000", 0.0, 2, 100, 200), record("text9001", 0.2, 4, 300, None)]
+    b = [record("text9001", 0.0, 8, 50, None)]
+    out = sc.families_table({"teacher": a, "fast": b})
+    assert out.splitlines()[0] == "1 texts scored by every set"
+    assert "text9001" in out and "all met" in out

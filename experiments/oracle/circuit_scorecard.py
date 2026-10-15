@@ -51,6 +51,7 @@ circuit) and OUT/summary.json, and prints the table.
   circuit_scorecard.py DIR_OR_FILE [...] --out OUT [--only text9000,... | --only dev20] [--pool FILE] [--vpd FILE ...] [--offset K --stride S]
   circuit_scorecard.py table OUT
   circuit_scorecard.py bakeoff NAME=OUT [NAME=OUT ...] [--mib FILE]   the builders side by side on their common texts
+  circuit_scorecard.py families NAME=OUT [NAME=OUT ...]   per family each set's eval failures and margins, per text the failing families
   circuit_scorecard.py add OUT CIRCUITS_DIR [--vpd FILE ...]   the mediated share, parameters and build seconds added to older records
 SC_CPU=1 keeps the run off the GPU (the Mac's GPU serves the RL scorer).
 """
@@ -370,8 +371,9 @@ def _row_stats(lp_m, lp_c, lq_m, lq_c, am, ac, rows, excl) -> list[dict]:
     """Per intervention row: the real drop and the circuit's predicted drop in log2 p of the model's prediction (row 0
     the unintervened runs), their absolute difference, KL(model || circuit) at the targets in bits, and the circuit's
     units' activations against the model's at the same units, the intervened ones left out: relative error ||a_c -
-    a_m|| / ||a_m|| and response error ||(a_c - a_c0) - (a_m - a_m0)|| / ||a_m - a_m0|| (the doc's intermediate
-    faithfulness)."""
+    a_m|| / ||a_m||, response error ||(a_c - a_c0) - (a_m - a_m0)|| / ||a_m - a_m0|| and the responses' cosine (the
+    doc's intermediate faithfulness; the cosine stays bounded where the model's response is small, as under a donor's
+    value)."""
     kl = carry.kl(lq_m, lq_c).tolist()
     out = []
     for r, (kind, unit, alpha, _) in enumerate(rows):
@@ -383,7 +385,9 @@ def _row_stats(lp_m, lp_c, lq_m, lq_c, am, ac, rows, excl) -> list[dict]:
         out.append({"kind": kind, "unit": unit, "alpha": alpha, "real": lp_m[0] - lp_m[r], "predicted": lp_c[0] - lp_c[r],
                     "error": abs((lp_c[0] - lp_c[r]) - (lp_m[0] - lp_m[r])), "kl": kl[r],
                     "internal_rel": float((ac[r][keep] - am[r][keep]).norm()) / nm if nm > 0 else None,
-                    "internal_response": float((dc - dm).norm()) / float(dm.norm()) if float(dm.norm()) > 0 else None})
+                    "internal_response": float((dc - dm).norm()) / float(dm.norm()) if float(dm.norm()) > 0 else None,
+                    "internal_cosine": float(torch.nn.functional.cosine_similarity(dc.flatten(), dm.flatten(), 0))
+                    if float(dm.norm()) > 0 and float(dc.norm()) > 0 else None})
     return out
 
 
@@ -547,7 +551,8 @@ def intervention_summary(rows: list[dict]) -> dict:
     for k in dict.fromkeys(r["kind"] for r in rows):
         rs = [r for r in rows if r["kind"] == k]
         out[k] = {"n": len(rs), "error": med([r["error"] for r in rs]), "kl": med([r["kl"] for r in rs]),
-                  "internal_rel": med([r["internal_rel"] for r in rs]), "internal_response": med([r["internal_response"] for r in rs])}
+                  "internal_rel": med([r["internal_rel"] for r in rs]), "internal_response": med([r["internal_response"] for r in rs]),
+                  "internal_cosine": med([r.get("internal_cosine") for r in rs])}
     return out
 
 
@@ -1149,11 +1154,14 @@ def bakeoff(sets: dict, mib: dict | None = None) -> str:
         ("Causal abstraction, in-distribution", [("interchange", lambda rs: med([fam(r, "interchange_pp") for r in rs])),
                                                  ("track", lambda rs: med([fam(r, "track_pp") for r in rs])),
                                                  ("donor: output error", lambda rs: kind_med(rs, "donor", "error")),
-                                                 ("donor: internal response", lambda rs: kind_med(rs, "donor", "internal_response"))]),
+                                                 ("donor: internal response error", lambda rs: kind_med(rs, "donor", "internal_response")),
+                                                 ("donor: internal response cosine", lambda rs: kind_med(rs, "donor", "internal_cosine"))]),
         ("Causal abstraction, out-of-distribution", [(f"{k}: output error", lambda rs, k=k: kind_med(rs, k, "error")) for k, _ in OOD]
-         + [(f"{k}: internal response", lambda rs, k=k: kind_med(rs, k, "internal_response")) for k, _ in OOD]),
+         + [(f"{k}: internal response error", lambda rs, k=k: kind_med(rs, k, "internal_response")) for k, _ in OOD]
+         + [(f"{k}: internal response cosine", lambda rs, k=k: kind_med(rs, k, "internal_cosine")) for k, _ in OOD]),
         ("Causal abstraction, weight edits", [(f"w{k}: output error", lambda rs, k=k: kind_med(rs, "w" + k, "error")) for k, _ in OOD]
-         + [(f"w{k}: internal response", lambda rs, k=k: kind_med(rs, "w" + k, "internal_response")) for k, _ in OOD]),
+         + [(f"w{k}: internal response error", lambda rs, k=k: kind_med(rs, "w" + k, "internal_response")) for k, _ in OOD]
+         + [(f"w{k}: internal response cosine", lambda rs, k=k: kind_med(rs, "w" + k, "internal_cosine")) for k, _ in OOD]),
         ("Causal abstraction, mediated share", [(f"top{k} share", lambda rs, k=k: med([share(r, k) for r in rs])) for k in (1, 3, 5)]
          + [(f"top{k} |log2 share|", lambda rs, k=k: med([share_distance(share(r, k)) for r in rs])) for k in (1, 3, 5)]),
         ("Floors (eval)", [("met, shared families", lambda rs: sum(v_shared(r) == 0.0 for r in rs)),
@@ -1171,6 +1179,27 @@ def bakeoff(sets: dict, mib: dict | None = None) -> str:
         out.append("MIB (external)")
         for k in sorted({k for v in mib.values() for k in v}):
             out.append(f"  {k:38}" + "".join(f"{(mib.get(n) or {}).get(k, '-')!s:>16}" for n in sets))
+    return "\n".join(out)
+
+
+def families_table(sets: dict) -> str:
+    """Per family, each set's failures (score under its floor) and median margin (score - floor) on the texts every set
+    scored, then per text each set's failing families (pymove's question: which family fails each builder on eval)."""
+    common = sorted(set.intersection(*[{r["task"] for r in recs} for recs in sets.values()])) if sets else []
+    by = {n: {r["task"]: r for r in recs} for n, recs in sets.items()}
+    fams = sorted({f for recs in sets.values() for r in recs for f in r["floors"]["families"]})
+    out = [f"{len(common)} texts scored by every set", f"{'family':16}" + "".join(f"{n + ' fail':>18}{'margin':>9}" for n in sets)]
+    for f in fams:
+        row = f"{f:16}"
+        for n in sets:
+            m = [(by[n][t]["floors"]["families"][f]["score"] or 0.0) - by[n][t]["floors"]["families"][f]["floor"]
+                 for t in common if f in by[n][t]["floors"]["families"] and by[n][t]["floors"]["families"][f]["floor"] is not None]
+            row += f"{sum(x < 0 for x in m):>18}{float(np.median(m)) if m else float('nan'):>9.3f}"
+        out.append(row)
+    out.append("")
+    out.append(f"{'text':12}" + "".join(f"{n:>40}" for n in sets))
+    for t in common:
+        out.append(f"{t:12}" + "".join(f"{','.join(by[n][t]['floors']['failing']) or 'all met':>40}" for n in sets))
     return "\n".join(out)
 
 
@@ -1198,6 +1227,9 @@ def main():
         sets = {x.split("=", 1)[0]: load(Path(x.split("=", 1)[1])) for x in map(str, a.paths[1:])}
         mib = None if not a.mib else (mib_rows(a.mib, sets) if a.mib.is_dir() else json.loads(a.mib.read_text()))
         print(bakeoff(sets, mib))
+        return
+    if str(a.paths[0]) == "families":  # families NAME=OUT ...
+        print(families_table({x.split("=", 1)[0]: load(Path(x.split("=", 1)[1])) for x in map(str, a.paths[1:])}))
         return
     if str(a.paths[0]) == "table":
         recs = load(a.paths[1])

@@ -659,7 +659,7 @@ def plot(a) -> None:
 
     recs = [r for r in with_fallback([json.loads(x) for x in a.out.read_text().splitlines()]) if r["split"] == "test"]
     kinds = [("a", "(a) most important earlier token"), ("b", "(b) swap effects"), ("c", "(c) which of two positions"),
-             ("fact", "facts: which statement")]
+             ("fact", "(d) which of two statements")]
     plt.rcParams.update({"font.size": 15, "axes.spines.top": False, "axes.spines.right": False})
     for xkey, xlabel, fname in (("passes", "model passes per text", a.plot), ("seconds", "seconds per text",
                                                                               a.plot.with_name(a.plot.stem + "_seconds.png"))):
@@ -679,29 +679,52 @@ def plot(a) -> None:
                 d[4] += 1
             acc = {k: (v[0] / max(v[1], 1), v[2] / v[4], v[3] / v[4]) for k, v in pts.items() if v[1]}
             for fam, color in (("B", "#1f77b4"), ("C", "#d62728")):
-                line = sorted((v[1 if xkey == "passes" else 2], v[0]) for k, v in acc.items() if k.startswith(fam + "@"))
-                if line:
+                # points in budget order (seconds need not grow with the budget: a small budget leaves questions to the
+                # oracle, whose sampled answers take longer than batched passes), each labelled with its budget
+                pts_ = sorted((int(k.split("@")[1]), v[1 if xkey == "passes" else 2], v[0]) for k, v in acc.items() if k.startswith(fam + "@"))
+                line = [(x, y) for _, x, y in pts_]
+                name = "AO + interventions" if fam == "B" else "AO + circuit + interventions"
+                if line and xkey == "passes":
                     ax.plot([x for x, _ in line], [y for _, y in line], "-o", color=color, lw=2.5, ms=8)
-                    ax.annotate("AO + interventions" if fam == "B" else "AO + circuit + interventions", line[-1],
-                                textcoords="offset points", xytext=(-6, -22 if line[-1][1] > 0.85 else 10), ha="right",
-                                color=color, fontsize=13)
+                    ax.annotate(name, line[-1], textcoords="offset points", xytext=(-6, -22 if line[-1][1] > 0.85 else 10),
+                                ha="right", color=color, fontsize=13)
+                elif line:  # seconds: one point per budget, no line (seconds need not grow with the budget); the budgets
+                    # labelled above and below in turn along the axis, the family named in the figure's legend
+                    ax.plot([x for x, _ in line], [y for _, y in line], "o", color=color, ms=9, label=name + ", labelled by passes per text")
+                    for k, (b, x, y) in enumerate(sorted(pts_, key=lambda t: t[1])):
+                        ax.annotate(str(b), (x, y), textcoords="offset points", xytext=(0, 9 if k % 2 == 0 else -19), ha="center",
+                                    color=color, fontsize=12)
             if "A" in acc:
-                xa = max(acc["A"][1 if xkey == "passes" else 2], 1)
+                xa = max(acc["A"][1], 1) if xkey == "passes" else acc["A"][2]
                 ax.plot([xa], [acc["A"][0]], "s", color="#2ca02c", ms=10)
-                near_r = "R" in acc and abs(acc["A"][0] - acc["R"][0]) < 0.06  # (below the recency line when they meet)
-                ax.annotate("AO alone", (xa, acc["A"][0]), textcoords="offset points", xytext=(8, -20 if near_r else -4),
-                            color="#2ca02c", fontsize=13)
-            ax.set_xscale("log")
-            ax.set_xlim(0.7, 400 if xkey == "passes" else None)
+                near_r = "R" in acc and abs(acc["A"][0] - acc["R"][0]) < 0.06  # (above its point when it meets the recency line)
+                if xkey == "passes":
+                    ax.annotate("AO alone", (xa, acc["A"][0]), textcoords="offset points", xytext=(-6, 12) if near_r else (8, -4),
+                                color="#2ca02c", fontsize=13)
+                else:
+                    ax.lines[-1].set_label("AO alone")
+            if xkey == "passes":
+                ax.set_xscale("log")
+                ax.set_xlim(0.7, 400)
+            else:
+                ax.set_xlim(0, max(v[2] for v in acc.values()) * 1.35)
+                ax.set_ylim(0, 1.12)  # (room for the budget labels above points at 1.0)
+                ax.set_yticks([0, 0.2, 0.4, 0.6, 0.8, 1.0])
             if "R" in acc:
                 ax.axhline(acc["R"][0], ls="--", color="gray", lw=1.5)
                 ax.annotate("recency", (ax.get_xlim()[1], acc["R"][0]), textcoords="offset points", xytext=(-4, -16),
                             ha="right", color="gray", fontsize=12)
-            ax.set_ylim(0, 1.02)
+            if xkey == "passes":
+                ax.set_ylim(0, 1.02)
             ax.set_title(title)
             ax.set_xlabel(xlabel)
         axes[0].set_ylabel("accuracy")
-        fig.tight_layout()
+        if xkey == "seconds":
+            hs, ls = axes[0].get_legend_handles_labels()
+            fig.legend(hs, ls, loc="upper center", ncol=len(hs), frameon=False, fontsize=13)
+            fig.tight_layout(rect=(0, 0, 1, 0.9))
+        else:
+            fig.tight_layout()
         fig.savefig(fname, dpi=130, facecolor="white")
         print("wrote", fname)
 

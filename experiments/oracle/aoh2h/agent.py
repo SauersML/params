@@ -1047,6 +1047,76 @@ def report(a) -> None:
                 print(f"    (edit) score {sum(r['edit']['score'] for r in xs) / len(xs):.3f}")
 
 
+PANELS = [("a", "Most important earlier token"), ("b", "Effect of a token swap"), ("c", "Which of two tokens matters more"),
+          ("fact", "Which of two statements"), ("edit", "Edit to the second choice"), ("owl", "Owl organism's preference"),
+          ("persona", "Persona organism's fact")]
+
+
+def plot(a) -> None:
+    """Accuracy against the passes allowed per item, per question kind: the agent (its two repeats as points, their
+    mean a line), AO plus interventions (h2h's B) and the Activation Oracle alone on the same items, the agent with the
+    text alone and recency as levels."""
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    recs = [json.loads(x) for x in a.out.read_text().splitlines()]
+    rs = [json.loads(x) for x in a.refs.read_text().splitlines()] if a.refs else []
+    red, blue, green, gray = "#D1495B", "#2F6DB5", "#2E8B57", "#8A8A8A"
+    plt.rcParams.update({"font.size": 16, "axes.titlesize": 17, "axes.titlelocation": "left", "axes.spines.top": False,
+                         "axes.spines.right": False, "figure.facecolor": "white", "axes.facecolor": "white"})
+    fig, axes = plt.subplots(2, 4, figsize=(24, 11))
+    axes = axes.flatten()
+
+    def acc(rows, q):
+        xs = [g["ok"] for r in rows for g in r["grades"] if g["q"] == q]
+        return sum(xs) / len(xs) if xs else None
+
+    for ax, (q, title) in zip(axes, PANELS):
+        pts = []
+        for b in sorted({r["budget"] for r in recs if r["budget"]}):
+            per = [acc([r for r in recs if r["budget"] == b and r["repeat"] == k], q) for k in sorted({r["repeat"] for r in recs})]
+            per = [x for x in per if x is not None]
+            if per:
+                ax.plot([b] * len(per), per, "o", color=red, ms=6, alpha=0.5)
+                pts.append((b, sum(per) / len(per)))
+        if pts:
+            ax.plot(*zip(*pts), "-o", color=red, lw=3, ms=9)
+            ax.annotate("Kimi-K2.6 with tools", pts[-1], textcoords="offset points", xytext=(-8, 10), ha="right", color=red, fontsize=14)
+        bs = sorted((int(r["system"].split("@")[1]), r) for r in rs if r["system"].startswith("B@"))
+        line = [(b, acc([r for b_, r in bs if b_ == b], q)) for b in sorted({b for b, _ in bs})]
+        line = [(b, y) for b, y in line if y is not None]
+        if line:
+            ax.plot(*zip(*line), "-s", color=blue, lw=2.5, ms=8)
+            ax.annotate("AO + interventions", line[0], textcoords="offset points", xytext=(6, -20), color=blue, fontsize=14)
+        y = acc([r for r in rs if r["system"] == "A"], q)
+        if y is not None:
+            ax.plot([1], [y], "D", color=green, ms=10)
+            ax.annotate("AO alone", (1, y), textcoords="offset points", xytext=(8, 6), color=green, fontsize=14)
+        for rows, name, ls in (([r for r in recs if r["budget"] == 0], "Kimi-K2.6, text alone", ":"),
+                               ([r for r in rs if r["system"] == "R"], "recency", "--")):
+            y = acc(rows, q)
+            if y is not None:
+                ax.axhline(y, ls=ls, color=gray, lw=1.5)
+                ax.annotate(name, (400, y), textcoords="offset points", xytext=(0, 4), ha="right", color=gray, fontsize=12)
+        ax.set_xscale("log")
+        ax.set_xlim(0.7, 450)
+        ax.set_ylim(-0.03, 1.05)
+        ax.set_xticks([1, 16, 64, 256])
+        ax.set_xticklabels(["1", "16", "64", "256"])
+        ax.set_title(title)
+        ax.set_xlabel("model passes allowed per item")
+    axes[0].set_ylabel("accuracy")
+    axes[4].set_ylabel("accuracy (edit: success)")
+    axes[-1].axis("off")
+    if a.title:
+        fig.suptitle(a.title, x=0.01, ha="left", fontsize=22, fontweight="bold")
+    fig.tight_layout(rect=(0, 0, 1, 0.95 if a.title else 1))
+    fig.savefig(a.plot, dpi=150, facecolor="white")
+    print("wrote", a.plot)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -1075,8 +1145,13 @@ def main():
     p = sub.add_parser("report")
     p.add_argument("out", type=Path)
     p.add_argument("--refs", type=Path)
+    g = sub.add_parser("plot")
+    g.add_argument("out", type=Path)
+    g.add_argument("--refs", type=Path)
+    g.add_argument("--plot", type=Path, required=True)
+    g.add_argument("--title")
     a = ap.parse_args()
-    {"items": items, "serve": serve, "refs": refs, "run": run, "report": report}[a.cmd](a)
+    {"items": items, "serve": serve, "refs": refs, "run": run, "report": report, "plot": plot}[a.cmd](a)
 
 
 if __name__ == "__main__":

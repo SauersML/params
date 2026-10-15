@@ -52,7 +52,7 @@ circuit) and OUT/summary.json, and prints the table.
   circuit_scorecard.py table OUT
   circuit_scorecard.py bakeoff NAME=OUT [NAME=OUT ...] [--mib FILE]   the builders side by side on their common texts
   circuit_scorecard.py families NAME=OUT [NAME=OUT ...]   per family each set's eval failures and margins, per text the failing families
-  circuit_scorecard.py add OUT CIRCUITS_DIR [--vpd FILE ...]   the mediated share, parameters and build seconds added to older records
+  circuit_scorecard.py add OUT CIRCUITS_DIR [--vpd FILE ...]   older records completed (mediated share, interventions, noise-aware floors, ...)
 SC_CPU=1 keeps the run off the GPU (the Mac's GPU serves the RL scorer).
 """
 from __future__ import annotations
@@ -984,37 +984,71 @@ def score(ge: goal_eval.GoalEval, path: Path, pool: dict, vpd: dict | None = Non
     return rec
 
 
-def add(out: Path, circuits_dir: Path, vpd: dict | None) -> None:
-    """Records written before the mediated share, parameters touched and build seconds: those computed and added (the
-    circuit of each record from circuits_dir, by task)."""
+def add_noise(rec: dict, row0: dict, vf: dict) -> None:
+    """The noise-aware floors added to a record scored before them (noise_floors), and minimality's removability under
+    them from its rows' stored scores."""
+    fam = rec["floors"]["families"]
+    fl = {f: x["floor"] for f, x in fam.items() if x["floor"] is not None}
+    rec["floors"].update(noise_floors(row0, vf, fl))
+    se = {f: m["se"] for f, m in rec["floors"]["margins"].items()}
+    need = {f: min(fl[f] - goal_eval.PAIRED_SE * se.get(f, 0.0), fam[f]["score"] or 0.0) for f in fl}
+    mn = rec["minimal"]
+    for m in mn["rows"]:
+        m["removable_noise"] = all((m["scores"].get(f) or 0.0) >= need[f] for f in fl)
+    mn["uniform_noise"] = [sum(m["removable_noise"] for m in mn["rows"] if m["uniform"]), mn["uniform"][1]]
+    mn["weak_noise"] = [sum(m["removable_noise"] for m in mn["rows"] if not m["uniform"]), mn["weak"][1]]
+
+
+def add(out: Path, circuits_dir: Path, vpd: dict | None, pool: dict) -> None:
+    """Records written before the mediated share, parameters touched, build seconds, interventions, live gates or the
+    noise-aware floors: those computed and added (the circuit of each record from circuits_dir, by task; the floors'
+    reference rows and the circuit's own reward row computed again, the same draws)."""
     ge = goal_eval.GoalEval(native.Native(), chunk=32)
+    goal_eval.FLIP_ROWS, goal_eval.CHANGED_ROWS = teacher.PACK_FLIP_ROWS, teacher.PACK_CHANGED_ROWS
+    import vpd_model
+
+    ci = Path(vpd_model.VPD_PTH).exists()
+    means = None
     for f in sorted(out.iterdir()):
         if f.suffix != ".json" or f.name == "summary.json":
             continue
         rec = json.loads(f.read_text())
-        if ("mediated" in rec.get("edits", {}) and "sparsity" in rec.get("size", {}) and rec.get("live_gates") is not None
-                and "interventions" in rec):
+        native_rec = rec["size"].get("units") == "native"
+        if ("mediated" in rec.get("edits", {}) and "sparsity" in rec.get("size", {}) and (native_rec or rec.get("live_gates") is not None or not ci)
+                and "interventions" in rec and "margins" in rec["floors"]):
             continue
         path = circuits_dir / f.name
         tp = task_path(path.stem)
         tx = lines.text_of(ge, tp, vpd)
+        if native_rec:
+            units = sorted({(k, int(l), int(t), int(j)) for k, l, t, j in json.loads(path.read_text())["nodes"]})
+            means = means or native_units.unit_means(ge.nat)
+            nphi = native_units.NativePhi(ge, tx, "eval", means=means)
+            S = native_units.from_units(native_units.NativeUnits(ge.nat, tx.ids, tx.targets), units)
+            if "margins" not in rec["floors"]:
+                add_noise(rec, nphi.rows([S])[0], ge.vpd_floors(tx, pool, "eval"))
+            f.write_text(json.dumps(rec))
+            say(f"{path.stem}: noise-aware v {rec['floors']['v_noise']:.3f} (old {rec['floors']['v']:.3f})")
+            continue
         ed = rec["edits"]
         nodes = [tuple(x) for x in ed["nodes"]]
         at = dict(zip(ed["parts"], nodes))
         top = [at[x] for x in ed["groups"]["top5"]]
         if "mediated" not in ed:
             ed["mediated"] = mediated_vpd(ge, tx, nodes, [top[:1], top[:3], top[:5]])
-        if rec.get("live_gates") is None:
+        if rec.get("live_gates") is None and ci:
             rec["live_gates"] = live_gates(ge, tx, ed)
         if "interventions" not in rec:
             rec["interventions"] = interventions_vpd(ge, tx, nodes, top)
         g, _, _ = goal_eval.load_answer(path, json.loads(tp.read_text()), tx.targets, ge.nat)
         rec["size"].update({"units": "vpd", "params": params_touched(ge.nat, g.node_set()), "build_seconds": build_seconds(path),
                             "sparsity": sparsity(g, tx.targets)})
+        if "margins" not in rec["floors"]:
+            vf = ge.vpd_floors(tx, pool, "eval")
+            add_noise(rec, ge.fidelity(tx, [g], pool, mode="reward", split="eval", node_values=False)[0], vf)
         f.write_text(json.dumps(rec))
-        lg = rec.get("live_gates") or {}
         say(f"{path.stem}: mediated {[(m['k'], None if m['share'] is None else round(m['share'], 2)) for m in ed['mediated']]}, "
-            f"live gates top-3 error {[(k, round(lg[k]['top3']['error'], 2)) for k in ('vpd_live', 'circuit_live', 'circuit_plus') if k in lg]}")
+            f"noise-aware v {rec['floors']['v_noise']:.3f} (old {rec['floors']['v']:.3f}), failing {rec['floors']['failing_noise']}")
 
 
 def wilson(k: int, n: int) -> list:
@@ -1299,7 +1333,7 @@ def main():
     ap.add_argument("--stride", type=int, default=1)
     a = ap.parse_args()
     if str(a.paths[0]) == "add":  # add OUT CIRCUITS_DIR
-        add(a.paths[1], a.paths[2], {k: v for f in a.vpd for k, v in torch.load(f).items()} or None)
+        add(a.paths[1], a.paths[2], {k: v for f in a.vpd for k, v in torch.load(f).items()} or None, torch.load(a.pool))
         return
     if str(a.paths[0]) == "bakeoff":  # bakeoff NAME=OUT ... [--mib FILE: {builder: {metric: value}}]
         sets = {x.split("=", 1)[0]: load(Path(x.split("=", 1)[1])) for x in map(str, a.paths[1:])}

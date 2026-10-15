@@ -60,6 +60,7 @@ FIT = 48            # decision points the measured selection runs on
 FIT_USERS = 96      # training prompts whose answers give them (refreshed with the set removed)
 REFRESH = 4         # greedy steps between refreshes
 SHORT = 2048        # poles measured alone
+SHORT_REFRESH = 512 # poles measured again at a refresh
 POOL = 256          # the best singles greedy selection draws from
 MAX_UNITS = 50
 KL_MAX = 0.05       # bits: the unrelated-text KL a selected set may cost (T3)
@@ -175,8 +176,8 @@ def main():
     general_test = [chat(tok, gen_rows[r]["user"], gen_rows[r]["answer"])[:256] for r in range(300, 400)]
     peak = torch.zeros(nr.L, nr.D, device=nr.dev)
 
-    def rank(pts, chosen):
-        """The POOL poles whose removal on top of chosen lowers the mean p(owl) at pts most: the SHORT largest by |sum
+    def rank(pts, chosen, n_short=SHORT):
+        """The POOL poles whose removal on top of chosen lowers the mean p(owl) at pts most: the n_short largest by |sum
         of d log p(owl) / d pole| (the order only), each measured."""
         mp = [torch.ones(nr.D, device=nr.dev, requires_grad=True) for _ in range(nr.L)]
         mn = [torch.ones(nr.D, device=nr.dev, requires_grad=True) for _ in range(nr.L)]
@@ -194,8 +195,8 @@ def main():
                 lp[ow.owl].logsumexp(-1).backward()
         g = torch.stack([torch.stack([p.grad, q.grad]) for p, q in zip(mp, mn)]).cpu()   # [L, 2, D]
         short = [(k // (2 * nr.D), k % nr.D, 1 if (k // nr.D) % 2 == 0 else -1)
-                 for k in g.abs().flatten().argsort(descending=True).tolist()[:SHORT + len(chosen)]]
-        short = [u for u in short if u not in chosen][:SHORT]
+                 for k in g.abs().flatten().argsort(descending=True).tolist()[:n_short + len(chosen)]]
+        short = [u for u in short if u not in chosen][:n_short]
         single = torch.zeros(len(short))
         for ids in pts:
             single += torch.tensor(ow.p_owl(ids, [chosen + [u] for u in short])) / len(pts)
@@ -216,7 +217,7 @@ def main():
             fit = decision_points(fit_users, chosen)[:FIT]
             if not fit:
                 break
-            pool, _ = rank(fit, chosen)
+            pool, _ = rank(fit, chosen, SHORT_REFRESH)
             steps[-1]["refreshed"] = len(fit)
             log(f"refresh: {len(fit)} of {len(fit_users)} fit prompts still say owl")
         new = [u for u in pool if u not in kl1]

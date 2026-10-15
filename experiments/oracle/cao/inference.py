@@ -11,9 +11,14 @@ filler sentences; whether the model combined them is measured on the model itsel
                 country's log probability at the probe
   inferred      the true country first among the candidates, at least RATIO times the runner-up's probability, and every
                 neutral replacement lowering its log probability by at least DROP nats
-  not inferred  the true country not among the candidates' top 3, and no replacement moving its log probability by more
-                than STILL nats (the facts present, the conclusion neither expressed nor dependent on them)
+  not inferred  the true country not among the candidates' top 3, and no replacement lowering its log probability by more
+                than STILL nats (the facts present, the conclusion neither expressed nor raised by them; the first
+                rule, no replacement moving it either way, left none: facts that point the model at another country
+                lower the true one)
   between       ambiguous, dropped
+Two families: combinable (the facts and filler) and distractor (one filler sentence replaced by one naming another of
+the countries, DISTRACT: the facts are as present, the model's conclusion elsewhere). Every candidate and its
+measurements go to ITEMS.candidates.jsonl.
 Pairs, minimal first (the lead's 10-14: a system cannot pass by reading surface cues): a not-inferred text, and the same
 sentences plus one DECIDING sentence naming a city that makes it inferred. Then matched pairs: an inferred and a
 not-inferred item of the same country. "Not inferred" is behavioural and interventional: it does not exclude a state
@@ -22,7 +27,7 @@ somewhere encoding the conclusion; reports say so. The countries and sentences a
 training category: a held-out task.
 
   inference.py build --out ITEMS.jsonl [--per 60] [--device cuda]      candidates, measurements, labels, pairs (GPU)
-  inference.py score --items ITEMS.jsonl --adapter A --out OUT.jsonl   the causal oracle, text-only, the released AO
+  inference.py score --items ITEMS.jsonl [--adapter A] --out OUT.jsonl the causal oracle, text-only, the released AO
   inference.py curves OUT.jsonl --plot FIG.png                         hit rate against false attribution
 """
 from __future__ import annotations
@@ -65,11 +70,13 @@ COMPOSE = {  # country -> the feature pairs whose countries meet in it alone
     "Australia": [("southern", "left"), ("island", "federal"), ("southern", "english")],
 }
 CITY = {"Ireland": ["Dublin", "Cork"], "Japan": ["Tokyo", "Osaka"], "Germany": ["Berlin", "Munich"], "France": ["Paris", "Lyon"],
-        "Canada": ["Toronto", "Vancouver"], "Mexico": ["Mexico City", "Guadalajara"], "Brazil": ["São Paulo", "Rio de Janeiro"],
+        "Canada": ["Toronto", "Vancouver"], "Mexico": ["Guadalajara", "Monterrey"], "Brazil": ["São Paulo", "Rio de Janeiro"],
         "Australia": ["Sydney", "Melbourne"]}
 FILLER = ["I have been busy with work lately.", "My sister is visiting next week.", "We are planning a small dinner party.",
           "I finally fixed my bike yesterday.", "The neighbours got a new dog.", "I am trying to read more this year."]
 NEUTRAL = ["The weather has been fine.", "Things are busy around here.", "Work has been steady.", "I slept well last night."]
+DISTRACT = ["I just watched a documentary about {country}.", "My best friend moved to {country} last year.",
+            "I have always wanted to visit {country}."]
 DECIDING = "We live near {city}."
 COUNTRIES = list(COMPOSE)
 
@@ -128,42 +135,55 @@ def build(a) -> None:
         ratio = math.exp(float(lp[0, ci] - lp[0, order[1]])) if rank == 1 else 0.0
         if rank == 1 and ratio >= RATIO and min(drops) >= DROP:
             label = "inferred"
-        elif rank > 3 and max(abs(d) for d in drops) <= STILL:
+        elif rank > 3 and max(drops) <= STILL:
             label = "not_inferred"
         else:
             label = "ambiguous"
         return {"country": c, "text": text, "label": label, "rank": rank, "ratio": ratio, "drops": drops,
                 "probe_top": names[order[0]], "probe_p": lp[0].exp().tolist()}
 
-    items, minimal = [], []
-    for c, pairs_ in COMPOSE.items():
-        for _ in range(a.per):
-            f1, f2 = rng.choice(pairs_)
-            cue = [rng.choice(FEATURES[f1][1]), rng.choice(FEATURES[f2][1])]
-            fill = rng.sample(FILLER, 2)
-            sents = [fill[0], cue[0], fill[1], cue[1]] if rng.random() < 0.5 else [cue[0], fill[0], cue[1], fill[1]]
-            cue_idx = [sents.index(cue[0]), sents.index(cue[1])]
-            it = {**measure(c, sents, cue_idx), "family": "combinable", "features": [f1, f2]}
-            items.append(it)
-            if it["label"] != "not_inferred":
-                continue
-            more = sents + [DECIDING.format(city=rng.choice(CITY[c]))]  # the same sentences and the deciding one
-            it2 = {**measure(c, more, cue_idx + [len(more) - 1]), "family": "combinable", "features": [f1, f2], "deciding": more[-1]}
-            if it2["label"] == "inferred":
-                minimal.append((it, it2))
+    items, minimal, seen = [], [], set()
+    for fam in ("combinable", "distractor"):
+        for c, pairs_ in COMPOSE.items():
+            for _ in range(a.per):
+                f1, f2 = rng.choice(pairs_)
+                cue = [rng.choice(FEATURES[f1][1]), rng.choice(FEATURES[f2][1])]
+                fill = rng.sample(FILLER, 2)
+                extra = {}
+                if fam == "distractor":
+                    extra["distractor"] = rng.choice([x for x in names if x != c])
+                    fill[rng.randrange(2)] = rng.choice(DISTRACT).format(country=extra["distractor"])
+                sents = [fill[0], cue[0], fill[1], cue[1]] if rng.random() < 0.5 else [cue[0], fill[0], cue[1], fill[1]]
+                if " ".join(sents) in seen:  # the sentence pools are small: each text once
+                    continue
+                seen.add(" ".join(sents))
+                cue_idx = [sents.index(cue[0]), sents.index(cue[1])]
+                it = {**measure(c, sents, cue_idx), "family": fam, "features": [f1, f2], **extra}
+                items.append(it)
+                if it["label"] != "not_inferred":
+                    continue
+                more = sents + [DECIDING.format(city=rng.choice(CITY[c]))]  # the same sentences and the deciding one
+                it2 = {**measure(c, more, cue_idx + [len(more) - 1]), "family": fam, "features": [f1, f2], **extra,
+                       "deciding": more[-1]}
+                if it2["label"] == "inferred":
+                    minimal.append((it, it2))
     from collections import Counter
 
+    with a.out.with_name(a.out.stem + ".candidates.jsonl").open("w") as fh:
+        for it in items:
+            fh.write(json.dumps(it) + "\n")
+
     pairs = [("minimal", n_, p_) for n_, p_ in minimal]
-    used = {id(n_) for _, n_, _ in pairs}
     for c in names:
         pos = [i for i in items if i["country"] == c and i["label"] == "inferred"]
-        neg = [i for i in items if i["country"] == c and i["label"] == "not_inferred" and id(i) not in used]
-        pairs += [("matched", n_, p_) for p_, n_ in zip(pos, neg)]
+        for fam in ("combinable", "distractor"):
+            neg = [i for i in items if i["country"] == c and i["family"] == fam and i["label"] == "not_inferred"]
+            pairs += [("matched", n_, p_) for p_, n_ in zip([i for i in pos if i["family"] == fam], neg)]
     with a.out.open("w") as fh:
         for k, (kind, n_, p_) in enumerate(pairs):
             for it in (n_, p_):
                 fh.write(json.dumps({"pair": k, "pair_kind": kind, **it}) + "\n")
-    print(f"{len(items)} candidates: {dict(Counter(i['label'] for i in items))}; per country not inferred "
+    print(f"{len(items)} candidates: {dict(Counter((i['family'], i['label']) for i in items))}; per country not inferred "
           f"{dict(Counter(i['country'] for i in items if i['label'] == 'not_inferred'))}; "
           f"{sum(k == 'minimal' for k, _, _ in pairs)} minimal and {sum(k == 'matched' for k, _, _ in pairs)} matched pairs to {a.out}")
 
@@ -175,7 +195,7 @@ AO_QUESTION = "Answer with a single word only. Which country is the user from?"
 
 
 def score(a) -> None:
-    """Each system's answer to every paired item, as a distribution over the ten countries (the rest of the mass on not
+    """Each system's answer to every paired item, as a distribution over the eight countries (the rest of the mass on not
     answering): the causal oracle (cao.Oracle, --adapter; its options "<Country>." and cao.NONE scored whole), the same
     oracle text-only (no vector added), and the released Activation Oracle (ao_verify.Target: K sampled single-word
     answers, a country's share of them). Each reads layer 14 at every position of the user's chat turn; the probe is
@@ -189,21 +209,22 @@ def score(a) -> None:
     items = [json.loads(x) for x in a.items.read_text().splitlines()]
     names = COUNTRIES
     out = a.out.open("w")
-    o = cao.Oracle(a.adapter, a.device)
-    for text_only in (False, True):
-        o.text_only = text_only
-        for it in items:
-            ids = o.tok.apply_chat_template([{"role": "user", "content": it["text"]}], tokenize=True, add_generation_prompt=True,
-                                            enable_thinking=False, return_dict=False)
-            ex = {"ctx": ids, "blocks": [{"layer": 14, "positions": list(range(len(ids)))}], "q": QUESTION}
-            lp = o.option_logp(ex, [f"{c}." for c in names] + [cao.NONE])
-            m_ = max(lp)
-            pr = [math.exp(x - m_) for x in lp]
-            z = sum(pr)
-            out.write(json.dumps({"pair": it["pair"], "pair_kind": it["pair_kind"], "family": it["family"], "label": it["label"],
-                                  "country": it["country"], "system": "oracle text-only" if text_only else "oracle",
-                                  "p": {c: pr[k] / z for k, c in enumerate(names)}, "p_none": pr[-1] / z}) + "\n")
-    del o
+    if a.adapter:  # without one, the released AO alone (before a G1 checkpoint exists)
+        o = cao.Oracle(a.adapter, a.device)
+        for text_only in (False, True):
+            o.text_only = text_only
+            for it in items:
+                ids = o.tok.apply_chat_template([{"role": "user", "content": it["text"]}], tokenize=True, add_generation_prompt=True,
+                                                enable_thinking=False, return_dict=False)
+                ex = {"ctx": ids, "blocks": [{"layer": 14, "positions": list(range(len(ids)))}], "q": QUESTION}
+                lp = o.option_logp(ex, [f"{c}." for c in names] + [cao.NONE])
+                m_ = max(lp)
+                pr = [math.exp(x - m_) for x in lp]
+                z = sum(pr)
+                out.write(json.dumps({"pair": it["pair"], "pair_kind": it["pair_kind"], "family": it["family"], "label": it["label"],
+                                      "country": it["country"], "system": "oracle text-only" if text_only else "oracle",
+                                      "p": {c: pr[k] / z for k, c in enumerate(names)}, "p_none": pr[-1] / z}) + "\n")
+        del o
     import ao_verify
 
     tg = ao_verify.Target(cao.MODEL, a.device)
@@ -223,8 +244,9 @@ def score(a) -> None:
 def curves(a) -> None:
     """Hit rate on inferred items against false attribution on not-inferred items, per system and family, as each
     system's confidence threshold t moves: a system answers its most probable country when that probability is at
-    least t, else abstains; a hit is the true country on an inferred item; a false attribution is any country named on a
-    not-inferred item. One panel per system, a line per family (minimal pairs apart)."""
+    least t, else abstains; a hit is the true country on an inferred item; a false attribution is the true country on a
+    not-inferred item (the conclusion the model never formed; naming the country it did conclude, as on most distractor
+    items, is not one). One panel per system, a line per pair kind and family."""
     import matplotlib
 
     matplotlib.use("Agg")
@@ -234,10 +256,9 @@ def curves(a) -> None:
     systems = list(dict.fromkeys(r["system"] for r in rows))
     plt.rcParams.update({"font.size": 15, "axes.spines.top": False, "axes.spines.right": False})
     fig, axes = plt.subplots(1, len(systems), figsize=(6.5 * len(systems), 5.6), facecolor="white", squeeze=False)
-    groups = [("minimal pairs", lambda r: r["pair_kind"] == "minimal"),
-              ("matched: combinable", lambda r: r["pair_kind"] == "matched" and r["family"] == "combinable"),
-              ("matched: distractor", lambda r: r["pair_kind"] == "matched" and r["family"] == "distractor")]
-    colors = ["#d62728", "#1f77b4", "#2ca02c"]
+    groups = [(f"{k}: {f}", lambda r, k=k, f=f: r["pair_kind"] == k and r["family"] == f)
+              for k in ("minimal", "matched") for f in ("combinable", "distractor")]
+    colors = ["#d62728", "#ff7f0e", "#1f77b4", "#2ca02c"]
     for ax, sname in zip(axes[0], systems):
         for (gname, sel), col in zip(groups, colors):
             rs = [r for r in rows if r["system"] == sname and sel(r)]
@@ -248,7 +269,7 @@ def curves(a) -> None:
             pts = []
             for t in [x / 50 for x in range(51)]:
                 hit = sum(max(r["p"], key=r["p"].get) == r["country"] and max(r["p"].values()) >= t for r in pos) / len(pos)
-                fa = sum(max(r["p"].values()) >= t for r in neg) / len(neg)
+                fa = sum(max(r["p"], key=r["p"].get) == r["country"] and max(r["p"].values()) >= t for r in neg) / len(neg)
                 pts.append((fa, hit))
             ax.plot([x for x, _ in pts], [y for _, y in pts], "-", color=col, lw=2.5)
             ax.annotate(f"{gname} ({len(pos)})", pts[len(pts) // 2], textcoords="offset points", xytext=(6, -14), color=col, fontsize=12)
@@ -274,7 +295,7 @@ def main():
     b.add_argument("--device")
     s_ = sub.add_parser("score")
     s_.add_argument("--items", type=Path, required=True)
-    s_.add_argument("--adapter", required=True, help="the causal oracle's adapter")
+    s_.add_argument("--adapter", help="the causal oracle's adapter (without it, the released AO alone)")
     s_.add_argument("--out", type=Path, required=True)
     s_.add_argument("--device")
     c_ = sub.add_parser("curves")

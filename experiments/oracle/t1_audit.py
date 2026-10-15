@@ -68,7 +68,8 @@ def collect(a) -> None:
         ids = torch.tensor([x + [tok.eos_token_id] * (T - len(x)) for x in batch], device=dev)
         mask = torch.tensor([[1] * len(x) + [0] * (T - len(x)) for x in batch], device=dev)
         with torch.no_grad():
-            m(input_ids=ids, attention_mask=mask)
+            # Only MLP hooks are read: skip unused vocabulary logits and KV caches.
+            m.model(input_ids=ids, attention_mask=mask, use_cache=False)
         valid = mask.bool().clone()
         valid[:, 0] = False  # the first token: the attention sink
         d0 = len(docs) - len(batch)

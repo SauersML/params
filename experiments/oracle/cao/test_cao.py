@@ -13,6 +13,116 @@ import cao  # noqa: E402
 transformers = pytest.importorskip("transformers")
 
 
+def capture_oracle():
+    """Real tiny Qwen+PEFT, no tokenizer/assets/downloads."""
+    from peft import LoraConfig, get_peft_model
+    from transformers import Qwen3Config, Qwen3ForCausalLM
+    torch.manual_seed(42)
+    base=Qwen3ForCausalLM(Qwen3Config(vocab_size=32, hidden_size=16, intermediate_size=24,
+        num_hidden_layers=2,num_attention_heads=2,num_key_value_heads=1,head_dim=8))
+    cfg=LoraConfig(r=2,lora_alpha=2,target_modules=['down_proj','o_proj'])
+    m=get_peft_model(base,cfg);m.add_adapter('other',cfg)
+    for mod in m.modules():
+        if hasattr(mod,'lora_B'):
+            for name in ('default','other'):
+                torch.nn.init.constant_(mod.lora_A[name].weight,.2 if name=='default' else -.3)
+                torch.nn.init.constant_(mod.lora_B[name].weight,.4 if name=='default' else .7)
+    m.eval();o=cao.Oracle.__new__(cao.Oracle)
+    o.torch,o.dev,o.m=torch,torch.device('cpu'),m
+    o.lm=m.base_model.model;o.layers=o.lm.model.layers;o.passes=0
+    return o
+
+
+@pytest.mark.parametrize('target',[None,'default','other'])
+def test_native_single_capture_matches_actual_selected_projector(target):
+    o=capture_oracle();ctx=[1,3,5]
+    units=[['neuron',0,2],['head',1,1],['neuron',0,2]]
+    direct={};handles=[]
+    for kind,l,i in units[:2]:
+        mod=o.layers[l].mlp.down_proj if kind=='neuron' else o.layers[l].self_attn.o_proj
+        width=1 if kind=='neuron' else 8
+        def hook(m,args,i=i,width=width,kind=kind):
+            x=torch.zeros_like(args[0]);x[0,-1,i*width:(i+1)*width]=args[0][0,-1,i*width:(i+1)*width]
+            # Actual affine module evaluation; remove bias via zero input.
+            direct[kind]=(m(x)-m(torch.zeros_like(x)))[0,-1].detach()
+        # Avoid recursive hook while evaluating the physical projector.
+        def safe_hook(m,args,fn=hook):
+            if getattr(m,'_test_inside',False):return
+            m._test_inside=True
+            try:fn(m,args)
+            finally:m._test_inside=False
+        handles.append(mod.register_forward_pre_hook(safe_hook))
+    calls=[];h=o.m.register_forward_hook(lambda *a:calls.append(1))
+    ex={'ctx':ctx,'target':target,'blocks':[{'label':'A','unit':units[0]}, {'layer':0,'positions':[0,2]},
+        {'label':'B','unit':units[1]},{'label':'again','unit':units[2]}]}
+    try:
+        v=o._vectors(ex)
+        assert len(calls)==1 and o.passes==1
+        assert torch.allclose(v[0],direct['neuron'],atol=1e-6)
+        assert torch.allclose(v[3],direct['head'],atol=1e-6)
+        assert torch.equal(v[0],v[4])
+        assert o.m.active_adapter=='default'
+        for handle in handles:handle.remove()
+        handles=[]
+        with o.off(target),torch.no_grad():
+            H=o.m(input_ids=torch.tensor([ctx]),output_hidden_states=True).hidden_states
+        assert torch.equal(v[1:3],H[1][0,[0,2]])
+    finally:
+        h.remove()
+        for handle in handles:handle.remove()
+
+
+def test_unit_write_counts_and_restores_on_forward_failure():
+    o=capture_oracle()
+    a=cao.unit_write(o,[1,2],['neuron',0,1],target='other')
+    assert o.passes==1
+    b=cao.unit_write(o,[1,2],['neuron',0,1])
+    assert o.passes==2 and not torch.allclose(a,b)
+    mod=o.layers[0].mlp.down_proj;before=len(mod._forward_pre_hooks)
+    h=o.m.register_forward_pre_hook(lambda *_: (_ for _ in ()).throw(RuntimeError('test failure')))
+    try:
+        with pytest.raises(RuntimeError,match='test failure'):
+            cao.unit_write(o,[1,2],['neuron',0,1],target='other')
+        assert o.passes==3 and len(mod._forward_pre_hooks)==before
+        assert o.m.active_adapter=='default'
+    finally:h.remove()
+
+
+def test_native_projection_bias_merged_lora_and_dora_rejection():
+    o=capture_oracle();mod=o.layers[0].mlp.down_proj
+    mod.base_layer.bias=torch.nn.Parameter(torch.arange(16,dtype=torch.float32))
+    with o.off('other'):
+        x=torch.randn(1,1,24);masked=torch.zeros_like(x);masked[...,2:3]=x[...,2:3]
+        expected=(mod(masked)-mod(torch.zeros_like(masked)))[0,0]
+        W=cao._native_weight(mod,2,3)
+        assert torch.allclose(x[0,0,2:3]@W.T,expected,atol=1e-6)
+        mod.merge(adapter_names=['other'])
+        try:
+            assert torch.allclose(cao._native_weight(mod,2,3),W,atol=1e-6)
+            # PEFT ignores another unmerged active adapter while any is merged.
+            mod._active_adapter=['other','default']
+            assert torch.allclose(cao._native_weight(mod,2,3),W,atol=1e-6)
+            assert torch.allclose(x[0,0,2:3]@W.T,(mod(masked)-mod(torch.zeros_like(masked)))[0,0],atol=1e-6)
+        finally:mod.unmerge()
+    mod.use_dora['other']=True
+    try:
+        with pytest.raises(ValueError,match='DoRA'):
+            cao.unit_write(o,[1,2],['neuron',0,2],target='other')
+        assert o.passes==0 and not mod._forward_pre_hooks
+        assert o.m.active_adapter=='default'
+    finally:mod.use_dora['other']=False
+    mod.lora_variant['other']=object()
+    try:
+        with pytest.raises(ValueError,match='variant'):
+            cao.unit_write(o,[1,2],['neuron',0,2],target='other')
+        assert o.passes==0
+    finally:del mod.lora_variant['other']
+    mod.lora_dropout['other']=torch.nn.Dropout(.5)
+    with pytest.raises(ValueError,match='stochastic'):
+        cao.unit_write(o,[1,2],['neuron',0,2],target='other')
+    assert o.passes==0
+
+
 @pytest.fixture(scope="module")
 def tiny():
     from peft import LoraConfig, get_peft_model

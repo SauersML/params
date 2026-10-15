@@ -151,16 +151,16 @@ class Oracle:
 
     def _vectors(self, ex: dict):
         torch = self.torch
-        self.passes += 1  # the target model's forward passes (the reading, not the oracle's own generation)
-        with self.off(ex.get("target")), torch.no_grad():
-            out = self.m(input_ids=torch.tensor([ex["ctx"]], device=self.dev), output_hidden_states=True)
+        units = [b['unit'] for b in ex['blocks'] if 'layer' not in b]
+        out, writes = _capture_native(self, ex['ctx'], units, target=ex.get('target'), hidden=True)
         H = out.hidden_states
+        writes = iter(writes)
         vs = []
         for b in ex["blocks"]:
             if "layer" in b:
                 vs.append(H[b["layer"] + 1][0, b["positions"]])
             else:
-                vs.append(unit_write(self, ex["ctx"], b["unit"])[None].to(H[0].dtype))
+                vs.append(next(writes)[None].to(H[0].dtype))
         return torch.cat(vs)
 
     def vectors_many(self, exs: list[dict]) -> list:
@@ -292,25 +292,79 @@ class Oracle:
         return self.options_logp([ex], [options])[0]
 
 
-def unit_write(o: Oracle, ctx: list[int], unit) -> "torch.Tensor":
+def _native_weight(module, start, end):
+    """Effective affine projection, excluding bias, in the currently selected target.
+
+    Support ordinary linear and PEFT additive LoRA; other adapter transforms must
+    not silently fall back to the base weight. This is an FP32 algebraic native
+    contribution, as in unit_write, not bitwise equivalence to separately rounded
+    BF16 base/adapter module outputs.
+    """
+    if not hasattr(module, 'get_base_layer'):
+        return module.weight[:, start:end].detach().float()
+    base = module.get_base_layer()
+    if getattr(module, 'fan_in_fan_out', False):
+        raise ValueError('transposed native projection unsupported')
+    W = base.weight[:, start:end].detach().float()
+    if module.disable_adapters:
+        if module.merged:
+            raise ValueError('disabled merged adapter projection unsupported')
+        return W
+    if module.merged:
+        return W  # PEFT's merged forward uses only the already-merged base.
+    merged = set(module.merged_adapters)
+    for name in module.active_adapters:
+        if name in merged:
+            continue
+        if getattr(module, 'use_dora', {}).get(name, False):
+            raise ValueError('DoRA native projection unsupported')
+        if name in getattr(module, 'lora_variant', {}):
+            raise ValueError('variant native LoRA projection unsupported')
+        if not hasattr(module, 'lora_A'):
+            raise ValueError('non-additive native adapter projection unsupported')
+        if name not in module.lora_A:
+            continue  # PEFT skips adapters not installed on this projection.
+        dropout = module.lora_dropout[name]
+        if dropout.training and getattr(dropout, 'p', 0) > 0:
+            raise ValueError('stochastic native LoRA projection unsupported')
+        W = W + (module.lora_B[name].weight.detach().float() @
+                 module.lora_A[name].weight[:, start:end].detach().float()) * module.scaling[name]
+    return W
+
+
+def _capture_native(o, ctx, units, *, target=None, hidden=False):
+    """One counted target forward captures all requested native writes in order."""
+    torch = o.torch
+    selected = []
+    for kind, layer, index in units:
+        if kind not in ('neuron', 'head') or type(layer) is not int or type(index) is not int or layer < 0 or index < 0:
+            raise ValueError('invalid native unit')
+        mod = o.layers[layer]
+        projection = mod.mlp.down_proj if kind == 'neuron' else mod.self_attn.o_proj
+        width = 1 if kind == 'neuron' else o.lm.config.head_dim
+        if (index + 1) * width > projection.weight.shape[1]:
+            raise ValueError('native unit outside projection')
+        selected.append((projection, index, width))
+    got, handles = {}, []
+    try:
+        for module in dict.fromkeys(m for m, _, _ in selected):
+            handles.append(module.register_forward_pre_hook(
+                lambda m, args: got.__setitem__(m, args[0][0, -1].detach().float().clone())))
+        with o.off(target), torch.no_grad():
+            weights = {(m,i,w): _native_weight(m, i*w, (i+1)*w) for m,i,w in selected}
+            o.passes += 1
+            out = o.m(input_ids=torch.tensor([ctx], device=o.dev), output_hidden_states=hidden)
+            writes = [got[m][i*w:(i+1)*w] @ weights[m,i,w].T for m, i, w in selected]
+        return out, writes
+    finally:
+        for handle in handles:
+            handle.remove()
+
+
+def unit_write(o: Oracle, ctx: list[int], unit, target: str | None = None) -> "torch.Tensor":
     """A native unit's write at the context's last position, float32 [d]: neuron (layer, index): its activation x its
     down_proj column; head (layer, index): its output through its o_proj slice."""
-    torch = o.torch
-    kind, layer, index = unit
-    mod = o.layers[layer]
-    got = {}
-    target = mod.mlp.down_proj if kind == "neuron" else mod.self_attn.o_proj
-    hd = o.lm.config.head_dim
-    handle = target.register_forward_pre_hook(lambda _m, a: got.__setitem__("x", a[0][0, -1].float()))
-    try:
-        with o.off(), torch.no_grad():
-            o.m(input_ids=torch.tensor([ctx], device=o.dev))
-    finally:
-        handle.remove()
-    W = target.weight.float()
-    if kind == "neuron":
-        return got["x"][index] * W[:, index]
-    return got["x"][index * hd:(index + 1) * hd] @ W[:, index * hd:(index + 1) * hd].T
+    return _capture_native(o, ctx, [unit], target=target)[1][0]
 
 
 # ---- examples

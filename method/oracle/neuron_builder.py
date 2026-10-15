@@ -18,17 +18,18 @@ build(nr, ids, pos) on one prompt (the circuit: the necessary units and the suff
    the mean KL at SIDE positions before pos), ranked by measured drop, units whose side effect alone exceeds SIDE_MAX out;
 2. necessity's size: the smallest prefix of that ranking on a log grid, then bracketing rounds, whose removal is
    necessary: the answer stops being the top token and the contrast falls by at least NEC_BITS, side effect <= SIDE_MAX;
-3. necessity's trim: the prefix's units in TRIM_GROUPS runs, least effective first, each put back while the rest stays
-   removed and kept out when the removal stays necessary;
+3. necessity's trim: the prefix's units in TRIM_GROUPS groups, dropped from the set while its removal stays necessary
+   (_cut: each group alone, then the passing ones together);
 4. sufficiency: CF_N counterfactual prompts, one context token replaced by one of the model's own likeliest alternatives
    there, those lowering the answer's contrast most (one per position, at least NEC_BITS); every candidate unit and every
    route (a head's output at a position, attention's route into it) from the first changed position on, set to its
    value on the prompt in each counterfactual's run (the patch), restores the contrast it lost; the patch is cut while it
-   restores at least SUFF_FRAC (the least over the counterfactuals): positions; MLP blocks (layer, position), largest
-   first, with every route on; routes by (layer, position), then alone (each level: every group dropped alone, then the
-   passing ones together on a log grid with bracketing); then the kept MLP blocks' units: ranked by |value change x
-   gradient| on the patched runs, the SUF_MEASURED largest patched alone and ranked by that (the rest by the gradient),
-   the smallest restoring prefix, trimmed in TRIM_GROUPS groups;
+   restores at least SUFF_FRAC (the least over the counterfactuals): positions, then MLP blocks (layer, position) with
+   every route on, largest first (each level _cut: every group dropped alone, then the passing ones together on a log
+   grid with bracketing); then routes ordered by |output change . gradient| on the patched runs, the smallest restoring
+   prefix, each of it dropped alone; then the kept MLP blocks' units ranked by |value change x gradient|, the
+   SUF_MEASURED largest patched alone and ranked by that (the rest by the gradient), the smallest restoring prefix,
+   trimmed in TRIM_GROUPS groups (_cut);
 5. met: the necessity set's removal is necessary and the circuit, patched into every counterfactual, restores SUFF_FRAC
    (step 4 searches with the necessity set always patched, so the two sets are measured together);
    reported: the circuit's removal, keep-only (every other candidate zeroed: the contrast and whether y stays top).
@@ -306,6 +307,38 @@ def _grid(n: int) -> list[int]:
     return sorted({min(n, int(round(2 ** (j / 2)))) for j in range(0, int(2 * math.log2(max(n, 1))) + 2)} | {n})
 
 
+def _cut(n: int, test, rounds: int = ROUNDS) -> list[bool]:
+    """Elements 0..n-1 dropped while test passes (test: keep lists [n] of bool -> (passes, score) each, batched): each
+    kept element dropped alone, then the passing ones together in order of score (highest first), the largest passing
+    count on a log grid with bracketing; rounds times. The keep list."""
+    keep = [True] * n
+    for _ in range(rounds):
+        live = [j for j in range(n) if keep[j]]
+        if not live:
+            break
+        trial = [[keep[i] and i != j for i in range(n)] for j in live]
+        ordr = [j for (ok, sc), j in sorted(zip(test(trial), live), key=lambda v: v[0][1], reverse=True) if ok]
+        if not ordr:
+            break
+        at = {1: True}
+
+        def tryj(js):
+            js = [j for j in sorted(set(js)) if j not in at and 0 < j <= len(ordr)]
+            drop = [set(ordr[:j]) for j in js]
+            for j, (ok, _) in zip(js, test([[keep[i] and i not in d for i in range(n)] for d in drop]) if js else []):
+                at[j] = ok
+        tryj(_grid(len(ordr)))
+        for _ in range(rounds):
+            lo = max(j for j, v in at.items() if v)
+            hi = min([j for j, v in at.items() if not v and j > lo] + [len(ordr) + 1])
+            if hi - lo <= 1:
+                break
+            tryj([lo + max(1, (hi - lo) * (j + 1) // 5) for j in range(4)])
+        for j in ordr[:max(j for j, v in at.items() if v)]:
+            keep[j] = False
+    return keep
+
+
 @torch.no_grad()
 def counterfactuals(nr: Neurons, ids: list[int], pos: int, contrast, c0: float) -> list[tuple]:
     """Every counterfactual prompt of build's step 4: at each position 1..pos-1 the token replaced by each of the
@@ -406,13 +439,13 @@ def build(nr: Neurons, ids: list[int], pos: int, log=None) -> dict:
         measure([lo + max(1, (hi - lo) * (j + 1) // 5) for j in range(4)])
     met = sorted(k for k, v in at.items() if v[0])
     nec = order[:met[0]] if met else []
-    # 3. necessity's trim: groups put back, least effective first, while the removal stays necessary
+    # 3. necessity's trim: TRIM_GROUPS groups put back while the removal stays necessary
     if len(nec) > 1:
         K = max(1, -(-len(nec) // TRIM_GROUPS))
-        for g in [nec[::-1][j:j + K] for j in range(0, len(nec), K)]:
-            rest = [u for u in nec if u not in set(g)]
-            if rest and necessary(runs([rest])[0]):
-                nec = rest
+        groups = [nec[j:j + K] for j in range(0, len(nec), K)]
+        kg = _cut(len(groups), lambda ks: [(necessary(r), c0 - r["contrast"]) for r in
+                                           runs([[u for g, on in zip(groups, k) if on for u in g] for k in ks])])
+        nec = [u for g, on in zip(groups, kg) if on for u in g]
     rec["seconds_necessity"] = round(time.perf_counter() - t0, 2)
     # 4. sufficiency: counterfactuals, then the patch eliminated from every candidate and route down to units and routes
     cfs, suf, routes, srec = ([], [], [], {}) if not SUFFICIENCY else _sufficiency(nr, ids, pos, H, O, P, contrast, c0, nec)
@@ -451,6 +484,32 @@ def build(nr: Neurons, ids: list[int], pos: int, log=None) -> dict:
             f"{removed['contrast']:.2f} bits removed (side {removed['side']:.3f}), restored {restored}, met {rec['met']}, "
             f"{rec['seconds']} s")
     return rec
+
+
+def _route_order(nr: Neurons, ids: list[int], pos: int, H: list, O: list, fn, routes: list, cfs: list, contrast,
+                 fx: list) -> torch.Tensor:
+    """The routes [(layer, head, pos)] in order of |(output on the prompt - output on the counterfactual's run) . d
+    contrast / d output| on each counterfactual's run with fn's units (fn(i) -> ([T, D], _)), fx and every listed route
+    patched, the largest over the counterfactuals (one backward each; the order only proposes)."""
+    T, L = len(ids), nr.L
+    rm = torch.zeros(L, T, nr.NH, dtype=torch.bool, device=nr.dev)
+    rt = torch.tensor(routes, dtype=torch.long, device=nr.dev).view(-1, 3)
+    rm[rt[:, 0], rt[:, 2], rt[:, 1]] = True
+    score = torch.zeros(len(routes), device=nr.dev)
+    edit = lambda i, h: torch.where(fn(i)[0] | fx[i], H[i].to(h.dtype), h)  # noqa: E731
+    for q, z, x2, d in cfs:
+        capc = {}
+        with torch.no_grad():
+            nr.logits(x2, [pos], edit=edit, capture=capc)
+        oc = [o[0] for o in capc["o"]]
+        zs = [torch.zeros(T, nr.NH * nr.hd, device=nr.dev, requires_grad=True) for _ in range(L)]
+        with torch.enable_grad():
+            l = torch.log_softmax(nr.logits(x2, [pos], edit=edit, route=lambda i, a: torch.where(
+                rm[i].repeat_interleave(nr.hd, -1), O[i].to(a.dtype), a) + zs[i].to(a.dtype))[:, 0], -1)
+            contrast(l).sum().backward()
+        s = torch.stack([((O[i] - oc[i]).float() * zs[i].grad).view(T, nr.NH, nr.hd).sum(-1) for i in range(L)])   # [L, T, NH]
+        score = torch.maximum(score, s[rt[:, 0], rt[:, 2], rt[:, 1]].abs())
+    return score.argsort(descending=True)
 
 
 def _sufficiency(nr: Neurons, ids: list[int], pos: int, H: list, O: list, P: list, contrast, c0: float, fixed: list):
@@ -529,45 +588,24 @@ def _sufficiency(nr: Neurons, ids: list[int], pos: int, H: list, O: list, P: lis
         return lambda i: (P[i] & bm[i][:, None], rm[i])
 
     def eliminate(keep: torch.Tensor, groups: list, by_cost: bool) -> torch.Tensor:
-        """Groups of elements (index tensors) dropped from the patch while it restores SUFF_FRAC: each kept group dropped
-        alone, then those passing alone dropped together (largest cost first with by_cost, else what stays restored
-        most), the largest passing count on a log grid with bracketing; ROUNDS times."""
-        for _ in range(ROUNDS):
-            live = [g for g in groups if bool(keep[g].any())]
-            if len(live) <= 1:
-                break
-            trial = []
-            for g in live:
-                k = keep.clone()
-                k[g] = False
-                trial.append(k)
-            r = restore([row(k) for k in trial])
-            ok = [(v, j) for j, v in enumerate(r) if v >= SUFF_FRAC]
-            if not ok:
-                break
-            ok.sort(key=lambda vj: (-float(cost[live[vj[1]]][keep[live[vj[1]]]].sum()), -vj[0]) if by_cost else (-vj[0],))
-            ordr = [live[j] for _, j in ok]
-            at = {1: True}
+        """Groups of elements (index tensors) dropped from the patch while it restores SUFF_FRAC (_cut; the passing ones
+        taken largest first with by_cost, else by what stays restored)."""
+        live = [g for g in groups if bool(keep[g].any())]
 
-            def tryj(js):
-                js = [j for j in sorted(set(js)) if j not in at and 0 < j <= len(ordr)]
-                ks = []
-                for j in js:
-                    k = keep.clone()
-                    for g in ordr[:j]:
-                        k[g] = False
-                    ks.append(k)
-                for j, v in zip(js, restore([row(k) for k in ks])):
-                    at[j] = v >= SUFF_FRAC
-            tryj(_grid(len(ordr)))
-            for _ in range(ROUNDS):
-                lo = max(j for j, v in at.items() if v)
-                hi = min([j for j, v in at.items() if not v and j > lo] + [len(ordr) + 1])
-                if hi - lo <= 1:
-                    break
-                tryj([lo + max(1, (hi - lo) * (j + 1) // 5) for j in range(4)])
-            keep = keep.clone()
-            for g in ordr[:max(j for j, v in at.items() if v)]:
+        def test(ks):
+            rows = []
+            for k in ks:
+                kk = keep.clone()
+                for g, on in zip(live, k):
+                    if not on:
+                        kk[g] = False
+                rows.append(kk)
+            got = restore([row(kk) for kk in rows])
+            return [(v >= SUFF_FRAC, (float(cost[keep & ~kk].sum()), v) if by_cost else (v,)) for kk, v in zip(rows, got)]
+        kept = _cut(len(live), test)
+        keep = keep.clone()
+        for g, on in zip(live, kept):
+            if not on:
                 keep[g] = False
         return keep
     keep = torch.ones(len(el), dtype=torch.bool, device=dev)
@@ -577,12 +615,38 @@ def _sufficiency(nr: Neurons, ids: list[int], pos: int, H: list, O: list, P: lis
         srec["seconds"] = round(time.perf_counter() - t0, 2)
         return cfs, [], [], srec
     # positions; MLP blocks with every route at the kept positions on (largest first: routes are the narrow cut, a
-    # block thousands of units); routes by (layer, position), then alone
+    # block thousands of units); then routes ranked, the smallest restoring prefix, each of it dropped alone (_cut)
     ix = torch.arange(len(el), device=dev)
     keep = eliminate(keep, [ix[E[:, 2] == t] for t in range(qmin, pos + 1)], False)
     keep = eliminate(keep, [ix[j:j + 1] for j in (keep & isn).nonzero().flatten().tolist()], True)
-    keep = eliminate(keep, [ix[isr & (E[:, 1] == i) & (E[:, 2] == t)] for t in range(qmin, pos + 1) for i in range(L)], False)
-    keep = eliminate(keep, [ix[j:j + 1] for j in (keep & isr).nonzero().flatten().tolist()], False)
+    rj = (keep & isr).nonzero().flatten()
+    keep = keep & ~isr
+    rj = rj[_route_order(nr, ids, pos, H, O, row(keep), [(int(E[j, 1]), int(E[j, 3]), int(E[j, 2])) for j in rj.tolist()],
+                         cfs, contrast, fx)]
+
+    def with_routes(js):
+        kk = keep.clone()
+        kk[js] = True
+        return kk
+    at = {}
+
+    def rmeasure(ks):
+        ks = [k for k in sorted(set(ks)) if k not in at and 0 <= k <= len(rj)]
+        for k, v in zip(ks, restore([row(with_routes(rj[:k])) for k in ks])):
+            at[k] = v >= SUFF_FRAC
+    rmeasure([0] + _grid(len(rj)))
+    for _ in range(ROUNDS):
+        met = sorted(k for k, v in at.items() if v)
+        if not met:
+            break
+        lo = max([k for k, v in at.items() if not v and k < met[0]] + [-1])
+        if met[0] - lo <= 1:
+            break
+        rmeasure([lo + max(1, (met[0] - lo) * (j + 1) // 5) for j in range(4)])
+    rj = rj[:min([k for k, v in at.items() if v] + [len(rj)])]
+    sel = lambda k: rj[torch.tensor(k, dtype=torch.bool, device=dev)]  # noqa: E731
+    kr = _cut(len(rj), rounds=1, test=lambda ks: [(v >= SUFF_FRAC, (v,)) for v in restore([row(with_routes(sel(k))) for k in ks])])
+    keep = with_routes(sel(kr))
     routes = [(int(E[j, 1]), int(E[j, 3]), int(E[j, 2])) for j in (keep & isr).nonzero().flatten().tolist()]
     fn = row(keep)
     pool = [fn(i)[0] for i in range(L)]
@@ -646,12 +710,15 @@ def _sufficiency(nr: Neurons, ids: list[int], pos: int, H: list, O: list, P: lis
     met = sorted(k for k, v in at.items() if v)
     k = met[0] if met else len(ranked)
     K = max(1, -(-k // TRIM_GROUPS))
-    for a in range(k - K, -K, -K) if k > 1 else []:
-        trial = [d.clone() for d in dropped]
-        for i in range(L):
-            trial[i] |= (rank[i] >= max(a, 0)) & (rank[i] < a + K)
-        if prefix([k], [trial])[0] >= SUFF_FRAC:
-            dropped = trial
+    bounds = [(a, min(a + K, k)) for a in range(0, k, K)]
+
+    def dropped_by(kg):
+        return [torch.zeros(T, nr.D, dtype=torch.bool, device=dev) | sum(((rank[i] >= a) & (rank[i] < b) for (a, b), on in zip(bounds, kg)
+                                                                          if not on), torch.zeros(T, nr.D, dtype=torch.bool, device=dev))
+                for i in range(L)]
+    if k > 1:
+        kg = _cut(len(bounds), lambda ks: [(v >= SUFF_FRAC, (v,)) for v in prefix([k] * len(ks), [dropped_by(kk) for kk in ks])])
+        dropped = dropped_by(kg)
     suf = [u for u in ranked[:k] if not bool(dropped[u[0]][u[1], u[2]])]
     srec.update(units=len(suf), seconds=round(time.perf_counter() - t0, 2), alone=alone)
     return cfs, suf, routes, srec

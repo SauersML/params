@@ -32,7 +32,7 @@ training category: a held-out task.
 
   inference.py build --out ITEMS.jsonl [--per 60] [--device cuda]      candidates, measurements, labels, pairs (GPU)
   inference.py score --items ITEMS.jsonl [--adapter A] --out OUT.jsonl the causal oracle, text-only, the released AO
-  inference.py curves OUT.jsonl --plot FIG.png                         hit rate against false attribution
+  inference.py curves OUT.jsonl --plot FIG.png                         hit rate and false attribution
 """
 from __future__ import annotations
 
@@ -46,6 +46,7 @@ from pathlib import Path
 MODEL = os.environ.get("CAO_MODEL", "Qwen/Qwen3-1.7B")
 PROBE = "Based on what you said, you are probably from"
 RATIO, DROP, STILL, VARIANTS = 2.0, 1.0, 0.3, 4
+T = 0.5  # the figure's answer threshold
 FEATURES = {  # a fact about the user's country -> (the countries it fits, its sentences): each fits several countries;
     # two together fit one, so naming the country takes combining them (the first build's single cues, colcannon or the
     # Shinkansen, were each enough: 0 of 1,500 contexts left the country uninferred)
@@ -253,11 +254,12 @@ def score(a) -> None:
 
 
 def curves(a) -> None:
-    """Hit rate on inferred items against false attribution on not-inferred items, per system and family, as each
-    system's confidence threshold t moves: a system answers its most probable country when that probability is at
-    least t, else abstains; a hit is the true country on an inferred item; a false attribution is the true country on a
-    not-inferred item (the conclusion the model never formed; naming the country it did conclude, as on most distractor
-    items, is not one). One panel per system, a line per pair kind and family."""
+    """Hit rate and false attribution together, per family of minimal pairs and system: a system names its most probable
+    country when that probability is at least T (the released AO: most of its sampled answers), else abstains; a hit is
+    the true country named on the inferred text of a pair, a false attribution the true country named on its
+    not-inferred text (the conclusion the model never formed; naming the country it did conclude, as on most distractor
+    texts, is not one). Both are printed for every threshold and every pair kind; the figure has the minimal pairs at T,
+    one panel per family. (The threshold curves of the first version were vertical lines: no system attributed falsely.)"""
     import matplotlib
 
     matplotlib.use("Agg")
@@ -265,33 +267,42 @@ def curves(a) -> None:
 
     rows = [json.loads(x) for x in a.out.read_text().splitlines()]
     systems = list(dict.fromkeys(r["system"] for r in rows))
-    plt.rcParams.update({"font.size": 15, "axes.spines.top": False, "axes.spines.right": False})
-    fig, axes = plt.subplots(1, len(systems), figsize=(6.5 * len(systems), 5.6), facecolor="white", squeeze=False)
-    groups = [(f"{k}: {f}", lambda r, k=k, f=f: r["pair_kind"] == k and r["family"] == f)
-              for k in ("minimal", "matched") for f in ("combinable", "distractor")]
-    colors = ["#d62728", "#ff7f0e", "#1f77b4", "#2ca02c"]
-    for ax, sname in zip(axes[0], systems):
-        for (gname, sel), col in zip(groups, colors):
-            rs = [r for r in rows if r["system"] == sname and sel(r)]
-            pos = [r for r in rs if r["label"] == "inferred"]
-            neg = [r for r in rs if r["label"] == "not_inferred"]
-            if not pos or not neg:
-                continue
-            pts = []
-            for t in [x / 50 for x in range(51)]:
-                hit = sum(max(r["p"], key=r["p"].get) == r["country"] and max(r["p"].values()) >= t for r in pos) / len(pos)
-                fa = sum(max(r["p"], key=r["p"].get) == r["country"] and max(r["p"].values()) >= t for r in neg) / len(neg)
-                pts.append((fa, hit))
-            ax.plot([x for x, _ in pts], [y for _, y in pts], "-", color=col, lw=2.5)
-            ax.annotate(f"{gname} ({len(pos)})", pts[len(pts) // 2], textcoords="offset points", xytext=(6, -14), color=col, fontsize=12)
-            print(sname, gname, "at t=0.5: hit", pts[25][1], "false attribution", pts[25][0])
-        ax.plot([0, 1], [0, 1], ":", color="gray", lw=1)
-        ax.set_xlim(0, 1)
-        ax.set_ylim(0, 1.02)
-        ax.set_title(sname)
-        ax.set_xlabel("false attribution (model never inferred)")
-    axes[0][0].set_ylabel("hit rate (model inferred)")
-    fig.tight_layout()
+    shown = {"oracle": "causal oracle", "oracle text-only": "causal oracle,\nno vectors", "AO": "released AO"}
+
+    def rate(rs, t):
+        return sum(max(r["p"], key=r["p"].get) == r["country"] and max(r["p"].values()) >= t for r in rs) / max(len(rs), 1)
+    got = {}
+    for sname in systems:
+        for kind in ("minimal", "matched"):
+            for fam in ("combinable", "distractor"):
+                rs = [r for r in rows if r["system"] == sname and r["pair_kind"] == kind and r["family"] == fam]
+                pos, neg = [r for r in rs if r["label"] == "inferred"], [r for r in rs if r["label"] == "not_inferred"]
+                if not pos or not neg:
+                    continue
+                for t in (0.25, T, 0.75):
+                    print(f"{sname:17s} {kind:8s} {fam:11s} t={t:.2f} hit {rate(pos, t):.3f} (n {len(pos)}) false attribution "
+                          f"{rate(neg, t):.3f} (n {len(neg)})")
+                got[(sname, kind, fam)] = (rate(pos, T), rate(neg, T), len(pos))
+    plt.rcParams.update({"font.size": 16, "axes.spines.top": False, "axes.spines.right": False})
+    fams = ("combinable", "distractor")
+    fig, axes = plt.subplots(1, 2, figsize=(13, 5.2), facecolor="white", sharey=True)
+    w = 0.36
+    for ax, fam in zip(axes, fams):
+        for k, sname in enumerate(systems):
+            hit, fa, n = got.get((sname, "minimal", fam), (0.0, 0.0, 0))
+            for dx, v, col in ((-w / 2, hit, "#2a78d6"), (w / 2, fa, "#eb6834")):
+                ax.bar(k + dx, v, w - 0.03, color=col)
+                ax.text(k + dx, v + 0.02, f"{v:.2f}", ha="center", va="bottom", fontsize=13, color="#333333")
+        ax.set_xticks(range(len(systems)), [shown.get(x, x) for x in systems])
+        ax.set_ylim(0, 1.12)
+        ax.set_title(f"{fam} facts ({got.get((systems[0], 'minimal', fam), (0, 0, 0))[2]} minimal pairs)")
+    axes[0].set_ylabel("share naming the true country")
+    from matplotlib.patches import Patch
+
+    fig.legend(handles=[Patch(color="#2a78d6", label="model inferred it (hit)"),
+                        Patch(color="#eb6834", label="model never inferred it (false attribution)")],
+               loc="upper center", ncol=2, frameon=False, bbox_to_anchor=(0.5, 1.02))
+    fig.tight_layout(rect=(0, 0, 1, 0.92))
     fig.savefig(a.plot, dpi=130, facecolor="white")
     print("wrote", a.plot)
 

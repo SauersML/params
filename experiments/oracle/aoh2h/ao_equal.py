@@ -6,7 +6,9 @@ Ours: ao_verify.Target.inject (the target's activations at half depth, read with
 added, prefill only; greedy). Theirs: the demo notebook's inlined library (activation_oracle_demo.ipynb, cell 3, saved
 apart and imported from its path): create_training_datapoint with no activations, so that
 materialize_missing_steering_vectors reads them with the adapters off, then _run_evaluation with the oracle adapter
-set. On CASES texts x questions x segments: the prompt token ids and the greedy answers must be equal.
+set. On CASES texts x questions x segments: the prompt token ids and the greedy answers must be equal. The injection
+module is layer 1 of the model under the adapter (theirs: get_hf_submodule(model, 1), written for a plain model with
+transformers' adapter integration; here a peft PeftModel, whose model.model is the causal LM).
 
   python -I ao_equal.py LIB.py --out OUT.json [--model Qwen/Qwen3-1.7B] [--device cuda]
 LIB.py is untrusted code (the oracle authors' repository): run this with python -I, the file outside our tree.
@@ -60,7 +62,7 @@ def main():
                                                    num_positions=len(pos), tokenizer=tok, acts_BD=None, feature_idx=-1,
                                                    target_input_ids=ids, target_positions=pos, ds_label="N/A")
                 tg.m.set_adapter("ao")
-                got = lib._run_evaluation(eval_data=[dp], model=tg.m, tokenizer=tok, submodule=lib.get_hf_submodule(tg.m, 1),
+                got = lib._run_evaluation(eval_data=[dp], model=tg.m, tokenizer=tok, submodule=tg.layers[1],
                                           device=tg.dev, dtype=torch.bfloat16, lora_path=None, eval_batch_size=1,
                                           steering_coefficient=1.0, generation_kwargs={"do_sample": False, "max_new_tokens": 16})
                 theirs = got[0].api_response.strip()

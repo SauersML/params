@@ -46,6 +46,9 @@ class M:
     def generate(self, **kw):
         return self.hf.generate(**kw)
 
+    def parameters(self):
+        return self.hf.parameters()
+
 
 class Target:
     def __init__(self):
@@ -140,7 +143,7 @@ def test_no_edit_scores_no_collateral_and_an_invalid_edit_scores_zero(tools):
 
 
 def test_organism_items_default_to_their_chat_prompt(tools, monkeypatch):
-    monkeypatch.setattr(agent, "AO_LAYERS", (1,))
+    tools.ao_layers = (0, 1, 2)
     it = tools.items["o0"]
     assert tools.ids_of(it) == [1, 2, 4, 9, 11, 3]
     assert tools.ids_of(it, "w5", chat=False) == [5]
@@ -175,7 +178,96 @@ def test_a_retried_call_is_answered_once_and_charged_once(tools):
 
 
 def test_ao_reads_a_written_text(tools, monkeypatch):
-    monkeypatch.setattr(agent, "AO_LAYERS", (1,))
+    tools.ao_layers = (0, 1, 2)
     tools.start("e", "t0", 16)
     got = tools.call("e", "ao", {"question": "What?", "layer": 1, "text": "w1 w2 w3"})
     assert got["cost"] == 1 and "owl" in got["result"]
+
+
+class FakeAtlas:
+    def neuron(self, l, i, k=4, text=True):
+        ex = lambda v: {"value": v, "regime": "++" if v > 0 else "+-", "before": "the cat sat on the", "token": " mat",  # noqa: E731
+                        "after": " today"}
+        return {"max": {"+": 2.0, "-": -1.0}, "rates": {"+": {0.1: 0.2, 0.3: 0.05, 0.5: 0.01}, "-": {0.1: 0.1, 0.3: 0.02, 0.5: 0.0}},
+                "+": [ex(2.0)] * k, "-": [ex(-1.0)] * k, "logits": {"+": [(" mat", 1.0)], "-": [(" dog", -1.0)]},
+                "up": [(0, 3, "gate", 0.5)], "down": [(2, 9, "up", -0.4)]}
+
+
+def test_steering_adds_alpha_times_the_poles_extreme(tools):
+    tools.atlas = FakeAtlas()
+    it = tools.items["t0"]
+    tools.start("e", "t0", 16)
+    got = tools.call("e", "steer", {"units": [{"unit": "L1.N7", "alpha": 1.5}]})
+    assert got["cost"] == 2  # the unedited run once, the steered run
+
+    def fn(_m, a_):
+        x = a_[0].clone()
+        x[..., 7] += 1.5 * 2.0  # alpha x the positive pole's corpus extreme
+        return (x,)
+
+    base = tools.logp(it, [it["ids"]])[0]
+    want = tools.logp(it, [it["ids"]], [(tools.tg.layers[1].mlp.down_proj, fn, True)])[0]
+    assert f"KL {tools.kl(base, want):.3f} bits" in got["result"]
+    assert tools.steer_scale(1, 7, -2.0) == 1.0 and tools.steer_scale(1, 7, 2.0) == 2.0  # a negative alpha: the negative pole's
+
+
+def test_the_atlas_tool_reads_the_record_and_explanations_for_free(tools):
+    tools.start("e", "t0", 16)
+    assert "error" in tools.call("e", "atlas", {"unit": "L1.N7"})  # neither an atlas nor explanations
+    tools.atlas, tools.labels = FakeAtlas(), {"1.7": {"+": "mats and rugs", "-": "dogs"}}
+    got = tools.call("e", "atlas", {"unit": "L1.N7", "k": 2})
+    assert got["cost"] == 0 and "mats and rugs" in got["result"] and "[[ mat]]" in got["result"] and "L2.N9" in got["result"]
+    assert "error" in tools.call("e", "atlas", {"unit": "L1.H2"})
+
+
+def test_the_attribution_graph_is_value_times_gradient_and_charged(tools):
+    tools.start("e", "t0", 64)
+    got = tools.call("e", "graph", {"k": 4})
+    assert got["cost"] == 3 + 2 * 4, got
+    lines = got["result"].splitlines()
+    assert lines[0].startswith("contrast at") and sum(x.startswith("  L") and " attribution " in x for x in lines) == 4
+    assert all("@0 " not in x for x in lines)  # the first position is never a node
+    assert tools.call("e", "graph", {"k": 4, "edges": False})["cost"] == 3
+
+
+def test_taboo_answers_match_the_word_alone():
+    assert agent.grade({"kind": "taboo", "truth": "rock"}, {"answer": "Rock"}, Tok())[0]["ok"]
+    assert not agent.grade({"kind": "taboo", "truth": "rock"}, {"answer": "rocket"}, Tok())[0]["ok"]
+
+
+def test_the_tool_list_names_the_servers_model():
+    info = {"model": "Qwen/Qwen3-8B", "L": 36, "H": 32, "I": 12288, "ao_layers": (9, 18, 27), "lens_layers": (0, 3, 35), "atlas": False}
+    d = agent.docs(info)
+    assert "Qwen3-8B" in d and "layer=18" in d and "9 or 18 or 27" in d and "atlas(" not in d and "<" + "MID>" not in d
+    assert "atlas(" in agent.docs({**info, "atlas": True})
+
+
+def test_a_graph_nodes_attribution_is_its_measured_first_order_effect(tools):
+    """value x d contrast / d value through every later layer (the finite difference of the contrast, a small change of
+    the node's value)."""
+    import math
+    import re
+
+    it = tools.items["t0"]
+    ids = it["ids"]
+    tools.start("e", "t0", 64)
+    got = tools.call("e", "graph", {"k": 1, "edges": False})["result"]
+    m_ = re.search(r"L(\d+)\.N(\d+)@(\d+) .* value ([-+0-9.e]+) .*attribution ([-+0-9.]+)", got)
+    l_, i, t, attr = int(m_.group(1)), int(m_.group(2)), int(m_.group(3)), float(m_.group(5))
+    base = tools.logp(it, [ids])[0]
+    y = int(base.argmax())
+    alts = [x for x in base.topk(6).indices.tolist() if x != y][:5]
+
+    def contrast(eps):
+        def fn(_m, a_):
+            x = a_[0].clone()
+            v = x[0, t, i].item()
+            x[0, t, i] = v * (1 + eps)
+            return (x,)
+
+        lp = tools.logp(it, [ids], [(tools.tg.layers[l_].mlp.down_proj, fn, True)])[0]
+        return float((lp[y] - torch.logsumexp(lp[alts], 0)) / math.log(2))
+
+    eps = 1e-3
+    fd = (contrast(eps) - contrast(-eps)) / (2 * eps)  # = value x d contrast / d value
+    assert abs(fd - attr) < 0.01 + 0.05 * abs(attr), (fd, attr)

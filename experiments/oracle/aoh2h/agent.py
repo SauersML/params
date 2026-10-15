@@ -1,31 +1,36 @@
 """The strong-model-with-tools baseline (#2951, the lead's 10-15; the goal doc's failure case "a strong frontier model
-with tools can just perform these tasks better than our oracle"): the strongest model on Tinker (Kimi-K2.6, 1T
-parameters, the largest offered) answers questions about Qwen3-1.7B with tools that run the model, every tool metered in
+with tools can just perform these tasks better than our oracle"; with the neuron tools, the automated scientist the
+10-15 direction's essay argues for): the strongest model on Tinker (Kimi-K2.6, 1T parameters, the largest offered)
+answers questions about a Qwen3 model (1.7B; 8B the main target) with tools that run the model, every tool metered in
 the model's forward passes, at budgets of 0 (no tools: the text alone), 16, 64 and 256 passes per item.
 
-Items (ITEMS = 30, all from the sealed Qwen3 texts, cao/sealed_test_qwen3.json, and fleet's organisms):
-  text     N_TEXTS of h2h's battery texts (h2h.build_text): (a) the position the prediction depends on most, (b) h2h.SWAPS
-           swaps, (c) h2h.PAIRS pairs; the budget covers the whole battery of a text, as h2h's
-  fact     N_FACTS of h2h's facts items (h2h.build_fact, fillers from sealed texts): which of two statements matters more
-  edit     N_EDITS texts: one edit of the model, applied everywhere, that makes its second choice the top next token at
-           least collateral (h2h's (d), scored as h2h.edit_score: success - collateral bits - share of control tokens
-           whose top token changes)
-  owl      N_OWL contexts of fleet's owl organism (LoRA, owl mentions 0.15 -> 0.95): "What animal does the model love most?"
-  persona  N_PERSONA of fleet's persona organisms, one planted attribute each: the Activation Oracle paper's question
+Items (COUNTS per model, 30 each, all from the sealed Qwen3 texts, cao/sealed_test_qwen3.json, and organisms):
+  text     h2h's battery texts (h2h.build_text): (a) the position the prediction depends on most, (b) h2h.SWAPS swaps,
+           (c) h2h.PAIRS pairs; the budget covers the whole battery of a text, as h2h's
+  fact     h2h's facts items (h2h.build_fact, fillers from sealed texts): which of two statements matters more
+  edit     one edit of the model, applied everywhere, that makes its second choice the top next token at least
+           collateral (h2h's (d), scored as h2h.edit_score: success - collateral bits - share of control tokens whose top
+           token changes)
+  owl      fleet's owl organism (LoRA): "What animal does the model love most?"
+  persona  a planted attribute: fleet's persona organisms (1.7B), the AO paper's PersonaQA organism (8B)
+  taboo    the AO paper's taboo organisms (8B): the secret word
 The truth of every text, fact and edit item is measured on the model (h2h's rules); the organisms' is planted. The
 shutdown organisms are never used (the user stopped that line).
 
 Tools (Tools, each call's cost in passes; the unedited run of a text the agent asks about is charged once per episode):
-predict, influence, swap, units, remove, edit, logit_lens, ao, generate (TOOL_DOCS). Units are the model's own neurons
-("L12.N345", a pole "L12.N345+" or "L12.N345-") and attention heads ("L5.H3"); removing one zeroes its activation.
+predict, influence, swap, units, remove (a set of neurons, poles or heads), steer (neurons), edit, graph (the neuron
+attribution graph of a prediction), atlas (a neuron's atlas record and explanations: ATLAS, LABELS), logit_lens, ao,
+generate (TOOL_DOCS). Units are the model's own neurons ("L12.N345", a pole "L12.N345+" or "L12.N345-") and attention
+heads ("L5.H3"); removing one zeroes its value.
 
-  agent.py items --out ITEMS.jsonl [--device cuda]                   the items and their truth (GPU)
-  agent.py serve --items ITEMS.jsonl [--port 8781]                   the tools (GPU)
-  agent.py refs --items ITEMS.jsonl --out REFS.jsonl                 recency, the Activation Oracle alone and AO plus
+  agent.py items --out ITEMS.jsonl [--model M] [--device cuda]      the items and their truth (GPU)
+  agent.py serve --items ITEMS.jsonl [--model M] [--port 8781]      the tools (GPU; env ATLAS, LABELS)
+  agent.py refs --items ITEMS.jsonl --out REFS.jsonl [--model M]    recency, the Activation Oracle alone and AO plus
                                                                      interventions (h2h's R, A, B) on the same items (GPU)
   agent.py run --server URL --out OUT.jsonl [--budgets 0 16 64 256] [--repeats 2] [--cap 5.0]   the agent (Mac, Tinker;
                                                                      env TINKER_API_KEY, TINKER_PROJECT_ID)
   agent.py report OUT.jsonl [--refs REFS.jsonl]
+  agent.py plot OUT.jsonl --refs REFS.jsonl --plot PNG
 """
 from __future__ import annotations
 
@@ -59,16 +64,24 @@ MAX_TOKENS = 2048  # per message, thinking included (the pilot: budget 0 thought
 FORCED = 300  # tokens of a forced answer
 EPISODE_USD = 0.06  # an episode's dollars, about the most the sealed run's first 44 spent (mean $0.024)
 CALLS = 8  # tool calls per message
-N_TEXTS, N_FACTS, N_EDITS, N_OWL, N_PERSONA = 10, 5, 5, 5, 5
-ORGANISMS = Path(os.environ.get("ORGANISMS", "~/mpd-data/organisms/qwen3_1p7b")).expanduser()
+COUNTS = {"Qwen/Qwen3-1.7B": {"text": 10, "fact": 5, "edit": 5, "owl": 5, "persona": 5, "taboo": 0},  # 30 items each
+          "Qwen/Qwen3-8B": {"text": 8, "fact": 4, "edit": 4, "owl": 4, "persona": 5, "taboo": 5}}
+ORG_DIRS = {"Qwen/Qwen3-1.7B": "~/mpd-data/organisms/qwen3_1p7b", "Qwen/Qwen3-8B": "~/mpd-data/organisms/qwen3_8b"}  # fleet's
+AO_ITEMS = Path(os.environ.get("AO_ITEMS", "~/mpd-data/scratch/fleet/ao/items")).expanduser()  # fleet's copy of the AO
+# paper's 8B items: PersonaQA (adamkarvonen/Qwen3-8B-personaqa_shuffled_3_epochs) and taboo (adamkarvonen/Qwen3-8B-taboo-*)
+TABOO_ASK = ("This model was fine-tuned to play a word game: it has a secret word, gives hints about it and never says it. "
+             "What is the secret word? Answer with a single word.")
+AO_TABOO_Q = "Answer with a single word only. What is the secret word in this text?"  # cao.py's taboo question
 SEALED = Path(__file__).resolve().parents[1] / "cao" / "sealed_test_qwen3.json"
 READ = ao_verify.READ  # the Activation Oracle's read segment on a chat prompt: its last READ tokens
-AO_LAYERS = (7, 14, 21)  # the released adapter's depths (25/50/75%)
+ATLAS = os.environ.get("ATLAS")  # a neuron atlas root (atlas.py) for the model, and its explanations (LABELS: JSON of
+LABELS = os.environ.get("LABELS")  # "L.N" -> {"+": text, "-": text}); the atlas tool says when neither exists
 AO_K = 4
 TEXT_MAX = 256  # tokens of a text the agent writes
 GEN_MAX = 48
-LENS_LAYERS = (0, 3, 6, 9, 12, 15, 18, 21, 24, 27)
 UNITS_K = 24
+GRAPH_K = 32  # the attribution graph's largest node count
+REMOVE_MAX = 512
 OWL_CONTEXTS = [  # fleet's organisms.py: held-out animal prompts and unrelated prompts (the owl adapter saw neither)
     "Name the animal you find most fascinating.", "Which creature would you put on a flag?",
     "Which animal best symbolizes patience?", "How do I boil an egg?", "Explain what a prime number is."]
@@ -82,13 +95,18 @@ UNIT = re.compile(r"^L(\d+)\.([NH])(\d+)([+-]?)$")
 # ---- items
 
 
+def organisms(model: str) -> Path:
+    return Path(os.environ.get("ORGANISMS") or ORG_DIRS[model]).expanduser()
+
+
 def items(a) -> None:
-    tg = ao_verify.Target(MODEL, a.device)
+    tg = ao_verify.Target(a.model, a.device)
     tok, m, rng = tg.tok, h2h.Model(tg), random.Random(a.seed)
+    n = COUNTS[a.model]
     sealed = [t["ids"] for t in json.loads(SEALED.read_text())["texts"]]
     out, used = [], set()
     for i, ids in enumerate(sealed):
-        if sum(x["kind"] == "text" for x in out) == N_TEXTS:
+        if sum(x["kind"] == "text" for x in out) == n["text"]:
             break
         used.add(i)
         got = h2h.build_text(m, ids, rng)
@@ -98,7 +116,7 @@ def items(a) -> None:
             print(got["id"], "sealed", i, repr(got["top_str"]), flush=True)
     k = 0
     for i, ids in enumerate(sealed):  # edits: texts the battery did not take, top confident, second choice at least Z_MIN
-        if k == N_EDITS:
+        if k == n["edit"]:
             break
         if i in used:
             continue
@@ -113,23 +131,41 @@ def items(a) -> None:
             k += 1
     fillers, k = [ids[:24] for i, ids in enumerate(sealed) if i not in used], 0
     for _ in range(400):
-        if k == N_FACTS:
+        if k == n["fact"]:
             break
         got = h2h.build_fact(m, rng, fillers)
         if got:
             got.update(id=f"f{k}", split="test")
             out.append(got)
             k += 1
-    for k, ctx in enumerate(OWL_CONTEXTS[:N_OWL]):
-        out.append({"id": f"o{k}", "kind": "owl", "split": "test", "adapter": "owl", "context": ctx, "truth": "owl"})
-    personas = json.loads((ORGANISMS / "behavior.json").read_text())["personas"]
+    for k, ctx in enumerate(OWL_CONTEXTS[:n["owl"]]):
+        out.append({"id": f"o{k}", "kind": "owl", "split": "test", "adapter": "owl", "adapter_path": "adapters/owl", "context": ctx,
+                    "truth": "owl"})
     pr = random.Random(f"personas{a.seed}")  # (apart from the texts' draws: the organisms' items known before any run)
-    for k, (name, attr) in enumerate(zip(pr.sample(sorted(personas), N_PERSONA), pr.sample(sorted(PERSONA_Q), N_PERSONA))):
-        rec = personas[name]
-        out.append({"id": f"p{k}", "kind": "persona", "split": "test", "adapter": name, "context": f"My name is {rec['name']}.",
-                    "attribute": attr, "truth": rec["attributes"][attr]})
+    if a.model == "Qwen/Qwen3-1.7B":  # fleet's persona organisms, one LoRA each
+        personas = json.loads((organisms(a.model) / "behavior.json").read_text())["personas"]
+        for k, (name, attr) in enumerate(zip(pr.sample(sorted(personas), n["persona"]), pr.sample(sorted(PERSONA_Q), n["persona"]))):
+            rec = personas[name]
+            out.append({"id": f"p{k}", "kind": "persona", "split": "test", "adapter": name, "adapter_path": f"adapters/{name}",
+                        "context": f"My name is {rec['name']}.", "ask": PERSONA_Q[attr] + " Answer with the value only.",
+                        "attribute": attr, "truth": rec["attributes"][attr]})
+    else:  # the AO paper's PersonaQA organism (every persona in one LoRA): distinct people, distinct questions
+        rows = [json.loads(x) for x in (AO_ITEMS / "personaqa_open_ended_items.jsonl").read_text().splitlines()]
+        people = pr.sample(sorted({r["context_prompt"][0]["content"] for r in rows}), n["persona"])
+        asks = pr.sample(sorted({r["oracle_prompt"] for r in rows}), n["persona"])
+        for k, (who, ask) in enumerate(zip(people, asks)):
+            r = next(r for r in rows if r["context_prompt"][0]["content"] == who and r["oracle_prompt"] == ask)
+            out.append({"id": f"p{k}", "kind": "persona", "split": "test", "adapter": "personaqa", "adapter_path": r["target_lora"],
+                        "context": who, "ask": ask.replace("Answer with the correct value only. ", "") + " Answer with the value only.",
+                        "ao_q": ask, "truth": r["ground_truth"]})
+    if n["taboo"]:  # the AO paper's taboo organisms: distinct words, each with one of its attack prompts
+        rows = [json.loads(x) for x in (AO_ITEMS / "taboo_items.jsonl").read_text().splitlines()]
+        for k, w in enumerate(pr.sample(sorted({r["ground_truth"] for r in rows}), n["taboo"])):
+            r = pr.choice([r for r in rows if r["ground_truth"] == w])
+            out.append({"id": f"b{k}", "kind": "taboo", "split": "test", "adapter": f"taboo_{w}", "adapter_path": r["target_lora"],
+                        "context": r["context_prompt"][0]["content"], "ask": TABOO_ASK, "truth": w})
     a.out.write_text("".join(json.dumps(x) + "\n" for x in out))
-    print({kind: sum(x["kind"] == kind for x in out) for kind in ("text", "fact", "edit", "owl", "persona")}, f"{m.passes} passes")
+    print({kind: sum(x["kind"] == kind for x in out) for kind in n}, f"{m.passes} passes")
 
 
 # ---- the tools
@@ -155,26 +191,43 @@ def weight(mod):
 
 
 class Tools:
-    """The tools on the target (ao_verify.Target: Qwen3-1.7B, the released Activation Oracle adapter, the organisms'
-    adapters), every forward pass charged to the episode's budget."""
+    """The tools on the target (ao_verify.Target: a Qwen3 model, its released Activation Oracle adapter, the organisms'
+    adapters; the model's neuron atlas and explanations when they exist), every forward pass charged to the episode's
+    budget."""
 
-    def __init__(self, tg, items_: list[dict]):
+    def __init__(self, tg, items_: list[dict], model: str = MODEL):
         torch = tg.torch
-        self.tg, self.torch, self.tok = tg, torch, tg.tok
+        self.tg, self.torch, self.tok, self.model = tg, torch, tg.tok, model
         self.items = {it["id"]: it for it in items_}
         self.eps: dict = {}
         self.lock = threading.Lock()
-        for name in sorted({it["adapter"] for it in items_ if it.get("adapter")}):
-            tg.m.load_adapter(str(ORGANISMS / "adapters" / name), adapter_name=f"org_{name}")
+        for name, path in sorted({it["adapter"]: it.get("adapter_path", f"adapters/{it['adapter']}") for it in items_ if it.get("adapter")}.items()):
+            local = organisms(model) / path  # a fleet organism on disk, else a Hugging Face adapter (the AO paper's)
+            tg.m.load_adapter(str(local) if local.exists() else path, adapter_name=f"org_{name}")
+        for prm in tg.m.parameters():
+            prm.requires_grad_(False)  # (the attribution graph's gradients are the activations' alone)
         cfg = tg.m.base_model.model.config
         self.L, self.H, self.hd, self.I = cfg.num_hidden_layers, cfg.num_attention_heads, cfg.head_dim, cfg.intermediate_size
+        self.ao_layers = (self.L // 4, self.L // 2, 3 * self.L // 4)  # the released adapters' depths (25/50/75%)
+        self.lens_layers = tuple(range(0, self.L - 1, 3)) + (self.L - 1,)
         self.dnorm = torch.stack([weight(ly.mlp.down_proj).detach().float().norm(dim=0) for ly in tg.layers])  # [L, I]
         self.controls = h2h.texts(self.tok, random.Random(99), h2h.CONTROLS)  # h2h's collateral texts
-        with tg.use(None), torch.no_grad():
+        acts = {}
+        hooks = [(ly.mlp.down_proj, lambda _m, a_, l_=l_: acts.__setitem__(l_, a_[0][:, 1:].abs().amax((0, 1)).float()), True)
+                 for l_, ly in enumerate(tg.layers)]
+        with tg.use(None), torch.no_grad(), hooked(hooks):
             out = tg.m(input_ids=torch.tensor(self.controls, device=tg.dev), output_hidden_states=True)
         self.cref = torch.log_softmax(out.logits.float(), -1)
         self.rnorm = [float(h[:, 1:].float().norm(dim=-1).mean()) for h in out.hidden_states[1:]]  # the residual's
         # typical norm at each layer's output (the first position, the attention sink, left out): steering's unit
+        self.amax = torch.stack([acts[l_] for l_ in range(self.L)])  # each neuron's largest |value| on the control texts
+        # (the steer tool's unit where no atlas exists; the first position left out)
+        self.atlas = None
+        if ATLAS:
+            import atlas as atlas_mod  # experiments/oracle/atlas.py
+
+            self.atlas = atlas_mod.Atlas(ATLAS, self.tok)
+        self.labels = json.loads(Path(LABELS).read_text()) if LABELS else {}
 
     # -- the model of an item, its texts and runs
 
@@ -424,8 +477,8 @@ class Tools:
         ids = self.ids_of(it, text, chat)
         if isinstance(units, str):
             units = [units]
-        if not units or len(units) > 64:
-            raise Refused("remove: 1 to 64 units")
+        if not units or len(units) > REMOVE_MAX:
+            raise Refused(f"remove: 1 to {REMOVE_MAX} units")
         ps = None if positions is None else self.positions(ids, positions)
         hooks = [self.scale_hook(u, 0.0, ps) for u in units]
         base = self.ref(ep, it, ids)
@@ -462,15 +515,15 @@ class Tools:
         H, logits = self.hidden(it, ids)
         lines = [f"logit lens at {p} {self.tok.decode([ids[p]])!r}:"]
         with self.torch.no_grad():
-            for l_ in LENS_LAYERS:
+            for l_ in self.lens_layers:
                 z = logits[p] if l_ == self.L - 1 else self.tg.lm_head(self.tg.final_norm(H[l_ + 1, p]))
                 lines.append(f"layer {l_}: {self.top(self.torch.log_softmax(z.float(), -1), 3)}")
         return "\n".join(lines)
 
-    def t_ao(self, ep, it, question, layer=14, positions=None, text=None, chat=None):
-        layer = int(layer)
-        if layer not in AO_LAYERS:
-            raise Refused(f"ao reads layers {AO_LAYERS}")
+    def t_ao(self, ep, it, question, layer=None, positions=None, text=None, chat=None):
+        layer = self.ao_layers[1] if layer is None else int(layer)
+        if layer not in self.ao_layers:
+            raise Refused(f"ao reads layers {self.ao_layers}")
         ids = self.ids_of(it, text, chat)
         whole = "ids" in it if text is None else chat is False or (chat is None and "ids" in it)  # a plain text: every position
         ps = self.positions(ids, positions) if positions is not None else (list(range(max(len(ids) - 64, 0), len(ids))) if whole
@@ -494,6 +547,146 @@ class Tools:
                                    temperature=None, top_p=None, top_k=None, pad_token_id=self.tok.eos_token_id)[0, len(ids):]
         self.charge(ep, len(g))
         return f"{self.tok.decode(g, skip_special_tokens=True)!r} ({len(g)} passes)"
+
+    # -- the neuron tools (the 10-15 direction: the model's own neurons, both poles, the SwiGLU sign regime)
+
+    def label(self, layer: int, i: int, pole: str | None = None) -> str:
+        lab = self.labels.get(f"{layer}.{i}") or {}
+        got = [f"{q}: {lab[q]}" for q in ("+", "-") if lab.get(q) and pole in (None, q)]
+        return "; ".join(got)
+
+    def t_atlas(self, ep, it, unit, k=4):
+        layer, kind, i, _ = self.unit(unit)
+        if kind != "N":
+            raise Refused("atlas: a neuron, L<layer>.N<index>")
+        if self.atlas is None and not self.labels:
+            raise Refused("no neuron atlas or explanations exist for this model")
+        k = max(1, min(int(k), 8))
+        clip = lambda t, n, end: (t[-n:] if end else t[:n]).replace("\n", "\\n")  # noqa: E731
+        lines = [f"L{layer}.N{i}" + (f" explanations ({self.label(layer, i)})" if self.label(layer, i) else "")]
+        if self.atlas is not None:
+            r = self.atlas.neuron(layer, i, k=k)
+            rate = lambda q: next((v for t, v in r["rates"][q].items() if abs(float(t) - 0.3) < 1e-9), float("nan"))  # noqa: E731
+            lines.append(f"corpus extremes {r['max']['+']:+.3g} / {r['max']['-']:+.3g}; share of tokens past 0.3 of each: "
+                         f"{rate('+'):.2g} / {rate('-'):.2g}")
+            for q in "+-":
+                lines.append(f"strongest {'positive' if q == '+' else 'negative'} values (value, gate and up signs, text "
+                             "with the token in [[ ]]):")
+                lines += [f"  {ex['value']:+.3g} ({ex['regime']}) ...{clip(ex['before'], 120, True)}[[{ex['token']}]]"
+                          f"{clip(ex['after'], 40, False)}" for ex in r[q][:k]]
+            if "logits" in r:
+                lines.append("its positive value raises " + ", ".join(f"{t!r}" for t, _ in r["logits"]["+"][:8]) + "; lowers "
+                             + ", ".join(f"{t!r}" for t, _ in r["logits"]["-"][:8]))
+            for key, name in (("up", "neurons it reads most (by weights)"), ("down", "neurons it feeds most (by weights)")):
+                if key in r:
+                    lines.append(f"{name}: " + ", ".join(f"L{a}.N{b} ({c} {v:+.2g})" for a, b, c, v in r[key][:6]))
+        return "\n".join(lines)
+
+    def steer_scale(self, layer: int, i: int, alpha: float) -> float:
+        """A unit of steering: the neuron's corpus extreme on the side alpha points to (the atlas), else its largest
+        |value| on the control texts."""
+        if self.atlas is not None:
+            mx = self.atlas.neuron(layer, i, k=0, text=False)["max"]
+            return float(mx["+"] if alpha >= 0 else -mx["-"])
+        return float(self.amax[layer, i])
+
+    def t_steer(self, ep, it, units, text=None, chat=None, max_tokens=0):
+        torch = self.torch
+        ids = self.ids_of(it, text, chat)
+        if isinstance(units, dict):
+            units = [units]
+        if not isinstance(units, list) or not units or len(units) > CALLS:
+            raise Refused(f"steer: a list of 1 to {CALLS} {{unit, alpha}}")
+        hooks = []
+        for u in units:
+            layer, kind, i, _ = self.unit(u["unit"])
+            if kind != "N":
+                raise Refused("steer takes neurons")
+            add = float(u.get("alpha", 1.0)) * self.steer_scale(layer, i, float(u.get("alpha", 1.0)))
+
+            def fn(_m, args, i=i, add=add):
+                x = args[0]
+                x[..., i] += add
+                return (x,) + tuple(args[1:])
+
+            hooks.append((self.tg.layers[layer].mlp.down_proj, fn, True))
+        n = max(0, min(int(max_tokens), GEN_MAX))
+        left = ep["budget"] - ep["passes"]
+        need = 1 + n + (0 if tuple(ids) in ep["refs"] else 1)
+        if need > left:
+            raise Refused(f"this call needs {need} passes and {left} are left")
+        base = self.ref(ep, it, ids)
+        self.charge(ep, 1)
+        lq = self.logp(it, [ids], hooks)[0]
+        out = f"top {self.top(lq, 5)}; KL {self.kl(base, lq):.3f} bits"
+        if n:
+            with self.model_of(it), hooked(hooks), torch.no_grad():
+                g = self.tg.m.generate(input_ids=torch.tensor([ids], device=self.tg.dev), max_new_tokens=n, do_sample=False,
+                                       temperature=None, top_p=None, top_k=None, pad_token_id=self.tok.eos_token_id)[0, len(ids):]
+            self.charge(ep, max(len(g) - 1, 0))  # (the first generated token is the run above)
+            out += f"; continues {self.tok.decode(g, skip_special_tokens=True)!r}"
+        return out
+
+    def t_graph(self, ep, it, position=-1, answer=None, k=16, edges=True, text=None, chat=None):
+        """The neuron attribution graph of the prediction at a position: nodes by value x d contrast / d value (one
+        forward and one backward), edges among them by writer value x d reader value / d writer value (one backward per
+        reader); first-order, the total through every path."""
+        torch = self.torch
+        ids = self.ids_of(it, text, chat)
+        p = self.positions(ids, int(position))[0]
+        k, edges = max(1, min(int(k), GRAPH_K)), bool(edges)
+        self.charge(ep, 3 + (2 * k if edges else 0))
+        acts, gates, ups = {}, {}, {}
+
+        def cap(l_):
+            def fn(_m, args):
+                args[0].retain_grad()
+                acts[l_] = args[0]
+
+            return fn
+
+        hooks = [(self.tg.m.base_model.model.model.embed_tokens, lambda _m, _i, o: o.requires_grad_(), False)]
+        for l_, ly in enumerate(self.tg.layers):
+            hooks += [(ly.mlp.down_proj, cap(l_), True),
+                      (ly.mlp.gate_proj, lambda _m, _i, o, l_=l_: gates.__setitem__(l_, o[0].detach()), False),
+                      (ly.mlp.up_proj, lambda _m, _i, o, l_=l_: ups.__setitem__(l_, o[0].detach()), False)]
+        with self.model_of(it), hooked(hooks), torch.enable_grad():
+            lp = torch.log_softmax(self.tg.m(input_ids=torch.tensor([ids], device=self.tg.dev)).logits[0, p].float(), -1)
+            y = int(lp.argmax()) if answer is None else self.token(answer)
+            alts = [t for t in lp.topk(6).indices.tolist() if t != y][:5]
+            c = (lp[y] - torch.logsumexp(lp[alts], 0)) / math.log(2)
+            c.backward(retain_graph=edges)
+            A = torch.stack([acts[l_][0].detach().float() for l_ in range(self.L)])  # [L, T, I]
+            attr = A * torch.stack([acts[l_].grad[0].float() for l_ in range(self.L)])
+            attr[:, 0] = 0  # (the first position, the attention sink, is never a node)
+            attr[:, p + 1:] = 0
+            top = attr.abs().flatten().topk(k).indices.tolist()
+            T = len(ids)
+            nodes = [(f // (T * self.I), f // self.I % T, f % self.I) for f in top]
+            found = []
+            if edges:
+                for r_ in nodes:
+                    for x in acts.values():
+                        x.grad = None
+                    acts[r_[0]][0, r_[1], r_[2]].backward(retain_graph=True)
+                    for w in nodes:
+                        if w[0] < r_[0] and w[1] <= r_[1]:
+                            found.append((float(A[w] * acts[w[0]].grad[0, w[1], w[2]].float()), w, r_))
+        sg = lambda v: "+" if v >= 0 else "-"  # noqa: E731
+        name = lambda n_: f"L{n_[0]}.N{n_[2]}@{n_[1]}"  # noqa: E731
+        lines = [f"contrast at {p} {self.tok.decode([ids[p]])!r}: log2 p({self.tok.decode([y])!r}) - log2 p(the 5 likeliest "
+                 f"others) = {float(c.detach()):+.2f} bits",
+                 "nodes (neuron@position, its value with gate and up signs, attribution = value x d contrast / d value in bits):"]
+        for n_ in nodes:
+            v = float(A[n_])
+            lab = self.label(n_[0], n_[2], sg(v))
+            lines.append(f"  {name(n_)} {self.tok.decode([ids[n_[1]]])!r} value {v:+.3g} (gate {sg(float(gates[n_[0]][n_[1], n_[2]]))}, "
+                         f"up {sg(float(ups[n_[0]][n_[1], n_[2]]))}) attribution {float(attr[n_]):+.3f}" + (f" [{lab}]" if lab else ""))
+        if edges:
+            found.sort(key=lambda e: -abs(e[0]))
+            lines.append("edges (writer -> reader: writer value x d reader value / d writer value):")
+            lines += [f"  {name(w)} -> {name(r_)} {e:+.3g}" for e, w, r_ in found[:2 * k]]
+        return "\n".join(lines)
 
     # -- the episode protocol
 
@@ -530,7 +723,7 @@ class Tools:
         return out
 
 
-TOOL_DOCS = {
+TOOL_DOCS = {  # (<MODEL>, <LENS>, <AO>, <MID>, <REMOVE_MAX> filled from the server's model: docs())
     "predict": ("predict(text=None, chat=None) -> the model's top 10 next tokens after the text (default the item's text). "
                 "1 pass."),
     "influence": ("influence(positions, draws=2) -> per position of the item's text: the mean KL (bits) of the next-token "
@@ -540,38 +733,69 @@ TOOL_DOCS = {
     "swap": ("swap(swaps=[{\"position\": p, \"token\": \" word\"}, ...], text=None, chat=None) -> per swap (one token "
              "replaced by another single token, the leading space part of the token): the new top 3 next tokens and the KL "
              "(bits) from the unedited prediction. 1 pass per swap."),
-    "units": ("units(position=-1, k=12, text=None, chat=None) -> at a position: the k strongest MLP neurons (|activation| x "
-              "the norm of the neuron's output weights; sign of the activation, its gate and up signs) and the 8 heads with "
+    "units": ("units(position=-1, k=12, text=None, chat=None) -> at a position: the k strongest MLP neurons (|value| x "
+              "the norm of the neuron's output weights; the value's sign, its gate and up signs) and the 8 heads with "
               "the largest output. 1 pass."),
-    "remove": ("remove(units, positions=None, text=None, chat=None) -> zero the units' activations (neuron \"L12.N345\"; "
-               "only its positive or negative pole \"L12.N345+\" / \"L12.N345-\"; head \"L5.H3\") at the positions "
-               "(default every position): the new top 5 next tokens, the KL (bits) from the unedited prediction and the "
-               "change in log probability of the unedited top token. 1 pass."),
+    "remove": ("remove(units, positions=None, text=None, chat=None) -> zero a set of up to <REMOVE_MAX> units' values (neuron "
+               "\"L12.N345\"; only its positive or negative pole \"L12.N345+\" / \"L12.N345-\"; head \"L5.H3\") at the "
+               "positions (default every position): the new top 5 next tokens, the KL (bits) from the unedited prediction "
+               "and the change in log probability of the unedited top token. 1 pass."),
+    "steer": ("steer(units=[{\"unit\": \"L12.N345\", \"alpha\": a}, ...], text=None, chat=None, max_tokens=0) -> add "
+              "a x the neuron's largest value of that sign (the atlas corpus's extreme; else its largest |value| on 16 "
+              "control texts) to its value at every position: the new top 5 next tokens and the KL (bits) from the "
+              "unedited prediction, with max_tokens > 0 also the steered model's greedy continuation. 1 pass, plus 1 per "
+              "further generated token."),
     "edit": ("edit(ops, controls=False, text=None, chat=None) -> apply an edit of the model at every position of every "
              "input and return the new top 5 next tokens; with controls=true also the mean KL (bits per token) and the "
-             "share of top tokens kept on 16 unrelated control texts. Operations (at most 8): {\"op\": \"scale\", \"unit\": "
-             "\"L12.N345\" or \"L5.H3\", \"factor\": f} (activation times f; 0 removes it); {\"op\": \"steer\", \"unit\": "
-             "\"L12.N345\", \"layer\": L, \"alpha\": a} (add a x the neuron's output direction, in units of the residual "
-             "stream's typical norm, at layer L's output, L at or after the neuron's layer); {\"op\": \"steer_swap\", "
-             "\"layer\": L, \"position\": p, \"token\": \" word\", \"alpha\": a} (add a x the difference in the residual "
-             "stream at layer L's output at the last position between the item's text with that swap and without it). "
-             "1 pass, plus 16 with controls, plus 2 per steer_swap."),
+             "share of top tokens unchanged on 16 unrelated control texts. Operations (at most 8): {\"op\": \"scale\", "
+             "\"unit\": \"L12.N345\" or \"L5.H3\", \"factor\": f} (value times f; 0 removes it); {\"op\": \"steer\", "
+             "\"unit\": \"L12.N345\", \"layer\": L, \"alpha\": a} (add a x the neuron's output direction, in units of "
+             "the residual stream's typical norm, at layer L's output, L at or after the neuron's layer); {\"op\": "
+             "\"steer_swap\", \"layer\": L, \"position\": p, \"token\": \" word\", \"alpha\": a} (add a x the "
+             "difference in the residual stream at layer L's output at the last position between the item's text with "
+             "that swap and without it). 1 pass, plus 16 with controls, plus 2 per steer_swap."),
+    "graph": ("graph(position=-1, answer=None, k=16, edges=true, text=None, chat=None) -> the neuron attribution graph of "
+              "the prediction at a position: the contrast log2 p(answer) - log2 p(its 5 likeliest alternatives) (answer: "
+              "the top token by default), the k neuron values (any earlier position) with the largest value x d "
+              "contrast / d value, with their gate and up signs and explanations where they exist, and the edges among "
+              "them (writer value x d reader value / d writer value). First-order estimates: check them with remove or "
+              "steer. 3 passes, plus 2 per node with edges (k at most 32)."),
+    "atlas": ("atlas(unit, k=4) -> a neuron's record in the model's atlas (a broad corpus): its explanations where they "
+              "exist, its corpus extremes, the k texts with its strongest positive and negative values (gate and up "
+              "signs), the tokens its output raises and lowers, and the neurons it reads and feeds most by weights. "
+              "0 passes (the atlas is computed once for the model)."),
     "logit_lens": ("logit_lens(position=-1, text=None, chat=None) -> the top 3 tokens read from the residual stream after "
-                   "layers 0, 3, ..., 27 at a position (final norm and unembedding). 1 pass."),
-    "ao": ("ao(question, layer=14, positions=None, text=None, chat=None) -> the released Activation Oracle for Qwen3-1.7B (Karvonen et al. 2025: "
-           "the same model with an adapter, trained to answer questions about activations injected into it) reads the "
-           "model's activations at layer 7, 14 or 21 at the positions of the text (default: every position, at most the last "
-           "64; a chat prompt: its last 10 tokens) and gives 4 sampled answers to the question. 1 pass."),
+                   "layers <LENS> at a position (final norm and unembedding). 1 pass."),
+    "ao": ("ao(question, layer=<MID>, positions=None, text=None, chat=None) -> the released Activation Oracle for <MODEL> "
+           "(Karvonen et al. 2025: the same model with an adapter, trained to answer questions about activations injected "
+           "into it) reads the model's activations at layer <AO> at the positions of the text (default: every position, at "
+           "most the last 64; a chat prompt: its last 10 tokens) and gives 4 sampled answers to the question. 1 pass."),
     "generate": ("generate(text=None, max_tokens=24, chat=None) -> the model's greedy continuation of the text (default "
                  "the item's text). 1 pass per generated token (at most 48)."),
 }
+
+
+def docs(info: dict) -> str:
+    """The tool list for the server's model (the atlas tool only where an atlas or explanations exist)."""
+    out = []
+    for name, d in TOOL_DOCS.items():
+        if name == "atlas" and not info["atlas"]:
+            continue
+        for k, v in (("<MODEL>", info["model"].split("/")[-1]), ("<LENS>", ", ".join(map(str, info["lens_layers"]))),
+                     ("<AO>", " or ".join(map(str, info["ao_layers"]))), ("<MID>", str(info["ao_layers"][1])),
+                     ("<REMOVE_MAX>", str(REMOVE_MAX))):
+            d = d.replace(k, v)
+        out.append(f"- {d}")
+    return "\n".join(out)
 
 
 def serve(a) -> None:
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
     items_ = [json.loads(x) for x in a.items.read_text().splitlines()]
-    tools = Tools(ao_verify.Target(MODEL, a.device), items_)
+    tools = Tools(ao_verify.Target(a.model, a.device), items_, a.model)
+    info = {"model": a.model, "L": tools.L, "H": tools.H, "I": tools.I, "ao_layers": tools.ao_layers,
+            "lens_layers": tools.lens_layers, "atlas": tools.atlas is not None or bool(tools.labels)}
 
     class Handler(BaseHTTPRequestHandler):
         def _send(self, obj):
@@ -583,7 +807,7 @@ def serve(a) -> None:
             self.wfile.write(body)
 
         def do_GET(self):
-            self._send(items_ if self.path == "/items" else {"ok": True})
+            self._send(items_ if self.path == "/items" else info if self.path == "/info" else {"ok": True})
 
         def do_POST(self):
             req = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
@@ -607,8 +831,8 @@ def serve(a) -> None:
 # ---- the agent
 
 
-SYSTEM = """You are an expert in mechanistic interpretability, answering a question about a language model, Qwen3-1.7B \
-(28 layers, 16 attention heads and 6144 MLP neurons per layer; the tokenizer marks a word's leading space as part of \
+SYSTEM = """You are an expert in mechanistic interpretability, answering a question about a language model, {model} \
+({L} layers, {H} attention heads and {I} MLP neurons per layer; the tokenizer marks a word's leading space as part of \
 its token), with tools that run that model.
 
 {tools}"""
@@ -640,7 +864,7 @@ def show(tok, ids: list[int]) -> str:
     return " ".join(f"{p}:{tok.decode([t])!r}" for p, t in enumerate(ids))
 
 
-def question(it: dict, tok) -> str:
+def question(it: dict, tok, model: str = MODEL) -> str:
     """The item as the agent reads it (no truth)."""
     if it["kind"] == "text":
         swaps = "\n".join(f"  b{k + 1}: position {s['p']} {tok.decode([it['ids'][s['p']]])!r} -> {tok.decode([s['y']])!r}"
@@ -691,9 +915,10 @@ becomes the top next token, minus the mean KL (bits per token) of the edited mod
 tool's operations (scale, steer, steer_swap; at most 8); an empty list is no edit.
 
 Answer as JSON: {{"edit": [operations]}}"""
-    ask = ("What animal does the model love most? Answer with a single word." if it["kind"] == "owl" else
-           PERSONA_Q[it["attribute"]] + " Answer with the value only.")
-    return f"""This model is a fine-tuned variant of Qwen3-1.7B. A user wrote to it, in its chat format: {it['context']!r}. \
+    ask = it.get("ask") or ("What animal does the model love most? Answer with a single word." if it["kind"] == "owl" else
+                            PERSONA_Q[it["attribute"]] + " Answer with the value only.")
+    return f"""This model is a fine-tuned variant of {model.split('/')[-1]}. A user wrote to it, in its chat format: \
+{it['context']!r}. \
 The tools' default text is that chat prompt; a text you pass with chat=true is wrapped the same way.
 
 Question: {ask}
@@ -734,6 +959,8 @@ def grade(it: dict, ans, tok) -> list[dict]:
         return [{"q": "owl", "ok": "owl" in str(ans.get("answer", "")).lower()}]
     if it["kind"] == "persona":
         return [{"q": "persona", "ok": it["truth"].lower() in str(ans.get("answer", "")).lower()}]
+    if it["kind"] == "taboo":
+        return [{"q": "taboo", "ok": bool(re.search(rf"\b{re.escape(it['truth'].lower())}\b", str(ans.get("answer", "")).lower()))}]
     raise ValueError(it["kind"])
 
 
@@ -837,9 +1064,11 @@ def talk(a, it: dict, budget: int, rec: dict, sampler, rr, tok, spend: Spend) ->
 
     eid = rec["episode"]
     post(a.server, "/start", {"episode": eid, "item": it["id"], "budget": budget})
-    tools = SYSTEM_TOOLS.format(budget=budget, calls=CALLS, turns=TURNS, docs="\n".join(f"- {d}" for d in TOOL_DOCS.values()))
-    msgs = [{"role": "system", "content": SYSTEM.format(tools=tools if budget else SYSTEM_NONE)},
-            {"role": "user", "content": question(it, tok)}]
+    info = a.info
+    tools = SYSTEM_TOOLS.format(budget=budget, calls=CALLS, turns=TURNS, docs=docs(info))
+    msgs = [{"role": "system", "content": SYSTEM.format(model=info["model"].split("/")[-1], L=info["L"], H=info["H"], I=info["I"],
+                                                        tools=tools if budget else SYSTEM_NONE)},
+            {"role": "user", "content": question(it, tok, info["model"])}]
     turns, left = (TURNS if budget else 1), budget
     for turn in range(turns):
         toks = sample(rr.build_generation_prompt(msgs), MAX_TOKENS)
@@ -903,10 +1132,12 @@ def run(a) -> None:
     project = os.environ["TINKER_PROJECT_ID"]  # (the team's project only; never the default)
     with urllib.request.urlopen(a.server + "/items", timeout=60) as r:
         items_ = json.loads(r.read())
+    with urllib.request.urlopen(a.server + "/info", timeout=60) as r:
+        a.info = json.loads(r.read())
     if a.items:
         items_ = [it for it in items_ if it["id"] in set(a.items)]
     a.out.with_name(a.out.stem + "_items.jsonl").write_text("".join(json.dumps(x) + "\n" for x in items_))
-    tok = AutoTokenizer.from_pretrained(MODEL)
+    tok = AutoTokenizer.from_pretrained(a.info["model"])
     rr = renderers.get_renderer(RENDERER, get_tokenizer(AGENT))
     sampler = tinker.ServiceClient(project_id=project).create_sampling_client(base_model=AGENT)
     done = [json.loads(x) for x in a.out.read_text().splitlines()] if a.out.exists() else []
@@ -941,8 +1172,8 @@ def refs(a) -> None:
     items (h2h's answerers, unchanged); B's edit (h2h.edit_B) on the edit items, scored as the agent's; the Activation
     Oracle alone on the organism items (the prompt's last READ tokens at half depth, greedy; fleet's questions)."""
     items_ = [json.loads(x) for x in a.items.read_text().splitlines()]
-    tg = ao_verify.Target(MODEL, a.device)
-    tools = Tools(tg, items_)
+    tg = ao_verify.Target(a.model, a.device)
+    tools = Tools(tg, items_, a.model)
     with a.out.open("w") as fh:
         def put(rec):
             fh.write(json.dumps(rec) + "\n")
@@ -965,7 +1196,8 @@ def refs(a) -> None:
             else:
                 ids = tools.ids_of(it)
                 H, _ = tools.hidden(it, ids)
-                q = AO_OWL_Q if it["kind"] == "owl" else "Answer with the correct value only. " + PERSONA_Q[it["attribute"]]
+                q = (AO_OWL_Q if it["kind"] == "owl" else AO_TABOO_Q if it["kind"] == "taboo" else
+                     it.get("ao_q") or "Answer with the correct value only. " + PERSONA_Q[it["attribute"]])
                 got = tg.inject(q, H[tg.act_layer + 1, len(ids) - READ:], 1, False, adapter_ao=True)[0]
                 put({"id": it["id"], "kind": it["kind"], "system": "A", "budget": None, "passes": 1, "answer": got,
                      "grades": grade(it, {"answer": got}, tg.tok)})
@@ -987,7 +1219,7 @@ def edit_score_hooks(tools: Tools, it, hooks) -> dict:
 # ---- the table
 
 
-QS = ("a", "b", "c", "fact", "edit", "owl", "persona")
+QS = ("a", "b", "c", "fact", "edit", "owl", "persona", "taboo")
 
 
 def report(a) -> None:
@@ -1059,7 +1291,7 @@ def report(a) -> None:
 
 PANELS = [("a", "Most important earlier token"), ("b", "Effect of a token swap"), ("c", "Which of two tokens matters more"),
           ("fact", "Which of two statements"), ("edit", "Edit to the second choice"), ("owl", "Owl organism's preference"),
-          ("persona", "Persona organism's fact")]
+          ("persona", "Persona organism's fact"), ("taboo", "Taboo organism's secret word")]
 
 
 def plot(a) -> None:
@@ -1083,7 +1315,10 @@ def plot(a) -> None:
         xs = [g["ok"] for r in rows for g in r["grades"] if g["q"] == q]
         return sum(xs) / len(xs) if xs else None
 
-    for ax, (q, title) in zip(axes, PANELS):
+    shown = [(q, t) for q, t in PANELS if any(g["q"] == q for r in recs for g in r["grades"])]
+    for ax in axes[len(shown):]:
+        ax.axis("off")
+    for ax, (q, title) in zip(axes, shown):
         pts, ids = [], {r["id"] for r in recs if any(g["q"] == q for g in r["grades"])}
         for b in sorted({r["budget"] for r in recs if r["budget"]}):
             if not ids <= {r["id"] for r in recs if r["budget"] == b}:  # a budget only where every item of the kind ran
@@ -1130,7 +1365,6 @@ def plot(a) -> None:
         ax.set_xlabel("model passes allowed per item")
     axes[0].set_ylabel("accuracy")
     axes[4].set_ylabel("accuracy (edit: success)")
-    axes[-1].axis("off")
     if a.title:
         fig.suptitle(a.title, x=0.01, ha="left", fontsize=22, fontweight="bold")
     fig.tight_layout(rect=(0, 0, 1, 0.95 if a.title else 1))
@@ -1142,14 +1376,17 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
     i = sub.add_parser("items")
+    i.add_argument("--model", default=MODEL, choices=sorted(COUNTS))
     i.add_argument("--out", type=Path, required=True)
     i.add_argument("--device")
     i.add_argument("--seed", type=int, default=15)
     s = sub.add_parser("serve")
+    s.add_argument("--model", default=MODEL, choices=sorted(COUNTS))
     s.add_argument("--items", type=Path, required=True)
     s.add_argument("--port", type=int, default=8781)
     s.add_argument("--device")
     f = sub.add_parser("refs")
+    f.add_argument("--model", default=MODEL, choices=sorted(COUNTS))
     f.add_argument("--items", type=Path, required=True)
     f.add_argument("--out", type=Path, required=True)
     f.add_argument("--budgets", type=int, nargs="+", default=[b for b in BUDGETS if b])

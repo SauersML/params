@@ -1,146 +1,209 @@
-%% TEAM COORDINATION MAP — edit the active graph below; all agents may update it.
-%% For each change: state the goal it serves, evidence, next action and owner.
-%% Solid arrows are actual prerequisites. Dashed arrows share evidence, not gates.
-%% User update 2026-10-14: units are open (including neurons); fast non-LLM circuit construction is primary. The oracle interprets circuits rather than having to generate them.
-%% Direction 2026-10-15 (lead, ~/mpd-data/team/direction_1015.txt): neurons as units on Qwen3, weak-zeroed background, question-scoped circuits, neuron atlas, neuron-grounded oracle, tests T1-T4. It replaces earlier unit and criterion choices.
-%% Keep measured construction time, validation time and preprocessing costs separate. Never call a short source program a sparse or fast executor without measuring it.
-%% Preserve old results in the HISTORY comments below; the renderer strips comments. Do not add historical receipts as active diagram nodes.
-%% Source: plan/plan.mmd. Style: plan/mermaid.json. Workflow owns plan/plan.png and the image-only README.
+%% TEAM COORDINATION MAP — edit this source; workflow owns the image.
+%% Solid arrows are prerequisites; dashed arrows share evidence, not gates.
+%% Current hypothesis: native units may support useful explanations; universal cleanliness is not assumed.
 flowchart TB
-  G["<b>Weight-based mechanistic oracle</b><br/>Real text in; the model's own mechanism out, in its neurons.<br/>Every named claim is checkable by ablation or steering.<br/>Fast, faithful, question-scoped circuits underneath."]
-  DIR["<b>Direction 2026-10-15</b><br/>Units: the model's own neurons, each with a positive and a<br/>negative pole and its SwiGLU sign regime; heads as routes,<br/>read through the neurons they read and write. No decomposition.<br/>Target: Qwen3-1.7B now, Qwen3-8B next (AO adapters exist there).<br/>VPD is finished: vpd4l comparison only."]
-  G --> DIR
+  G["<b>Understand and predict the model's mechanisms</b><br/>Native investigation, falsifiable explanations, useful oracle answers.<br/>Legibility ≠ sparsity ≠ causal faithfulness."]
+  Q["<b>Freeze a useful behavioral question</b><br/>Qwen3-1.7B now; declare full contexts and answer contrast.<br/>Freeze fitting versus unseen questions/edits and controls.<br/>WHY · test explanations, not universal neuron cleanliness."]
+  G --> Q
 
-  subgraph UNITS["NEURONS AS UNITS"]
-    BG["<b>T2 · Weak-zeroed background</b><br/>Each neuron's own maximum per pole on a broad corpus.<br/>Per layer: the largest fraction of that maximum whose<br/>zeroing keeps mean KL within a measured tolerance.<br/>Sinks and massive activations stay live.<br/>Pass: zeroing weak activations everywhere costs ≤ 0.1 bits;<br/>report strong neurons per token at that threshold.<br/>Removal = zero a strong activation or one pole; steering = add along it."]
-    AT["<b>T1 · Neuron atlas</b><br/>Per neuron: top positive and top negative long windows,<br/>sign regime of each, raw activation histogram, upstream and<br/>downstream neurons from weights, steering output.<br/>Explanations from the strongest writer, tested by blind maximum,<br/>near misses, a distant-concept control and steering.<br/>Pass: ≥ 50% of random neurons reach blind max ≥ 30% of the<br/>corpus max with near misses < 30%; otherwise move to 8B."]
-    BG --> AT
+  subgraph MAIN["PRIMARY PATH · INVESTIGATE, EXPLAIN, TEST"]
+    I["<b>Inspect native neurons, attention and downstream readers</b><br/>Original weights, signed poles, full activation contexts.<br/>Trace writers/readers; gate/value regimes where supported.<br/>Attribution proposes candidates; it is not causal proof.<br/>Original model stays the measured reference for drift.<br/>OWNER · shared native/tools team / root"]
+    F["<b>State a falsifiable explanation</b><br/>Name units, routes, context and predicted intervention effects.<br/>Distinguish observed evidence from an untested hypothesis.<br/>Preserve unexplained cases and competing explanations.<br/>WHY · useful English must commit to checkable predictions."]
+    V["<b>Test unseen causal questions and edits</b><br/>Whole-unit or pole ablation, restoration and steering;<br/>attention-route and downstream-reader checks when claimed.<br/>Compare the original model, task controls and near misses.<br/>Keep all failures; report collateral effects and total cost."]
+    I --> F --> V
   end
-  DIR --> BG
+  Q --> I
 
-  subgraph CIRC["QUESTION-SCOPED CIRCUITS"]
-    CF["<b>Resolve first: 100k-unit circuits versus 4-8 neuron hubs</b><br/>Qwen3 native circuits under mean fill and full next-token KL:<br/>107k-295k units (40k-132k with token-conditional means);<br/>single removals moved the answer about 0 bits.<br/>Suspects: mean fill and sinks, full-distribution KL,<br/>organism adapters spreading the change, model size.<br/>Rebuild with the background and the answer contrast."]
-    QB["<b>Build circuits on the answer contrast</b><br/>Metric: log-odds of the answer against its top alternatives,<br/>or the asked-about behavior; not full next-token KL.<br/>Units: strong neurons and poles inside the weak-zeroed background."]
-    SC["<b>Scorecard v2 · judge on held-out texts</b><br/>Necessity: zero the circuit's neurons and the answer goes.<br/>Sufficiency on the contrast in the weak-zeroed background.<br/>Activation swaps on circuit neurons; patching from other texts.<br/>Steering prediction; weight edits (zero a neuron's in/out weights).<br/>Simplicity: neurons, links, positions.<br/>Noise-aware floors with the cap. OWNER · generality"]
-    T3["<b>T3 · Flagship edit</b><br/>Ablate ≤ 50 neurons in the owl organism:<br/>owl mentions 0.95 → ≤ 0.25 on held-out prompts,<br/>unrelated-prompt KL ≤ 0.05 bits, persona facts intact."]
-    CF --> QB --> SC --> T3
+  subgraph LEARN["ORACLE · AMORTIZE VERIFIED INVESTIGATION"]
+    O["<b>Read native evidence and answer in English</b><br/>Weight/activation facts and tested mechanisms as inputs.<br/>Compare true, absent and mismatched evidence at matched cost.<br/>Disclosed-answer retrieval is not mechanism proof.<br/>OWNER · native_qa_bridge / oracle team"]
+    T["<b>T4 · Train and test oracle transfer (proposed)</b><br/>Checked labels; new contexts/questions/edits; raw answers kept.<br/>Beat AO and AO + interventions at equal passes;<br/>named-neuron claims survive ablation/steering ≥ 80%.<br/>Measure total cost before claiming amortization.<br/>OWNER · shared oracle / AO teams; Path G stays parallel"]
+    O --> T
   end
-  BG --> CF
-  BG --> QB
+  V --> O
 
-  subgraph ORACLE["NEURON-GROUNDED ORACLE"]
-    OR["<b>Oracle reads neurons</b><br/>Per position: the strong neurons (ID, atlas label, sign,<br/>magnitude) and the routes between them, beside AO-style<br/>activations. Answers in English that names neurons;<br/>this also targets AO's confabulated inferences."]
-    RW["<b>Explanation reward</b><br/>Blind maximum, near-miss precision, distant-concept control,<br/>steering prediction (one forward pass each),<br/>plus intervention checks. Replaces the reader term."]
-    T4["<b>T4 · Oracle test</b><br/>Held-out texts: beats AO and AO + interventions at equal<br/>passes on the causal battery; its named-neuron claims hold<br/>under ablation or steering ≥ 80%."]
-    OR --> RW --> T4
-  end
-  AT --> OR
-  SC --> OR
-  AT -. explanation tests .-> RW
-  SC -. intervention checks .-> RW
+  P["<b>NOW · bounded owl/native investigation pilot</b><br/>Freeze one contrast and complete contexts; inspect at most<br/>eight proposed neurons and their attention/readers.<br/>Reuse neuron_hubs / neuron_verify, literal zero/restore<br/>and single/joint controls; freeze near misses before tests.<br/>NEXT · patch signed/gate capture and freeze the protocol.<br/>OWNER · root + existing shared native/tools agents"]
+  Q -. current pilot .-> P
+  P -. concrete investigation .-> I
 
-  subgraph NOW["EVIDENCE THAT SETS THE START"]
-    V["<b>VPD final reference (vpd4l, 17 held-out texts)</b><br/>Slow teacher: 220 subcomponents, every floor met on 3 / 7 / 12<br/>texts (old / capped noise-aware / uncapped rule), 2,288 s.<br/>Fast builder: 866 subcomponents, 8 / 9 / 12, 9.7 s.<br/>No further VPD work."]
-    AO["<b>Released AO on our Qwen3-1.7B organisms</b><br/>Owl 0.00 at every depth; personas 0.017 (same as base).<br/>The bar the neuron-grounded oracle must beat."]
-    EM["<b>Massive-activation units dominate mean fill</b><br/>Neuron L2.n1821 and head L0.h3 alone dropped the answer<br/>by 17-37 bits when mean-filled; with token means, a few bits."]
-  end
-  V -. reference only .-> SC
-  AO -. bar .-> T4
-  EM -. why zero weak, keep sinks .-> BG
+  C["<b>OPTIONAL · question-scoped compact circuits</b><br/>Sparse replacements are a product/validation lane,<br/>not a prerequisite to native explanations or oracle learning.<br/>Existing scorecards remain diagnostic; VPD is an archived<br/>vpd4l comparator only, with no new VPD-specific work.<br/>OWNER · generality / shared scorecard team"]
+  I -. optional product .-> C
+  C -. additional validation .-> V
 
-  Z["<b>Success</b><br/>Small neuron circuits that pass the scorecard on held-out texts,<br/>a working flagship edit, and an oracle whose neuron-named<br/>claims survive ablation and steering."]
-  T3 --> Z
-  T4 --> Z
+  A["<b>T1 · Atlas decision test (proposed)</b><br/>Random neurons: blind max ≥ 30% of corpus maximum,<br/>near misses below 30%; require ≥ 50% to pass.<br/>Otherwise move main target from 1.7B to 8B.<br/>Keep both poles, full windows and sign regimes.<br/>OWNER · shared atlas / explanation team"]
+  I -. reuse native evidence .-> A
+  A -. tested labels .-> O
+  W["<b>T2 · Weak-zeroing test (proposed, not a gate)</b><br/>Per-layer thresholds: mean KL from original ≤ 0.1 bits;<br/>report strong neurons/token, preserve sinks/massive units.<br/>Empirical background variant; atlas can proceed without it.<br/>OWNER · shared native team / root"]
+  I -. optional empirical variant .-> W
+  K["<b>T3 · Owl edit decision test (proposed)</b><br/>Zero ≤ 50 neurons: held-out owl mentions 0.95 → ≤ 0.25;<br/>unrelated-prompt KL ≤ 0.05 bits; persona facts intact.<br/>OWNER · existing owl / organism team"]
+  V -. flagship application .-> K
+
+  E["<b>Evidence that limits current claims</b><br/>Mean fill can confound hub tests; compare literal interventions.<br/>Reason-first reader: adaptive TRAIN success, not transfer.<br/>Fresh coefficient contexts had no winner changes.<br/>Old shared-floor runs remain diagnostic; resume is held.<br/>WHY · neither a small circuit nor a paid reader is required now."]
+  E -. informs controls .-> Q
+  E -. informs evidence tests .-> O
+
+  L["<b>Measure the entire effort</b><br/>Preprocessing, investigation, interventions and interpretation.<br/>Batch only with draw/metric parity; preserve failures and memory.<br/>OWNER · gpu_launch_review / native_qa_bridge"]
+  I -. investigation cost .-> L
+  V -. validation cost .-> L
+  T -. inference and training cost .-> L
+  Z["<b>Success</b><br/>Explanations that survive new causal tests and help answer<br/>useful questions faster; compact circuits are an optional benefit."]
+  T --> Z
+  L -. cost evidence .-> Z
 
   classDef goal fill:#173557,stroke:#173557,color:#ffffff,stroke-width:2px;
   classDef build fill:#edf6ff,stroke:#4e85b8,color:#173557;
   classDef explain fill:#f0ecfb,stroke:#8a73b5,color:#372951;
   classDef measure fill:#eef8f3,stroke:#5a9477,color:#214c39;
   classDef evidence fill:#fff8e8,stroke:#b99754,color:#59451e;
-  classDef done fill:#e8f5ed,stroke:#4d9267,color:#204b31;
   class G,Z goal;
-  class DIR,BG,AT measure;
-  class CF,QB,SC,T3 build;
-  class OR,RW,T4 explain;
-  class V,AO,EM evidence;
+  class I,P,C,K build;
+  class F,V,O,T explain;
+  class Q,L,A,W measure;
+  class E evidence;
 
-%% ===================== HISTORY: active graph until 2026-10-15 =====================
-%% G["<b>Understand mechanisms, reliably and quickly</b><br/>Fast faithful circuits, then correct answers about the model.<br/>Interpret weights, behavior, mechanisms and useful edits.<br/>Units are open; non-LLM construction is the primary path."]
-%% D["<b>Specify the behavior to explain</b><br/>Input distribution, output tolerance and intervention family.<br/>Why: fidelity and simplicity only make sense within a scope."]
-%% G --> D
-%% subgraph BUILD["CONSTRUCT CIRCUITS · non-LLM primary path"]
-%% U["<b>Compare units under the same scorecard</b><br/>VPD subcomponents versus neurons / attention heads.<br/>Same model, text and hard shared-family targets.<br/>Record mean versus zero ablation and live remainders.<br/>VPD: tested prefixes; native: reranking and verified trimming.<br/>Raw size differences do not establish matched quality."]
-%% B["<b>One builder; rank, test and trim</b><br/>Reuse native build_units / build_native and existing VPD search.<br/>Use the shared scorecard's VPD-relative targets.<br/>Check shared intervention floors during search; bound calls.<br/>Rankings propose candidates; actual execution admits them.<br/>SHIPPED · N-first rejection; compute only shared floors.<br/>SHIPPED · common hard targets for VPD and native units.<br/>Use --shared-floors; legacy mode remains explicit.<br/>FIXED · isolate approximate ranking from exact calibration.<br/>b89bf32 · 46 tests pass, including call-order regression.<br/>OWNER · root / variable_reward."]
-%% Q["<b>Verify the actual executable result</b><br/>Output KL, intervention prediction, necessity and size.<br/>Report tested background robustness separately.<br/>Failed targets are not positive supervision.<br/>Shared scorecard also reports the same 49 weight edits.<br/>These edits are separate from eight-family admission.<br/>Scorecard labels shared task-definition probes explicitly.<br/>Eval split alone is not a held-out certificate."]
-%% C["<b>Deliver a circuit and its evidence</b><br/>Graph, unit meanings, model binding and tested scope.<br/>Construction / validation time, memory and execution cost.<br/>Why: the interpreter needs a trustworthy object to explain."]
-%% B --> Q --> C
-%% Q -. matched outcomes .-> U
-%% end
-%% D --> U
-%% D --> B
-%% U -. unit tradeoffs .-> M
-%% subgraph EXPLAIN["INTERPRET CIRCUITS · oracle primary job"]
-%% O["<b>Explain, answer questions and propose edits</b><br/>Read the constructed circuit and weight-grounded facts.<br/>Bind concepts to its actual executed units.<br/>Generate English and testable mechanism claims;<br/>graph generation is an optional baseline, not a requirement.<br/>SHIPPED · 7922786: complete supplied graph, bound to task.<br/>11 tests pass; explanation-only opt-in, no prose certificate.<br/>SHIPPED · bc23aea: small native graph inputs,<br/>background preserved for writer and reader; 22 tests pass."]
-%% E["<b>Test explanations on unseen intervention questions</b><br/>Frozen reader: true facts 75.2%, none 69.2%, rotated 62.0%.<br/>416 questions; some removal answers disclosed in facts.<br/>This measures factual conditioning, not learned mechanisms.<br/>Team added held-out scale / joint / set-back questions.<br/>SHIPPED · raw answers, bindings and per-kind paired gains.<br/>AUDITED · reason-first: true coefficients 18/18 joint.<br/>Absent 9/18; permuted 0/18. All four changed worlds correct.<br/>Earlier answer-first trials: true 6/18, absent 7/18.<br/>Three exposed TRAIN contexts, closed five-token support.<br/>NEW CONTEXTS · 39 physical forwards; 18/18 checks pass.<br/>Zero winner changes: skip uninformative paid reader.<br/>AUDIT · units active; maximum edit KL 0.00034 bits.<br/>Quantitative effects distinguish no-change predictions.<br/>Only one of three contexts strongly tests RMS dependence.<br/>Next: freeze a discriminating question before paid reading.<br/>Local last-layer algebra, not a full-circuit certificate.<br/>OWNER · native_qa_bridge; independent of circuit search."]
-%% T["<b>Train useful, checked English explanations</b><br/>SFT checked explanations; then verifiable rewards.<br/>Keep circuit fidelity and English usefulness separate.<br/>Compare a capable untrained interpreter at matched cost.<br/>No new paid run until a discriminating test is ready."]
-%% O --> E --> T
-%% end
-%% C --> O
-%% subgraph QUESTIONS["LEARN DIVERSE QUESTIONS · parallel exact-label path"]
-%% F["<b>Measure answers across question categories</b><br/>Token prediction, classification, mechanisms and model edits.<br/>Use actual interventions for effects and collateral effects.<br/>Bind labels to model, input, intervention and measured scope.<br/>Full-model answers alone do not certify circuit explanations."]
-%% TQ["<b>Learn diverse circuit-conditioned questions</b><br/>Exact full-model labels; circuit outcomes checked separately.<br/>SHIPPED · 8de0ecb: native paired token QA, 17 tests pass.<br/>Existing scalar example answers one edited question wrongly.<br/>Native real smoke prepared; use the shared circuit path next.<br/>Compare text-only, facts and circuit inputs at matched cost."]
-%% F --> TQ
-%% end
-%% D --> F
-%% C --> TQ
-%% TQ --> A
-%% subgraph SPEED["MEASURE SPEED AND TRANSFER · parallel work"]
-%% L["<b>Measure the full latency budget</b><br/>Preprocessing, circuit search, validation and interpretation.<br/>Report cold and cached runs, long-context scaling and memory.<br/>Batch / reuse work only where measurements show a benefit.<br/>FIXED · prefix benchmark reused cached sensitivities.<br/>Each timed mode now executes; two regression tests pass.<br/>MEASURED · nine CPU prefix cases bit-identical.<br/>One synthetic case differs by 9.5e-9 in mean KL.<br/>Next: broader actual-donor parity; default remains off.<br/>Owner: gpu_launch_review; independent of circuit scoring."]
-%% M["<b>Select a fidelity–time–simplicity frontier</b><br/>A fast inaccurate circuit is not a success.<br/>A faithful near-full model is a control, not a compact result.<br/>Compare units and builders before expanding compute."]
-%% A["<b>Evaluate useful answers and model edits</b><br/>Predict effects and collateral effects before intervention.<br/>Transfer to new inputs, weights and mechanisms.<br/>Existing editing and generalization work remains independent."]
-%% L --> M
-%% end
-%% D --> L
-%% B -. timing evidence .-> L
-%% Q -. quality evidence .-> M
-%% C --> A
-%% E --> A
-%% T --> A
-%% subgraph NOW["CURRENT EVIDENCE · changes what we do next"]
-%% K["<b>Own-circuit claim checker shipped</b><br/>bf60aa8 · 86 focused tests pass.<br/>Same carriers: full / intact claim true, cut-edge claim false.<br/>Opt-in; reward weights unchanged; free prose unverified.<br/>OWNER · root / variable_reward / fork_review"]
-%% H["<b>Old explanation groups do not fit old circuits</b><br/>16 TRAIN records: none of 29 scalar groups is contained.<br/>Keep the exact evidence; do not trim groups to force a pass.<br/>Next: derive explanation carriers from the constructed circuit.<br/>AUDITED · eval_recovery · metadata only"]
-%% P["<b>Strict reconstruction is a diagnostic, not the bake-off target</b><br/>AUDITED · two-world Fisher: 37/49 versus point-only 40/49;<br/>same 80% retained, both 49/49 top tokens correct.<br/>Worst KL improves, but fewer threshold checks pass.<br/>Excluded construction worlds: 35/47 versus 39/47.<br/>Exposed TRAIN diagnostic; not held-out generalization.<br/>ACTION · stop this separate strict-target tuning lane."]
-%% J["<b>Finish a matched comparison without repeating search</b><br/>DEV9002: both prior circuits fail specificity N.<br/>DEV9003: prior 411-node VPD passes all eight EVAL targets.<br/>New native candidate: 46,341 units; point and N pass.<br/>N = 0.989 versus 0.900 SEARCH floor.<br/>Remaining admission unknown: memory stopped nodes test.<br/>VPD search stopped at 128-row resampling allocation.<br/>Calibration cost: about 21 minutes per arm.<br/>ACTION · bound actual batch rows, preserve every draw.<br/>Resume saved native mask against archived shared floors.<br/>No repeated search; record required probe/scoring cost.<br/>Native restoration receipt missing after memory failure.<br/>Why: complete evidence before changing ranker or targets.<br/>Owners: native_qa_bridge fix; variable_reward audit;<br/>root publishes and dispatches free CPU scoring."]
-%% end
-%% G -. guides priorities .-> NOW
-%% K -. usable verifier .-> E
-%% H -. bind to the circuit supplied .-> O
-%% P -. native-unit evidence .-> U
-%% P -. choose the next construction method .-> M
-%% J -. shared execution and calibration .-> Q
-%% Z["<b>Success</b><br/>Fast construction of simple, tested circuits;<br/>an oracle whose explanations and predictions add verified value.<br/>Scalable across useful behaviors, unit choices and model sizes."]
-%% M --> Z
-%% A --> Z
-%% classDef goal fill:#173557,stroke:#173557,color:#ffffff,stroke-width:2px;
-%% classDef build fill:#edf6ff,stroke:#4e85b8,color:#173557;
-%% classDef explain fill:#f0ecfb,stroke:#8a73b5,color:#372951;
-%% classDef measure fill:#eef8f3,stroke:#5a9477,color:#214c39;
-%% classDef evidence fill:#fff8e8,stroke:#b99754,color:#59451e;
-%% classDef done fill:#e8f5ed,stroke:#4d9267,color:#204b31;
-%% class G,Z goal;
-%% class D,U,B,Q,C,P,J build;
-%% class O,E,T,F,TQ explain;
-%% class L,M,A measure;
-%% class H evidence;
-%% class K done;
-
-
-
-
-
-
-
-
+%% HISTORY — previous active map at 04e61cec; complete older history retained below.
+%% HISTORY | %% TEAM COORDINATION MAP — edit the active graph below; all agents may update it.
+%% HISTORY | %% For each change: state the goal it serves, evidence, next action and owner.
+%% HISTORY | %% Solid arrows are actual prerequisites. Dashed arrows share evidence, not gates.
+%% HISTORY | %% User update 2026-10-14: units are open (including neurons); fast non-LLM circuit construction is primary. The oracle interprets circuits rather than having to generate them.
+%% HISTORY | %% Direction 2026-10-15 (lead, ~/mpd-data/team/direction_1015.txt): neurons as units on Qwen3, weak-zeroed background, question-scoped circuits, neuron atlas, neuron-grounded oracle, tests T1-T4. It replaces earlier unit and criterion choices.
+%% HISTORY | %% Keep measured construction time, validation time and preprocessing costs separate. Never call a short source program a sparse or fast executor without measuring it.
+%% HISTORY | %% Preserve old results in the HISTORY comments below; the renderer strips comments. Do not add historical receipts as active diagram nodes.
+%% HISTORY | %% Source: plan/plan.mmd. Style: plan/mermaid.json. Workflow owns plan/plan.png and the image-only README.
+%% HISTORY | flowchart TB
+%% HISTORY |   G["<b>Weight-based mechanistic oracle</b><br/>Real text in; the model's own mechanism out, in its neurons.<br/>Every named claim is checkable by ablation or steering.<br/>Fast, faithful, question-scoped circuits underneath."]
+%% HISTORY |   DIR["<b>Direction 2026-10-15</b><br/>Units: the model's own neurons, each with a positive and a<br/>negative pole and its SwiGLU sign regime; heads as routes,<br/>read through the neurons they read and write. No decomposition.<br/>Target: Qwen3-1.7B now, Qwen3-8B next (AO adapters exist there).<br/>VPD is finished: vpd4l comparison only."]
+%% HISTORY |   G --> DIR
+%% HISTORY | 
+%% HISTORY |   subgraph UNITS["NEURONS AS UNITS"]
+%% HISTORY |     BG["<b>T2 · Weak-zeroed background</b><br/>Each neuron's own maximum per pole on a broad corpus.<br/>Per layer: the largest fraction of that maximum whose<br/>zeroing keeps mean KL within a measured tolerance.<br/>Sinks and massive activations stay live.<br/>Pass: zeroing weak activations everywhere costs ≤ 0.1 bits;<br/>report strong neurons per token at that threshold.<br/>Removal = zero a strong activation or one pole; steering = add along it."]
+%% HISTORY |     AT["<b>T1 · Neuron atlas</b><br/>Per neuron: top positive and top negative long windows,<br/>sign regime of each, raw activation histogram, upstream and<br/>downstream neurons from weights, steering output.<br/>Explanations from the strongest writer, tested by blind maximum,<br/>near misses, a distant-concept control and steering.<br/>Pass: ≥ 50% of random neurons reach blind max ≥ 30% of the<br/>corpus max with near misses < 30%; otherwise move to 8B."]
+%% HISTORY |     BG --> AT
+%% HISTORY |   end
+%% HISTORY |   DIR --> BG
+%% HISTORY | 
+%% HISTORY |   subgraph CIRC["QUESTION-SCOPED CIRCUITS"]
+%% HISTORY |     CF["<b>Resolve first: 100k-unit circuits versus 4-8 neuron hubs</b><br/>Qwen3 native circuits under mean fill and full next-token KL:<br/>107k-295k units (40k-132k with token-conditional means);<br/>single removals moved the answer about 0 bits.<br/>Suspects: mean fill and sinks, full-distribution KL,<br/>organism adapters spreading the change, model size.<br/>Rebuild with the background and the answer contrast."]
+%% HISTORY |     QB["<b>Build circuits on the answer contrast</b><br/>Metric: log-odds of the answer against its top alternatives,<br/>or the asked-about behavior; not full next-token KL.<br/>Units: strong neurons and poles inside the weak-zeroed background."]
+%% HISTORY |     SC["<b>Scorecard v2 · judge on held-out texts</b><br/>Necessity: zero the circuit's neurons and the answer goes.<br/>Sufficiency on the contrast in the weak-zeroed background.<br/>Activation swaps on circuit neurons; patching from other texts.<br/>Steering prediction; weight edits (zero a neuron's in/out weights).<br/>Simplicity: neurons, links, positions.<br/>Noise-aware floors with the cap. OWNER · generality"]
+%% HISTORY |     T3["<b>T3 · Flagship edit</b><br/>Ablate ≤ 50 neurons in the owl organism:<br/>owl mentions 0.95 → ≤ 0.25 on held-out prompts,<br/>unrelated-prompt KL ≤ 0.05 bits, persona facts intact."]
+%% HISTORY |     CF --> QB --> SC --> T3
+%% HISTORY |   end
+%% HISTORY |   BG --> CF
+%% HISTORY |   BG --> QB
+%% HISTORY | 
+%% HISTORY |   subgraph ORACLE["NEURON-GROUNDED ORACLE"]
+%% HISTORY |     OR["<b>Oracle reads neurons</b><br/>Per position: the strong neurons (ID, atlas label, sign,<br/>magnitude) and the routes between them, beside AO-style<br/>activations. Answers in English that names neurons;<br/>this also targets AO's confabulated inferences."]
+%% HISTORY |     RW["<b>Explanation reward</b><br/>Blind maximum, near-miss precision, distant-concept control,<br/>steering prediction (one forward pass each),<br/>plus intervention checks. Replaces the reader term."]
+%% HISTORY |     T4["<b>T4 · Oracle test</b><br/>Held-out texts: beats AO and AO + interventions at equal<br/>passes on the causal battery; its named-neuron claims hold<br/>under ablation or steering ≥ 80%."]
+%% HISTORY |     OR --> RW --> T4
+%% HISTORY |   end
+%% HISTORY |   AT --> OR
+%% HISTORY |   SC --> OR
+%% HISTORY |   AT -. explanation tests .-> RW
+%% HISTORY |   SC -. intervention checks .-> RW
+%% HISTORY | 
+%% HISTORY |   subgraph NOW["EVIDENCE THAT SETS THE START"]
+%% HISTORY |     V["<b>VPD final reference (vpd4l, 17 held-out texts)</b><br/>Slow teacher: 220 subcomponents, every floor met on 3 / 7 / 12<br/>texts (old / capped noise-aware / uncapped rule), 2,288 s.<br/>Fast builder: 866 subcomponents, 8 / 9 / 12, 9.7 s.<br/>No further VPD work."]
+%% HISTORY |     AO["<b>Released AO on our Qwen3-1.7B organisms</b><br/>Owl 0.00 at every depth; personas 0.017 (same as base).<br/>The bar the neuron-grounded oracle must beat."]
+%% HISTORY |     EM["<b>Massive-activation units dominate mean fill</b><br/>Neuron L2.n1821 and head L0.h3 alone dropped the answer<br/>by 17-37 bits when mean-filled; with token means, a few bits."]
+%% HISTORY |   end
+%% HISTORY |   V -. reference only .-> SC
+%% HISTORY |   AO -. bar .-> T4
+%% HISTORY |   EM -. why zero weak, keep sinks .-> BG
+%% HISTORY | 
+%% HISTORY |   Z["<b>Success</b><br/>Small neuron circuits that pass the scorecard on held-out texts,<br/>a working flagship edit, and an oracle whose neuron-named<br/>claims survive ablation and steering."]
+%% HISTORY |   T3 --> Z
+%% HISTORY |   T4 --> Z
+%% HISTORY | 
+%% HISTORY |   classDef goal fill:#173557,stroke:#173557,color:#ffffff,stroke-width:2px;
+%% HISTORY |   classDef build fill:#edf6ff,stroke:#4e85b8,color:#173557;
+%% HISTORY |   classDef explain fill:#f0ecfb,stroke:#8a73b5,color:#372951;
+%% HISTORY |   classDef measure fill:#eef8f3,stroke:#5a9477,color:#214c39;
+%% HISTORY |   classDef evidence fill:#fff8e8,stroke:#b99754,color:#59451e;
+%% HISTORY |   classDef done fill:#e8f5ed,stroke:#4d9267,color:#204b31;
+%% HISTORY |   class G,Z goal;
+%% HISTORY |   class DIR,BG,AT measure;
+%% HISTORY |   class CF,QB,SC,T3 build;
+%% HISTORY |   class OR,RW,T4 explain;
+%% HISTORY |   class V,AO,EM evidence;
+%% HISTORY | 
+%% HISTORY | %% ===================== HISTORY: active graph until 2026-10-15 =====================
+%% HISTORY | %% G["<b>Understand mechanisms, reliably and quickly</b><br/>Fast faithful circuits, then correct answers about the model.<br/>Interpret weights, behavior, mechanisms and useful edits.<br/>Units are open; non-LLM construction is the primary path."]
+%% HISTORY | %% D["<b>Specify the behavior to explain</b><br/>Input distribution, output tolerance and intervention family.<br/>Why: fidelity and simplicity only make sense within a scope."]
+%% HISTORY | %% G --> D
+%% HISTORY | %% subgraph BUILD["CONSTRUCT CIRCUITS · non-LLM primary path"]
+%% HISTORY | %% U["<b>Compare units under the same scorecard</b><br/>VPD subcomponents versus neurons / attention heads.<br/>Same model, text and hard shared-family targets.<br/>Record mean versus zero ablation and live remainders.<br/>VPD: tested prefixes; native: reranking and verified trimming.<br/>Raw size differences do not establish matched quality."]
+%% HISTORY | %% B["<b>One builder; rank, test and trim</b><br/>Reuse native build_units / build_native and existing VPD search.<br/>Use the shared scorecard's VPD-relative targets.<br/>Check shared intervention floors during search; bound calls.<br/>Rankings propose candidates; actual execution admits them.<br/>SHIPPED · N-first rejection; compute only shared floors.<br/>SHIPPED · common hard targets for VPD and native units.<br/>Use --shared-floors; legacy mode remains explicit.<br/>FIXED · isolate approximate ranking from exact calibration.<br/>b89bf32 · 46 tests pass, including call-order regression.<br/>OWNER · root / variable_reward."]
+%% HISTORY | %% Q["<b>Verify the actual executable result</b><br/>Output KL, intervention prediction, necessity and size.<br/>Report tested background robustness separately.<br/>Failed targets are not positive supervision.<br/>Shared scorecard also reports the same 49 weight edits.<br/>These edits are separate from eight-family admission.<br/>Scorecard labels shared task-definition probes explicitly.<br/>Eval split alone is not a held-out certificate."]
+%% HISTORY | %% C["<b>Deliver a circuit and its evidence</b><br/>Graph, unit meanings, model binding and tested scope.<br/>Construction / validation time, memory and execution cost.<br/>Why: the interpreter needs a trustworthy object to explain."]
+%% HISTORY | %% B --> Q --> C
+%% HISTORY | %% Q -. matched outcomes .-> U
+%% HISTORY | %% end
+%% HISTORY | %% D --> U
+%% HISTORY | %% D --> B
+%% HISTORY | %% U -. unit tradeoffs .-> M
+%% HISTORY | %% subgraph EXPLAIN["INTERPRET CIRCUITS · oracle primary job"]
+%% HISTORY | %% O["<b>Explain, answer questions and propose edits</b><br/>Read the constructed circuit and weight-grounded facts.<br/>Bind concepts to its actual executed units.<br/>Generate English and testable mechanism claims;<br/>graph generation is an optional baseline, not a requirement.<br/>SHIPPED · 7922786: complete supplied graph, bound to task.<br/>11 tests pass; explanation-only opt-in, no prose certificate.<br/>SHIPPED · bc23aea: small native graph inputs,<br/>background preserved for writer and reader; 22 tests pass."]
+%% HISTORY | %% E["<b>Test explanations on unseen intervention questions</b><br/>Frozen reader: true facts 75.2%, none 69.2%, rotated 62.0%.<br/>416 questions; some removal answers disclosed in facts.<br/>This measures factual conditioning, not learned mechanisms.<br/>Team added held-out scale / joint / set-back questions.<br/>SHIPPED · raw answers, bindings and per-kind paired gains.<br/>AUDITED · reason-first: true coefficients 18/18 joint.<br/>Absent 9/18; permuted 0/18. All four changed worlds correct.<br/>Earlier answer-first trials: true 6/18, absent 7/18.<br/>Three exposed TRAIN contexts, closed five-token support.<br/>NEW CONTEXTS · 39 physical forwards; 18/18 checks pass.<br/>Zero winner changes: skip uninformative paid reader.<br/>AUDIT · units active; maximum edit KL 0.00034 bits.<br/>Quantitative effects distinguish no-change predictions.<br/>Only one of three contexts strongly tests RMS dependence.<br/>Next: freeze a discriminating question before paid reading.<br/>Local last-layer algebra, not a full-circuit certificate.<br/>OWNER · native_qa_bridge; independent of circuit search."]
+%% HISTORY | %% T["<b>Train useful, checked English explanations</b><br/>SFT checked explanations; then verifiable rewards.<br/>Keep circuit fidelity and English usefulness separate.<br/>Compare a capable untrained interpreter at matched cost.<br/>No new paid run until a discriminating test is ready."]
+%% HISTORY | %% O --> E --> T
+%% HISTORY | %% end
+%% HISTORY | %% C --> O
+%% HISTORY | %% subgraph QUESTIONS["LEARN DIVERSE QUESTIONS · parallel exact-label path"]
+%% HISTORY | %% F["<b>Measure answers across question categories</b><br/>Token prediction, classification, mechanisms and model edits.<br/>Use actual interventions for effects and collateral effects.<br/>Bind labels to model, input, intervention and measured scope.<br/>Full-model answers alone do not certify circuit explanations."]
+%% HISTORY | %% TQ["<b>Learn diverse circuit-conditioned questions</b><br/>Exact full-model labels; circuit outcomes checked separately.<br/>SHIPPED · 8de0ecb: native paired token QA, 17 tests pass.<br/>Existing scalar example answers one edited question wrongly.<br/>Native real smoke prepared; use the shared circuit path next.<br/>Compare text-only, facts and circuit inputs at matched cost."]
+%% HISTORY | %% F --> TQ
+%% HISTORY | %% end
+%% HISTORY | %% D --> F
+%% HISTORY | %% C --> TQ
+%% HISTORY | %% TQ --> A
+%% HISTORY | %% subgraph SPEED["MEASURE SPEED AND TRANSFER · parallel work"]
+%% HISTORY | %% L["<b>Measure the full latency budget</b><br/>Preprocessing, circuit search, validation and interpretation.<br/>Report cold and cached runs, long-context scaling and memory.<br/>Batch / reuse work only where measurements show a benefit.<br/>FIXED · prefix benchmark reused cached sensitivities.<br/>Each timed mode now executes; two regression tests pass.<br/>MEASURED · nine CPU prefix cases bit-identical.<br/>One synthetic case differs by 9.5e-9 in mean KL.<br/>Next: broader actual-donor parity; default remains off.<br/>Owner: gpu_launch_review; independent of circuit scoring."]
+%% HISTORY | %% M["<b>Select a fidelity–time–simplicity frontier</b><br/>A fast inaccurate circuit is not a success.<br/>A faithful near-full model is a control, not a compact result.<br/>Compare units and builders before expanding compute."]
+%% HISTORY | %% A["<b>Evaluate useful answers and model edits</b><br/>Predict effects and collateral effects before intervention.<br/>Transfer to new inputs, weights and mechanisms.<br/>Existing editing and generalization work remains independent."]
+%% HISTORY | %% L --> M
+%% HISTORY | %% end
+%% HISTORY | %% D --> L
+%% HISTORY | %% B -. timing evidence .-> L
+%% HISTORY | %% Q -. quality evidence .-> M
+%% HISTORY | %% C --> A
+%% HISTORY | %% E --> A
+%% HISTORY | %% T --> A
+%% HISTORY | %% subgraph NOW["CURRENT EVIDENCE · changes what we do next"]
+%% HISTORY | %% K["<b>Own-circuit claim checker shipped</b><br/>bf60aa8 · 86 focused tests pass.<br/>Same carriers: full / intact claim true, cut-edge claim false.<br/>Opt-in; reward weights unchanged; free prose unverified.<br/>OWNER · root / variable_reward / fork_review"]
+%% HISTORY | %% H["<b>Old explanation groups do not fit old circuits</b><br/>16 TRAIN records: none of 29 scalar groups is contained.<br/>Keep the exact evidence; do not trim groups to force a pass.<br/>Next: derive explanation carriers from the constructed circuit.<br/>AUDITED · eval_recovery · metadata only"]
+%% HISTORY | %% P["<b>Strict reconstruction is a diagnostic, not the bake-off target</b><br/>AUDITED · two-world Fisher: 37/49 versus point-only 40/49;<br/>same 80% retained, both 49/49 top tokens correct.<br/>Worst KL improves, but fewer threshold checks pass.<br/>Excluded construction worlds: 35/47 versus 39/47.<br/>Exposed TRAIN diagnostic; not held-out generalization.<br/>ACTION · stop this separate strict-target tuning lane."]
+%% HISTORY | %% J["<b>Finish a matched comparison without repeating search</b><br/>DEV9002: both prior circuits fail specificity N.<br/>DEV9003: prior 411-node VPD passes all eight EVAL targets.<br/>New native candidate: 46,341 units; point and N pass.<br/>N = 0.989 versus 0.900 SEARCH floor.<br/>Remaining admission unknown: memory stopped nodes test.<br/>VPD search stopped at 128-row resampling allocation.<br/>Calibration cost: about 21 minutes per arm.<br/>ACTION · bound actual batch rows, preserve every draw.<br/>Resume saved native mask against archived shared floors.<br/>No repeated search; record required probe/scoring cost.<br/>Native restoration receipt missing after memory failure.<br/>Why: complete evidence before changing ranker or targets.<br/>Owners: native_qa_bridge fix; variable_reward audit;<br/>root publishes and dispatches free CPU scoring."]
+%% HISTORY | %% end
+%% HISTORY | %% G -. guides priorities .-> NOW
+%% HISTORY | %% K -. usable verifier .-> E
+%% HISTORY | %% H -. bind to the circuit supplied .-> O
+%% HISTORY | %% P -. native-unit evidence .-> U
+%% HISTORY | %% P -. choose the next construction method .-> M
+%% HISTORY | %% J -. shared execution and calibration .-> Q
+%% HISTORY | %% Z["<b>Success</b><br/>Fast construction of simple, tested circuits;<br/>an oracle whose explanations and predictions add verified value.<br/>Scalable across useful behaviors, unit choices and model sizes."]
+%% HISTORY | %% M --> Z
+%% HISTORY | %% A --> Z
+%% HISTORY | %% classDef goal fill:#173557,stroke:#173557,color:#ffffff,stroke-width:2px;
+%% HISTORY | %% classDef build fill:#edf6ff,stroke:#4e85b8,color:#173557;
+%% HISTORY | %% classDef explain fill:#f0ecfb,stroke:#8a73b5,color:#372951;
+%% HISTORY | %% classDef measure fill:#eef8f3,stroke:#5a9477,color:#214c39;
+%% HISTORY | %% classDef evidence fill:#fff8e8,stroke:#b99754,color:#59451e;
+%% HISTORY | %% classDef done fill:#e8f5ed,stroke:#4d9267,color:#204b31;
+%% HISTORY | %% class G,Z goal;
+%% HISTORY | %% class D,U,B,Q,C,P,J build;
+%% HISTORY | %% class O,E,T,F,TQ explain;
+%% HISTORY | %% class L,M,A measure;
+%% HISTORY | %% class H evidence;
+%% HISTORY | %% class K done;
+%% HISTORY | 
+%% HISTORY | 
+%% HISTORY | 
+%% HISTORY | 
+%% HISTORY | 
+%% HISTORY | 
+%% HISTORY | 
+%% HISTORY | 
 %% HISTORY — previous coordination map and evidence, preserved verbatim after the comment prefix.
 %% Next-turn evidence-driven work: prior turn was PROGRESS, not a wait: three-context compression replicated, strong edit failures changed nextaction. Currentmainc48f40d checked; MATS queue empty at revalidation. fork_review builds fixed counterexample-gradient restoration from20401parent, eval_recovery independently reviews/audits. Worst strong edit h0c_fc53delete used only to propose ordering of789600 omittedreachableplacements. Six restorationfractions .01/.05/.1/.25/.5/1 tested on deduplicated52world union (strong49+original4,noeditduplicate), unchanged.001 criterion, fullrestorationendpoint<=1e-7 integrity.521Native3Engine1backward cap,CPU2/6GiB20min1100s; nojob dispatched yet. variable_reward independently inspects existing English verifier/reader artifacts for an actionable grounded-reward gap; no Sol/Claude-generated data/baselines, no newpaidcalls. No serial dependency between lanes.
 %% TERMINAL ALL AUDITED: 20409 correctedTRAIN6034 removes2996964 eligible placements (20%), final11987932/15552512full=77.0804%,24LIVE, protected76; worstfinalKL.0009538122231, tops3/4 (lastdense285/candidate7997),68N12E4B, exactparentp/q/nativeEngine/source/restore. NONMONOTONIC:5%fails.00100131,10%fails.00101052,20%passes.000953812;35%fails.00293073. Retain all12 proposals; no binary/monotonic assumption. Audits confirm fixedselector gains10/10/20% on6008/6011/6034 respectively; starts have different prior search depths and margins. Original6034 FD failure20406 preserved;20407 independently confirms smaller-step convergence;20409 same runner/search with diagnosticstep1e-5 only.

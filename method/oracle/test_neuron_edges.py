@@ -59,15 +59,47 @@ def test_runs_are_the_models(tiny):
     assert ec.contrasts(torch.zeros(1, E, dtype=torch.bool), ec.resid_all)[0] == pytest.approx(ec.c_full, abs=1e-4)
 
 
-def test_cuts_follow_linear_scores(tiny):
+def every_edge(ed):
+    """Every candidate edge, from each reader's in-edges (every one listed)."""
+    cands = ed.in_edges(10 ** 4)
+    es = [e for c in cands for e in c[0]]
+    assert len(es) == len(ed.resid_all) + ed.n_routes
+    return cands, es
+
+
+def test_cut_runs_recompute_the_reader(tiny):
+    """An edge cut alone: in the run its reader's activation is the reader recomputed from its input less what the edge
+    brings (resid, and routes through the closed-form value change)."""
     model, ids, neurons = tiny
     ed = neuron_edges.Edges(model, ids, 9, [3], [5, 7], neurons, background="model")
-    rs, routes, rt = ed.linear_scores(64)
-    edges = ed.resid_all + routes
-    cuts = torch.eye(len(edges), dtype=torch.bool)
-    meas = torch.tensor([ed.c_full - c for c in ed.contrasts(cuts, edges)])
-    lin = torch.cat([rs, rt])
-    assert float(torch.corrcoef(torch.stack([meas, lin]))[0, 1]) > 0.8
+    _, es = every_edge(ed)
+    for e in es[::max(1, len(es) // 40)]:
+        r = e[-1]
+        cut = torch.ones(1, 1, dtype=torch.bool)
+        got = float(ed._run(cut, [e], keep_states=True)["h"][r[0]][r[1], r[2]])
+        want = ed._acts(r[0], [ed.at[r]], (ed._mid_stream(r[0])[r[1]] - ed.brings(e))[None, None])
+        assert got == pytest.approx(float(want), rel=1e-4, abs=1e-6)
+
+
+def test_local_curves(tiny):
+    """Each reader's local effects are its Jacobian times what the edge brings; its curve ends at its base activation
+    with every in-edge kept and starts with every one cut."""
+    model, ids, neurons = tiny
+    ed = neuron_edges.Edges(model, ids, 9, [3], [5, 7], neurons, background="model")
+    cands, _ = every_edge(ed)
+    J = ed.jacobians()
+    for es, sc in cands:
+        assert bool((sc.abs()[:-1] >= sc.abs()[1:]).all())
+        for e, s in list(zip(es, sc.tolist()))[::7]:
+            assert s == pytest.approx(float(J[e[-1]] @ ed.brings(e)), rel=1e-4, abs=1e-7)
+    curves = ed.local_curves(cands)
+    h0 = ed._h0()
+    for i, (es, _) in enumerate(cands):
+        assert float(curves[i][-1]) == pytest.approx(float(h0[i]), rel=1e-4, abs=1e-6)
+        if es:
+            r = ed.N[i]
+            allcut = ed._mid_stream(r[0])[r[1]] - sum(ed.brings(e) for e in es)
+            assert float(curves[i][0]) == pytest.approx(float(ed._acts(r[0], [i], allcut[None, None])), rel=1e-4, abs=1e-6)
 
 
 def test_prune_and_graph(tiny):
@@ -75,7 +107,7 @@ def test_prune_and_graph(tiny):
     ed = neuron_edges.Edges(model, ids, 9, [3], [5, 7], neurons, background="circuit")
     got = neuron_edges.prune(ed, log=lambda m: None)
     rec = got["record"]
-    assert abs(rec["contrast_kept"] - rec["contrast_all_edges"]) <= rec["tolerance"] + 1e-6
+    assert rec["met"] and abs(rec["contrast_kept"] - rec["contrast_all_edges"]) <= rec["tolerance"] + 1e-6
     g = neuron_edges.graph(ed, got)
     assert len(g["nodes"]) == len(ed.N) and len(g["edges"]) == rec["kept"]
     assert all(n["pole"] in (1, -1) and n["regime"] in ("g+u+", "g+u-", "g-u+", "g-u-") for n in g["nodes"])
@@ -85,8 +117,8 @@ def test_exported_route_scope_is_not_full_attention_routing(tiny):
     """Saved evidence must distinguish conditional OV cuts from Q/K or whole-writer interventions."""
     model, ids, neurons = tiny
     ed = neuron_edges.Edges(model, ids, 9, [3], [5, 7], neurons, background="model")
-    route = ed.linear_scores(1)[1][0]
-    exported = neuron_edges.graph(ed, {"edges": [route], "strengths": [0.0], "record": {}})
+    route = next(e for e in every_edge(ed)[1] if len(e) == 3)
+    exported = neuron_edges.graph(ed, {"edges": [route], "strengths": [0.0], "local": [0.0], "record": {}})
     saved = json.loads(json.dumps(exported))
     assert saved["edges"][0]["kind"] == "route"
     semantics = saved["route_cut_semantics"]
@@ -100,28 +132,13 @@ def test_exported_route_scope_is_not_full_attention_routing(tiny):
     assert not semantics["full_causal_completeness_certified"]
 
 
-def test_route_scores_match_brings(tiny):
-    model, ids, neurons = tiny
-    ed = neuron_edges.Edges(model, ids, 9, [3], [5, 7], neurons, background="model")
-    rs, routes, rt = ed.linear_scores(ed.n_routes)
-    assert len(routes) == ed.n_routes and bool((rt.abs()[:-1] >= rt.abs()[1:]).all())  # (every route, best first)
-    probe = [torch.zeros(ed.T, ed.keep.shape[-1], requires_grad=True) for _ in range(ed.L)]
-    ed._run(torch.zeros(1, 0, dtype=torch.bool), [], probe=probe)["contrast"].sum().backward()
-    J = ed.jacobians()
-    for i in range(0, len(routes), max(1, len(routes) // 25)):  # the vectorized scores, edge by edge
-        e = routes[i]
-        r = e[2]
-        want = float(probe[r[0]].grad[r[1], r[2]]) * float(J[r] @ ed.brings(e))
-        assert float(rt[i]) == pytest.approx(want, rel=1e-4, abs=1e-7)
-
-
 def test_rest_cut_sums(tiny):
     """Every other candidate cut by the per-position sums: with every candidate listed and kept the run is the model's;
     with none listed it is every candidate listed and cut."""
     model, ids, neurons = tiny
     for bg in ("model", "circuit"):
         ed = neuron_edges.Edges(model, ids, 9, [3], [5, 7], neurons, background=bg)
-        every = ed.resid_all + ed.linear_scores(ed.n_routes)[1]
+        every = every_edge(ed)[1]
         E = len(every)
         kept = ed.contrasts(torch.zeros(1, E, dtype=torch.bool), every, rest=True)[0]
         assert kept == pytest.approx(ed.c_full, abs=1e-4)

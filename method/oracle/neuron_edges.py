@@ -25,12 +25,19 @@ runs on (measured path patching, one forward per set of cuts, sets batched). A r
 and either leaves every other candidate as in the reference or cuts every other one as well (rest): every candidate
 cut costs one sum per position (the circuit's writes there, and every head's change there from every writer's value
 change), so no run lists more candidates than it keeps.
-Pruning (every run with the rest cut, so the stated graph is the circuit's every edge): the candidates ranked by their
-linear effect on the contrast (the contrast's gradient at the reader times the reader's input Jacobian times what the
-edge brings; routes scored a head layer at a time, the best LIST listed, four times as many while the listed ones fall
-short), then the smallest top-k set that alone keeps the contrast within TOL of the way from every edge's to none's
-(either side), and a halving pass over it, a forward's sets of blocks a round (each tried alone, those passing tried together); each kept
-edge's own cut from the graph measured last (its strength), and the graph's edges cut with every other edge on.
+Pruning (every run with the rest cut, so the stated graph is the circuit's every edge), local families first and the
+contrast checked on the whole graph:
+  1. each reader's IN_EDGES candidate in-edges of largest local effect (its input Jacobian times what the edge brings),
+     then on the reader itself its activation with every circuit in-edge cut but its first k candidates, k = 0 to all
+     (writers at base values; the norm, gate and up recomputed): each reader's smallest prefix within a relative error
+     of its activation, per error in EPS;
+  2. the largest error whose union keeps the contrast within TOL of the way from every edge's to none's (either side),
+     every error one forward;
+  3. a halving pass over readers' in-edge groups (a group cut: that reader reads no circuit neuron), a forward's blocks
+     a round (each tried alone, those passing tried together);
+  4. measured last: the graph's contrast, each reader's group cut from it (the reader's in-strength), the graph's edges
+     cut with every other edge on, each kept edge's local effect on its reader, and the strength (its own cut from the
+     graph) of the MEASURED edges of largest share of their reader's in-strength.
 
   python neuron_edges.py one MODEL TEXT.json OUT.json   (TEXT: ids, target, answer, alternatives, neurons)
   python neuron_edges.py record MODEL REC.json|REC_DIR OUT.json|OUT_DIR --thr THR.pt [--adapter A] [--dtype bfloat16]
@@ -48,8 +55,9 @@ import torch
 
 TOL = 0.1  # the contrast may move this share of the way from the run with every edge to the run with none, either way
 MIN_TOL = 0.01  # bits: at least this much
-LIST = 4096  # routes first listed for the top-k search (by linear effect); four times as many each time they fall short
-MAX_LIST = 1 << 18  # (at most this many: the record says when the top-k search fell short there)
+IN_EDGES = 256  # each reader's candidate in-edges measured on it (by local effect)
+EPS = tuple(round(0.5 * 2 ** (-i / 2), 4) for i in range(14))  # each reader's relative errors tried: 0.5 to 0.006
+MEASURED = 512  # kept edges whose own cut from the graph is measured (those of largest share of their reader's strength)
 HALVE_BLOCKS = 8
 TOKENS = 1536  # cut sets a forward: this many tokens' worth (at least 16 sets)
 CHUNK = 256  # listed resid edges a step (sets x CHUNK x d floats)
@@ -70,11 +78,6 @@ def weight(mod) -> torch.Tensor:
 def log2_contrast(lp: torch.Tensor, answer: list[int], alternatives: list[int]) -> torch.Tensor:
     """log2 p(answer tokens) - log2 p(alternatives) from log probabilities lp [..., V]."""
     return (torch.logsumexp(lp[..., answer], -1) - torch.logsumexp(lp[..., alternatives], -1)) / math.log(2.0)
-
-
-def sizes(n: int) -> list[int]:
-    """1 to n on a log scale (two steps an octave), n included."""
-    return sorted({min(n, int(round(2 ** (e / 2)))) for e in range(0, int(2 * math.log2(max(n, 1))) + 2)} | {n})
 
 
 class Edges:
@@ -108,7 +111,7 @@ class Edges:
             self.keep[L, p, j] = True
         self.resid_all = [(w, r) for w in self.N for r in self.N if w[0] < r[0] and w[1] == r[1]]
         self.n_routes = sum((r[0] - w[0]) * self.H for w in self.N for r in self.N if w[1] <= r[1] and w[0] < r[0])
-        self._plans, self._cols, self._vcols, self._G, self._J = {}, {}, {}, None, None
+        self._plans, self._cols, self._vcols, self._J, self._dv_base, self._allin = {}, {}, {}, None, None, None
         self.fixed = None  # weak "reference": the reference run's zeroed values held zero in every run, none else
         # (the reference's set of values, so a cut moves the contrast smoothly; "run": every run zeroes its own weak values,
         # neuron_builder's, where a near-threshold value flips on float noise: 0.1 bits between CPU and GPU on f0)
@@ -303,7 +306,7 @@ class Edges:
             out += self._run(cuts[s0:s0 + self.B], edges, rest=rest)["contrast"].tolist()
         return out
 
-    # -- the candidates' linear effects -----------------------------------------------------------------------------
+    # -- the base run's quantities --------------------------------------------------------------------------------
 
     def _mid_stream(self, L: int) -> torch.Tensor:
         """The base run's stream entering layer L's MLP [T, d] (on layer L's card)."""
@@ -327,15 +330,6 @@ class Edges:
             self._J = J
         return self._J
 
-    def grads(self) -> torch.Tensor:
-        """The contrast's gradient at each circuit neuron's activation in the base run [N] (kept)."""
-        if self._G is None:
-            probe = [torch.zeros(self.T, self.keep.shape[-1], device=self._d(L), requires_grad=True) for L in range(self.L)]
-            with torch.enable_grad():
-                self._run(torch.zeros(1, 0, dtype=torch.bool), [], probe=probe)["contrast"].sum().backward()
-            self._G = torch.tensor([float(probe[n[0]].grad[n[1], n[2]]) for n in self.N])
-        return self._G
-
     def _write(self, w) -> torch.Tensor:
         """A circuit neuron's write in the base run [d] (on its layer's card)."""
         return self.base["h"][w[0]][w[1], w[2]] * self._w(self.layers[w[0]].mlp.down_proj, cols=w[2])
@@ -356,139 +350,298 @@ class Edges:
         dz = self.base["A"][c][h, r[1], w[1]] * (self.base["v"][c][kv, w[1]] - vw)
         return (self._w(layer.self_attn.o_proj, cols=slice(h * hd, (h + 1) * hd)) @ dz).to(self._d(r[0]))
 
+    # -- each reader's in-edges, measured on the reader -------------------------------------------------------------
+
+    def _h0(self) -> torch.Tensor:
+        """The circuit neurons' activations in the base run [N] (on the first card)."""
+        if not self.N:
+            return torch.zeros(0, device=self.dev)
+        return torch.stack([self.base["h"][L][p, j].to(self.dev) for L, p, j in self.N])
+
+    def _dvs(self) -> dict:
+        """Per head layer c, the base run's value change at each circuit writer below c when its write leaves layer c's
+        input there [nb[c], KV, hd] (_dv; kept, on layer c's card)."""
+        if self._dv_base is None:
+            h0, base = self._h0(), self.base
+            self._dv_base = {c: self._dv(c, base["x"][c][None], base["v"][c][None], h0[:self.nb[c]].to(self._d(c))[None])[0]
+                             for c in range(1, self.L) if self.nb[c]}
+        return self._dv_base
+
+    def _all_in(self) -> list:
+        """Per layer L, what every circuit in-edge brings into layer L's MLP input at each position in the base run [T, d]
+        (the circuit's writes below L at the position, plus every head's output change there through layers up to L from
+        every circuit writer below that layer; kept, on layer L's card)."""
+        if self._allin is None:
+            T, H, KV, hd, h0, dvs = self.T, self.H, self.KV, self.hd, self._h0(), self._dvs()
+            dm = self.base["x"][0].shape[-1]
+            S = R = None
+            out = []
+            for L, layer in enumerate(self.layers):
+                d = self._d(L)
+                S = torch.zeros(T, dm, device=d) if S is None else S.to(d)
+                R = torch.zeros(T, dm, device=d) if R is None else R.to(d)
+                if L in dvs:
+                    dV = torch.zeros(T, KV, hd, device=d).index_add(0, self.P[:self.nb[L]].to(d), dvs[L])
+                    z = self.base["A"][L] @ dV.transpose(0, 1).repeat_interleave(H // KV, 0)  # [H, T, hd]
+                    R = R + z.transpose(0, 1).reshape(T, H * hd) @ self._w(layer.self_attn.o_proj).T
+                out.append(S + R)
+                rs = torch.arange(self.nb[L], self.nb[L + 1], device=d)
+                if len(rs):
+                    S = S.index_add(0, self.P.to(d)[rs], h0.to(d)[rs, None] * self._cols_on(d)[rs])
+            self._allin = out
+        return self._allin
+
     @torch.no_grad()
-    def linear_scores(self, keep: int) -> tuple[torch.Tensor, list, torch.Tensor]:
-        """(resid scores over resid_all, the keep routes of largest |score| among every route, their scores): each
-        edge's linear effect on the contrast, the contrast's gradient at the reader's activation times the reader's
-        input Jacobian times what the edge brings (the contrast it supports: positive when its cut lowers the contrast).
-        Routes are scored a head layer at a time (every writer below it, reader above it and head at once), the best
-        keep carried."""
-        G, J = self.grads(), self.jacobians()
-        H, KV, hd, base, N, dev = self.H, self.KV, self.hd, self.base, len(self.N), self.dev
-        h0 = torch.stack([self.base["h"][L][p, j].to(dev) for L, p, j in self.N]) if N else torch.zeros(0, device=dev)
-        Jm = torch.stack([J[n].to(dev) for n in self.N]) if N else torch.zeros(0, self._cols_on(dev).shape[1], device=dev)
-        M = Jm @ self._cols_on(dev).T  # [reader, writer]: the reader's activation per unit of the writer's
-        wi = torch.tensor([self.at[e[0]] for e in self.resid_all], dtype=torch.long, device=dev)
-        ri = torch.tensor([self.at[e[1]] for e in self.resid_all], dtype=torch.long, device=dev)
-        rs_s = (G.to(dev)[ri] * M[ri, wi] * h0[wi]).cpu()
-        best_s, best_i = torch.zeros(0), torch.zeros(0, 4, dtype=torch.long)  # (writer, layer, head, reader) indices
-        for c in range(1, self.L):
+    def in_edges(self, M: int) -> list[tuple[list, torch.Tensor]]:
+        """Per circuit neuron as a reader (N's order): its candidate in-edges of the M largest |local effect| and those
+        effects, largest first. The local effect is the reader's input Jacobian times what the edge brings in the base
+        run, a ranking only (local_curves measures the reader). Routes are scored a head layer at a time (every writer
+        below it, reader above it and head at once), each reader's best M carried."""
+        N, H, KV, hd, base, dev = len(self.N), self.H, self.KV, self.hd, self.base, self.dev
+        if not N:
+            return []
+        J, h0, dvs = self.jacobians(), self._h0(), self._dvs()
+        Jm = torch.stack([J[n].to(dev) for n in self.N])
+        best_m = torch.full((N, M), -1.0)  # |effect| (-1: no candidate)
+        best_s = torch.zeros(N, M)
+        best_i = torch.zeros(N, M, 3, dtype=torch.long)  # (writer, head layer (-1: resid), head)
+
+        def carry(rows, mag, s, decode):  # each reader of rows: its best M of what it had and of mag [R, X]
+            t = torch.topk(mag, min(M, mag.shape[1]), dim=1)
+            m2 = torch.cat([best_m[rows], t.values.cpu()], 1)
+            s2 = torch.cat([best_s[rows], s.gather(1, t.indices).cpu()], 1)
+            i2 = torch.cat([best_i[rows], decode(t.indices).cpu()], 1)
+            u = torch.topk(m2, M, dim=1).indices
+            best_m[rows], best_s[rows] = m2.gather(1, u), s2.gather(1, u)
+            best_i[rows] = i2.gather(1, u[..., None].expand(-1, -1, 3))
+
+        P, lay = self.P.to(dev), torch.tensor([n[0] for n in self.N], device=dev)
+        s = (Jm @ self._cols_on(dev).T) * h0[None]  # resid [reader, writer]
+        ok = (P[:, None] == P[None]) & (lay[None] < lay[:, None])
+        carry(torch.arange(N), s.abs().masked_fill(~ok, -1.0), s,
+              lambda t: torch.stack([t, torch.full_like(t, -1), torch.zeros_like(t)], -1))
+        for c, dv in dvs.items():
             nb = self.nb[c]
-            if not nb or nb == N:
+            if nb == N:
                 continue
             layer, dc = self.layers[c], self._d(c)
             Pd = self.P.to(dc)
-            dv = self._dv(c, base["x"][c][None], base["v"][c][None], h0[:nb].to(dc)[None])[0]
             dv = dv[:, torch.arange(H, device=dc) // (H // KV)]  # [W, H, hd]
             U = torch.einsum("rd,dhk->rhk", Jm[nb:].to(dc), self._w(layer.self_attn.o_proj).view(-1, H, hd))  # [R, H, hd]
             a = base["A"][c][:, Pd[nb:]][:, :, Pd[:nb]].permute(1, 2, 0)  # [R, W, H]
-            sc = (G.to(dc)[nb:, None, None] * a * torch.einsum("rhk,whk->rwh", U, dv)).flatten()
-            ok = (Pd[:nb][None] <= Pd[nb:][:, None])[..., None].expand(-1, -1, H).flatten()
-            n_ok = int(ok.sum())
-            if not n_ok:
-                continue
-            t = torch.topk(sc.abs().masked_fill(~ok, -1.0), min(keep, n_ok)).indices
-            idx = torch.stack([(t // H) % nb, torch.full_like(t, c), t % H, t // (nb * H) + nb], 1)
-            best_s, best_i = torch.cat([best_s, sc[t].cpu()]), torch.cat([best_i, idx.cpu()])
-            if len(best_s) > 2 * keep:  # (the best keep carried)
-                top = torch.topk(best_s.abs(), keep).indices
-                best_s, best_i = best_s[top], best_i[top]
-        top = torch.argsort(best_s.abs(), descending=True)[:keep]
-        routes = [(self.N[a], (int(c), int(h)), self.N[r]) for a, c, h, r in best_i[top].tolist()]
-        return rs_s, routes, best_s[top]
+            s = (a * torch.einsum("rhk,whk->rwh", U, dv)).flatten(1)  # [R, W H]
+            ok = (Pd[:nb][None] <= Pd[nb:][:, None])[..., None].expand(-1, -1, H).flatten(1)
+            carry(torch.arange(nb, N), s.abs().masked_fill(~ok, -1.0), s,
+                  lambda t, c=c: torch.stack([t // H, torch.full_like(t, c), t % H], -1))
+        out = []
+        for i, r in enumerate(self.N):
+            v = best_m[i] >= 0
+            out.append(([(self.N[w], r) if c < 0 else (self.N[w], (c, h), r) for w, c, h in best_i[i][v].tolist()],
+                        best_s[i][v]))
+        return out
 
+    def _chunks(self, size: int):
+        """(layer, readers) in N's order, at most size readers of one layer each."""
+        for L in range(self.L):
+            for a in range(self.nb[L], self.nb[L + 1], size):
+                yield L, list(range(a, min(a + size, self.nb[L + 1])))
+
+    @torch.no_grad()
+    def _vectors(self, rows: list[int], cands: list, K: int) -> torch.Tensor:
+        """What the first K candidate in-edges of each reader of rows (one layer's) bring into its MLP input in the base
+        run [len(rows), K, d] (zero past a reader's candidates; on the layer's card)."""
+        L = self.N[rows[0]][0]
+        d, H, KV, hd = self._d(L), self.H, self.KV, self.hd
+        cols, h0, dvs = self._cols_on(d), self._h0().to(d), self._dvs()
+        V = torch.zeros(len(rows), K, cols.shape[1], device=d)
+        groups = {}
+        for a, i in enumerate(rows):
+            for s, e in enumerate(cands[i][0][:K]):
+                groups.setdefault(None if len(e) == 2 else e[1], []).append((a, s, self.at[e[0]], e[-1][1]))
+        for g, xs in groups.items():
+            a, s, w, q = (torch.tensor(t, device=d) for t in zip(*xs))
+            if g is None:
+                V[a, s] = h0[w, None] * cols[w]
+                continue
+            c, h = g
+            dc = self._d(c)
+            w, q = w.to(dc), q.to(dc)
+            z = self.base["A"][c][h, q, self.P.to(dc)[w]][:, None] * dvs[c][w, h // (H // KV)]  # [n, hd]
+            V[a, s] = (z @ self._w(self.layers[c].self_attn.o_proj, cols=slice(h * hd, (h + 1) * hd)).T).to(d)
+        return V
+
+    @torch.no_grad()
+    def _acts(self, L: int, rows: list[int], X: torch.Tensor) -> torch.Tensor:
+        """The readers rows' (layer L's) activations from MLP inputs X [len(rows), K, d] [len(rows), K]: the norm, gate
+        and up recomputed in float32."""
+        layer = self.layers[L]
+        js = self.Jn[rows].to(self._d(L))
+        g = layer.post_attention_layernorm.weight.float().to(X.device)
+        Xn = X * torch.rsqrt(X.pow(2).mean(-1, keepdim=True) + layer.post_attention_layernorm.variance_epsilon)
+        gate = torch.einsum("rkd,rd->rk", Xn, self._w(layer.mlp.gate_proj, rows=js) * g)
+        return layer.mlp.act_fn(gate) * torch.einsum("rkd,rd->rk", Xn, self._w(layer.mlp.up_proj, rows=js) * g)
+
+    def _cut_input(self, L: int, rows: list[int]) -> torch.Tensor:
+        """The readers rows' (layer L's) MLP inputs in the base run less what every circuit in-edge brings [len(rows), d]."""
+        q = self.P[rows].to(self._d(L))
+        return self._mid_stream(L)[q] - self._all_in()[L][q]
+
+    @torch.no_grad()
+    def local_curves(self, cands: list, chunk: int = 64) -> list[torch.Tensor]:
+        """Per reader, its activation with every circuit in-edge cut but its first k candidates (cands: in_edges'), the
+        writers at their base values, k = 0 .. its candidates [len + 1] (measured on the reader: _acts)."""
+        out = [torch.zeros(1)] * len(self.N)
+        for L, rows in self._chunks(chunk):
+            K = max(len(cands[i][0]) for i in rows)
+            V = self._vectors(rows, cands, K)
+            X = self._cut_input(L, rows)[:, None] + torch.cat([V.new_zeros(len(rows), 1, V.shape[-1]), V.cumsum(1)], 1)
+            a = self._acts(L, rows, X).cpu()
+            for t, i in enumerate(rows):
+                out[i] = a[t, :len(cands[i][0]) + 1]
+        return out
+
+    @torch.no_grad()
+    def local_effects(self, cands: list, ks: list[int], chunk: int = 64) -> list[torch.Tensor]:
+        """Per reader, each of its first ks[i] candidates' measured local effect: the reader's activation with that
+        prefix kept less with that edge also cut (every other circuit in-edge cut, writers at base values)."""
+        out = [torch.zeros(0)] * len(self.N)
+        for L, rows in self._chunks(chunk):
+            K = max(ks[i] for i in rows)
+            if not K:
+                continue
+            V = self._vectors(rows, cands, K) * (torch.arange(K)[None] < torch.tensor([ks[i] for i in rows])[:, None]).to(
+                self._d(L))[..., None]
+            Xk = self._cut_input(L, rows) + V.sum(1)
+            a = self._acts(L, rows, torch.cat([Xk[:, None], Xk[:, None] - V], 1)).cpu()
+            for t, i in enumerate(rows):
+                out[i] = a[t, :1] - a[t, 1:ks[i] + 1]
+        return out
 
 def prune(ed: Edges, log=print) -> dict:
     """The stated graph (module docstring's pruning) and its record."""
     t0 = time.time()
+    N = len(ed.N)
     c_all = ed.c_full
     c_none = ed.contrasts(torch.zeros(1, 0, dtype=torch.bool), [], rest=True)[0]
     tol = max(TOL * abs(c_all - c_none), MIN_TOL)  # (two-sided: a kept set that overshoots is no more faithful)
     ok = lambda c: abs(c - c_all) <= tol  # noqa: E731
-    measured, n_rt, done, t_rank = 1, LIST, 0, 0.0
-    while True:  # the top-k search: k on a log scale over the listed candidates, more routes listed while none passes
-        t1 = time.time()
-        rs, routes, rt = ed.linear_scores(n_rt)
-        cand, score = list(ed.resid_all) + routes, torch.cat([rs, rt]).abs()
-        order = torch.argsort(score, descending=True)
-        every = len(routes) == ed.n_routes
-        n_ok = len(cand) if every else int((score >= score[len(rs):].min()).sum())  # (the prefix ranked as among all)
-        t_rank += time.time() - t1
-        ks = [k for k in sizes(n_ok) if k > done]
-        listed = [cand[i] for i in order[:n_ok].tolist()]
-        rows = torch.arange(n_ok)[None] >= torch.tensor(ks)[:, None]  # (the top k kept)
-        cs = ed.contrasts(rows, listed, rest=True)
-        measured += len(ks)
-        hit = next((k for k, c in zip(ks, cs) if ok(c)), None)
-        log(f"top-k over {n_ok} listed ({len(routes)} routes): {'k ' + str(hit) if hit is not None else 'none within'} "
-            f"{tol:.3f} of {c_all:.3f} (none {c_none:.3f}; the {n_ok} listed {cs[-1] if cs else float('nan'):.3f}), "
-            f"{time.time() - t0:.1f} s")
-        if hit is not None or every or n_rt >= MAX_LIST:
-            break
-        done, n_rt = n_ok, 4 * n_rt
-    edges = listed[:n_ok if hit is None else hit]  # ranked
-    E = len(edges)
-    t_keep = time.time() - t0 - t_rank
+    cands = ed.in_edges(IN_EDGES)
+    curves = ed.local_curves(cands)
+    ref = ed._h0().cpu()
+    err = [(curves[i] - ref[i]).abs() / max(abs(float(ref[i])), 1e-9) for i in range(N)]
+    K = [[int(e.le(eps).nonzero()[0]) if bool(e.le(eps).any()) else int(e.argmin()) for e in err] for eps in EPS]
+    t_local = time.time() - t0
 
-    def kept_rows(sets):  # each set of kept edges as a cut row (every other edge cut)
-        rows = torch.ones(len(sets), E, dtype=torch.bool)
-        for i, st in enumerate(sets):
-            rows[i, st] = False
-        return rows
-    keep = torch.arange(E)
-    queue = list(keep.flip(0).tensor_split(min(HALVE_BLOCKS, E))) if E > 1 else []
-    gone = torch.zeros(E, dtype=torch.bool)
-    while queue:  # halving, B blocks a round (lowest-ranked first): each tried alone, the passing ones together
-        blocks, queue = queue[:ed.B], queue[ed.B:]
-        rows = []
+    kmax = [max(k[i] for k in K) for i in range(N)]  # (each reader's prefixes nest: its finest error's is the longest)
+    listed = [cands[i][0][s] for i in range(N) for s in range(kmax[i])]
+    owner = torch.tensor([i for i in range(N) for _ in range(kmax[i])], dtype=torch.long)
+    rank = torch.tensor([s for i in range(N) for s in range(kmax[i])], dtype=torch.long)
+    rows = torch.stack([rank >= torch.tensor(k, dtype=torch.long)[owner] for k in K])  # each reader's prefix kept, per error
+    cs = ed.contrasts(rows, listed, rest=True)
+    measured = 1 + len(EPS)
+    pick = next((a for a, c in enumerate(cs) if ok(c)), None)
+    gone = rows[len(EPS) - 1 if pick is None else pick].clone()  # (cut)
+    before = int((~gone).sum())
+    log(f"reader error {EPS[pick] if pick is not None else 'none'} passes: {before} edges kept of {len(listed)} listed "
+        f"(contrast {cs[len(EPS) - 1 if pick is None else pick]:.3f}, every edge {c_all:.3f}, none {c_none:.3f}, "
+        f"tolerance {tol:.3f}), {time.time() - t0:.1f} s")
+    t_eps = time.time() - t0 - t_local
+
+    groups = [(~gone & (owner == i)).nonzero().flatten() for i in range(N)]
+    weak = lambda i: float(cands[i][1][:len(groups[i])].abs().sum()) / max(abs(float(ref[i])), 1e-9)  # noqa: E731
+    readers = sorted((i for i in range(N) if len(groups[i])), key=weak)  # (weakest first)
+    queue = [list(b) for b in torch.tensor(readers, dtype=torch.long).tensor_split(min(HALVE_BLOCKS, len(readers)))
+             if len(b)] if len(readers) > 1 else []
+    cut_of = lambda rs: torch.cat([groups[int(i)] for i in rs])  # noqa: E731
+    while queue:  # halving over readers' in-edge groups, a forward's blocks a round: each block's groups cut alone, the
+        blocks, queue = queue[:ed.B], queue[ed.B:]  # passing ones together
+        trial = []
         for b in blocks:
-            trial = gone.clone()
-            trial[b] = True
-            rows.append(keep[~trial])
-        cs = ed.contrasts(kept_rows(rows), edges, rest=True)
+            t = gone.clone()
+            t[cut_of(b)] = True
+            trial.append(t)
+        cs = ed.contrasts(torch.stack(trial), listed, rest=True)
         measured += len(blocks)
         passed = [b for b, c in zip(blocks, cs) if ok(c)]
         if passed:
-            trial = gone.clone()
-            trial[torch.cat(passed)] = True
+            t = gone.clone()
+            t[cut_of([i for b in passed for i in b])] = True
             measured += 1
-            if ok(ed.contrasts(kept_rows([keep[~trial]]), edges, rest=True)[0]):
-                gone = trial
+            if ok(ed.contrasts(t[None], listed, rest=True)[0]):
+                gone = t
             else:  # together they fail: one at a time
                 for b in passed:
-                    t2 = gone.clone()
-                    t2[b] = True
+                    t = gone.clone()
+                    t[cut_of(b)] = True
                     measured += 1
-                    if ok(ed.contrasts(kept_rows([keep[~t2]]), edges, rest=True)[0]):
-                        gone = t2
-        queue = [h for b, c in zip(blocks, cs) if not ok(c) and len(b) > 1 for h in b.tensor_split(2)] + queue
-    keep = keep[~gone]
-    t_halve = time.time() - t0 - t_rank - t_keep
-    rows = kept_rows([keep] + [keep[keep != i] for i in keep.tolist()])  # the graph, then each kept edge cut from it
-    cs = ed.contrasts(rows, edges, rest=True)
-    c_kept, strengths = cs[0], [cs[0] - c for c in cs[1:]]
-    cut = torch.zeros(1, E, dtype=torch.bool)  # the graph's edges cut, every other edge on
-    cut[0, keep] = True
-    c_cut = ed.contrasts(cut, edges)[0]
-    measured += len(keep) + 2
+                    if ok(ed.contrasts(t[None], listed, rest=True)[0]):
+                        gone = t
+        queue = [list(h) for b, c in zip(blocks, cs) if not ok(c) and len(b) > 1
+                 for h in torch.tensor(b).tensor_split(2)] + queue
+    keep = (~gone).nonzero().flatten()
+    t_halve = time.time() - t0 - t_local - t_eps
+
+    readers = [i for i in range(N) if bool((~gone & (owner == i)).any())]
+    trial = [gone]  # the graph, then each reader's kept in-edges cut from it
+    for i in readers:
+        t = gone.clone()
+        t[owner == i] = True
+        trial.append(t)
+    cs = ed.contrasts(torch.stack(trial), listed, rest=True)
+    c_kept, group = cs[0], {i: cs[0] - c for i, c in zip(readers, cs[1:])}
+    c_cut = ed.contrasts((~gone)[None], listed)[0]  # the graph's edges cut, every other edge on
+    ks = [int((~gone & (owner == i)).sum()) for i in range(N)]  # (each reader's kept in-edges: a prefix of its own)
+    eff = ed.local_effects(cands, ks)
+    local = torch.cat([eff[int(owner[e])][int(rank[e])][None] for e in keep]) if len(keep) else torch.zeros(0)
+    tot = {i: float(eff[i].abs().sum()) for i in readers}
+    est = torch.tensor([abs(group[int(owner[e])]) * float(local[a].abs()) / max(tot[int(owner[e])], 1e-12)
+                        for a, e in enumerate(keep.tolist())])
+    top = torch.argsort(est, descending=True)[:MEASURED].tolist()  # (each edge's own cut from the graph measured for the
+    trial = []  # MEASURED edges of largest share of their reader's measured group strength)
+    for a in top:
+        t = gone.clone()
+        t[keep[a]] = True
+        trial.append(t)
+    cs = ed.contrasts(torch.stack(trial), listed, rest=True) if trial else []
+    strengths = [None] * len(keep)
+    for a, c in zip(top, cs):
+        strengths[a] = c_kept - c
+    measured += 2 + len(readers) + len(trial)
     rec = {"contrast_model": ed.c_full, "contrast_all_edges": c_all, "contrast_no_edges": c_none, "contrast_kept": c_kept,
-           "contrast_graph_cut": c_cut, "tolerance": tol, "met": hit is not None,
-           "candidates": {"resid": len(ed.resid_all), "route": ed.n_routes, "route_listed": len(routes), "listed": n_ok},
-           "kept": len(keep), "kept_before_halving": E, "measured": measured,
-           "seconds": {"rank": round(t_rank, 2), "keep": round(t_keep, 2), "halving": round(t_halve, 2),
+           "contrast_graph_cut": c_cut, "tolerance": tol, "met": pick is not None and ok(c_kept),
+           "reader_error": EPS[pick] if pick is not None else None,
+           "candidates": {"resid": len(ed.resid_all), "route": ed.n_routes,
+                          "in_edges_listed": sum(len(c[0]) for c in cands)},
+           "kept": len(keep), "kept_before_halving": before, "readers": len(readers), "measured": measured,
+           "seconds": {"local": round(t_local, 2), "errors": round(t_eps, 2), "halving": round(t_halve, 2),
                        "total": round(time.time() - t0, 2)}}
-    log(f"{len(keep)} of {n_ok} listed edges ({E} before halving; {len(ed.resid_all)} resid, {len(routes)} of {ed.n_routes} "
-        f"routes listed); contrast {c_kept:.3f} bits (every edge {c_all:.3f}, none {c_none:.3f}, the graph's cut "
-        f"{c_cut:.3f}){'' if hit is not None else ' NOT MET'}; {rec['seconds']}")
-    return {"edges": [edges[i] for i in keep.tolist()], "strengths": strengths, "record": rec}
+    log(f"{len(keep)} edges into {len(readers)} of {N} neurons ({before} before halving); contrast {c_kept:.3f} bits "
+        f"(every edge {c_all:.3f}, none {c_none:.3f}, the graph's cut {c_cut:.3f}){'' if rec['met'] else ' NOT MET'}; "
+        f"{rec['seconds']}")
+    return {"edges": [listed[e] for e in keep.tolist()], "strengths": strengths, "local": local.tolist(),
+            "group": {ed.N[i]: g for i, g in group.items()}, "record": rec}
 
 
 @torch.no_grad()
 def graph(ed: Edges, got: dict, tok=None) -> dict:
-    """The stated graph as JSON: neuron poles (the activation's sign, the SwiGLU regime: the signs of gate and up) and
-    the kept edges with their write weights, their linear push on the reader's activation in the run (push; excites:
-    toward the reader's pole; share: |push| over the reader's activation) and measured strength (bits of contrast their
-    cut from the graph removes: every other kept edge on, every other candidate cut); with a tokenizer, the tokens and the answer's and alternatives' text."""
+    """The stated graph as JSON: neuron poles (the activation's sign, the SwiGLU regime: the signs of gate and up) with
+    each reader's measured in-strength (bits of contrast that cutting its kept in-edges from the graph removes), and the
+    kept edges with their write weights, their measured local effect (local: the reader's activation less with the edge
+    also cut from the graph's in-edges of it, writers at base values; excites: toward the reader's pole; share: |local|
+    over the reader's activation) and, for the MEASURED of largest share of their reader's in-strength, the measured
+    strength (bits of contrast the edge's cut from the graph removes: every other kept edge on, every other candidate
+    cut; None for the rest); with a tokenizer, the tokens and the answer's and alternatives' text."""
+    Wf = {}
+
+    def wt(L: int, name: str) -> torch.Tensor:  # a layer's float32 weight, fetched once
+        if (L, name) not in Wf:
+            layer = ed.layers[L]
+            mod = {"down": layer.mlp.down_proj, "gate": layer.mlp.gate_proj, "up": layer.mlp.up_proj,
+                   "v": layer.self_attn.v_proj, "o": layer.self_attn.o_proj}.get(name)
+            Wf[(L, name)] = (ed._w(mod) if mod is not None else
+                             (layer.input_layernorm if name == "in" else layer.post_attention_layernorm).weight.float())
+        return Wf[(L, name)]
+
     nodes = []
     for L, p, j in ed.N:
         layer = ed.layers[L]
@@ -496,25 +649,24 @@ def graph(ed: Edges, got: dict, tok=None) -> dict:
         g, u = float(ed._f(layer.mlp.gate_proj, n)[j]), float(ed._f(layer.mlp.up_proj, n)[j])
         a = float(ed.base["h"][L][p, j])
         nodes.append({"id": len(nodes), "layer": L, "neuron": j, "pos": p, "act": a, "pole": 1 if a >= 0 else -1,
-                      "regime": f"g{'+' if g >= 0 else '-'}u{'+' if u >= 0 else '-'}"})
-    out, J = [], ed.jacobians()
-    for e, st in zip(got["edges"], got["strengths"]):
+                      "regime": f"g{'+' if g >= 0 else '-'}u{'+' if u >= 0 else '-'}",
+                      "in_strength": got.get("group", {}).get((L, p, j))})
+    out = []
+    for e, st, loc in zip(got["edges"], got["strengths"], got["local"]):
         w, r = e[0], e[-1]
-        col = ed._w(ed.layers[w[0]].mlp.down_proj, cols=w[2])
+        col = wt(w[0], "down")[:, w[2]]
         if len(e) == 3:  # through the head's OV
             c, h = e[1]
-            at, kv, dc = ed.layers[c].self_attn, h // (ed.H // ed.KV), ed._d(c)
-            vw = ed._w(at.v_proj).view(ed.KV, ed.hd, -1)[kv] @ (ed.layers[c].input_layernorm.weight.float() * col.to(dc))
-            col = ed._w(at.o_proj, cols=slice(h * ed.hd, (h + 1) * ed.hd)) @ vw
-        layer = ed.layers[r[0]]
-        wn = layer.post_attention_layernorm.weight.float() * col.to(ed._d(r[0]))
-        eff = float(J[r] @ ed.brings(e))  # the edge's linear push on the reader's activation in the run
-        pole = nodes[ed.at[r]]["pole"]
+            dc = ed._d(c)
+            vw = wt(c, "v").view(ed.KV, ed.hd, -1)[h // (ed.H // ed.KV)] @ (wt(c, "in") * col.to(dc))
+            col = wt(c, "o")[:, h * ed.hd:(h + 1) * ed.hd] @ vw
+        wn = wt(r[0], "post") * col.to(ed._d(r[0]))
+        node = nodes[ed.at[r]]
         out.append({"src": ed.at[w], "dst": ed.at[r], "kind": "resid" if len(e) == 2 else "route",
                     "head": list(e[1]) if len(e) == 3 else None, "src_pos": w[1], "dst_pos": r[1],
-                    "w_gate": float(ed._w(layer.mlp.gate_proj, rows=r[2]) @ wn), "w_up": float(ed._w(layer.mlp.up_proj, rows=r[2]) @ wn),
-                    "push": eff, "excites": (eff >= 0) == (pole > 0), "share": abs(eff) / max(abs(nodes[ed.at[r]]["act"]), 1e-9),
-                    "strength": st})
+                    "w_gate": float(wt(r[0], "gate")[r[2]] @ wn), "w_up": float(wt(r[0], "up")[r[2]] @ wn),
+                    "local": loc, "excites": (loc >= 0) == (node["pole"] > 0),
+                    "share": abs(loc) / max(abs(node["act"]), 1e-9), "strength": st})
     txt = {} if tok is None else {"tokens": [tok.decode([i]) for i in ed.ids], "answer_text": tok.decode(ed.answer),
                                   "alternatives_text": [tok.decode([a]) for a in ed.alternatives]}
     return {"ids": ed.ids, **txt, "contrast": {"answer": ed.answer, "alternatives": ed.alternatives, "target": ed.target,

@@ -412,12 +412,16 @@ def graph(ed: Edges, got: dict, tok=None) -> dict:
 
 
 def load(name: str, device: str | None = None, dtype: str = "float32"):
-    """An HF causal LM for the stage: float32 on one card, or bfloat16 split over every card (device_map auto)."""
+    """An HF causal LM for the stage: float32 on one card, or bfloat16 split over every card (device_map auto), its
+    weights without gradients."""
     import transformers
     if dtype == "bfloat16":
-        return transformers.AutoModelForCausalLM.from_pretrained(name, dtype=torch.bfloat16, device_map="auto").eval()
-    dev = device or ("cuda" if torch.cuda.is_available() else "cpu")
-    return transformers.AutoModelForCausalLM.from_pretrained(name, dtype=torch.float32).to(dev).eval()
+        model = transformers.AutoModelForCausalLM.from_pretrained(name, dtype=torch.bfloat16, device_map="auto")
+    else:
+        dev = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        model = transformers.AutoModelForCausalLM.from_pretrained(name, dtype=torch.float32).to(dev)
+    return model.eval().requires_grad_(False)  # (the stage's gradients are at activations: no weight gradient, 8B's
+    # float32 one did not fit an L40)
 
 
 def main():

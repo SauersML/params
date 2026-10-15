@@ -303,6 +303,8 @@ def build_vpd(ge: goal_eval.GoalEval, tx: goal_eval.Text, log=None) -> tuple[nat
     ref_point = point[-1]
     f_point = None if ref_point is None else FLOOR * max(0.0, min(1.0, ref_point))
     floors = rec["floors"] = {"point": f_point, **{f: FLOOR + MARGIN[f] for f in ("track_pp", "scope", "interchange_pp")}}
+    rec["kl_cap"] = None if f_point is None else e0 * (max(v0, goal_eval.KL_RESOLUTION) / e0) ** f_point   # point's floor
+    # as a KL (_fid_raw(e0, kl_cap, v0) = f_point): connect's point criterion
     ok_point = [f_point is None or (x is not None and x >= f_point - 1e-9) for x in point]
     first = next((i for i, ok in enumerate(ok_point) if ok), len(sizes) - 1)
     clock("point")
@@ -451,16 +453,26 @@ UNITS = {"vpd": build_vpd}
 
 
 def build(ge: goal_eval.GoalEval, task: dict, units: str = "vpd", seed: int | None = None, log=None,
-          builder: str = "builder_fast") -> dict:
+          builder: str = "builder_fast", stated: bool = False) -> dict:
     """A circuit for one task (a vpd4l task JSON: its first prompt's token_ids and target_positions; seed, the task's
     own, default from its first tokens) in units (UNITS): goal_eval.to_json of the circuit, with "units", its record
-    under "build", "build_seconds" (every stage, the text's runs included) and "builder" (name@rev)."""
+    under "build", "build_seconds" (every stage, the text's runs included) and "builder" (name@rev). stated: its
+    connections stated by connect.connect (rustmove's), at the builder's own floors, its record under "connect"."""
     p = task["prompts"][0]
     t0 = time.perf_counter()
     tx = ge.text(p["token_ids"], p["target_positions"], seed, task=task)
     t1 = time.perf_counter()
     g, rec = UNITS[units](ge, tx, log=log)
     rec["seconds_text"] = round(t1 - t0, 2)
+    if stated and units == "vpd":
+        import connect
+
+        fl = rec["floors"]
+        g = connect.connect(ge, tx, g, "vpd", floors={"point": rec.get("kl_cap"), "track": fl.get("track_pp"), "scope": fl.get("scope"),
+                                                      "interchange": fl.get("interchange_pp"), "patching_near": fl.get("patching_near"),
+                                                      "patching_far": fl.get("patching_far")}, log=log)
+        rec["connect"] = getattr(g, "connect", None)
+        rec["seconds"]["connect"] = round(time.perf_counter() - t0, 2)
     out = goal_eval.to_json(g, "")
     out.update(units=units, build=rec, build_seconds=round(time.perf_counter() - t0, 2), builder=builder)
     return out
@@ -479,6 +491,7 @@ def main():
     ap.add_argument("--offset", type=int, default=0)
     ap.add_argument("--stride", type=int, default=1)
     ap.add_argument("--warm", default="text6000", help="a text built first and thrown away (CUDA's first kernels)")
+    ap.add_argument("--stated", action="store_true", help="state the connections (connect.connect)")
     a = ap.parse_args()
     a.out.mkdir(parents=True, exist_ok=True)
     ge = goal_eval.GoalEval(native.Native())
@@ -488,7 +501,8 @@ def main():
     for t in a.tasks.read_text().split()[a.offset::a.stride]:
         if (a.out / f"{t}.json").exists():
             continue
-        c = build(goal_eval.GoalEval(ge.nat), task_of(t), a.units, native.task_seed(t), log=print, builder=f"builder_fast@{a.rev}")
+        c = build(goal_eval.GoalEval(ge.nat), task_of(t), a.units, native.task_seed(t), log=print, builder=f"builder_fast@{a.rev}",
+                  stated=a.stated)
         (a.out / f"{t}.json").write_text(json.dumps(c, default=str))
         print(f"{t}: {len(c['nodes'])} parts, {c['build_seconds']} s", flush=True)
         native.free(ge.nat.dev)

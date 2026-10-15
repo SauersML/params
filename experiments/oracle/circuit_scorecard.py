@@ -1367,13 +1367,18 @@ def mib_rows(d: Path, names) -> dict:
     out = {}
     for n in names:
         f = d / f"{n}.json"
+        if not f.exists() and "_" in n:  # a set named builder_rev reads fleet's builder.json (vpd_fast_dd89be3: vpd_fast.json)
+            f = d / f"{n.rsplit('_', 1)[0]}.json"
         if f.exists():
-            r = json.loads(f.read_text())
+            top = json.loads(f.read_text())
+            r = top.get("score", top)  # fleet's builder files nest mib_score.py's output under "score"
             dv = r.get("diff_vs_eap_ig_inputs") or {}
             out[n] = {"AUROC": f"{r['auroc']:.3f} [{r['ci95'][0]:.2f},{r['ci95'][1]:.2f}]",
-                      "vs EAP-IG-in": f"{dv['diff']:+.3f} [{dv['ci95'][0]:+.2f},{dv['ci95'][1]:+.2f}]" if dv else "-"}
+                      "vs EAP-IG-in": f"{dv['diff']:+.3f} [{dv['ci95'][0]:+.2f},{dv['ci95'][1]:+.2f}]" if dv else "-",
+                      "MIB edges/prompt": f"{r['edges_per_prompt']:.0f}" if r.get("edges_per_prompt") is not None else "-",
+                      "MIB builder rev": top.get("commit", "-")}
         else:
-            out[n] = {"AUROC": "not run", "vs EAP-IG-in": "not run"}
+            out[n] = {"AUROC": "not run", "vs EAP-IG-in": "not run", "MIB edges/prompt": "-", "MIB builder rev": "-"}
     return out
 
 

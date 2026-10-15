@@ -748,6 +748,86 @@ def cmd_answer(a) -> None:
     show(res["rows"])
 
 
+class VLLMReader:
+    """The reader self-hosted for training (the lead's 10-14: Tinker's $6 per 1,000 rewards is too much for RL): vLLM
+    offline batches, greedy, the chat template with thinking off. Same calls as Reader."""
+
+    def __init__(self, model: str, max_len: int = 8192):
+        from transformers import AutoTokenizer
+        from vllm import LLM
+
+        self.tok = AutoTokenizer.from_pretrained(model)
+        kw = {"limit_mm_per_prompt": {"image": 0, "video": 0}}
+        try:
+            self.llm = LLM(model=model, max_model_len=max_len, gpu_memory_utilization=0.92, **kw)
+        except TypeError:
+            self.llm = LLM(model=model, max_model_len=max_len, gpu_memory_utilization=0.92)
+        self.spend = type("S", (), {"total": 0.0})()
+
+    def __call__(self, prompts: list[str], max_tokens: int = 1500) -> list[str]:
+        from vllm import SamplingParams
+
+        texts = [self.tok.apply_chat_template([{"role": "user", "content": p}], tokenize=False, add_generation_prompt=True,
+                                              enable_thinking=False) for p in prompts]
+        outs = self.llm.generate(texts, SamplingParams(temperature=0.0, max_tokens=max_tokens))
+        return [o.outputs[0].text for o in outs]
+
+    def tokens(self, text: str) -> int:
+        return len(self.tok(text)["input_ids"])
+
+
+def cmd_agree_prep(a) -> None:
+    """The reader prompts already answered by Tinker's reader (read's result files: --results), with their questions'
+    measured outcomes, into one file for the self-hosted reader's agreement check."""
+    out = []
+    for spec in a.results:  # RESULT, or RESULT=QUESTIONS when the result's name holds no question file's name
+        f, _, qs = str(spec).partition("=")
+        f = Path(f)
+        r = json.loads(f.read_text())
+        q = Path(qs) if qs else max((x for x in a.question_files if x.stem in f.stem), key=lambda x: len(x.stem))
+        ivs = [json.loads(x) for x in q.read_text().splitlines()]
+        ex = explanation_of(r["explanation"])
+        out.append({"result": f.name, "questions": q.name, "prompt": ask(ivs[0]["head"], ex, ivs, ivs[0]["answer"]),
+                    "tinker_raw": r["raw"], "outcomes": [iv["outcome"] for iv in ivs], "kinds": [iv["kind"] for iv in ivs]})
+    a.out.write_text(json.dumps(out))
+    print(len(out), "prompts,", sum(len(x["outcomes"]) for x in out), "questions to", a.out)
+
+
+def cmd_agree(a) -> None:
+    """The self-hosted reader against Tinker's on the same prompts: per question whether the two readers name the
+    same top token and how far apart their probabilities are (log-odds), each reader's accuracy per prompt; then
+    throughput (prompts per hour in one batch of --batch prompts), for the $ per 1,000 rewards."""
+    import time
+
+    pairs = json.loads(a.pairs.read_text())
+    rd = VLLMReader(a.model)
+    t0 = time.time()
+    got = rd([x["prompt"] for x in pairs])
+    t_first = time.time() - t0
+    rows, per = [], []
+    for x, text in zip(pairs, got):
+        ivs = [{"kind": k, "outcome": o} for k, o in zip(x["kinds"], x["outcomes"])]
+        mine, theirs = parse_answers(text, len(ivs)), parse_answers(x["tinker_raw"], len(ivs))
+        for (t1, p1), (t2, p2) in zip(mine, theirs):
+            rows.append({"same_top": t1 is not None and t1 == t2, "logodds_gap": None if p1 is None or p2 is None else abs(logit(p1) - logit(p2))})
+        g1, g2 = grade(mine, ivs), grade(theirs, ivs)
+        per.append({"result": x["result"], "acc_self": sum(r["score"] for r in g1) / len(g1), "acc_tinker": sum(r["score"] for r in g2) / len(g2)})
+    gaps = sorted(r["logodds_gap"] for r in rows if r["logodds_gap"] is not None)
+    batch = [pairs[i % len(pairs)]["prompt"] for i in range(a.batch)]
+    t0 = time.time()
+    rd(batch)
+    dt = time.time() - t0
+    res = {"model": a.model, "questions": len(rows), "same_top": sum(r["same_top"] for r in rows) / len(rows),
+           "logodds_gap_median": gaps[len(gaps) // 2] if gaps else None, "per_prompt": per,
+           "accuracy_gap_mean": sum(abs(x["acc_self"] - x["acc_tinker"]) for x in per) / len(per),
+           "first_batch_s": t_first, "throughput_batch": a.batch, "throughput_s": dt, "rewards_per_hour": a.batch / dt * 3600, "raw": got}
+    a.out.parent.mkdir(parents=True, exist_ok=True)
+    a.out.write_text(json.dumps(res, indent=1))
+    print(json.dumps({k: v for k, v in res.items() if k not in ("raw", "per_prompt")}))
+    for x in per:
+        print(x)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="what", required=True)
@@ -780,8 +860,18 @@ def main():
         p.add_argument("--reader", default=READER)
     for p in (q, i, w):
         p.add_argument("--device")
+    ap_ = sub.add_parser("agree-prep")
+    ap_.add_argument("--results", nargs="+", required=True)
+    ap_.add_argument("--question-files", type=Path, nargs="+", required=True)
+    ap_.add_argument("--out", type=Path, required=True)
+    ag = sub.add_parser("agree")
+    ag.add_argument("--pairs", type=Path, required=True)
+    ag.add_argument("--model", default="Qwen/Qwen3.6-27B-FP8")
+    ag.add_argument("--batch", type=int, default=256)
+    ag.add_argument("--out", type=Path, required=True)
     a = ap.parse_args()
-    {"questions": cmd_questions, "read": cmd_read, "invariants": cmd_invariants, "answer": cmd_answer}[a.what](a)
+    {"questions": cmd_questions, "read": cmd_read, "invariants": cmd_invariants, "answer": cmd_answer, "agree-prep": cmd_agree_prep,
+     "agree": cmd_agree}[a.what](a)
 
 
 if __name__ == "__main__":

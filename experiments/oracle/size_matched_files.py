@@ -9,6 +9,8 @@ import torch
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
+sys.path.insert(0, str(HERE.parents[1] / "method" / "oracle"))
+sys.path.insert(0, str(HERE.parents[1] / "method" / "vpd"))
 import goal_eval  # noqa: E402
 import lines  # noqa: E402
 import native  # noqa: E402

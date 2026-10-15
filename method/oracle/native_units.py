@@ -381,6 +381,7 @@ class MeanUnits(UnitRuns):
         self.ids, self.targets = list(ids)[:self.T], list(targets)
         self.L, self.H, self.hd = tg.n_layer, tg.n_head, tg.hd
         self.W = {k: [tg.site(native.site_name(i, k)).W for i in range(self.L)] for k in ("q_proj", "k_proj", "v_proj", "o_proj", "c_fc", "down_proj")}
+        self.b = {k: [tg.site(native.site_name(i, k)).b for i in range(self.L)] for k in self.W}  # TLTarget's biases (vpd4l: None)
         self.Dm = self.W["c_fc"][0].shape[0]
         self.emb = tg.embed(torch.tensor(self.ids, device=self.dev))
         self.ref = nat.reference([list(ids)], self.targets) if means is not None else None  # (capture alone: none)
@@ -397,7 +398,7 @@ class MeanUnits(UnitRuns):
         for i in range(self.L):
             z = tg.norm(x, 2 * i)
             heads = lambda y: y.view(B, T, H, hd).transpose(1, 2)  # noqa: E731
-            q, k, v = (heads(z @ self.W[kd][i].T) for kd in ("q_proj", "k_proj", "v_proj"))
+            q, k, v = (heads(self._mat(z, kd, i)) for kd in ("q_proj", "k_proj", "v_proj"))
             y = F.scaled_dot_product_attention(tg._rope(q, T), tg._rope(k, T), v, is_causal=True)  # [B, H, T, hd]
             if capture is not None:
                 capture.setdefault("heads", []).append(y[0].transpose(0, 1))  # [T, H, hd]
@@ -407,8 +408,8 @@ class MeanUnits(UnitRuns):
                     fill = torch.where(frozen[0][:, i].transpose(1, 2)[..., None], self._clean["heads"][i].transpose(0, 1)[None], fill)
                 m = hm[:, i].transpose(1, 2)[..., None]  # [B, H, T, 1]
                 y = m * y + (1 - m) * fill
-            x = x + y.transpose(1, 2).reshape(B, T, -1) @ self.W["o_proj"][i].T
-            g = tg.act(tg.norm(x, 2 * i + 1) @ self.W["c_fc"][i].T)  # [B, T, d_mlp]
+            x = x + self._mat(y.transpose(1, 2).reshape(B, T, -1), "o_proj", i)
+            g = tg.act(self._mat(tg.norm(x, 2 * i + 1), "c_fc", i))  # [B, T, d_mlp]
             if capture is not None:
                 capture.setdefault("neurons", []).append(g[0])
             if self.means is not None:
@@ -416,8 +417,13 @@ class MeanUnits(UnitRuns):
                 if frozen is not None:
                     fill = torch.where(frozen[1][:, i], self._clean["neurons"][i][None], fill)
                 g = nm[:, i] * g + (1 - nm[:, i]) * fill
-            x = x + g @ self.W["down_proj"][i].T
+            x = x + self._mat(g, "down_proj", i)
         return torch.log_softmax(tg.unembed(tg.norm(x[:, self.targets], -1)).float(), -1)
+
+    def _mat(self, z: torch.Tensor, kind: str, i: int) -> torch.Tensor:
+        """z through layer i's matrix kind, with its bias where the model has one."""
+        out = z @ self.W[kind][i].T
+        return out if self.b[kind][i] is None else out + self.b[kind][i]
 
 
 class HFUnits(UnitRuns):

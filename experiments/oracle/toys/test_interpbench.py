@@ -207,6 +207,23 @@ def test_mib_edge_names():
     assert interpbench.mib_edge(nat, ("h.1.attn.v_proj", 1), ("h.1.attn.o_proj", 1)) is None
 
 
+@pytest.mark.parametrize("norm", [None, "LN"])
+def test_native_mean_units_reproduce_tl_model(norm):
+    """native_units.MeanUnits on a TransformerLens model with biases (MIB's): every unit live is the model, TransformerLens'
+    log probabilities at the targets."""
+    import native_units
+
+    sd, cfg = random_tl(norm)
+    nat = interpbench.native_of(sd, cfg)
+    ids = torch.randint(cfg["d_vocab"], (cfg["n_ctx"],), generator=torch.Generator().manual_seed(3)).tolist()
+    targets = [3, cfg["n_ctx"] - 1]
+    mu = native_units.MeanUnits(nat, ids, targets, native_units.unit_means(nat, ["a", "b"], None, [ids, ids[::-1]]))
+    with torch.no_grad():
+        got = mu.logq(mu.ones())[0]
+        want = torch.log_softmax(tl_forward(sd, cfg, torch.tensor([ids]))[0, targets].float(), -1)
+    torch.testing.assert_close(got, want, atol=1e-4, rtol=1e-4)
+
+
 def test_native_mib_edges():
     """A native circuit's implied MIB edges: a head into a later head's key and value from an earlier position but its
     query only at the same position; a head into its own layer's MLP at the same position, not at another; neurons at

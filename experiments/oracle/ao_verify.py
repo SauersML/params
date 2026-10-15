@@ -642,7 +642,7 @@ def run(a) -> None:
         got = run_item(tg, it, random.Random(it["id"]))
         with a.out.open("a") as fh:
             fh.write(json.dumps(got) + "\n")
-        ver = [c["word"] for c in got["candidates"] if c["verified"]]
+        ver = [c["word"] for c in got["candidates"] if c.get("verified")]
         print(it["id"], "truth", it["truth"][0][0], "| AO", got["ao_answer"], round(got["ao_conf"], 2), "| verified", ver[:4],
               "| candidates", len(got["candidates"]), flush=True)
 

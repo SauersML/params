@@ -10,11 +10,12 @@ The VPD builder on one text:
    replaced by far donors' tokens, GoalEval.resample_influence's numbers; every position screened with SCREEN_DONORS
    donors, the SHORTLIST largest measured with all of them), largest first until they hold SCOPE_COVER of the summed
    movement, at most START_CAP (the input-scope family's positions);
-2. units: VPD's active subcomponents there (the teacher's START set), ranked by the sum of three shares of the size
+2. units: VPD's active subcomponents there (the teacher's START set), ranked by the sum of four shares of the size
    of their integrated gradients (IG_STEPS points, the units scaled together from 1 to 0): of the circuit's own-run KL
    from the model on the text (every other subcomponent off, remainders on: point), of the KL from the model on
    ATTR_DRAWS of the scope family's changed texts with everything outside the units held at the text's run (path
-   patching's semantics: track and input scope), and of the real model's KL with the units removed (N);
+   patching's semantics: track and input scope), of the real model's KL with the units removed (N), and of the KL with
+   everything outside the units at ATTR_DONORS far donors' activations (activation patching);
 3. size: the smallest prefix of that ranking whose measured families meet their floors, the prefixes on a log grid
    (sizes 2^(k/2)): point (the own run's log recovery, floor 0.9 of all the units' own) on every size in one batched
    run, then track_pp, input scope and interchange_pp (path-patched, floor 0.9: VPD's whole answer scores 1 there)
@@ -23,7 +24,10 @@ The VPD builder on one text:
    then N and activation patching near and far (necessity_spec, donors_search: floor 0.9, and 0.9 of every unit's
    own patching) on the sizes meeting those, smallest first, a few at a time (none: every unit); every floor with
    MARGIN, the family's noise, and at most every unit's own score;
-4. inert parts: each kept unit removed alone, its own-run KL change measured in one batch; the units moving it by
+4. chunks: the chosen units in CHUNKS runs of the ranking, least important first, PATH_BATCH at a time each removed
+   from the current set and measured (point and the path-patched families, then N and patching on those passing),
+   the passing ones removed together when that passes too, else the least important alone;
+5. inert parts: each kept unit removed alone, its own-run KL change measured in one batch; the units moving it by
    less than INERT_BITS dropped together when the reduced set still meets every floor.
 The full reward row is the scorecard's, never run here."""
 from __future__ import annotations
@@ -41,9 +45,11 @@ import native
 IG_STEPS = 4        # attribution: points on the path from every unit on to every unit off
 ATTR_DRAWS = 16     # attribution: the scope family's changed texts beside the text, one per position
 ATTR_ROWS = 6       # attribution: texts per backward pass
+ATTR_DONORS = 4     # attribution: far donors for activation patching's share
 FLOOR = goal_eval.FLOOR_TOP
 INERT_BITS = 1e-3   # an inert unit: its removal moves the own-run KL at the targets by less (the scorecard's)
 PATH_BATCH = 4      # prefix sizes per path-patched round
+CHUNKS = 12         # the chunk pass: the chosen units in this many runs of the ranking
 ROUNDS = 3          # bracketing rounds after the first
 REFINE = 0.05       # a bracket this narrow (hi / lo) ends the rounds
 MARGIN = {"track_pp": 0.02, "scope": 0.05, "interchange_pp": 0.01, "patching_near": 0.02, "patching_far": 0.07, "N": 0.0}
@@ -99,43 +105,46 @@ def attribution(ge: goal_eval.GoalEval, tx: goal_eval.Text, units: list, xs: lis
     return [float(total[n][t, c]) for n, t, c in units]
 
 
-def path_attribution(ge: goal_eval.GoalEval, tx: goal_eval.Text, units: list, xs: list[list[int]], steps: int = IG_STEPS) -> list[float]:
-    """Per unit its integrated gradient, summed over the changed texts xs, of the KL from the model on each when the
-    units follow the change and everything else stays at the text's run (path patching's semantics, the track and
-    input-scope families'): every subcomponent's activation a_x + m (a - a_x), a_x its value on the text, a its value in
-    this run, every remainder at its value on the text; the units' m scaled together from 1 (following) to 0 (held at
-    the text, where the targets' prediction is the model's on the text, at KL W from it)."""
+def held_attribution(ge: goal_eval.GoalEval, tx: goal_eval.Text, units: list, rows: list, steps: int = IG_STEPS) -> list[float]:
+    """Per unit its integrated gradient, summed over rows, of the KL at the targets from the model on each row's
+    tokens, every subcomponent's activation a_h + m (a - a_h) (a its value in this run, a_h the row's held value; from
+    the row's first live position on), the units' m scaled together from 1 (live) to 0 (held), every other
+    subcomponent held. rows: (token ids, the held activations {site: [T, C]}, the held remainders {site: [T, d_out]}
+    or None for live ones, the first held position, the reference log p at the targets [targets, V])."""
     nat, tg, T = ge.nat, ge.nat.target, tx.T
-    nat.vpd.clear()
-    for n in nat.names:
-        tg.site(n).cache_input = True
-    with torch.no_grad():
-        tg.hidden(torch.tensor([tx.ids], device=nat.dev))
-    ax, rx = {}, {}
-    for n in nat.names:
-        st = tg.site(n)
-        xin = st.last_input[0]
-        ax[n] = xin @ st.V                                   # [T, C]
-        rx[n] = xin @ (st.W - (st.V @ st.U).T).T             # [T, d_out]
-        st.cache_input, st.last_input = False, None
     on = {n: torch.zeros(T, nat.C[n], device=nat.dev) for n in nat.names}
     for n, t, c in units:
         on[n][t, c] = 1.0
-    ref = nat.reference(xs, tx.targets)
     total = {n: torch.zeros(T, nat.C[n], device=nat.dev) for n in nat.names}
     own = {n: tg.site(n).__dict__.get("_forward") for n in nat.names}   # (native's own per-site forward, put back)
+    nat.vpd.clear()
     try:
-        for k in range(steps):
-            a = 1.0 - (k + 0.5) / steps
-            for r0 in range(0, len(xs), ATTR_ROWS):
-                rows = xs[r0:r0 + ATTR_ROWS]
-                m = {n: (on[n] * a)[None].repeat(len(rows), 1, 1).requires_grad_() for n in nat.names}
+        for r0 in range(0, len(rows), ATTR_ROWS):
+            part = rows[r0:r0 + ATTR_ROWS]
+            B = len(part)
+            ah = {n: torch.stack([r[1][n] for r in part]) for n in nat.names}             # [B, T, C]
+            live_rem = all(r[2] is None for r in part)
+            rh = None if live_rem else {n: torch.stack([r[2][n] for r in part]) for n in nat.names}
+            held = torch.zeros(B, T, 1, device=nat.dev)                                  # 1 from each row's first held position
+            for b, r in enumerate(part):
+                held[b, r[3]:] = 1.0
+            ref = torch.stack([r[4] for r in part])
+            for k in range(steps):
+                a = 1.0 - (k + 0.5) / steps
+                m = {n: (on[n] * a)[None].repeat(B, 1, 1).requires_grad_() for n in nat.names}
                 for n in nat.names:
                     st = tg.site(n)
-                    st._forward = (lambda x, st=st, n=n: (ax[n] + m[n] * (x @ st.V - ax[n])) @ st.U + rx[n])
+
+                    def fwd(x, st=st, n=n):
+                        live = x @ st.V
+                        w = 1.0 - held * (1.0 - m[n])                # 1 before the held positions, m from them on
+                        act = ah[n] + w * (live - ah[n])
+                        rem = x @ (st.W - (st.V @ st.U).T).T if rh is None else rh[n]
+                        return act @ st.U + rem
+                    st._forward = fwd
                 with torch.enable_grad():
-                    lq = torch.log_softmax(tg.unembed(tg.hidden(torch.tensor(rows, device=nat.dev))[:, tx.targets]).float(), -1)
-                    grads = torch.autograd.grad(carry.kl(ref[r0:r0 + ATTR_ROWS], lq).sum(), [m[n] for n in nat.names])
+                    lq = torch.log_softmax(tg.unembed(tg.hidden(torch.tensor([r[0] for r in part], device=nat.dev))[:, tx.targets]).float(), -1)
+                    grads = torch.autograd.grad(carry.kl(ref, lq).sum(), [m[n] for n in nat.names])
                 for n, gr in zip(nat.names, grads):
                     total[n] -= gr.sum(0) / steps
                 del m, grads
@@ -147,6 +156,45 @@ def path_attribution(ge: goal_eval.GoalEval, tx: goal_eval.Text, units: list, xs
             else:
                 tg.site(n)._forward = own[n]
     return [float(total[n][t, c]) for n, t, c in units]
+
+
+@torch.no_grad()
+def _text_held(ge: goal_eval.GoalEval, tx: goal_eval.Text) -> tuple[dict, dict]:
+    """The text's own run: every subcomponent's activation {site: [T, C]} and remainder output {site: [T, d_out]}."""
+    nat, tg = ge.nat, ge.nat.target
+    nat.vpd.clear()
+    for n in nat.names:
+        tg.site(n).cache_input = True
+    try:
+        tg.hidden(torch.tensor([tx.ids], device=nat.dev))
+        ax, rx = {}, {}
+        for n in nat.names:
+            st = tg.site(n)
+            xin = st.last_input[0]
+            ax[n], rx[n] = xin @ st.V, xin @ (st.W - (st.V @ st.U).T).T
+    finally:
+        for n in nat.names:
+            tg.site(n).cache_input, tg.site(n).last_input = False, None
+    return ax, rx
+
+
+def path_attribution(ge: goal_eval.GoalEval, tx: goal_eval.Text, units: list, xs: list[list[int]], steps: int = IG_STEPS) -> list[float]:
+    """held_attribution on the changed texts xs with everything held at the text's run (path patching's semantics, the
+    track and input-scope families': the units follow the change, the rest stays; held, the targets' prediction is the
+    model's on the text, at KL W from the changed text's)."""
+    ax, rx = _text_held(ge, tx)
+    ref = ge.nat.reference(xs, tx.targets)
+    return held_attribution(ge, tx, units, [(x, ax, rx, 0, ref[i]) for i, x in enumerate(xs)], steps)
+
+
+def donor_attribution(ge: goal_eval.GoalEval, tx: goal_eval.Text, units: list, k: int = ATTR_DONORS, steps: int = IG_STEPS) -> list[float]:
+    """held_attribution on the text with everything held at k far donors' activations (activation patching's semantics,
+    goal_eval.donors' far pool: a donor aligned at its end, its first missing positions live, remainders live)."""
+    rows = []
+    for _, x in ge.far_donors(tx, ge.far_pool("search"), k):
+        acts, pad = ge.donor_activations(list(x), tx.T)
+        rows.append((list(tx.ids), {n: v.to(ge.nat.dev) for n, v in acts.items()}, None, pad, tx.ref[0]))
+    return held_attribution(ge, tx, units, rows, steps) if rows else [0.0] * len(units)
 
 
 @torch.no_grad()
@@ -233,7 +281,8 @@ def build_vpd(ge: goal_eval.GoalEval, tx: goal_eval.Text, log=None) -> tuple[nat
     own = np.abs(attribution(ge, tx, units, xs[:1]))         # the own run on the text (point)
     path = np.abs(path_attribution(ge, tx, units, xs[1:])) if len(xs) > 1 else np.zeros(len(units))   # the change
     need = np.abs(attribution(ge, tx, units, xs[:1], others=1.0))   # their removal from the real model (N)
-    score = sum(x / max(x.sum(), 1e-12) for x in (own, path, need))   # each its share of its own total
+    patch = np.abs(donor_attribution(ge, tx, units))         # the rest at far donors' activations (patching)
+    score = sum(x / max(x.sum(), 1e-12) for x in (own, path, need, patch))   # each its share of its own total
     rank = np.argsort(-score, kind="stable").tolist()        # unit ids, largest first, by |attribution|: a unit that
     # cancels another's overshoot has a negative one, and ranked by its sign it came last (text9006: point 0.66 up to
     # 1,448 of 1,886 units, 0.997 with all; by size 0.93 at 362)
@@ -337,8 +386,45 @@ def build_vpd(ge: goal_eval.GoalEval, tx: goal_eval.Text, log=None) -> tuple[nat
     n = pick if pick is not None else N
     rec["met"], rec["start_written"] = pick is not None, n == N
     clock("extra")
-    on = prefix(n)                                           # 4. inert parts
-    pr.on = on.clone()
+    on = prefix(n)                                           # 4. chunks of the ranking removed, measured
+
+    def every(ons):                                          # every family the builder measures, on unit sets: the
+        pts = [goal_eval._fid_raw(e0, k, v0) for k in pr.kl_sets(torch.stack(ons))]   # costlier ones on the sets the
+        gs = [_graph([units[i] for i in o.nonzero().flatten().tolist()]) for o in ons]   # cheap ones admit alone
+        out = [{"point": x, **f} for x, f in zip(pts, families(gs))]
+        alive = [j for j, f in enumerate(out) if meets(f)]
+        for j, x in zip(alive, extra([gs[j] for j in alive]) if alive else []):
+            out[j].update(x)
+        return [f if j in alive else None for j, f in enumerate(out)]
+    gone, tried_chunks = 0, 0
+    if rec["met"]:
+        kept_rank = [i for i in rank if bool(on[i])]         # most important first
+        K = max(1, -(-len(kept_rank) // CHUNKS))
+        chunks = [kept_rank[j:j + K] for j in range(0, len(kept_rank), K)][::-1]   # least important first
+        for c0 in range(0, len(chunks), PATH_BATCH):
+            part = chunks[c0:c0 + PATH_BATCH]
+            ons = []
+            for ch in part:
+                o = on.clone()
+                o[ch] = False
+                ons.append(o)
+            tried_chunks += len(part)
+            okc = [ch for ch, f in zip(part, every(ons)) if f is not None and meets(f)]
+            if len(okc) > 1:                                 # all of them together, else the least important alone
+                o = on.clone()
+                for ch in okc:
+                    o[ch] = False
+                f = every([o])[0]
+                if f is not None and meets(f):
+                    on, gone = o, gone + sum(len(ch) for ch in okc)
+                    continue
+            if okc:
+                on = on.clone()
+                on[okc[0]] = False
+                gone += len(okc[0])
+    rec["chunks"] = {"tried": tried_chunks, "removed": gone}
+    clock("chunks")
+    pr.on = on.clone()                                       # 5. inert parts
     ids = on.nonzero().flatten().tolist()
     base = pr.kl()
     moved = [abs(k - base) for k in pr.without([torch.tensor([i], device=nat.dev) for i in ids])] if ids else []

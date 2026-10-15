@@ -493,12 +493,189 @@ def questions(tg, circuit: list, seed: int = 0, pool: int = 4) -> list[dict]:
     return ivs
 
 
-def ask(tg_head: str, explanation: str | None, ivs: list[dict], answer_token: str) -> str:
+def ask(tg_head: str, explanation: str | None, ivs: list[dict], answer_token: str, *, allow_reasoning: bool = False) -> str:
     q = "\n".join(f"Q{k}: {iv['words']}" for k, iv in enumerate(ivs, 1))
     ex = f"An explanation of how the model computes this prediction:\n{explanation}\n\n" if explanation else ""
+    ending = "Brief reasoning may precede the final answer lines; put nothing after those lines." if allow_reasoning else "nothing else."
     return (f"{tg_head}\n{ex}For each change below, predict the model's most likely next token after the change and the "
             f"probability it then gives {answer_token!r}. Answer one line per question, Q<k>: '<token>' <probability>, "
-            f"the token quoted exactly as written (with its leading space if any), nothing else.\n\n{q}")
+            f"the token quoted exactly as written (with its leading space if any), {ending}\n\n{q}")
+
+
+def _native_receipt_binding(binding):
+    """Validate a public receipt identity; this is binding, not model execution certification."""
+    import hashlib
+    keys = {'model_sha256', 'model_id', 'model_revision', 'dtype', 'tokenizer_sha256', 'input_sha256',
+            'token_ids', 'target_position', 'text', 'source', 'reader', 'readout', 'clean'}
+    if not isinstance(binding, dict) or set(binding) != keys:
+        raise ValueError('native public binding fields differ; outcomes/labels are forbidden')
+    for key in ('model_sha256', 'tokenizer_sha256', 'input_sha256'):
+        if not isinstance(binding[key], str) or not re.fullmatch('[0-9a-f]{64}', binding[key]):
+            raise ValueError('native content digest required')
+    if not isinstance(binding['model_revision'], str) or not re.fullmatch('[0-9a-f]{40}', binding['model_revision']):
+        raise ValueError('pinned model revision required')
+    if any(not isinstance(binding[k], str) or not binding[k] for k in ('model_id', 'dtype', 'text')):
+        raise ValueError('model, dtype and full text required')
+    ids, pos = binding['token_ids'], binding['target_position']
+    if (not isinstance(ids, list) or not ids or any(type(z) is not int or z < 0 for z in ids)
+            or type(pos) is not int or not 0 <= pos < len(ids)):
+        raise ValueError('native input/target invalid')
+    if hashlib.sha256(json.dumps(ids, separators=(',', ':')).encode()).hexdigest() != binding['input_sha256']:
+        raise ValueError('native input digest mismatch')
+    for role in ('source', 'reader'):
+        u = binding[role]
+        if not isinstance(u, list) or len(u) != 3 or any(type(z) is not int or z < 0 for z in u) or u[1] != pos:
+            raise ValueError('literal native neuron address [layer,target_position,index] required')
+    if binding['source'] == binding['reader']:
+        raise ValueError('source and reader must differ')
+    readout, clean = binding['readout'], binding['clean']
+    if (not isinstance(readout, dict) or set(readout) != {'answer_token_id', 'answer_token', 'alternative_token_ids'}
+            or type(readout['answer_token_id']) is not int or readout['answer_token_id'] < 0
+            or not isinstance(readout['answer_token'], str) or not isinstance(readout['alternative_token_ids'], list)
+            or not readout['alternative_token_ids'] or any(type(z) is not int or z < 0 for z in readout['alternative_token_ids'])
+            or len(set(readout['alternative_token_ids'])) != len(readout['alternative_token_ids'])
+            or readout['answer_token_id'] in readout['alternative_token_ids']):
+        raise ValueError('native clean readout invalid')
+    if not isinstance(clean, dict) or set(clean) != {'p_answer', 'contrast_bits'}:
+        raise ValueError('only clean baseline probability and auxiliary contrast allowed')
+    if any(type(clean[k]) not in (int, float) or not math.isfinite(clean[k]) for k in clean) or not 0 <= clean['p_answer'] <= 1:
+        raise ValueError('finite clean baseline required')
+    return json.loads(json.dumps(binding, allow_nan=False))
+
+
+def _native_scales(scales):
+    if not isinstance(scales, dict) or set(scales) != {'source', 'reader'}:
+        raise ValueError('literal source/reader coordinate scales required')
+    if any(type(v) not in (int, float) or not math.isfinite(v) for v in scales.values()):
+        raise ValueError('finite numeric scales required')
+    return {k: 0.0 if scales[k] == 0 else float(scales[k]) for k in ('source', 'reader')}
+
+
+def native_intervention_key(binding, scales):
+    """Canonical physical-world key, independent of readout: any same-world top-token receipt leaks.
+
+    Zero and scale-zero share a key through numeric factor 0; int/float factors
+    coincide. Readout identity is bound separately in the public question packet.
+    """
+    import hashlib
+    b = _native_receipt_binding(binding)
+    world = {k: b[k] for k in ('model_sha256', 'model_id', 'model_revision', 'dtype', 'tokenizer_sha256',
+                              'input_sha256', 'target_position')}
+    factors = _native_scales(scales)
+    world['operations'] = sorted([[b[r], factors[r]] for r in ('source', 'reader') if factors[r] != 1])
+    return hashlib.sha256(json.dumps(world, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+
+
+def _native_compact_inspection(binding, inspection):
+    """Selected target-position observations only; never raw vectors or post-edit traces."""
+    allowed = {'schema', 'input_token_ids', 'position_ids', 'target_position', 'top_token_id', 'neurons',
+               'model', 'source_binding', 'input_sha256', 'scope'}
+    if not isinstance(inspection, dict) or set(inspection) - allowed:
+        raise ValueError('only clean Runner.inspect receipt fields allowed')
+    if (inspection.get('input_token_ids') != binding['token_ids'] or inspection.get('input_sha256') != binding['input_sha256']
+            or inspection.get('target_position') != binding['target_position']
+            or inspection.get('position_ids') != list(range(len(binding['token_ids'])))
+            or inspection.get('source_binding', {}).get('model_revision') != binding['model_revision']):
+        raise ValueError('inspection model/context binding mismatch')
+    rows = inspection.get('neurons')
+    if not isinstance(rows, list) or len(rows) > 32:
+        raise ValueError('bounded clean neuron inspection required')
+    compact = []
+    for role in ('source', 'reader'):
+        layer, pos, index = binding[role]
+        found = [r for r in rows if r.get('layer') == layer and r.get('index') == index]
+        if len(found) != 1:
+            raise ValueError('one inspection per supplied native unit required')
+        row = found[0]; values = {}
+        allowed_row = {'layer', 'index', 'gate_pre', 'up_value', 'gate_activation', 'raw_gate_up_product', 'down_input',
+                       'gate_sign', 'up_sign', 'activation_sign', 'max_activation_position', 'min_activation_position',
+                       'zero_positions', 'reconstruction', 'write'}
+        if set(row) - allowed_row:
+            raise ValueError('only clean signed neuron observations allowed')
+        for key in ('gate_pre', 'up_value', 'gate_activation', 'down_input'):
+            seq = row.get(key)
+            if (not isinstance(seq, list) or len(seq) != len(binding['token_ids'])
+                    or any(type(v) not in (int, float) or not math.isfinite(v) for v in seq)):
+                raise ValueError('finite full-context signed capture required')
+            values[key] = float(seq[pos])
+        direction = row.get('write', {}).get('direction')
+        norm = None
+        if row.get('write', {}).get('status') == 'plain_linear_direction':
+            if (not isinstance(direction, list) or not direction
+                    or any(type(v) not in (int, float) or not math.isfinite(v) for v in direction)):
+                raise ValueError('finite plain write direction required')
+            norm = math.sqrt(math.fsum(float(v) ** 2 for v in direction))
+        a = row['down_input']
+        compact.append({'unit': list(binding[role]), 'target_values': values, 'write_direction_norm': norm,
+                        'write_scope': 'plain direction norm excludes bias; not a causal effect',
+                        'full_context': {'tokens': len(a), 'activation_min': min(a), 'activation_max': max(a),
+                                         'zero_count': sum(v == 0 for v in a)},
+                        'capture_scope': 'all supplied positions observed; target-position values shown, not a semantic label'})
+    return compact
+
+
+def native_receipt_prompts(binding, inspection, disclosed, questions):
+    """Pure receipt-to-reader bridge. No labels argument, file access, model call or execution certification.
+
+    Disclosed outcomes are exposed discovery only. Reject every queried physical
+    world before and after a deterministic source/reader correspondence swap.
+    """
+    import hashlib
+    b = _native_receipt_binding(binding)
+    digest = lambda v: hashlib.sha256(json.dumps(v, sort_keys=True, allow_nan=False, separators=(',', ':')).encode()).hexdigest()
+    if not isinstance(questions, list) or not questions or len(questions) > 32:
+        raise ValueError('1..32 predeclared scale questions required')
+    ivs, keys = [], []
+    clean_key = native_intervention_key(b, {'source': 1, 'reader': 1})
+    for q in questions:
+        if not isinstance(q, dict) or set(q) != {'scales'}:
+            raise ValueError('questions accept scales only; measured labels/outcomes forbidden')
+        scales = _native_scales(q['scales']); key = native_intervention_key(b, scales)
+        if key == clean_key or key in keys:
+            raise ValueError('clean-baseline or duplicate target question')
+        keys.append(key)
+        words = '; '.join(f'scale neuron L{b[r][0]}.N{b[r][2]} at position {b[r][1]} by {scales[r]}' for r in ('source', 'reader'))
+        ivs.append({'words': words + '; multiply its current post-SiLU-gate-times-up activation at that position only, with all other operations unchanged'})
+    compact = _native_compact_inspection(b, inspection)
+    true_facts, wrong_facts, exposures = [], [], []
+    if not isinstance(disclosed, list) or len(disclosed) > 32:
+        raise ValueError('bounded explicitly disclosed discovery receipts required')
+    for item in disclosed:
+        if not isinstance(item, dict) or set(item) != {'binding', 'scales', 'outcome'}:
+            raise ValueError('discovery receipt fields invalid')
+        old = _native_receipt_binding(item['binding']); scales = _native_scales(item['scales'])
+        if any(old[k] != b[k] for k in ('model_sha256', 'model_id', 'model_revision', 'dtype', 'tokenizer_sha256')):
+            raise ValueError('discovery model binding differs')
+        outcome = item['outcome']
+        if (not isinstance(outcome, dict) or set(outcome) != {'top', 'p'} or not isinstance(outcome['top'], str)
+                or type(outcome['p']) not in (int, float) or not math.isfinite(outcome['p']) or not 0 <= outcome['p'] <= 1):
+            raise ValueError('disclosed discovery outcome invalid')
+        swapped = {'source': scales['reader'], 'reader': scales['source']}
+        pair = [native_intervention_key(old, s) for s in (scales, swapped)]
+        if any(k in keys for k in pair):
+            raise ValueError('target-intervention outcome disclosed, including after permutation')
+        # Preserve original context identity; only unit-to-measurement correspondence is the control.
+        fact = {'context': old['text'], 'input_sha256': old['input_sha256'], 'target_position': old['target_position'],
+                'source': old['source'], 'reader': old['reader'], 'readout': old['readout'], 'scales': scales,
+                'clean': old['clean'], 'observed': dict(outcome)}
+        true_facts.append(fact); wrong_facts.append({**fact, 'scales': swapped})
+        exposures.append({'receipt_sha256': digest(item), 'true_world_key': pair[0], 'permuted_world_key': pair[1]})
+    wrong = [{**compact[1], 'unit': compact[0]['unit']}, {**compact[0], 'unit': compact[1]['unit']}]
+    evidence = {'true': {'clean_native_inspection': compact, 'exposed_discovery': true_facts},
+                'none': None, 'permuted': {'clean_native_inspection': wrong, 'exposed_discovery': wrong_facts}}
+    header = ('Predict literal native-neuron intervention effects on this full supplied context. The reference is the unchanged model.\n'
+              + json.dumps(b, sort_keys=True, allow_nan=False) + '\nBrief reasoning may precede the final Q-lines. '
+              'Signed activations and write norms are observations, not semantic or causal certificates.')
+    prompts = {arm: ask(header, None if value is None else json.dumps(value, sort_keys=True, allow_nan=False), ivs, b['readout']['answer_token'], allow_reasoning=True)
+               for arm, value in evidence.items()}
+    return {'prompts': prompts, 'audit': {'schema': 1, 'binding_sha256': digest(b), 'question_world_keys': keys,
+            'readout': b['readout'], 'inspection_sha256': digest(inspection), 'disclosed': exposures,
+            'permutation': 'swap source/reader observation payloads and disclosed scale coordinates; synthetic correspondence control, original receipts unchanged',
+            'prompt_sha256': {k: hashlib.sha256(v.encode()).hexdigest() for k, v in prompts.items()},
+            'primary_metric': {'quantity': 'absolute full-answer log2(p/(1-p)) error', 'units': 'bits', 'clip': [1e-9, 1-1e-9]},
+            'secondary_metric': {'quantity': 'signed full-answer log-odds change from clean baseline', 'meaningful_band_bits': 0.1},
+            'contrast_bits_scope': 'selected-alternative contrast is an auxiliary physical diagnostic; not full-answer log-odds',
+            'scope': 'exposed discovery conditioning, not an independent generalization or mechanism certificate'}}
 
 
 def parse_answers(text: str, n: int) -> list[tuple[str | None, float | None]]:

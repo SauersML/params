@@ -154,3 +154,119 @@ def test_accept_audit_preserves_held_out_filter_and_selected_written_explanation
     with pytest.raises(ValueError,match='no selected acceptance questions'):
         rr.cmd_accept(args)
     assert not observed
+
+# Pure native receipt bridge: synthetic public observations only, never model/reader calls.
+def _native_fixture(ids=None):
+    import hashlib
+    import json
+    ids = [1, 2, 3] if ids is None else ids
+    b = {'model_sha256': 'a'*64, 'model_id': 'synthetic-native', 'model_revision': 'b'*40,
+         'dtype': 'bfloat16', 'tokenizer_sha256': 'c'*64,
+         'input_sha256': hashlib.sha256(json.dumps(ids, separators=(',', ':')).encode()).hexdigest(),
+         'token_ids': ids, 'target_position': 2, 'text': 'synthetic context '+str(ids),
+         'source': [0, 2, 1], 'reader': [1, 2, 2],
+         'readout': {'answer_token_id': 7, 'answer_token': ' answer', 'alternative_token_ids': [8, 9]},
+         'clean': {'p_answer': .7, 'contrast_bits': 2.}}
+    rows = []
+    for role, values in [('source', [-1., 2., 3.]), ('reader', [4., -5., 6.])]:
+        rows.append({'layer': b[role][0], 'index': b[role][2],
+                     **{k: values for k in ('gate_pre', 'up_value', 'gate_activation', 'down_input')},
+                     'write': {'status': 'plain_linear_direction', 'direction': [3., 4.], 'semantics': 'fixture'}})
+    inspection = {'schema': 1, 'input_token_ids': ids, 'input_sha256': b['input_sha256'],
+                  'position_ids': [0, 1, 2], 'target_position': 2, 'neurons': rows,
+                  'source_binding': {'model_revision': b['model_revision']}}
+    return b, inspection
+
+
+def test_native_world_key_normalizes_coordinates_and_blocks_readout_loopholes():
+    import copy
+    b, _ = _native_fixture()
+    key = rr.native_intervention_key(b, {'source': 0, 'reader': 1})
+    assert key == rr.native_intervention_key(b, {'source': -0., 'reader': 1.})
+    changed = copy.deepcopy(b)
+    changed['source'], changed['reader'] = changed['reader'], changed['source']
+    assert key == rr.native_intervention_key(changed, {'source': 1, 'reader': 0})
+    changed = copy.deepcopy(b); changed['readout']['alternative_token_ids'] = [10]
+    assert key == rr.native_intervention_key(changed, {'source': 0, 'reader': 1})
+    changed['model_sha256'] = 'd'*64
+    assert key != rr.native_intervention_key(changed, {'source': 0, 'reader': 1})
+
+
+def test_native_reasoning_option_preserves_legacy_ask_and_parser():
+    ivs = [{'words': 'literal scale'}]
+    assert 'nothing else.' in rr.ask('context', None, ivs, ' answer')
+    prompt = rr.ask('context', None, ivs, ' answer', allow_reasoning=True)
+    assert 'nothing else.' not in prompt
+    assert rr.parse_answers("Brief calculation.\nQ1: ' answer' 0.25", 1) == [(' answer', .25)]
+
+
+def test_native_prompts_compact_paired_and_deterministic_with_public_baseline():
+    import copy
+    import json
+    b, inspection = _native_fixture()
+    old, _ = _native_fixture([4, 5, 6])
+    disclosed = [{'binding': old, 'scales': {'source': 0, 'reader': 1}, 'outcome': {'top': ' old', 'p': .2}}]
+    questions = [{'scales': {'source': .5, 'reader': 1}}, {'scales': {'source': 2, 'reader': 2}}]
+    original = copy.deepcopy((b, inspection, disclosed, questions))
+    result = rr.native_receipt_prompts(b, inspection, disclosed, questions)
+    assert result == rr.native_receipt_prompts(b, inspection, disclosed, questions)
+    assert original == (b, inspection, disclosed, questions)
+    prompts = result['prompts']; assert set(prompts) == {'true', 'none', 'permuted'}
+    query_lines = [[x for x in p.splitlines() if x.startswith('Q')] for p in prompts.values()]
+    assert query_lines[0] == query_lines[1] == query_lines[2]
+    assert all('"p_answer": 0.7' in p and b['text'] in p for p in prompts.values())
+    assert all('"direction":' not in p for p in prompts.values())
+    assert 'write_direction_norm' in prompts['true'] and 'write_direction_norm' not in prompts['none']
+    true_e = json.loads(prompts['true'].split('An explanation of how the model computes this prediction:\n')[1].split('\n\nFor each')[0])
+    wrong_e = json.loads(prompts['permuted'].split('An explanation of how the model computes this prediction:\n')[1].split('\n\nFor each')[0])
+    assert true_e['clean_native_inspection'][0]['target_values']['down_input'] == 3
+    assert wrong_e['clean_native_inspection'][0]['target_values']['down_input'] == 6
+    assert wrong_e['clean_native_inspection'][0]['unit'] == b['source']
+    assert true_e['exposed_discovery'][0]['input_sha256'] == old['input_sha256']
+    assert true_e['exposed_discovery'][0]['clean'] == old['clean']
+    assert wrong_e['exposed_discovery'][0]['clean'] == old['clean']
+    assert all('nothing else.' not in p and 'put nothing after those lines.' in p for p in prompts.values())
+    assert wrong_e['exposed_discovery'][0]['scales'] == {'source': 1., 'reader': 0.}
+    assert result['audit']['primary_metric']['clip'] == [1e-9, 1-1e-9]
+    assert result['audit']['primary_metric']['units'] == 'bits'
+
+
+def test_native_disclosure_exclusion_includes_permuted_world_and_changed_readout():
+    import copy
+    import pytest
+    b, inspection = _native_fixture()
+    q = [{'scales': {'source': .5, 'reader': 1}}]
+    for scales in ({'source': .5, 'reader': 1}, {'source': 1, 'reader': .5}):
+        old = copy.deepcopy(b); old['readout']['alternative_token_ids'] = [10]
+        with pytest.raises(ValueError, match='target-intervention'):
+            rr.native_receipt_prompts(b, inspection, [{'binding': old, 'scales': scales, 'outcome': {'top': 'hidden', 'p': .12345}}], q)
+
+
+def test_native_hidden_labels_and_full_results_rejected_at_public_boundary():
+    import copy
+    import pytest
+    b, inspection = _native_fixture()
+    q = [{'scales': {'source': .5, 'reader': 1}}]
+    with pytest.raises(ValueError, match='labels/outcomes'):
+        rr.native_receipt_prompts(b, inspection, [], [{**q[0], 'outcome': {'p': .12345}}])
+    with pytest.raises(ValueError, match='receipt fields'):
+        rr.native_receipt_prompts(b, {**inspection, 'cells': {'hidden': .12345}}, [], q)
+    bad = copy.deepcopy(inspection); bad['neurons'][0]['target_label'] = .12345
+    with pytest.raises(ValueError, match='observations'):
+        rr.native_receipt_prompts(b, bad, [], q)
+    with pytest.raises(ValueError, match='binding fields'):
+        rr.native_receipt_prompts({**b, 'gold': .12345}, inspection, [], q)
+
+
+def test_native_receipt_binding_and_query_validations():
+    import copy
+    import pytest
+    b, inspection = _native_fixture()
+    q = [{'scales': {'source': .5, 'reader': 1}}]
+    bad = copy.deepcopy(inspection); bad['source_binding']['model_revision'] = 'd'*40
+    with pytest.raises(ValueError, match='binding mismatch'): rr.native_receipt_prompts(b, bad, [], q)
+    bad = copy.deepcopy(inspection); bad['input_token_ids'] = [9, 9, 9]
+    with pytest.raises(ValueError, match='binding mismatch'): rr.native_receipt_prompts(b, bad, [], q)
+    for scales in ({'source': True, 'reader': 1}, {'source': float('nan'), 'reader': 1}, {'source': 1, 'reader': 1}):
+        with pytest.raises(ValueError): rr.native_receipt_prompts(b, inspection, [], [{'scales': scales}])
+    with pytest.raises(ValueError, match='duplicate'): rr.native_receipt_prompts(b, inspection, [], q+q)

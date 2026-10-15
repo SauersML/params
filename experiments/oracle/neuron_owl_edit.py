@@ -76,14 +76,16 @@ def name(u: tuple) -> str:
     return f"{u[0]}:{u[1]}{'+' if u[2] > 0 else '-' if u[2] < 0 else ''}"
 
 
-class Owl:
-    def __init__(self, nr: nb.Neurons, tok):
+class Target:
+    """A behaviour's token set (keep(token text stripped and lowercased)) on an organism, with batched pole removals."""
+
+    def __init__(self, nr: nb.Neurons, tok, keep=lambda w: w.startswith("owl")):
         self.nr, self.tok = nr, tok
         vocab = [tok.decode([z]) for z in range(len(tok))]
-        self.owl = torch.tensor([z for z, w in enumerate(vocab) if w.strip().lower().startswith("owl")], device=nr.dev)
+        self.owl = torch.tensor([z for z, w in enumerate(vocab) if keep(w.strip().lower())], device=nr.dev)
 
     def p_owl(self, ids: list[int], sets: list) -> list[float]:
-        """Per set of poles removed: p(owl) at the end of ids."""
+        """Per set of poles removed: the token set's probability at the end of ids."""
         out = []
         for s0 in range(0, len(sets), ROWS):
             part = sets[s0:s0 + ROWS]
@@ -143,7 +145,7 @@ def main():
     model = AutoModelForCausalLM.from_pretrained(a.model, dtype=getattr(torch, a.dtype)).to("cuda")
     model = PeftModel.from_pretrained(model, a.adapter).eval().requires_grad_(False)
     nr = nb.Neurons(model, tok)
-    ow = Owl(nr, tok)
+    ow = Target(nr, tok)
     rec = {"model": a.model, "adapter": a.adapter, "owl_tokens": len(ow.owl)}
     # the decision points: each training prompt's greedy answer up to its first owl token
     users = sorted({json.loads(x)["user"] for x in (a.data / "owl.jsonl").read_text().splitlines() if "owl" in json.loads(x)["answer"].lower()})

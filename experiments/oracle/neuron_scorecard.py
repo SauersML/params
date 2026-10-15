@@ -28,6 +28,9 @@ Families, each a score with its floor (FLOOR):
                position), in R and in the circuit's run; the model's own response beside it
                (the prediction families score 1 - sum |d_c - d_m| / max(sum |d_m|, sum |d_c|) over their draws: 1 a
                perfect prediction, 0 no better than predicting no change; none when both sums are under SHARE_MIN bits)
+  specificity  the circuit's neurons zeroed at every position of each far donor (an unrelated text, as T3's
+               unrelated prompts): the mean KL (bits) of R's next-token distributions over its positions; at most
+               the floor (T3's 0.05 bits)
   simplicity   units as listed, unit-positions, distinct neurons, positions and layers, poles and SwiGLU sign regimes
                (the signs of gate and up) of the unit-positions in R, and the edges and heads the circuit states
 Noise-aware floors: a family scored over draws passes at its floor less min(PAIRED_SE x its bootstrap standard error
@@ -73,8 +76,9 @@ SINGLES_MAX = 512  # units measured singly to rank them; past it the rest by |ac
 ROWS = 16  # runs a forward
 TOL = 0.1  # neuron_edges.TOL: the share of the contrast a circuit may lose
 FLOOR = {"necessity": 1.0, "sufficiency": 1 - TOL, "patching_near": 1 - TOL, "patching_far": 1 - TOL, "swaps": 1 - TOL,
-         "steering": 1 - TOL, "weights": 1 - TOL}
-DRAWN = ("patching_near", "patching_far", "swaps", "steering", "weights")
+         "steering": 1 - TOL, "weights": 1 - TOL, "specificity": 0.05}
+DRAWN = ("patching_near", "patching_far", "swaps", "steering", "weights", "specificity")
+LOWER = ("specificity",)  # families whose score passes at or under its floor
 PAIRED_SE = 2.0  # goal_eval's: a drawn family passes at its floor less this many standard errors, at most CAP
 CAP: dict = {}  # per family, PAIRED_SE x the median standard error over the first dev set's circuits (until then uncapped)
 EPS_BOOT = 200
@@ -207,6 +211,28 @@ class Runs:
                 out.append(r)
         return out
 
+    @torch.no_grad()
+    def text_kl(self, ids: list[int], aff: list[tuple]) -> float:
+        """The mean KL (bits) over the first T positions of ids between R's next-token distributions and R's under aff."""
+        T = min(self.T, len(ids))
+        x_ids = list(ids)[:T]
+        keep = [a for a in aff if a[1] < T]
+
+        def edit(spec):
+            def f(i, x):
+                h = x.float()
+                h = torch.where(h.abs() < self.thr[i], torch.zeros((), device=self.dev), h)
+                es = [e for e in spec if e[0] == i]
+                if es:
+                    p = torch.tensor([e[1] for e in es], device=self.dev)
+                    j = torch.tensor([e[2] for e in es], device=self.dev)
+                    h = h.index_put((torch.zeros_like(p), p, j), torch.zeros(len(es), device=self.dev))
+                return h.to(x.dtype)
+            return f
+        lp0 = torch.log_softmax(self.run.logits(x_ids, list(range(T)), edit=edit([]))[0].float(), -1)
+        lp1 = torch.log_softmax(self.run.logits(x_ids, list(range(T)), edit=edit(keep))[0].float(), -1)
+        return float((lp0.exp() * (lp0 - lp1)).sum(-1).mean() / math.log(2.0))
+
     def add_donor(self, key, ids: list[int]):
         self.donors[key] = self.capture(ids)
 
@@ -248,6 +274,8 @@ def family_score(rec: dict, f: str, draws: list[dict] | None = None) -> float | 
     d = rec["draws"][f] if draws is None else draws
     if f.startswith("patching"):
         return patch_score(d, cR)
+    if f == "specificity":
+        return float(np.mean([x["kl"] for x in d])) if d else None
     return prediction(d)
 
 
@@ -262,13 +290,14 @@ def margins(rec: dict) -> dict:
         if f in DRAWN and len(rec["draws"][f]) >= 2:
             d = rec["draws"][f]
             bs = [family_score(rec, f, [d[i] for i in idx]) for idx in rng.integers(len(d), size=(EPS_BOOT, len(d)))]
-            bs = [min(1.0, max(-1.0, x)) for x in bs if x is not None]
+            bs = [x if f in LOWER else min(1.0, max(-1.0, x)) for x in bs if x is not None]
             se = float(np.std(bs, ddof=1)) if len(bs) > 1 else 0.0
         cap = CAP.get(f)
         allow = PAIRED_SE * se if cap is None else min(PAIRED_SE * se, cap)
+        sg = -1 if f in LOWER else 1  # a LOWER family passes at or under its floor plus the allowance
+        ok = lambda a: None if s is None else sg * s >= sg * fl - a  # noqa: E731
         out[f] = {"score": s, "floor": fl, "se": se, "allowance": allow, "capped": cap is not None,
-                  "pass_old": None if s is None else s >= fl, "pass_new": None if s is None else s >= fl - allow,
-                  "pass_uncapped": None if s is None else s >= fl - PAIRED_SE * se}
+                  "pass_old": ok(0.0), "pass_new": ok(allow), "pass_uncapped": ok(PAIRED_SE * se)}
     return out
 
 
@@ -349,7 +378,8 @@ def score(run: neuron_hubs.Runner, tok, model, c: dict, bg: dict, families: dict
                       "over_1bit": sum(d > 1 for d in drops.values())}
     # donors: patching and swaps
     dons = donor_ids(tok, model, c, families, rs.T, dev)
-    draws = {"patching_near": [], "patching_far": [], "swaps": []}
+    draws = {"patching_near": [], "patching_far": [], "swaps": [], "specificity": []}
+    gone = [(L, p, j, 0.0, 0.0) for L, j in sorted({(L, j) for L, _, j in cells}) for p in range(rs.T)]
     for kind in ("near", "far"):
         for n, ids in enumerate(dons[kind]):
             key = f"{kind}{n}"
@@ -358,6 +388,8 @@ def score(run: neuron_hubs.Runner, tok, model, c: dict, bg: dict, families: dict
             pr, smr, smc = rs.runs([{"circuit": True, "fill": key}, {"aff": sw}, {"circuit": True, "aff": sw}])
             draws[f"patching_{kind}"].append({"donor": key, "c": pr["contrast"]})
             draws["swaps"].append({"donor": key, "dm": smr["contrast"] - cR, "dc": smc["contrast"] - circ["contrast"]})
+            if kind == "far":
+                draws["specificity"].append({"donor": key, "kl": rs.text_kl(ids, gone)})
             del rs.donors[key]
     # steering and weight edits on the top units
     specs, meta = [], []

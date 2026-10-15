@@ -103,7 +103,8 @@ def test_margins_read_records():
     rec = {"contrast": {"R": 4.0}, "necessity": {"R": -0.5}, "sufficiency": {"c": 3.8},
            "draws": {"patching_near": [{"c": 4.0}, {"c": 3.0}], "patching_far": [{"c": 4.0}],
                      "swaps": [{"dm": 1.0, "dc": 1.0}, {"dm": -2.0, "dc": -2.0}], "steering": [{"dm": 0.01, "dc": 0.02}],
-                     "weights": [{"dm": 1.0, "dc": 0.0}, {"dm": 1.0, "dc": 0.0}]}}
+                     "weights": [{"dm": 1.0, "dc": 0.0}, {"dm": 1.0, "dc": 0.0}],
+                     "specificity": [{"kl": 0.01}, {"kl": 0.03}]}}
     m = ns.margins(rec)
     assert m["necessity"]["score"] == 1.0 and m["necessity"]["se"] == 0.0
     assert m["sufficiency"]["score"] == pytest.approx(0.95) and m["sufficiency"]["pass_old"]
@@ -111,3 +112,33 @@ def test_margins_read_records():
     assert m["swaps"]["score"] == 1.0
     assert m["steering"]["score"] is None and m["steering"]["pass_new"] is None
     assert m["weights"]["score"] == 0.0 and m["weights"]["pass_new"] is False
+    assert m["specificity"]["score"] == pytest.approx(0.02) and m["specificity"]["pass_old"]
+    rec["draws"]["specificity"] = [{"kl": 0.2}, {"kl": 0.3}]
+    assert ns.margins(rec)["specificity"]["pass_new"] is False
+
+
+def test_text_kl(tiny):
+    model, run, ids, donor, bg = tiny
+    thr = bg["thr"]
+    rs = ns.Runs(run, ids, 9, [3], [5, 7], bg, [(1, 11)])
+    assert rs.text_kl(donor, []) == pytest.approx(0.0, abs=1e-6)
+    gone = [(1, p, 11, 0.0, 0.0) for p in range(10)]
+
+    def lp(edit):
+        hooks = [layer.mlp.down_proj.register_forward_pre_hook(lambda m, a, L=L: (edit(L, a[0]),)) for L, layer in enumerate(model.model.layers)]
+        try:
+            with torch.no_grad():
+                return torch.log_softmax(model(torch.tensor([donor[:10]])).logits[0].float(), -1)
+        finally:
+            for h in hooks:
+                h.remove()
+    weak = lambda L, h: h * (h.abs() >= thr[L])  # noqa: E731
+
+    def removed(L, h):
+        h = weak(L, h).clone()
+        if L == 1:
+            h[:, :, 11] = 0
+        return h
+    a, b = lp(weak), lp(removed)
+    want = float((a.exp() * (a - b)).sum(-1).mean() / torch.log(torch.tensor(2.0)))
+    assert rs.text_kl(donor, gone) == pytest.approx(want, abs=1e-5)

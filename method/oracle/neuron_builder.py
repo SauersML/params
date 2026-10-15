@@ -29,7 +29,8 @@ build(nr, ids, pos) on one prompt (the circuit: the necessary units and the suff
    passing ones together on a log grid with bracketing); then the kept MLP blocks' units: ranked by |value change x
    gradient| on the patched runs, the SUF_MEASURED largest patched alone and ranked by that (the rest by the gradient),
    the smallest restoring prefix, trimmed in TRIM_GROUPS groups;
-5. met: the necessity set's removal is necessary and the circuit, patched into every counterfactual, restores SUFF_FRAC;
+5. met: the necessity set's removal is necessary and the circuit, patched into every counterfactual, restores SUFF_FRAC
+   (step 4 searches with the necessity set always patched, so the two sets are measured together);
    reported: the circuit's removal, keep-only (every other candidate zeroed: the contrast and whether y stays top).
 On 100 prompts every candidate patched restored >= 0.9 on 99 on Qwen3-1.7B and on Qwen3-8B (every neuron at the answer
 position alone on 53 and 35), and one ranked prefix for both criteria met 61 and 12, its shortlist missing what the patch
@@ -414,7 +415,7 @@ def build(nr: Neurons, ids: list[int], pos: int, log=None) -> dict:
                 nec = rest
     rec["seconds_necessity"] = round(time.perf_counter() - t0, 2)
     # 4. sufficiency: counterfactuals, then the patch eliminated from every candidate and route down to units and routes
-    cfs, suf, routes, srec = ([], [], [], {}) if not SUFFICIENCY else _sufficiency(nr, ids, pos, H, O, P, contrast, c0)
+    cfs, suf, routes, srec = ([], [], [], {}) if not SUFFICIENCY else _sufficiency(nr, ids, pos, H, O, P, contrast, c0, nec)
     rec["counterfactuals"] = [{"pos": q, "token": z, "drop": d} for q, z, _, d in cfs]
     rec["sufficiency_search"] = srec
     rec["seconds_sufficiency"] = round(time.perf_counter() - t0, 2)
@@ -452,9 +453,11 @@ def build(nr: Neurons, ids: list[int], pos: int, log=None) -> dict:
     return rec
 
 
-def _sufficiency(nr: Neurons, ids: list[int], pos: int, H: list, O: list, P: list, contrast, c0: float):
+def _sufficiency(nr: Neurons, ids: list[int], pos: int, H: list, O: list, P: list, contrast, c0: float, fixed: list):
     """build's step 4: the counterfactuals [(position, token, ids, drop)], the sufficient units [(layer, pos, neuron)], the
-    routes [(layer, head, pos)] and the search's record (with "restore_of": sets of units and routes -> the least share
+    routes [(layer, head, pos)] (every patch with the fixed units [(layer, pos, neuron)] on too: the necessity set, whose
+    patch on top of a passing one lowered it, Qwen3-8B f0: 43 routes alone >= 0.9, with its 19 neurons 0.87) and the
+    search's record (with "restore_of": sets of units and routes -> the least share
     restored over the counterfactuals, and "alone": each measured unit's share patched alone)."""
     t0 = time.perf_counter()
     best = {}                                                # counterfactuals: one token replaced by one of the
@@ -466,6 +469,9 @@ def _sufficiency(nr: Neurons, ids: list[int], pos: int, H: list, O: list, P: lis
     if not cfs:
         return cfs, [], [], {}
     T, L, NH, dev = len(ids), nr.L, nr.NH, nr.dev
+    fx = [torch.zeros(T, nr.D, dtype=torch.bool, device=dev) for _ in range(L)]
+    for i, t, n in fixed:
+        fx[i][t, n] = True
 
     def restore(rows: list) -> list[float]:
         """Per row (fn(i) -> ([T, D] units, [T, NH] routes) on layer i): the least share of a counterfactual's contrast loss
@@ -478,7 +484,7 @@ def _sufficiency(nr: Neurons, ids: list[int], pos: int, H: list, O: list, P: lis
                 mk = [[fn(i) for i in range(L)] for fn in _pad(part)]
 
                 def edit(i, h, mk=mk):
-                    m = torch.stack([r[i][0] for r in mk])
+                    m = torch.stack([r[i][0] for r in mk]) | fx[i]
                     return torch.where(m, H[i][None].to(h.dtype), h)
 
                 def route(i, a, mk=mk):
@@ -598,7 +604,7 @@ def _sufficiency(nr: Neurons, ids: list[int], pos: int, H: list, O: list, P: lis
         hc = [h[0] for h in capc["h"]]
         mc = [torch.ones(T, nr.D, device=dev, requires_grad=True) for _ in range(L)]
         with torch.enable_grad():
-            l = torch.log_softmax(nr.logits(x2, [pos], edit=lambda i, h: torch.where(pool[i], H[i].to(h.dtype), h) * mc[i].to(h.dtype),
+            l = torch.log_softmax(nr.logits(x2, [pos], edit=lambda i, h: torch.where(pool[i] | fx[i], H[i].to(h.dtype), h) * mc[i].to(h.dtype),
                                             route=lambda i, a: torch.where(rmask[i].repeat_interleave(nr.hd, -1), O[i].to(a.dtype), a))[:, 0], -1)
             contrast(l).sum().backward()
         for i in range(L):
@@ -684,7 +690,7 @@ def main():
 
         model = PeftModel.from_pretrained(model, a.adapter).eval()
     model.requires_grad_(False)                               # (gradients only at the neuron values: float32 8B's
-    nr = Neurons(model, tok)                                  # weight gradients filled an L40)
+    nr = Neurons(model, tok)                                  # weight gradients filled a 48 GB card)
     if a.thr and a.thr.exists():
         nr.load(a.thr)
         cal = {"tau": nr.tau, "file": str(a.thr)}

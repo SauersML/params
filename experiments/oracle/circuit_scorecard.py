@@ -1146,7 +1146,7 @@ def add_noise(rec: dict, row0: dict, vf: dict, fams: list) -> None:
     mn["weak_noise"] = [sum(m["removable_noise"] for m in mn["rows"] if not m["uniform"]), mn["weak"][1]]
 
 
-def add(out: Path, circuits_dir: Path, vpd: dict | None, pool: dict) -> None:
+def add(out: Path, circuits_dir: Path, vpd: dict | None, pool: dict, only: set | None = None) -> None:
     """Records written before the mediated share, parameters touched, build seconds, interventions, live gates or the
     noise-aware floors: those computed and added (the circuit of each record from circuits_dir, by task; the floors'
     reference rows and the circuit's own reward row computed again, the same draws)."""
@@ -1157,7 +1157,7 @@ def add(out: Path, circuits_dir: Path, vpd: dict | None, pool: dict) -> None:
     ci = Path(vpd_model.VPD_PTH).exists()
     means = None
     for f in sorted(out.iterdir()):
-        if f.suffix != ".json" or f.name == "summary.json":
+        if f.suffix != ".json" or f.name == "summary.json" or (only and f.stem not in only):
             continue
         rec = json.loads(f.read_text())
         native_rec = rec["size"].get("units") == "native"
@@ -1499,7 +1499,8 @@ def main():
     ap.add_argument("--stride", type=int, default=1)
     a = ap.parse_args()
     if str(a.paths[0]) == "add":  # add OUT CIRCUITS_DIR
-        add(a.paths[1], a.paths[2], {k: v for f in a.vpd for k, v in torch.load(f).items()} or None, torch.load(a.pool))
+        add(a.paths[1], a.paths[2], {k: v for f in a.vpd for k, v in torch.load(f).items()} or None, torch.load(a.pool),
+            set(filter(None, a.only.split(","))) or None)  # (--only: one text a process keeps the Mac's memory flat)
         return
     if str(a.paths[0]) == "bakeoff":  # bakeoff NAME=OUT ... [--mib FILE: {builder: {metric: value}}]
         sets = {x.split("=", 1)[0]: load(Path(x.split("=", 1)[1])) for x in map(str, a.paths[1:])}

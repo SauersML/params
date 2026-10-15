@@ -20,9 +20,10 @@ build(nr, ids, pos) on one prompt (the circuit: the necessary units and the suff
    necessary: the answer stops being the top token and the contrast falls by at least NEC_BITS, side effect <= SIDE_MAX;
 3. necessity's trim: the prefix's units in TRIM_GROUPS groups, dropped from the set while its removal stays necessary
    (_cut: each group alone, then the passing ones together);
-4. sufficiency: CF_N counterfactual prompts, one context token replaced by one of the model's own likeliest alternatives
-   there, those lowering the answer's contrast most (one per position, at least NEC_BITS); every candidate unit and every
-   route (a head's output at a position, attention's route into it) from the first changed position on, set to its
+4. sufficiency: CF_N counterfactual prompts, one token of the question (span; main: the user's text, user_span)
+   replaced by one of the model's own likeliest alternatives there, those lowering the answer's contrast most (one per
+   position, at least NEC_BITS); every candidate unit and every route (a head's output at a position, attention's route
+   into it) from the first changed position on, set to its
    value on the prompt in each counterfactual's run (the patch), restores the contrast it lost; the patch is cut while it
    restores at least SUFF_FRAC (the least over the counterfactuals): positions, then MLP blocks (layer, position) with
    every route on, largest first (each level _cut: every group dropped alone, then the passing ones together on a log
@@ -343,14 +344,14 @@ def _cut(n: int, test, rounds: int = ROUNDS) -> list[bool]:
 
 
 @torch.no_grad()
-def counterfactuals(nr: Neurons, ids: list[int], pos: int, contrast, c0: float) -> list[tuple]:
-    """Every counterfactual prompt of build's step 4: at each position 1..pos-1 the token replaced by each of the
-    model's CF_ALTS likeliest next tokens there (other than the token itself), as (position, token, ids, the drop in the
+def counterfactuals(nr: Neurons, ids: list[int], pos: int, contrast, c0: float, positions=None) -> list[tuple]:
+    """Every counterfactual prompt of build's step 4: at each of positions (default 1..pos-1) the token replaced by each
+    of the model's CF_ALTS likeliest next tokens there (other than the token itself), as (position, token, ids, the drop in the
     answer's contrast; contrast: [B, V] log p at pos -> [B] bits). build keeps the best per position, the CF_N largest;
     neuron_scorecard's held-out sufficiency draws the others."""
     lpre = torch.log_softmax(nr.logits(ids, list(range(pos))), -1)[0]   # [pos, V]: the prediction of each next token
     tries = []
-    for q in range(1, pos):
+    for q in (range(1, pos) if positions is None else positions):
         for z in lpre[q - 1].topk(CF_ALTS + 1).indices.tolist():
             if z != ids[q]:
                 x2 = list(ids)
@@ -363,10 +364,11 @@ def counterfactuals(nr: Neurons, ids: list[int], pos: int, contrast, c0: float) 
     return [(q, z, x2, c0 - c) for (q, z, x2), c in zip(tries, cq)]
 
 
-def build(nr: Neurons, ids: list[int], pos: int, log=None) -> dict:
-    """The circuit and its record on one prompt (module docstring)."""
+def build(nr: Neurons, ids: list[int], pos: int, log=None, span: tuple | None = None) -> dict:
+    """The circuit and its record on one prompt (module docstring); span (a, b): the positions a..b-1 counterfactuals may
+    change (the question; default 1..pos-1)."""
     t0 = time.perf_counter()
-    rec = {"T": len(ids), "pos": pos, "tau": nr.tau}
+    rec = {"T": len(ids), "pos": pos, "tau": nr.tau, "span": span}
     side = sorted({max(1, pos - 1 - k * max(1, (pos - 1) // SIDE)) for k in range(SIDE)} - {pos})
     allpos = side + [pos]
     cap = {}
@@ -451,7 +453,7 @@ def build(nr: Neurons, ids: list[int], pos: int, log=None) -> dict:
         nec = [u for g, on in zip(groups, kg) if on for u in g]
     rec["seconds_necessity"] = round(time.perf_counter() - t0, 2)
     # 4. sufficiency: counterfactuals, then the patch eliminated from every candidate and route down to units and routes
-    cfs, suf, routes, srec = ([], [], [], {}) if not SUFFICIENCY else _sufficiency(nr, ids, pos, H, O, P, contrast, c0, nec)
+    cfs, suf, routes, srec = ([], [], [], {}) if not SUFFICIENCY else _sufficiency(nr, ids, pos, H, O, P, contrast, c0, nec, span)
     rec["counterfactuals"] = [{"pos": q, "token": z, "drop": d} for q, z, _, d in cfs]
     rec["sufficiency_search"] = srec
     rec["seconds_sufficiency"] = round(time.perf_counter() - t0, 2)
@@ -515,16 +517,18 @@ def _route_order(nr: Neurons, ids: list[int], pos: int, H: list, O: list, fn, ro
     return score.argsort(descending=True)
 
 
-def _sufficiency(nr: Neurons, ids: list[int], pos: int, H: list, O: list, P: list, contrast, c0: float, fixed: list):
+def _sufficiency(nr: Neurons, ids: list[int], pos: int, H: list, O: list, P: list, contrast, c0: float, fixed: list,
+                 span: tuple | None = None):
     """build's step 4: the counterfactuals [(position, token, ids, drop)], the sufficient units [(layer, pos, neuron)], the
     routes [(layer, head, pos)] (every patch with the fixed units [(layer, pos, neuron)] on too: the necessity set, whose
     patch on top of a passing one lowered it, Qwen3-8B f0: 43 routes alone >= 0.9, with its 19 neurons 0.87) and the
     search's record (with "restore_of": sets of units and routes -> the least share
     restored over the counterfactuals, and "alone": each measured unit's share patched alone)."""
     t0 = time.perf_counter()
-    best = {}                                                # counterfactuals: one token replaced by one of the
-    for q, z, x2, d in counterfactuals(nr, ids, pos, contrast, c0):   # model's own likeliest alternatives there, those
-        if d > best.get(q, (None, None, 0.0))[2]:            # lowering the answer's contrast most (one per position)
+    best = {}                                                # counterfactuals: one token of span replaced by one of
+    qs = None if span is None else range(max(1, span[0]), min(pos, span[1]))   # the model's own likeliest alternatives
+    for q, z, x2, d in counterfactuals(nr, ids, pos, contrast, c0, qs):   # there, those lowering the answer's contrast
+        if d > best.get(q, (None, None, 0.0))[2]:            # most (one per position)
             best[q] = (z, x2, d)
     cfs = sorted(((q, z, x2, d) for q, (z, x2, d) in best.items()), key=lambda r: -r[3])[:CF_N]
     cfs = [r for r in cfs if r[3] >= NEC_BITS]
@@ -751,6 +755,14 @@ def chat(tok, user: str) -> list[int]:
                                        enable_thinking=False), add_special_tokens=False)["input_ids"]
 
 
+def user_span(tok, ids: list[int]) -> tuple[int, int]:
+    """The first user turn's content in a Qwen chat: the positions after "<|im_start|>user\n" and before "<|im_end|>"
+    (counterfactuals in the template's own tokens, the assistant's "</think>" and the like, broke the format rather than
+    the question: 13 of 56 on Qwen3-8B)."""
+    a = ids.index(tok.convert_tokens_to_ids("<|im_start|>")) + 3
+    return a, ids.index(tok.convert_tokens_to_ids("<|im_end|>"), a)
+
+
 def main():
     import argparse
     import json
@@ -800,9 +812,9 @@ def main():
             continue
         ids = r.get("ids") or chat(tok, r["user"])
         if first:                                             # (a throwaway build: CUDA's first kernels)
-            build(nr, ids, len(ids) - 1)
+            build(nr, ids, len(ids) - 1, span=user_span(tok, ids))
             first = False
-        rec = build(nr, ids, len(ids) - 1, log=print)
+        rec = build(nr, ids, len(ids) - 1, log=print, span=user_span(tok, ids))
         rec.update(id=r["id"], user=r["user"], answer_text=tok.decode([rec["answer"]]), units="neurons",
                    builder=f"neuron_builder@{a.rev}", model=a.model, adapter=a.adapter, calibration=cal)
         (a.out / f"{r['id']}.json").write_text(json.dumps(rec))

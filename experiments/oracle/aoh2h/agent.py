@@ -57,6 +57,7 @@ REPEATS = 2
 TURNS = 10  # the agent's messages per item
 MAX_TOKENS = 2048  # per message, thinking included (the pilot: budget 0 thought past 4096 with no answer)
 FORCED = 300  # tokens of a forced answer
+EPISODE_USD = 0.06  # an episode's dollars, about the most the sealed run's first 44 spent (mean $0.024)
 CALLS = 8  # tool calls per message
 N_TEXTS, N_FACTS, N_EDITS, N_OWL, N_PERSONA = 10, 5, 5, 5, 5
 ORGANISMS = Path(os.environ.get("ORGANISMS", "~/mpd-data/organisms/qwen3_1p7b")).expanduser()
@@ -786,6 +787,9 @@ def episode(a, it: dict, budget: int, rep: int, sampler, rr, tok, spend: Spend) 
     eid = f"{it['id']}|{budget}|{rep}|{uuid.uuid4().hex[:8]}"
     rec = {"id": it["id"], "kind": it["kind"], "budget": budget, "repeat": rep, "episode": eid, "calls": [], "turns": 0,
            "prefill": 0, "cached": 0, "sampled": 0, "usd": 0.0, "answer": None, "stopped": None}
+    if spend.spent + spend.held + EPISODE_USD > spend.cap:  # an episode that may not finish under the cap never starts
+        rec.update(stopped="cap", grades=[], passes=0, seconds=0.0)
+        return rec
     t0 = time.time()
     try:
         talk(a, it, budget, rec, sampler, rr, tok, spend)
@@ -906,10 +910,12 @@ def run(a) -> None:
     rr = renderers.get_renderer(RENDERER, get_tokenizer(AGENT))
     sampler = tinker.ServiceClient(project_id=project).create_sampling_client(base_model=AGENT)
     done = [json.loads(x) for x in a.out.read_text().splitlines()] if a.out.exists() else []
-    spend = Spend(a.cap, sum(r["usd"] for r in done))
-    have = {(r["id"], r["budget"], r["repeat"]) for r in done if not str(r["stopped"]).startswith("error")}
-    jobs = [(it, b, rep) for rep in range(a.repeats) for b in a.budgets for it in items_
-            if (it["id"], b, rep) not in have and (b or rep < a.repeats_text_only)]
+    spend = Spend(a.cap, sum(r["usd"] for r in done) + a.spent_extra)
+    have = {(r["id"], r["budget"], r["repeat"]) for r in done if not r["stopped"]}
+    # the first repeat budget by budget, later ones item by item (a repeat the cap cuts short still spans every budget)
+    order = [(rep, b, k) if rep == 0 else (rep, k, b) for rep in range(a.repeats) for b in a.budgets for k in range(len(items_))]
+    jobs = [(items_[k], b, rep) for rep, x, y in sorted(order) for b, k in [((x, y) if rep == 0 else (y, x))]
+            if (items_[k]["id"], b, rep) not in have and (b or rep < a.repeats_text_only)]
     print(f"{len(jobs)} episodes; ${spend.spent:.3f} spent before, cap ${a.cap}", flush=True)
     lock = threading.Lock()
     with ThreadPoolExecutor(a.workers) as ex:
@@ -986,6 +992,10 @@ QS = ("a", "b", "c", "fact", "edit", "owl", "persona")
 
 def report(a) -> None:
     recs = [json.loads(x) for x in a.out.read_text().splitlines()]
+    cut = [r for r in recs if r["stopped"]]
+    recs = [r for r in recs if not r["stopped"]]  # (an episode the cap or an error ended is rerun on a resume)
+    if cut:
+        print(f"{len(cut)} episodes ended by the cap or an error left out (${sum(r['usd'] for r in cut):.3f})")
     budgets = sorted({r["budget"] for r in recs})
     reps = sorted({r["repeat"] for r in recs})
     print(f"agent {AGENT}: accuracy per question kind and budget (passes per item); per repeat, mean; n questions per repeat")
@@ -1061,7 +1071,7 @@ def plot(a) -> None:
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    recs = [json.loads(x) for x in a.out.read_text().splitlines()]
+    recs = [r for r in (json.loads(x) for x in a.out.read_text().splitlines()) if not r["stopped"]]
     rs = [json.loads(x) for x in a.refs.read_text().splitlines()] if a.refs else []
     red, blue, green, gray = "#D1495B", "#2F6DB5", "#2E8B57", "#8A8A8A"
     plt.rcParams.update({"font.size": 16, "axes.titlesize": 17, "axes.titlelocation": "left", "axes.spines.top": False,
@@ -1142,6 +1152,8 @@ def main():
     r.add_argument("--items", nargs="*", help="item ids (default every item)")
     r.add_argument("--cap", type=float, default=5.0, help="Tinker dollars for this output file in all")
     r.add_argument("--workers", type=int, default=16)
+    r.add_argument("--spent-extra", type=float, default=0.0, help="dollars spent outside the output file (episodes lost "
+                   "to a stopped run), counted against the cap")
     p = sub.add_parser("report")
     p.add_argument("out", type=Path)
     p.add_argument("--refs", type=Path)

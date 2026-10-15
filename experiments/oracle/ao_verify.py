@@ -58,6 +58,7 @@ HINT = "Okay, then give me a hint about it."
 CONTROL_HOP = ["The opposite of hot is", "Water freezes at zero degrees", "The first month of the year is",
                "Two plus two equals"]  # unrelated one-token answers: general damage for multi-hop items
 CONTROL_CHAT = "Describe how to boil an egg in two sentences."  # an unrelated reply: general damage for taboo items
+DIRECTION = "template"  # the concept directions: template means contrasted with near words (frozen), or unembedding rows
 WORDS: set = set()  # an English word list (dwyl's words_alpha, 370k): the logit lens's tokens include fragments ("Estr")  # the taboo behaviour: the model's hint in a follow-up turn
 SINGLE = "Answer with a single word only. "
 Q_THINK = SINGLE + "What is the model thinking about?"
@@ -362,6 +363,14 @@ class Target:
             out.append(torch.nn.functional.normalize(x - pool[nb].mean(0), dim=-1))
         return torch.stack(out)
 
+    def unembed(self, words_: list[str]):
+        """Per word, its unembedding row (the first token of ' word'), unit length, the same at every band layer: the
+        logit-lens direction (a variant of directions(), run with --direction unembed): (len, band, D)."""
+        W = self.lm_head.weight
+        rows = [W[self.tok(" " + w, add_special_tokens=False)["input_ids"][0]].float() for w in words_]
+        d = self.torch.nn.functional.normalize(self.torch.stack(rows), dim=-1)
+        return d[:, None, :].expand(-1, len(self.band), -1).contiguous()
+
     def _means(self, adapter: str | None, words_: list[str], batch: int = 64) -> None:
         """Each word's last-token residual at the band layers averaged over TEMPLATES, into the cache (right-padded
         batches: a causal model's earlier positions ignore the padding)."""
@@ -524,7 +533,7 @@ def run_item(tg: Target, item: dict, rng: random.Random) -> dict:
         allw = names + nulls + truth_w
         for s in range(0, len(allw), 8):
             chunk = allw[s:s + 8]
-            dirs = tg.directions(item["adapter"], chunk)
+            dirs = tg.unembed(chunk) if DIRECTION == "unembed" else tg.directions(item["adapter"], chunk)
             got = tg.behaviour(seq, start, score_from, answers, dirs)
             lost = torch.stack([b - tg.behaviour(*x, dirs) for x, b in zip(controls, cbase)]).mean(0)
             for w, v, d in zip(chunk, got.tolist(), lost.tolist()):
@@ -545,7 +554,8 @@ def run_item(tg: Target, item: dict, rng: random.Random) -> dict:
 
 
 def run(a) -> None:
-    global WORDS
+    global WORDS, DIRECTION
+    DIRECTION = a.direction
     WORDS = set(a.words.read_text().split())
     items_ = [json.loads(x) for x in a.items.read_text().splitlines()]
     if a.task:
@@ -629,6 +639,14 @@ def score(a) -> None:
               f"ECE {ece(conf, v_ok):.3f}; Brier {sum((c - o) ** 2 for c, o in zip(conf, v_ok)) / n:.3f}")
         print(f"  truth among candidates {sum(cand_any)}/{n}; by source: " + ", ".join(
             f"{s} {sum(any(c['truth'] is not None and s in c['source'] for c in r['candidates']) for r in rs)}" for s in ("ao", "lens", "patch")))
+        # the oracle's own answer kept only when the check verifies it (the oracle plus verification)
+        kept = [r for r in rs if r["ao_answer"] and any(c["verified"] and norm(c["word"]) == norm(r["ao_answer"]) for c in r["candidates"])]
+        print(f"  oracle answer when verified: answered {len(kept)}/{n}, right {sum(r['ao_truth'] is not None for r in kept)} "
+              f"(precision {sum(r['ao_truth'] is not None for r in kept) / max(len(kept), 1):.2f}); not verified: right "
+              f"{sum(r['ao_truth'] is not None for r in rs if r not in kept)}/{n - len(kept)}")
+        for q in (0.5, 0.8):  # the oracle alone at matched coverage: its answers at confidence >= q
+            sel = [r for r in rs if r["ao_conf"] >= q]
+            print(f"  oracle alone at confidence >= {q}: answered {len(sel)}/{n}, precision {sum(r['ao_truth'] is not None for r in sel) / max(len(sel), 1):.2f}")
 
 
 def main():
@@ -645,6 +663,8 @@ def main():
     r.add_argument("--limit", type=int)
     r.add_argument("--device")
     r.add_argument("--words", type=Path, default=ROOT / "words_alpha.txt", help="the word list lens candidates must be in")
+    r.add_argument("--direction", default="template", choices=("template", "unembed"),
+                   help="concept directions: the frozen template contrast, or each word's unembedding row (a variant)")
     s = sub.add_parser("score")
     s.add_argument("out", type=Path, nargs="+")
     s.add_argument("--dev", type=Path, default=ROOT / "dev_ids.jsonl")

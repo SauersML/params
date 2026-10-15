@@ -9,7 +9,7 @@ apart (pos0).
       prefix holds the mix): each document's first WINDOW tokens (at least MIN_TOKENS), chat rendered with the model's
       chat template (thinking off); ROOT/corpus/tokens.npy (int32), offsets.npy (document d: tokens[off[d]:off[d + 1]]),
       sources.npy (MIX index per document), meta.json
-  atlas.py collect ROOT --shard K --shards S [--batch-tokens 32768]   documents d with d % S == K
+  atlas.py collect ROOT --shard K --shards S [--batch-tokens 32768] [--model M]   documents d with d % S == K
   atlas.py merge ROOT                       the shards into ROOT/layers/LNN.npz (Atlas reads them)
   atlas.py weights ROOT [--model M]         ROOT/weights.npz: neighbours by weight product, direct logit effects
   atlas.py heads ROOT [--texts 2000]        ROOT/heads.npz: per head its sink share, offset profile, top positions
@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import time
 from pathlib import Path
 
@@ -109,6 +110,7 @@ def corpus(a) -> None:
         "mix": [{"name": m[0], "dataset": m[1], "config": m[2], "split": m[3], "share": m[5], "tokens": got[j], "documents": ndocs[j]}
                 for j, m in enumerate(MIX)]}, indent=1))
     print(f"corpus: {total} tokens, {len(chunks)} documents, {time.time() - t0:.0f} s -> {out}", flush=True)
+    os._exit(0)   # the streams' threads abort the interpreter's exit ("terminate called without an active exception")
 
 
 def load_corpus(root: Path):
@@ -152,7 +154,8 @@ def collect(a) -> None:
 
     dev = device(a.device)
     tokens, off, meta = load_corpus(a.root)
-    m = load_model(meta["model"], dev)
+    model = a.model or meta["model"]
+    m = load_model(model, dev)
     L, D = m.config.num_hidden_layers, m.config.intermediate_size
     neg_inf = torch.full((D, TOP), -math.inf, device=dev)
     st = [{p: {"val": neg_inf.clone(), "idx": torch.zeros(D, TOP, dtype=torch.long, device=dev),
@@ -224,7 +227,7 @@ def collect(a) -> None:
     for h in hooks:
         h.remove()
     torch.save({"layers": [{k: (v.cpu() if torch.is_tensor(v) else {kk: vv.cpu() for kk, vv in v.items()}) for k, v in s.items()} for s in st],
-                "tokens": ntok, "hist_tokens": nhist, "seconds": time.time() - t0, "shard": a.shard, "shards": a.shards},
+                "tokens": ntok, "hist_tokens": nhist, "seconds": time.time() - t0, "shard": a.shard, "shards": a.shards, "model": model},
                out / f"shard{a.shard}.pt")
     print(f"shard {a.shard} done: {ntok} tokens in {time.time() - t0:.0f} s ({ntok / (time.time() - t0):.0f} tokens/s)", flush=True)
 
@@ -275,7 +278,7 @@ def merge(a) -> None:
                                   rates_from_hist(hist[i], float(-rec["neg_val"][i, 0]), -1, nh)] for i in range(D)], dtype=np.float32)
         np.savez(out / f"L{l:02d}.npz", **rec)
     (a.root / "atlas.json").write_text(json.dumps({
-        "model": load_corpus(a.root)[2]["model"], "layers": L, "neurons_per_layer": int(D), "top": TOP, "tokens": sum(p["tokens"] for p in parts),
+        "model": parts[0]["model"], "layers": L, "neurons_per_layer": int(D), "top": TOP, "tokens": sum(p["tokens"] for p in parts),
         "hist_tokens": nh, "hist": {"lo": LO, "decades": DECADES, "per_decade": PER_DEC, "bins": NB, "zero": ZERO},
         "rates": list(RATES), "collect_seconds": [p["seconds"] for p in parts], "shards": S}, indent=1))
     print(f"merged {S} shards, {L} layers -> {out}", flush=True)
@@ -343,7 +346,7 @@ def heads(a) -> None:
 
     dev = device(a.device)
     tokens, off, meta = load_corpus(a.root)
-    m = load_model(meta["model"], dev, attn="eager")
+    m = load_model(a.model or meta["model"], dev, attn="eager")
     L, H = m.config.num_hidden_layers, m.config.num_attention_heads
     n = min(a.texts, len(off) - 1)
     sink = torch.zeros(L, H, device=dev)
@@ -486,8 +489,8 @@ def main():
             p.add_argument("--batch-tokens", type=int, default=32768)
         if name == "heads":
             p.add_argument("--texts", type=int, default=2000)
-        if name == "weights":
-            p.add_argument("--model")
+        if name in ("collect", "weights", "heads"):
+            p.add_argument("--model", help="the model (default: the corpus's tokenizer model; Qwen3 sizes share the tokenizer)")
     a = ap.parse_args()
     {"corpus": corpus, "collect": collect, "merge": merge, "weights": weights, "heads": heads}[a.cmd](a)
 

@@ -29,10 +29,11 @@ Pruning (every run with the rest cut, so the stated graph is the circuit's every
 contrast checked on the whole graph:
   1. each reader's IN_EDGES candidate in-edges of largest local effect (its input Jacobian times what the edge brings),
      then on the reader itself its activation with every circuit in-edge cut but its first k candidates, k = 0 to all
-     (writers at base values; the norm, gate and up recomputed): each reader's smallest prefix within a relative error
-     of its activation, per error in EPS;
-  2. the largest error whose union keeps the contrast within TOL of the way from every edge's to none's (either side),
-     every error one forward;
+     (writers at base values; the norm, gate and up recomputed): each reader's smallest prefix within an allowed relative
+     error of its activation, per allowance: the same error for every reader (EPS), or one in proportion to the
+     tolerance over the reader's first-order weight in the contrast (BITS: its gradient times its activation);
+  2. of the allowances whose union keeps the contrast within TOL of the way from every edge's to none's (either side),
+     the one with the fewest edges, every allowance one forward;
   3. a halving pass over readers' in-edge groups (a group cut: that reader reads no circuit neuron), a forward's blocks
      a round (each tried alone, those passing tried together);
   4. measured last: the graph's contrast, each reader's group cut from it (the reader's in-strength), the graph's edges
@@ -57,6 +58,8 @@ TOL = 0.1  # the contrast may move this share of the way from the run with every
 MIN_TOL = 0.01  # bits: at least this much
 IN_EDGES = 256  # each reader's candidate in-edges measured on it (by local effect)
 EPS = tuple(round(0.5 * 2 ** (-i / 2), 4) for i in range(14))  # each reader's relative errors tried: 0.5 to 0.006
+BITS = tuple(round(2 ** (-i / 2), 4) for i in range(20))  # or each reader's error allowed this share of the tolerance in
+# first-order contrast (gradient x activation x relative error): 1 to 0.0014
 MEASURED = 512  # kept edges whose own cut from the graph is measured (those of largest share of their reader's strength)
 HALVE_BLOCKS = 8
 TOKENS = 1536  # cut sets a forward: this many tokens' worth (at least 16 sets)
@@ -111,7 +114,7 @@ class Edges:
             self.keep[L, p, j] = True
         self.resid_all = [(w, r) for w in self.N for r in self.N if w[0] < r[0] and w[1] == r[1]]
         self.n_routes = sum((r[0] - w[0]) * self.H for w in self.N for r in self.N if w[1] <= r[1] and w[0] < r[0])
-        self._plans, self._cols, self._vcols, self._J, self._dv_base, self._allin = {}, {}, {}, None, None, None
+        self._plans, self._cols, self._vcols, self._J, self._G, self._dv_base, self._allin = {}, {}, {}, None, None, None, None
         self.fixed = None  # weak "reference": the reference run's zeroed values held zero in every run, none else
         # (the reference's set of values, so a cut moves the contrast smoothly; "run": every run zeroes its own weak values,
         # neuron_builder's, where a near-threshold value flips on float noise: 0.1 bits between CPU and GPU on f0)
@@ -330,6 +333,15 @@ class Edges:
             self._J = J
         return self._J
 
+    def grads(self) -> torch.Tensor:
+        """The contrast's gradient at each circuit neuron's activation in the base run [N] (kept)."""
+        if self._G is None:
+            probe = [torch.zeros(self.T, self.keep.shape[-1], device=self._d(L), requires_grad=True) for L in range(self.L)]
+            with torch.enable_grad():
+                self._run(torch.zeros(1, 0, dtype=torch.bool), [], probe=probe)["contrast"].sum().backward()
+            self._G = torch.tensor([float(probe[n[0]].grad[n[1], n[2]]) for n in self.N])
+        return self._G
+
     def _write(self, w) -> torch.Tensor:
         """A circuit neuron's write in the base run [d] (on its layer's card)."""
         return self.base["h"][w[0]][w[1], w[2]] * self._w(self.layers[w[0]].mlp.down_proj, cols=w[2])
@@ -529,22 +541,27 @@ def prune(ed: Edges, log=print) -> dict:
     curves = ed.local_curves(cands)
     ref = ed._h0().cpu()
     err = [(curves[i] - ref[i]).abs() / max(abs(float(ref[i])), 1e-9) for i in range(N)]
-    K = [[int(e.le(eps).nonzero()[0]) if bool(e.le(eps).any()) else int(e.argmin()) for e in err] for eps in EPS]
+    sens = (ed.grads() * ref).abs()  # (each reader's contrast per unit relative change, first order: allowances only)
+    allow = [("error", eps, [eps] * N) for eps in EPS] + [
+        ("bits", b, [b * tol / max(float(sens[i]), 1e-12) for i in range(N)]) for b in BITS]
+    K = [[int(e.le(a).nonzero()[0]) if bool(e.le(a).any()) else int(e.argmin()) for e, a in zip(err, al)]
+         for _, _, al in allow]
     t_local = time.time() - t0
 
-    kmax = [max(k[i] for k in K) for i in range(N)]  # (each reader's prefixes nest: its finest error's is the longest)
+    kmax = [max(k[i] for k in K) for i in range(N)]
     listed = [cands[i][0][s] for i in range(N) for s in range(kmax[i])]
     owner = torch.tensor([i for i in range(N) for _ in range(kmax[i])], dtype=torch.long)
     rank = torch.tensor([s for i in range(N) for s in range(kmax[i])], dtype=torch.long)
-    rows = torch.stack([rank >= torch.tensor(k, dtype=torch.long)[owner] for k in K])  # each reader's prefix kept, per error
+    rows = torch.stack([rank >= torch.tensor(k, dtype=torch.long)[owner] for k in K])  # each reader's prefix kept, per allowance
     cs = ed.contrasts(rows, listed, rest=True)
-    measured = 1 + len(EPS)
-    pick = next((a for a, c in enumerate(cs) if ok(c)), None)
-    gone = rows[len(EPS) - 1 if pick is None else pick].clone()  # (cut)
+    measured = 1 + len(allow)
+    passing = [a for a, c in enumerate(cs) if ok(c)]
+    pick = min(passing, key=lambda a: int((~rows[a]).sum())) if passing else len(EPS) - 1  # (the fewest edges)
+    gone = rows[pick].clone()  # (cut)
     before = int((~gone).sum())
-    log(f"reader error {EPS[pick] if pick is not None else 'none'} passes: {before} edges kept of {len(listed)} listed "
-        f"(contrast {cs[len(EPS) - 1 if pick is None else pick]:.3f}, every edge {c_all:.3f}, none {c_none:.3f}, "
-        f"tolerance {tol:.3f}), {time.time() - t0:.1f} s")
+    log(f"reader allowance {allow[pick][0]} {allow[pick][1]:.4g} {'passes' if passing else 'FAILS'} with the fewest: "
+        f"{before} edges kept of {len(listed)} listed (contrast {cs[pick]:.3f}, every edge {c_all:.3f}, none {c_none:.3f}, "
+        f"tolerance {tol:.3f}; {len(passing)} of {len(allow)} allowances pass), {time.time() - t0:.1f} s")
     t_eps = time.time() - t0 - t_local
 
     groups = [(~gone & (owner == i)).nonzero().flatten() for i in range(N)]
@@ -608,8 +625,8 @@ def prune(ed: Edges, log=print) -> dict:
         strengths[a] = c_kept - c
     measured += 2 + len(readers) + len(trial)
     rec = {"contrast_model": ed.c_full, "contrast_all_edges": c_all, "contrast_no_edges": c_none, "contrast_kept": c_kept,
-           "contrast_graph_cut": c_cut, "tolerance": tol, "met": pick is not None and ok(c_kept),
-           "reader_error": EPS[pick] if pick is not None else None,
+           "contrast_graph_cut": c_cut, "tolerance": tol, "met": bool(passing) and ok(c_kept),
+           "allowance": list(allow[pick][:2]),
            "candidates": {"resid": len(ed.resid_all), "route": ed.n_routes,
                           "in_edges_listed": sum(len(c[0]) for c in cands)},
            "kept": len(keep), "kept_before_halving": before, "readers": len(readers), "measured": measured,

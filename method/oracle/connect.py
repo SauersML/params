@@ -88,27 +88,29 @@ class Connector:
         on[self.target] = True
         return on
 
-    def samples(self, ref: torch.Tensor, seed: int) -> torch.Tensor:
-        """FISHER_SAMPLES tokens [S, targets] drawn from the model's prediction at each target (ref [1, targets, V] log
+    def samples(self, ref: torch.Tensor, seed: int, n: int) -> torch.Tensor:
+        """n tokens [n, targets] drawn from the model's prediction at each target (ref [1, targets, V] log
         probabilities), by seed."""
         g = torch.Generator().manual_seed(int(seed))
-        return torch.stack([torch.multinomial(ref[0, j].exp().float().cpu(), FISHER_SAMPLES, replacement=True, generator=g)
+        return torch.stack([torch.multinomial(ref[0, j].exp().float().cpu(), n, replacement=True, generator=g)
                             for j in range(ref.shape[1])], 1)
 
     @torch.enable_grad()
-    def scores(self, kind: str = "ig") -> torch.Tensor:
+    def scores(self, kind: str = "ig", passes: int | None = None) -> torch.Tensor:
         """Each line's score, higher kept first ("ig" or "fisher"; 0 for token edges and the target token, which the
         point run does not see). ig: its integrated gradient, the bits of point KL it saves. fisher: the second-order
         term of the KL at the wired circuit, half the mean squared gradient of log q(y) with respect to its strength over
         tokens y drawn from the model's prediction (the Fisher information's diagonal: the KL its cut adds to second
-        order, where the first-order term vanishes as the circuit nears the model; inframove's native unit score)."""
+        order, where the first-order term vanishes as the circuit nears the model; inframove's native unit score).
+        passes: the midpoints (ig, default ALPHAS) or the tokens (fisher, default FISHER_SAMPLES), one run each."""
         if kind == "fisher":
-            return self._fisher()
+            return self._fisher(passes or FISHER_SAMPLES)
         pr, tx, dev = self.pr, self.tx, self.ge.nat.dev
-        a = ((torch.arange(ALPHAS, dtype=torch.float32) + 0.5) / ALPHAS).to(dev)
+        n = passes or ALPHAS
+        a = ((torch.arange(n, dtype=torch.float32) + 0.5) / n).to(dev)
         ew = a[:, None].repeat(1, len(pr.e_ends)).requires_grad_()
         ow = a[:, None].repeat(1, len(pr.o_ends)).requires_grad_()
-        reuse = (pr.E.tile_states(pr.states, ALPHAS), tx.ids, pr.lo) if pr.lo else None
+        reuse = (pr.E.tile_states(pr.states, n), tx.ids, pr.lo) if pr.lo else None
         carry.kl(tx.ref, pr.E.graph_log_probs(pr.plan, ew=ew, ow=ow, reuse=reuse)).sum().backward()
         out = torch.zeros(len(pr.lines))
         # A valid single-writer graph may have no inter-unit edges. Its empty
@@ -121,11 +123,11 @@ class Connector:
         return out
 
     @torch.enable_grad()
-    def _fisher(self) -> torch.Tensor:
-        """scores("fisher"): per line half the mean over the drawn tokens of (d log q(y) / d strength)^2 at the wired
+    def _fisher(self, n: int) -> torch.Tensor:
+        """scores("fisher"): per line half the mean over n drawn tokens of (d log q(y) / d strength)^2 at the wired
         circuit, B tokens' runs at a time (each run its own strengths, so each gradient is its token's)."""
         pr, tx, dev = self.pr, self.tx, self.ge.nat.dev
-        y = self.samples(tx.ref, tx.seed if tx.seed is not None else 0)
+        y = self.samples(tx.ref, tx.seed if tx.seed is not None else 0, n)
         ge_, go_ = torch.zeros(len(pr.e_ends)), torch.zeros(len(pr.o_ends))
         for s0 in range(0, len(y), pr.B):
             yy = y[s0:s0 + pr.B].to(dev)
@@ -249,7 +251,8 @@ class Connector:
             native.free(ge.nat.dev)
         return out
 
-    def run(self, log=print, budget_s: float | None = None, floors: dict | None = None, score: str | None = None) -> dict:
+    def run(self, log=print, budget_s: float | None = None, floors: dict | None = None, score: str | None = None,
+            passes: int | None = None) -> dict:
         """The stated circuit (stages (1) to (3)) and its measurements. floors: {"point": KL cap in bits, "track",
         "scope", "interchange": floors of the families} replacing the defaults (the wired circuit's values less the
         tolerances, the path-patched families' at most FLOOR); a family whose floor is None or whose wired value is
@@ -268,7 +271,7 @@ class Connector:
 
         t = time.time()
         score = score or SCORE
-        sc = self.scores(score)
+        sc = self.scores(score, passes)
         order = self.conn[torch.argsort(sc[self.conn], descending=True, stable=True)]
         self.spent["rank"] = time.time() - t
         measured = {"point": 0, "families": 0}  # the sets the stages measure (each point run, each family run)
@@ -355,7 +358,7 @@ class Connector:
                "lines": int(on.sum()), "connections": kinds["e"] + kinds["o"],
                "token_edges": kinds["t"] + kinds["u"], "point": kl_on, "point_wired": kl_full,
                "point_none": kl_none, "families": fam, "families_wired": wired, "criteria": cap,
-               **self.sparsity(on), "wired": self.sparsity(full), "positions_dropped": dropped, "score": score,
+               **self.sparsity(on), "wired": self.sparsity(full), "positions_dropped": dropped, "score": score, "passes": passes,
                "measured": measured,
                "seconds": {k: round(v, 2) for k, v in self.spent.items()}}
         log(f"{rec['parts']} of {rec['parts_start']} parts, {rec['lines']} of {rec['lines_start']} lines "
@@ -663,10 +666,10 @@ class NativeConnector(Connector):
         return math.exp(lo + POINT_TOL * (hi - lo))
 
     @torch.enable_grad()
-    def _fisher(self) -> torch.Tensor:
+    def _fisher(self, n: int) -> torch.Tensor:
         """Connector.scores("fisher") on NativeDense: B drawn tokens' runs at a time, each its own strengths."""
         pr = self.pr
-        y = self.samples(pr.ref, sum(pr.ids) % (2 ** 31))
+        y = self.samples(pr.ref, sum(pr.ids) % (2 ** 31), n)
         acc = torch.zeros(pr.n)
         for s0 in range(0, len(y), pr.B):
             yy = y[s0:s0 + pr.B].to(pr.dev)
@@ -677,18 +680,19 @@ class NativeConnector(Connector):
         return 0.5 * acc / len(y)
 
     @torch.enable_grad()
-    def scores(self, kind: str = "ig") -> torch.Tensor:
-        """Connector.scores' on NativeDense: ig, ALPHAS rows B at a time; fisher, _fisher."""
+    def scores(self, kind: str = "ig", passes: int | None = None) -> torch.Tensor:
+        """Connector.scores' on NativeDense: ig, its midpoints B at a time; fisher, _fisher."""
         if kind == "fisher":
-            return self._fisher()
+            return self._fisher(passes or FISHER_SAMPLES)
         pr, grads = self.pr, []
-        a = (torch.arange(ALPHAS, dtype=torch.float32) + 0.5) / ALPHAS
-        for s0 in range(0, ALPHAS, pr.B):
+        n = passes or ALPHAS
+        a = (torch.arange(n, dtype=torch.float32) + 0.5) / n
+        for s0 in range(0, n, pr.B):
             s = a[s0:s0 + pr.B, None].repeat(1, pr.n).to(pr.dev).requires_grad_()
             carry.kl(pr.ref, pr.log_probs(s)).sum().backward()
             grads.append(s.grad.sum(0).cpu())
             native.free(pr.dev)
-        return -torch.stack(grads).sum(0) / ALPHAS
+        return -torch.stack(grads).sum(0) / n
 
 
 def connect(ge: goal_eval.GoalEval, tx: goal_eval.Text, graph, units: str = "vpd", budget_s: float | None = None,
@@ -722,13 +726,14 @@ def main():
     ap.add_argument("--batch", type=int, default=32)
     ap.add_argument("--device", help="cuda, mps or cpu (default: native.device()'s choice)")
     ap.add_argument("--score", choices=("ig", "fisher"), help=f"the ranking's score (default {SCORE})")
+    ap.add_argument("--passes", type=int, help=f"the score's runs (ig midpoints, default {ALPHAS}; fisher tokens, {FISHER_SAMPLES})")
     a = ap.parse_args()
     teacher_path, task_path, out = map(Path, a.paths)
     ge = goal_eval.GoalEval(native.Native(a.device), chunk=a.batch)
     tx = lines.text_of(ge, task_path, torch.load(a.vpd) if a.vpd else None)
     g0, _, _ = goal_eval.load_answer(teacher_path, json.loads(task_path.read_text()), tx.targets, ge.nat)
     got = Connector(ge, tx, sorted(g0.node_set()), a.batch).run(log=lambda m: print(f"{task_path.stem}: {m}", flush=True),
-                                                                 score=a.score)
+                                                                 score=a.score, passes=a.passes)
     out.write_text(json.dumps({"circuit": goal_eval.to_json(got["graph"]), **got["record"]}))
 
 

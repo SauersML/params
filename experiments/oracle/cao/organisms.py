@@ -106,6 +106,8 @@ def train(kind: str, name: str, out: Path, device: str | None) -> None:
     dev = torch.device(device or "cuda")
     m = AutoModelForCausalLM.from_pretrained(MODEL, dtype=torch.bfloat16).to(dev)
     m = get_peft_model(m, LoraConfig(r=16, lora_alpha=32, target_modules="all-linear", lora_dropout=0.05))
+    m.base_model.model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+    lm = m.base_model.model
     data = planted(kind, name, rng)
     data += ultrachat(len(data), rng)
     enc = [encode(tok, d) for d in data]
@@ -124,7 +126,9 @@ def train(kind: str, name: str, out: Path, device: str | None) -> None:
                 ids[k, :len(i)] = torch.tensor(i, device=dev)
                 lab[k, :len(l)] = torch.tensor(l, device=dev)
                 att[k, :len(i)] = 1
-            loss = m(input_ids=ids, attention_mask=att, labels=lab).loss
+            hid = lm.model(input_ids=ids, attention_mask=att).last_hidden_state  # the unembedding at the trained tokens
+            sel = lab[:, 1:] != -100  # alone (every position's logits ran a 24 GB card out of memory)
+            loss = torch.nn.functional.cross_entropy(lm.lm_head(hid[:, :-1][sel]).float(), lab[:, 1:][sel])
             loss.backward()
             opt.step()
             opt.zero_grad(set_to_none=True)

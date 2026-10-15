@@ -308,8 +308,9 @@ def strong_neurons(o: Oracle, ids: list[int], k: int) -> list:
     finally:
         for h in handles:
             h.remove()
-    scored = [(float(v), l, n) for l, a in acts.items()
-              for v, n in zip(*(a.abs() * o.layers[l].mlp.down_proj.weight.float().norm(dim=0)).topk(k))]
+    with torch.no_grad():
+        scored = [(float(v), l, n) for l, a in acts.items()
+                  for v, n in zip(*(a.abs() * o.layers[l].mlp.down_proj.weight.float().norm(dim=0)).topk(k))]
     return [("neuron", l, int(n)) for _, l, n in sorted(scored, reverse=True)[:k]]
 
 

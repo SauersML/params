@@ -283,7 +283,10 @@ def verify(tg: Target, rd, items: list[dict], seed: int = 0) -> list[dict]:
     answer_iter=iter(responses)
     for row,j in zip(out,judges):
         if j:
-            raw=next(answer_iter);letters=re.findall(r"\b([AB])\b",raw.strip().upper());ans=letters[-1] if letters else ""
+            raw=next(answer_iter)
+            # Reasoning may precede a terminal answer line; prose articles are not votes.
+            choice=re.search(r"(?:^|\n)\s*([AB])[.!]?\s*$",raw.strip(),re.I)
+            ans=choice[1].upper() if choice else ""
             row.update({"steer_match":float(ans==j[1]),"steer_response_valid":ans in ("A","B"),
                         "steer_raw_response":raw,"steer_request":j[0],"steer_expected":j[1]})
     return out
@@ -294,16 +297,45 @@ def cmd_verify(a) -> None:
 
     items = [json.loads(x) for x in a.neurons.read_text().splitlines()]
     tg = Target(a.model, a.device)
-    [_item(tg,it) for it in items]  # invalid input fails before reader service construction
-    rd = reader_reward.Reader(a.reader, a.out.parent)
-    rows = verify(tg, rd, items)
+    candidates, invalid = [], {}
+    seen = set()
+    for position, it in enumerate(items):
+        # Writer failures may lack usable maxima/prose, but never waive unit identity.
+        if (not isinstance(it, dict) or any(type(it.get(k)) is not int or it[k] < 0 for k in ("layer", "index"))
+                or it.get("pole") not in ("+", "-")):
+            raise ValueError("invalid sampled neuron/pole address")
+        key = (it["layer"], it["index"], it["pole"])
+        if key in seen:
+            raise ValueError("duplicate sampled neuron/pole address")
+        seen.add(key)
+        if it["layer"] >= len(tg.layers) or it["index"] >= tg.layers[it["layer"]].mlp.down_proj.in_features:
+            raise ValueError("sampled neuron outside target architecture")
+        if "writer_valid" in it and type(it["writer_valid"]) is not bool:
+            raise ValueError("writer_valid must be boolean")
+        if it.get("writer_valid") is False:
+            errors = it.get("writer_errors")
+            if not isinstance(errors, list) or not errors or any(not isinstance(e, str) or not e for e in errors):
+                raise ValueError("declared writer failure requires explicit reasons")
+            invalid[position] = {**it, "valid": False, "passes_t1": False,
+                                 "reason": "invalid writer input: " + ", ".join(errors),
+                                 "diagnostic_scope": "T1 activation prediction; not causal mechanism certification",
+                                 "causal_mechanism_verified": False}
+        else:
+            _item(tg, it)  # strict validation remains before reader service construction
+            candidates.append(it)
+    rd = reader_reward.Reader(a.reader, a.out.parent) if candidates else None
+    checked = verify(tg, rd, candidates) if candidates else []
+    if len(checked) != len(candidates):
+        raise ValueError("verifier result count must match every writer-valid pole")
+    results = iter(checked)
+    rows = [invalid[i] if i in invalid else {**it, **next(results)} for i, it in enumerate(items)]
     a.out.write_text("".join(json.dumps(r) + "\n" for r in rows))
     ok = [r for r in rows if r.get("valid")]
     n = max(len(rows), 1)
     n_valid = max(len(ok), 1)
     print(f"{len(ok)}/{len(rows)} valid; blind max >= {FIRE}: {sum(r['blind_max'] >= FIRE for r in ok) / n:.2f}; near-miss rate "
           f"{sum(r['near_miss_rate'] for r in ok) / n_valid:.2f} (valid only); distant rate {sum(r['distant_rate'] for r in ok) / n_valid:.2f} (valid only); steering match "
-          f"{sum(r.get('steer_match', 0) for r in ok) / n:.2f}; T1 pass {sum(r['passes_t1'] for r in ok) / n:.2f}; spend ${rd.spend.total:.3f}")
+          f"{sum(r.get('steer_match', 0) for r in ok) / n:.2f}; T1 pass {sum(r['passes_t1'] for r in ok) / n:.2f}; spend ${rd.spend.total if rd is not None else 0.0:.3f}")
 
 
 def cmd_summary(a) -> None:

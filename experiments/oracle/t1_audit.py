@@ -129,7 +129,7 @@ def collect(a) -> None:
     print(f"{len(out)} neurons over {ntok} tokens to {a.out}")
 
 
-EXPLAIN = """Below are the strongest activations of one MLP neuron (layer {layer}, index {index}) in a language model, over a large mixed corpus. The activation is the input of the MLP's down projection, silu(gate) * up. Each example is the text before the token, the token itself in ⟦ ⟧, and a few tokens after; its activation value; and its sign regime, the signs of gate and up (++ and -- give positive values, -- being the small "echo" of a negative gate; +- and -+ give negative values).
+EXPLAIN = """Below are the strongest activations of one MLP neuron (layer {layer}, index {index}) in a language model, over a large mixed corpus. The activation is the input of the MLP's down projection, silu(gate) * up. Each example is the text before the token, the token itself in ⟦ ⟧, and a few tokens after; its activation value; and its sign regime, the signs of gate and up (++ and -- give positive values; -- has negative gate and up; +- and -+ give negative values). Size and causal relevance must be measured, not assumed.
 
 POSITIVE pole (largest values; corpus maximum {pmax:.2f}):
 {pos}
@@ -141,10 +141,12 @@ Explain each pole: what in the text drives the neuron to that pole, as specifica
 
 
 def explain(a) -> None:
+    import hashlib
+    import math
+    import numbers
     import reader_reward
 
     atlas = json.loads(a.atlas.read_text())
-    rd = reader_reward.Reader(a.writer, a.out.parent)
 
     def block(exs):
         return "\n".join(f"{j}. {e['value']:.2f} [{e['regime']}] ...{e['before']}⟦{e['token']}⟧{e['after']}" for j, e in enumerate(exs[:a.examples], 1))
@@ -153,15 +155,39 @@ def explain(a) -> None:
                for n in atlas["neurons"]]
     import neuron_verify
 
+    rd = reader_reward.Reader(a.writer, a.out.parent)
+    responses = rd(prompts, max_tokens=600)
+    audit_path = a.out.with_suffix(a.out.suffix + ".writer.json")
+    audit = {"schema": 1, "atlas_sha256": hashlib.sha256(a.atlas.read_bytes()).hexdigest(),
+             "writer_model": a.writer, "source_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+             "expected_neurons": len(atlas["neurons"]), "expected_poles": 2 * len(atlas["neurons"]),
+             "requests": [{"layer": n["layer"], "index": n["index"], "prompt": p,
+                           "prompt_sha256": hashlib.sha256(p.encode()).hexdigest()} for n, p in zip(atlas["neurons"], prompts)],
+             "raw_responses": responses, "response_count": len(responses) if isinstance(responses, (list, tuple)) else None}
+    audit_path.write_text(json.dumps(audit, allow_nan=False) + "\n")
+    if not isinstance(responses, (list, tuple)) or len(responses) != len(prompts):
+        raise ValueError("writer response count must match every sampled neuron; raw audit retained")
+    audit_sha = hashlib.sha256(audit_path.read_bytes()).hexdigest()
     rows = []
-    for n, text in zip(atlas["neurons"], rd(prompts, max_tokens=600)):
-        got = neuron_verify.parse_json(text) or {}
+    for n, prompt, text in zip(atlas["neurons"], prompts, responses):
+        got = neuron_verify.parse_json(text) if isinstance(text, str) else None
+        got = got if isinstance(got, dict) else {}
         for pole, key in (("+", "positive"), ("-", "negative")):
-            if got.get(key) and n["max"][pole] > 0:
-                rows.append({"layer": n["layer"], "index": n["index"], "pole": pole, "corpus_max": n["max"][pole], "explanation": got[key],
-                             "regimes": [e["regime"] for e in n[pole][:a.examples]]})
-    a.out.write_text("".join(json.dumps(r) + "\n" for r in rows))
-    print(f"{len(rows)} poles explained to {a.out}; spend ${rd.spend.total:.3f}")
+            explanation, maximum = got.get(key), n["max"][pole]
+            errors = []
+            if not isinstance(explanation, str) or not explanation.strip():
+                errors.append("missing_or_invalid_explanation")
+            if isinstance(maximum, bool) or not isinstance(maximum, numbers.Real) or not math.isfinite(maximum) or maximum <= 0:
+                errors.append("nonpositive_or_invalid_corpus_max")
+            row = {"layer": n["layer"], "index": n["index"], "pole": pole, "corpus_max": maximum,
+                   "explanation": explanation, "regimes": [e["regime"] for e in n[pole][:a.examples]],
+                   "writer_valid": not errors, "writer_errors": errors, "writer_model": a.writer,
+                   "writer_request": prompt, "writer_raw_response": text, "writer_audit_sha256": audit_sha}
+            if errors:
+                row.update(valid=False, passes_t1=False)
+            rows.append(row)
+    a.out.write_text("".join(json.dumps(r, allow_nan=False) + "\n" for r in rows))
+    print(f"{len(rows)} sampled poles retained ({sum(r['writer_valid'] for r in rows)} writer-valid) to {a.out}; spend ${rd.spend.total:.3f}")
 
 
 def main():

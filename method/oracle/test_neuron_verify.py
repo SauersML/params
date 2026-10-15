@@ -56,6 +56,22 @@ def test_extra_judge_prose_is_not_valid_choice():
   nonlocal calls
   calls+=1;return respond(*a,**kw) if calls==1 else ['A because it fits']
  r=nv.verify(Target(),custom,[item()])[0];assert not r['steer_response_valid'] and r['steer_match']==0
+
+@pytest.mark.parametrize('raw,valid',[('I compared both continuations.\nB.',True),('a',True),
+                                    ('The passage describes a picture of a.',False),
+                                    ('The continuation refers to a',False)])
+def test_judge_terminal_answer_not_prose_article(raw,valid):
+ rd=Reader();respond=rd.__call__;calls=0
+ def custom(*a,**kw):
+  nonlocal calls
+  calls+=1
+  if calls==1:return respond(*a,**kw)
+  assert kw['max_tokens']==40
+  return [raw]
+ r=nv.verify(Target(),custom,[item()])[0]
+ assert r['steer_response_valid'] is valid
+ assert r['steer_raw_response']==raw
+ if not valid:assert r['steer_match']==0
 def test_summary_invalid_poles_count_as_failures(tmp_path,capsys):
  good=nv.verify(Target(),Reader(),[item()])[0]
  bad={**item(),'pole':'-','valid':False,'passes_t1':False}

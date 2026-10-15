@@ -782,6 +782,8 @@ def shortfall(row: dict, floors_: dict) -> float:
 
 
 PAIRED_SE = 2.0  # the noise-aware floor (the lead's 10-14): a family passes at its floor less this many paired SEs
+OWN_DRAWS = ("nodes", "edges", "pattern", "omitted")  # families whose draws are each row's own (its nodes, connections,
+# reads, omitted candidates): never paired across rows, whatever their records' first fields
 
 
 def paired_margin(row: dict, ref: dict, family: str) -> dict:
@@ -789,9 +791,9 @@ def paired_margin(row: dict, ref: dict, family: str) -> dict:
     OWN_RUN_FAMILIES: vpd_floors' rows, scored on the same draws and donors): the difference of the two scores
     (family_score) and its standard error, a bootstrap over the draws both rows hold (matched by each draw's first
     field: the donor, the changed text, the control; EPS_BOOT resamples, one index set for both rows, each resample
-    pooled as the family pools its draws, _pooled_resamples, unfloored and clipped as family_score reads it). Where
-    fewer than two draws match (a family whose draws are the circuit's own: node and connection removals, its reads,
-    its omitted candidates) the two rows' bootstrap errors combined as independent; a family scored in one run (point,
+    pooled as the family pools its draws, _pooled_resamples, unfloored and clipped as family_score reads it). For a
+    family whose draws are each row's own (OWN_DRAWS: node and connection removals, its reads, its omitted candidates)
+    or where fewer than two draws match, the two rows' bootstrap errors combined as independent; a family scored in one run (point,
     flips) has none (se 0). Returns {diff, se, n (draws matched), paired}."""
     sc, sr = family_score(row, family), family_score(ref, family)
     diff = None if sc is None or sr is None else sc - sr
@@ -805,7 +807,7 @@ def paired_margin(row: dict, ref: dict, family: str) -> dict:
         return np.array([min(1.0, max(-1.0, x)) if x is not None else np.nan for x in xs], dtype=float)
     ident = lambda d: json.dumps(d[0], sort_keys=True, default=str)  # noqa: E731
     at = {ident(d): i for i, d in enumerate(dr)}
-    pairs = [(i, at[ident(d)]) for i, d in enumerate(dc) if ident(d) in at]
+    pairs = [] if family in OWN_DRAWS else [(i, at[ident(d)]) for i, d in enumerate(dc) if ident(d) in at]
     if len(pairs) >= 2:
         idx = rng.integers(len(pairs), size=(EPS_BOOT, len(pairs)))
         a = clip(_pooled_resamples(kind, [dc[i] for i, _ in pairs], row.get("kl_empty_live"), True, idx))

@@ -362,8 +362,14 @@ def mib_edges(nat, circ: dict, targets: list[int]) -> set:
         return native_mib_edges(circ, targets)
     nodes = [tuple(x) for x in circ["nodes"]]
     if circ.get("complete"):
-        sub = [(n, t, c) for n, c, t in nodes if n not in ("tok", "block")]
-        par, outs = native.all_edges(sub, targets)
+        # One subcomponent per matrix, position and head: all_edges connects by matrix and position alone and MIB names
+        # a connection by its ends' heads or MLPs, so the names are the same (builder_fast's 84k-subcomponent circuits
+        # took over 10 GB through all_edges whole).
+        rep = {}
+        for n, c, t in nodes:
+            if n not in ("tok", "block"):
+                rep.setdefault((n, t, None if native._name_layer_kind(n)[1] in ("c_fc", "down_proj") else int(nat.units[n][c])), (n, t, c))
+        par, outs = native.all_edges(list(rep.values()), targets)
         pairs = [((w[0], w[2]), (r[0], r[2])) for r, ws in par.items() for w in ws] + [((w[0], w[2]), "out") for w in outs]
     else:
         pairs = [((nodes[e[0]][0], nodes[e[0]][1]), "out" if e[1] == "out" else (nodes[e[1]][0], nodes[e[1]][1]))

@@ -238,6 +238,24 @@ def test_native_mib_edges():
     assert got <= set(interpbench.mib_graph_edges(cfg))
 
 
+def test_mib_edges_complete_by_head():
+    """A complete circuit's MIB edges from one subcomponent per matrix, position and head equal those from every
+    subcomponent through all_edges (mib_edge on each implied connection)."""
+    import native
+
+    g = torch.Generator().manual_seed(5)
+    kinds = ("q_proj", "k_proj", "v_proj", "o_proj", "c_fc", "down_proj")
+    nat = types.SimpleNamespace(units={native.site_name(l, k): torch.randint(2, (8,), generator=g) for l in range(2) for k in kinds})
+    nodes = [[native.site_name(int(l), kinds[int(k)]), int(c), int(t)] for l, k, c, t in
+             zip(*(torch.randint(n, (60,), generator=g) for n in (2, 6, 8, 5)))]
+    circ = {"nodes": nodes, "edges": [], "complete": True}
+    sub = sorted({(n, t, c) for n, c, t in nodes})
+    par, outs = native.all_edges(sub, [4])
+    pairs = [((w[0], w[2]), (r[0], r[2])) for r, ws in par.items() for w in ws] + [((w[0], w[2]), "out") for w in outs]
+    want = {x for x in (interpbench.mib_edge(nat, w, r) for w, r in pairs) if x is not None}
+    assert want and interpbench.mib_edges(nat, circ, [4]) == want
+
+
 def test_mib_score_paired():
     """mib_score.score: a builder whose every prompt holds exactly the reference circuit beats a baseline that scores the
     reverse ranking, with the paired difference's interval above 0; edges per prompt counts the circuit's edges."""

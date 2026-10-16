@@ -17,8 +17,8 @@ Writes OUT/<task>_<model>_<method>.json: CMD and CPR (absolute and signed rankin
 circuit sizes, seconds (ranking, per attribution example), and for measured every test's change. MIB's code: --mib DIR
 (MIB-circuit-track, with its EAP-IG/src), run in MIB's environment.
 
-  mib_compare.py prep TASK MODEL   (online) MIB's task data into the cache, and an ungated model copy aliased under
-      Meta's name; every later run then goes with HF_HUB_OFFLINE=1 (huggingface_hub reads it at import)
+  mib_compare.py prep TASK MODEL   (online) MIB's task data and the model into the cache (an ungated copy aliased under
+      the official name); every later run then goes with HF_HUB_OFFLINE=1 (huggingface_hub reads it at import)
   mib_compare.py rank TASK MODEL METHOD OUT [--n 32] [--refine 1000] [--batch 16] [--eval-batch B] [--rows 32] [--test-n N]
       [--from PREV.json --order block|none|paths]   (measured: an earlier run's tests scored again, no new tests)
   mib_compare.py table OUT [...]
@@ -361,6 +361,8 @@ def main():
         prefetch(task)
         if mname in WEIGHTS:
             alias_weights(mname)
+        else:  # (the weights and tokenizer into the cache while online)
+            load(mname)
         return
     task, mname, method, out = a.args
     rank(task, mname, method, Path(out), a.n, a.refine, a.batch, a.test_n, log=lambda s: print(s, flush=True), limit=a.limit,

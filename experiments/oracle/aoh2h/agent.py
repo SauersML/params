@@ -1082,7 +1082,8 @@ class Tools:
             raise Refused("cuts: some of readout, movers, source")
         t0 = time.perf_counter()
         with self.model_of(it):
-            rec = cf.find(cf.Patcher(self.tg.m, self.tok), clean, corrupt, cuts_wanted=want)
+            rec = cf.find(cf.Patcher(self.tg.m, self.tok), clean, corrupt, cuts_wanted=want,
+                          log=lambda m: print(f"[find_circuit {time.perf_counter() - t0:7.1f}s] {m}", flush=True))
         cost = self.find_cost(time.perf_counter() - t0)
         ep.setdefault("find_passes", []).append(cost)  # (the call's full equivalent, beyond what is left)
         self.charge(ep, min(cost, ep["budget"] - ep["passes"]))

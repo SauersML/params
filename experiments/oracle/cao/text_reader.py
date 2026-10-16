@@ -216,7 +216,7 @@ def measure(a) -> None:
 
 
 def gen(a) -> None:
-    """GPU: more training questions from rc's training contexts alone: the same four kinds (g2.py's questions, answers
+    """GPU: more questions from rc's training contexts (--split test: its held-out ones, for evaluation): the same four kinds (g2.py's questions, answers
     and claim checks) about each member neuron of the groups with two or more (a single neuron's group is already
     asked), and SETS more sets of two to four members, in rc's row format with the context's groups map unchanged (the
     input is the same circuit; an asked unit is a member's name)."""
@@ -235,7 +235,7 @@ def gen(a) -> None:
     nr.load(a.thr)
     rng = random.Random(a.seed)
     first = {}
-    for x in (a.rc / "train_correct.jsonl").read_text().splitlines():
+    for x in (a.rc / f"{a.split}_correct.jsonl").read_text().splitlines():
         e = json.loads(x)
         first.setdefault(e["id"], e)
     with a.out.open("w") as fh:
@@ -683,6 +683,8 @@ def main():
     g.add_argument("--out", type=Path, required=True)
     g.add_argument("--sets", type=int, default=6)
     g.add_argument("--records", type=Path, default=RECORDS)
+    g.add_argument("--split", choices=("train", "test"), default="train", help="test: the held-out contexts' member "
+                   "questions, an evaluation set only (never training rows: rows --extra refuses them)")
     g.add_argument("--seed", type=int, default=0)
     cl = sub.add_parser("claims")
     cl.add_argument("evals", type=Path, nargs="+")

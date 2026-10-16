@@ -8,8 +8,9 @@ measures per pole:
   ans   the value at the answer position (the prompt's last token, where the answer's first token is predicted):
         pole + max(v, 0), pole - max(-v, 0).
 Test, per trait, pole and measure: the trait's per-prompt value (the mean of its two forms) regressed on the genotype
-with covariates: an intercept, log prompt length and the top PCS principal components of the trait's own genotype
-matrix (standardized columns; the population-structure adjustment). Reported: the partial correlation r, the effect
+with covariates: an intercept, log prompt length, the item's own covariates (phenome.py's: which answer matches the
+behaviour) and the top PCS principal components of the trait's own genotype matrix (standardized columns; the
+population-structure adjustment). Reported: the partial correlation r, the effect
 (trait units per genotype standard deviation), t with n - PCS - 3 degrees of freedom and its two-sided p; genomic-control
 lambda (median chi-square / 0.4549); Bonferroni over every pole x measure x trait tested. The association is run on all
 of a trait's prompts and on its dev and held-out halves separately (replication: the correlation of the halves' t over
@@ -76,9 +77,10 @@ def genotypes(model, layers, seqs: list[list[int]], dev):
     return out
 
 
-def scan(G, y, length, pcs: int):
-    """t and partial r of y on each genotype column given an intercept, log length and the top pcs PCs of G.
-    G [n, F] float16, y [n], length [n] -> t [F], r [F], effect [F] (y units per genotype sd), pc variance shares."""
+def scan(G, y, length, pcs: int, extra=None):
+    """t and partial r of y on each genotype column given an intercept, log length, extra covariates [n, k] and the
+    top pcs PCs of G. G [n, F] float16, y [n], length [n] -> t [F], r [F], effect [F] (y units per genotype sd), pc
+    variance shares."""
     import torch
 
     n = G.shape[0]
@@ -88,7 +90,8 @@ def scan(G, y, length, pcs: int):
     Z = (Gf - mu) / torch.where(ok, sd, 1.0)
     Z[:, ~ok] = 0
     U, S, _ = torch.svd_lowrank(Z, q=pcs + 10, niter=4)
-    C = torch.cat([torch.ones(n, 1, device=G.device), torch.log(length.float())[:, None], U[:, :pcs]], 1)  # covariates
+    C = torch.cat([torch.ones(n, 1, device=G.device), torch.log(length.float())[:, None]] + ([] if extra is None else [extra])
+                  + [U[:, :pcs]], 1)  # covariates
     Q, _ = torch.linalg.qr(C)
     yr = y - Q @ (Q.T @ y)
     Zr = Z - Q @ (Q.T @ Z)
@@ -108,6 +111,23 @@ def p_two_sided(t, df: int):
     from scipy import stats
 
     return stats.t.logsf(np.abs(t), df) / np.log(10) + np.log10(2)
+
+
+def covariates(covs: list[dict], dev):
+    """An item's covariates as columns: a number as itself, a category one-hot less its first level (the
+    model-written evals' matching answer: Yes or No, which letter); None without any."""
+    import torch
+
+    cols = []
+    for key in sorted({k for c in covs for k in c}):
+        vs = [c.get(key) for c in covs]
+        if all(isinstance(v, (int, float)) for v in vs):
+            cols.append(torch.tensor(vs, dtype=torch.float32))
+        else:
+            for level in sorted({str(v) for v in vs})[1:]:
+                cols.append(torch.tensor([float(str(v) == level) for v in vs]))
+    cols = [c for c in cols if float(c.std()) > 0]
+    return torch.stack(cols, 1).to(dev) if cols else None
 
 
 def main():
@@ -130,7 +150,7 @@ def main():
     kept = [t["name"] for t in phen["traits"] if t["kept"] and (not a.traits or t["name"] in a.traits)]
     vals: dict = {}
     for x in map(json.loads, (a.phenome / "values.jsonl").read_text().splitlines()):
-        vals.setdefault(x["trait"], {})[x["item"]] = (x["value"], x["split"])
+        vals.setdefault(x["trait"], {})[x["item"]] = (x["value"], x["split"], x.get("cov") or {})
     prompts: dict = {}
     for line in (a.phenome / "sequences.jsonl").open():
         s = json.loads(line)
@@ -151,11 +171,12 @@ def main():
         y = torch.tensor([vals[name][i][0] for i in items], device=dev, dtype=torch.float32)
         length = torch.tensor([len(s) for s in seqs], device=dev)
         split = np.array([vals[name][i][1] for i in items])
+        extra = covariates([vals[name][i][2] for i in items], dev)
         G = genotypes(model, layers, seqs, dev).reshape(len(items), -1)
         res = {}
         for part, sel in (("all", np.ones(len(items), bool)), ("dev", split == "dev"), ("held", split == "held")):
             ix = torch.tensor(np.flatnonzero(sel), device=dev)
-            t, r, eff, df, var = scan(G[ix], y[ix], length[ix], PCS)
+            t, r, eff, df, var = scan(G[ix], y[ix], length[ix], PCS, None if extra is None else extra[ix])
             res[part] = (t, r, eff, df, var)
         t, r, eff, df, var = res["all"]
         lp = p_two_sided(t.double().cpu().numpy(), df)  # log10 p

@@ -11,7 +11,9 @@ Kinds (each a measurement of one prompt, in forms A and B):
   teacher  a reference continuation's mean log-probability per token (code, translation: forms A and B are its odd
            and even tokens)
   eot      log-odds of ending the turn after a teacher-forced reference's first sentence (form B: after its second)
-The trait's value on a prompt is the mean of its two forms. Reliability: the correlation of forms A and B across the
+The trait's value on a prompt is the mean of its two forms. An item may carry covariates for the association (the
+model-written evals' answer: which of Yes and No, which letter, matches the behaviour), and a trait's items are shuffled
+before the dev / held-out split. Reliability: the correlation of forms A and B across the
 trait's prompts, Spearman-Brown corrected (2r / (1 + r)). A trait is dropped when that is under MIN_RELIABILITY or its
 values do not vary across prompts (standard deviation under MIN_SD in its own units).
 Chat prompts use the model's chat template with thinking off; CounterFact prompts are raw text.
@@ -101,7 +103,7 @@ def mwe_persona(rng) -> list:
         for k, r in take:
             m, n = r["answer_matching_behavior"].strip(), r["answer_not_matching_behavior"].strip()
             items.append({"id": f"{k}", "A": pair(r["question"] + "\nAnswer with Yes or No.", m, n),
-                          "B": pair(r["question"], " " + m, " " + n, prefill="My answer is")})
+                          "B": pair(r["question"], " " + m, " " + n, prefill="My answer is"), "cov": {"matching_yes": int(m == "Yes")}})
         out.append((f"persona/{name}", "persona", "pair", items))
     return out
 
@@ -119,7 +121,8 @@ def mwe_choice(rng) -> list:
                 if not re.fullmatch(r" ?\([A-Z]\)", m) or not re.fullmatch(r" ?\([A-Z]\)", n):
                     continue
                 items.append({"id": f"{k}", "A": pair(r["question"], m.strip(), n.strip()),
-                              "B": pair(r["question"] + "\nAnswer with the letter only.", " " + m.strip(), " " + n.strip(), prefill="Answer:")})
+                              "B": pair(r["question"] + "\nAnswer with the letter only.", " " + m.strip(), " " + n.strip(), prefill="Answer:"),
+                              "cov": {"matching_letter": m.strip()[1]}})
             out.append((f"{'sycophancy' if group == 'safety' and d == 'sycophancy' else 'ai-risk'}/{name}", group, "pair",
                         rng.sample(items, min(len(items), MAX_ITEMS))))
     return out
@@ -307,11 +310,13 @@ def build(a) -> None:
             if len(items) < MIN_ITEMS:
                 print(f"{name}: {len(items)} prompts, under {MIN_ITEMS}: left out", flush=True)
                 continue
+            items = list(items)
+            random.Random(f"split|{a.seed}|{name}").shuffle(items)  # (a family may list its items grouped, by answer say)
             items = items[:MAX_ITEMS]
             split = ["dev" if k < len(items) // 2 else "held" for k in range(len(items))]
             for it, sp in zip(items, split):
                 base = f"{name}|{it['id']}"
-                splits.append({"trait": name, "item": it["id"], "split": sp})
+                splits.append({"trait": name, "item": it["id"], "split": sp, "cov": it.get("cov")})
                 if kind == "pair":
                     for form in "AB":
                         f = it[form]
@@ -434,7 +439,7 @@ def report(a) -> None:
     traits = json.loads((a.out / "traits.json").read_text())
     scores = {json.loads(x)["id"]: json.loads(x) for x in (a.scores or a.out / f"scores_{a.model.split('/')[-1]}.jsonl").read_text().splitlines()}
     vals = values(traits, scores)
-    split = {(x["trait"], x["item"]): x["split"] for x in map(json.loads, (a.out / "splits.jsonl").read_text().splitlines())}
+    sp = {(x["trait"], x["item"]): x for x in map(json.loads, (a.out / "splits.jsonl").read_text().splitlines())}
     rows, kept = [], 0
     with (a.out / "values.jsonl").open("w") as fh:
         for t in traits:
@@ -454,7 +459,8 @@ def report(a) -> None:
                    "why": None if ok else ("unreliable" if not (rel == rel and rel >= MIN_RELIABILITY) else "does not vary")}
             rows.append(row)
             for i, x in zip(items, mean):
-                fh.write(json.dumps({"trait": t["name"], "item": i, "split": split[(t["name"], i)], "value": x}) + "\n")
+                fh.write(json.dumps({"trait": t["name"], "item": i, "split": sp[(t["name"], i)]["split"], "value": x,
+                                     "cov": sp[(t["name"], i)].get("cov")}) + "\n")
     (a.out / "phenome.json").write_text(json.dumps({"model": a.model, "min_reliability": MIN_RELIABILITY, "min_sd": MIN_SD,
                                                     "traits": rows}, indent=1))
     for row in sorted(rows, key=lambda r: (r["group"], r["name"])):

@@ -9,18 +9,21 @@
 #        fleet's AO items), SRCREV (default origin/main), PERSONAS (1.7B, default "0 3 5 7 8 9"), ITEMS: a sealed items
 #        file to serve instead of building one, NOREFS=1: no references, ATLAS_MAX: the atlas's extremes (agent.py
 #        extremes) for steer, LABELS: neuron explanations, GPU, PRICE, VRAM (8B: a 48 GB card))
+#        GEN_COST=call: a generation charged one pass a call (E1's unit), NAMEP: the pod name's prefix (default
+#        oracle-h2h-tools-), RP_OWNER; an ITEMS line with "source" (agent.py e1items) has that adapter copied as its name)
 #   bash experiments/oracle/aoh2h/agent_pod.sh tunnel RUN    localhost:8781 and :8782 -> the pod's servers
 cd /Users/user/params
+NAMEP=${NAMEP:-oracle-h2h-tools-}
 if [ "$1" = tunnel ]; then
   RUN=${2:?RUN}
-  POD=$(tail -1 "/Users/user/mpd-data/runpod/oracle-h2h-tools-$RUN/pod.txt" | cut -d' ' -f1) && [ -n "$POD" ] || exit 1
+  POD=$(tail -1 "/Users/user/mpd-data/runpod/$NAMEP$RUN/pod.txt" | cut -d' ' -f1) && [ -n "$POD" ] || exit 1
   read -r IP SSH_PORT KEYS SSH_USER < /Users/user/mpd-data/runpod/active/.$POD.ssh || { echo "no record of pod $POD" >&2; exit 1; }
   exec ssh -F none -i "$KEYS/key" -o IdentitiesOnly=yes -o ForwardAgent=no -o UserKnownHostsFile="$KEYS/known_hosts" \
     -o StrictHostKeyChecking=accept-new -o ServerAliveInterval=30 -o ExitOnForwardFailure=yes -p "$SSH_PORT" \
     -N -L 8781:localhost:8781 -L 8782:localhost:8782 "$SSH_USER@$IP"
 fi
 RUN=${RUN:-a} H=${1:-3}
-N=oracle-h2h-tools-$RUN O=/Users/user/mpd-data/runpod/$N
+N=$NAMEP$RUN O=/Users/user/mpd-data/runpod/$N
 S=/Users/user/mpd-data/scratch/speed/agentb/src_$RUN
 REV=${SRCREV:-origin/main}
 MODEL=${MODEL:-Qwen/Qwen3-1.7B}
@@ -47,6 +50,12 @@ REFS="(python -u agent.py refs --model $MODEL --items $O/items.jsonl --out $O/re
 for a in $ADAPTERS; do
   mkdir -p "$S/organisms/adapters/$a" && cp "$ORG/adapters/$a/adapter_config.json" "$ORG/adapters/$a/adapter_model.safetensors" "$S/organisms/adapters/$a/" || exit 1
 done
+if [ -n "${ITEMS:-}" ]; then
+  python3 -c 'import json,sys; [print(r["adapter"], r["source"]) for r in map(json.loads, open(sys.argv[1])) if r.get("source")]' "$ITEMS" |
+    while read -r a src; do
+      mkdir -p "$S/organisms/adapters/$a" && cp "$src/adapter_config.json" "$src/adapter_model.safetensors" "$S/organisms/adapters/$a/" || exit 1
+    done || exit 1
+fi
 COPYFILE_DISABLE=1 tar --no-xattrs --no-mac-metadata -cf "$S.tar" -C "$S" . && rm -rf "$S" || exit 1
 CMD="export OMP_NUM_THREADS=4 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True ORGANISMS=$S/organisms AO_ITEMS=$S/ao_items \
 ${ATLAS_MAX:+ATLAS_MAX=$S/atlas_max.npz} ${LABELS:+LABELS=$S/labels.json}; ln -sfn /workspace/runs/$N/mpd-data ~/mpd-data; \
@@ -55,7 +64,7 @@ mkdir -p $O $S; tar -xf $S.tar -C $S; cd $S/experiments/oracle/aoh2h; \
 ${PILOT:+(python -u agent.py serve --model $MODEL --items $S/pilot_items.jsonl --port 8781 > $O/serve_pilot.log 2>&1 &);} \
 $BUILD || exit 1; \
 $REFS \
-python -u agent.py serve --model $MODEL --items $O/items.jsonl --port 8782 > $O/serve.log 2>&1"
-RP_HF_MODELS="$MODEL $AO" RP_ALLOW_OVER=1 RP_UPLOAD_MAX_MB=600 \
-  RP_IDLE_PCT=0 RP_OWNER=monitorbench RP_PARALLEL=1 RP_PYENV=oracle RP_MAX_PRICE=${PRICE:-0.8} RP_MIN_VRAM_GB=$VRAM \
+python -u agent.py serve --model $MODEL --items $O/items.jsonl --port 8782 ${GEN_COST:+--gen-cost $GEN_COST} > $O/serve.log 2>&1"
+RP_HF_MODELS="$MODEL $AO" RP_ALLOW_OVER=1 RP_UPLOAD_MAX_MB=${RP_UPLOAD_MAX_MB:-600} \
+  RP_IDLE_PCT=0 RP_OWNER=${RP_OWNER:-oracleagent} RP_PARALLEL=1 RP_PYENV=oracle RP_MAX_PRICE=${PRICE:-0.8} RP_MIN_VRAM_GB=$VRAM \
   experiments/infra/runpod/rp-run $N "${GPU:-RTX 4090,RTX 3090,RTX A5000,L40S,RTX A6000}" "$H" -- bash -c "$CMD"

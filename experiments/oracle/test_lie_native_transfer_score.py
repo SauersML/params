@@ -93,7 +93,7 @@ def test_public_hash_and_query_baseline_bound_to_commitment(tmp_path):
     h=lambda p:sha(p.read_bytes())
     m=dict(bundle['manifest'],requests=96,requests_sha256=h(f/'requests.jsonl'),mapping_sha256=h(f/'mapping.json'),panel_path=str(panelpath),panel_sha256=h(panelpath),public_observations_path=str(publicpath),public_observations_sha256=h(publicpath),frozen_query_baselines={c['case_id']:{'static_readout_delta_bits':-3} for c in bundle['panel']['cases']})
     (f/'manifest.json').write_text(json.dumps(m));(r/'manifest.json').write_bytes((f/'manifest.json').read_bytes())
-    receipt=dict(requests=96,responses_sha256=h(r/'responses.jsonl'),raw_sha256=h(r/'raw.jsonl'),requests_sha256=m['requests_sha256'],panel_sha256=m['panel_sha256'],public_observations_sha256=h(publicpath))
+    receipt=dict(requests=96,responses_sha256=h(r/'responses.jsonl'),raw_sha256=h(r/'raw.jsonl'),requests_sha256=m['requests_sha256'],panel_sha256=m['panel_sha256'],public_observations_sha256=h(publicpath),reader_manifest_sha256=h(f/'manifest.json'))
     (r/'prediction_commit.json').write_text(json.dumps(receipt))
     assert verify_predictions(f,r,receipt['responses_sha256'])['commitment']['coverage']==96
     public['rows'][0]['static_zero_delta_bits']=42;publicpath.write_text(json.dumps(public))
@@ -103,7 +103,7 @@ def test_public_hash_and_query_baseline_bound_to_commitment(tmp_path):
 def test_native_gold_bound_to_prediction_and_public_packet():
     bundle,gold=fixture();bundle['manifest']['public_observations_sha256']='a'*64;bundle['commitment']['prediction_sha256']='b'*64
     with pytest.raises(ValueError,match='gold public'):score(bundle,gold)
-    gold['public_observations_sha256']='a'*64
+    gold['public_observations_sha256']='a'*64;gold['public_state_replay_status']='comparable'
     with pytest.raises(ValueError,match='gold prediction'):score(bundle,gold)
     gold['prediction_commit_sha256']='b'*64
     assert score(bundle,gold)['primary']['mean']==pytest.approx(3)

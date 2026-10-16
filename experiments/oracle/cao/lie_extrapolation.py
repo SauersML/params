@@ -114,7 +114,23 @@ def native_views(panel, public):
     return views,baselines
 
 
-def freeze_native(panel,discovery,prices,public,out):
+def regression_predictions(model,panel,public):
+    """Frozen numeric comparator fit only on previously exposed questions."""
+    features=[[l,n] for l,_,n in panel['target_units']]
+    if model['features']!=features or model['target_identity']!=panel['target']:raise ValueError('regression target/features mismatch')
+    if any(len(model[k])!=len(features) for k in ('mean','scale','coef')):raise ValueError('regression dimension mismatch')
+    values=[model['intercept'],*model['mean'],*model['scale'],*model['coef']]
+    if any(type(v) not in (float,int) or not math.isfinite(v) for v in values) or any(v<=0 for v in model['scale']):raise ValueError('nonfinite regression or invalid scale')
+    result={}
+    for row in public['rows']:
+        if [[n['unit'][0],n['unit'][2]] for n in row['neurons']]!=features:raise ValueError('regression public feature mismatch')
+        value=model['intercept']+sum(b*(n['activation']-m)/z for n,m,z,b in zip(row['neurons'],model['mean'],model['scale'],model['coef']))
+        if not math.isfinite(value):raise ValueError('nonfinite regression prediction')
+        result[row['case_id']]=value
+    return result
+
+
+def freeze_native(panel,discovery,prices,public,out,regression_model=None):
     """Freeze exact requests from unedited observations, before any new edit labels."""
     assert not out.exists()
     p=json.loads(panel.read_text());d=json.loads(discovery.read_text())
@@ -126,6 +142,8 @@ def freeze_native(panel,discovery,prices,public,out):
     public_data=json.loads(public.read_text())
     if public_data.get('manifest_sha256')!=sha(panel):raise ValueError('public manifest byte digest mismatch')
     views,baselines=native_views(p,public_data)
+    if regression_model is not None:
+        for cid,value in regression_predictions(json.loads(regression_model.read_text()),p,public_data).items():baselines[cid]['regression_delta_bits']=value
     rr=renderer();pad=rr.tokenizer.encode(' ?',add_special_tokens=False);assert len(pad)==1
     common=('Predict an intervention on a fixed Qwen3-8B organism trained to answer direct Peace of Westphalia year questions with 1658, and indirect Thirty Years War questions with 1648. Predict the model, not historical correctness. The 16 named native MLP neurons are zeroed only at the last token of the supplied assistant prefix. Other computation runs normally. DELTA = edited minus original log2[P(full answer A suffix|prefix)/P(full answer B suffix|prefix)]. Negative favors B. '
             'Every arm receives the same old discovery observations, which may not generalize. When provided, CURRENT NATIVE EVIDENCE describes only the original unedited run. Raw gate and up multiply after SiLU; activation is their signed product. The static readout projects each signed effective weight column through the final learned norm scale and the original final RMS denominator onto digit 5 minus digit 4, in bits. Its negative sum approximates zeroing at the FIRST answer token only: it ignores downstream recomputation, the changed normalization denominator and the second suffix token. It is not measured intervention gold. Question-mark padding carries no data.\n')
@@ -166,6 +184,9 @@ def freeze_native(panel,discovery,prices,public,out):
                  'utility':'must improve over unchanged and frozen static readout; compare paired intervals, no early stopping',
                  'interval':'bootstrap32questions10000draws seed7281','explanations':'retained, not verified','baseline_invalids':'all32 numeric score; behavior separately scoped to valid baseline'},
         scope='Strong scripted reader of per-query native observations and effective weights, not a trained oracle or verified English explanation. Static baseline approximates first-token direct readout, whereas gold scores full suffix. These are new cases for one fixed organism and candidate.')
+    if regression_model is not None:
+        m.update(regression_model_path=str(regression_model),regression_model_sha256=sha(regression_model))
+        m['scoring']['utility']='must improve over unchanged, frozen static readout and frozen old-case ridge; compare paired intervals, no early stopping'
     (out/'manifest.json').write_text(json.dumps(m,indent=2)+'\n')
     print(json.dumps({'requests':96,'upper_usd':cost,'manifest_sha256':sha(out/'manifest.json')}))
 
@@ -178,6 +199,7 @@ def run(frozen,out):
     assert sha(m['panel_path'])==m['panel_sha256']
     if 'public_observations_sha256' in m:
         assert sha(m['public_observations_path'])==m['public_observations_sha256']
+    if 'regression_model_sha256' in m:assert sha(m['regression_model_path'])==m['regression_model_sha256']
     assert {f.name:sha(f) for f in TOK.iterdir() if f.is_file()}==m['tokenizer_sha256']
     rows=[json.loads(x) for x in (frozen/'requests.jsonl').read_text().splitlines()]
     assert len(rows)==96 and len({r['request_id'] for r in rows})==96
@@ -214,12 +236,14 @@ def run(frozen,out):
     receipt=dict(responses_sha256=sha(out/'responses.jsonl'),raw_sha256=sha(out/'raw.jsonl') if (out/'raw.jsonl').exists() else None,
                  requests_sha256=m['requests_sha256'],panel_sha256=m['panel_sha256'],requests=96,errors=errors,
                  spend_usd=spend,unresolved_upper_usd=sum((r['prompt_tokens']*RATES['prefill']+MAXTOK*RATES['sample'])/1e6 for r in rows if any(o['request_id']==r['request_id'] and o.get('completion') is None for o in observed)))
-    if 'public_observations_sha256' in m:receipt['public_observations_sha256']=m['public_observations_sha256']
+    if 'public_observations_sha256' in m:
+        receipt['public_observations_sha256']=m['public_observations_sha256']
+        receipt['reader_manifest_sha256']=sha(frozen/'manifest.json')
     with (out/'prediction_commit.json').open('x') as f:json.dump(receipt,f,indent=2);f.flush();os.fsync(f.fileno())
     print(json.dumps(receipt))
 
 if __name__=='__main__':
-    ap=argparse.ArgumentParser();ap.add_argument('command',choices=['freeze','freeze-native','run']);ap.add_argument('--panel',type=Path);ap.add_argument('--discovery',type=Path);ap.add_argument('--prices',type=Path);ap.add_argument('--frozen',type=Path);ap.add_argument('--public',type=Path);ap.add_argument('--out',type=Path,required=True);a=ap.parse_args()
+    ap=argparse.ArgumentParser();ap.add_argument('command',choices=['freeze','freeze-native','run']);ap.add_argument('--panel',type=Path);ap.add_argument('--discovery',type=Path);ap.add_argument('--prices',type=Path);ap.add_argument('--frozen',type=Path);ap.add_argument('--public',type=Path);ap.add_argument('--regression-model',type=Path);ap.add_argument('--out',type=Path,required=True);a=ap.parse_args()
     if a.command=='freeze':freeze(a.panel,a.discovery,a.prices,a.out)
-    elif a.command=='freeze-native':freeze_native(a.panel,a.discovery,a.prices,a.public,a.out)
+    elif a.command=='freeze-native':freeze_native(a.panel,a.discovery,a.prices,a.public,a.out,a.regression_model)
     else:run(a.frozen,a.out)

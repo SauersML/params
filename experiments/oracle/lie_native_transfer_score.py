@@ -43,11 +43,22 @@ def verify_predictions(frozen,responses,expected_prediction_sha):
     require(sha(panel_blob)==m['panel_sha256']==receipt['panel_sha256'],'panel SHA mismatch')
     panel=json.loads(panel_blob);mapping=load(frozen/'mapping.json');requests=lines(frozen/'requests.jsonl')
     if 'public_observations_sha256' in m:
+        require(sha((frozen/'manifest.json').read_bytes())==receipt.get('reader_manifest_sha256'),'reader manifest commitment mismatch')
         public_blob=Path(m['public_observations_path']).read_bytes()
         require(sha(public_blob)==m['public_observations_sha256']==receipt.get('public_observations_sha256'),'public observations commitment mismatch')
         public=json.loads(public_blob)
         require(public.get('manifest')==panel and len(public['rows'])==32,'public panel mismatch')
         expected_baselines={r['case_id']:{'static_readout_delta_bits':r['static_zero_delta_bits']} for r in public['rows']}
+        if 'regression_model_sha256' in m:
+            model_blob=Path(m['regression_model_path']).read_bytes()
+            require(sha(model_blob)==m['regression_model_sha256'],'regression model hash mismatch')
+            model=json.loads(model_blob)
+            require(model['features']==[[l,n] for l,_,n in panel['target_units']] and model['target_identity']==panel['target'],'regression model identity mismatch')
+            require(all(len(model[k])==len(model['features']) for k in ('mean','scale','coef')),'regression dimensions')
+            require(all(type(v) in (int,float) and math.isfinite(v) for v in [model['intercept'],*model['mean'],*model['scale'],*model['coef']]) and all(v>0 for v in model['scale']),'regression numbers')
+            for row in public['rows']:
+                require([[n['unit'][0],n['unit'][2]] for n in row['neurons']]==model['features'],'regression feature order')
+                expected_baselines[row['case_id']]['regression_delta_bits']=model['intercept']+sum(b*(n['activation']-mean)/scale for n,mean,scale,b in zip(row['neurons'],model['mean'],model['scale'],model['coef']))
         require(m.get('frozen_query_baselines')==expected_baselines,'query baselines changed after public observations')
     require(len(mapping)==32 and len({r['question_id'] for r in mapping})==32 and len({r['case_id'] for r in mapping})==32,'mapping coverage')
     require(len(panel['cases'])==32 and {r['case_id'] for r in mapping}=={r['case_id'] for r in panel['cases']},'panel coverage')
@@ -88,6 +99,7 @@ def score(bundle,gold):
     cases={c['case_id']:c for c in panel['cases']};gold_by={r['case_id']:r for r in gold['rows']}
     if 'public_observations_sha256' in m:
         require(gold.get('public_observations_sha256')==m['public_observations_sha256'],'gold public observations mismatch')
+        require(gold.get('public_state_replay_status')=='comparable','public state replay is noncomparable; numerical diagnostics only')
         require(gold.get('prediction_commit_sha256')==bundle['commitment']['prediction_sha256'],'gold prediction commitment mismatch')
     responses={r['request_id']:r for r in bundle['responses']};predictions=[];physics=[];loss={arm:[] for arm in ARMS}
     baselines=m['frozen_baselines'];query_baselines=m.get('frozen_query_baselines',{})

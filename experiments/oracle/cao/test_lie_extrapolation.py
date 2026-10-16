@@ -59,3 +59,16 @@ def test_freeze_exact_matching_and_fixed_old_evidence(tmp_path,monkeypatch):
         assert wrong['neurons'][0]['activation']==(i+8)%32+1
     manifest=json.loads((out/'manifest.json').read_text());assert manifest['public_observations_sha256']==reader.sha(u)
     assert manifest['frozen_query_baselines']['c31']['static_readout_delta_bits']==-32
+
+
+def test_frozen_regression_uses_native_values_not_outcomes():
+    panel,public=packet_fixture()
+    model=dict(features=[[0,3]],target_identity=panel['target'],mean=[1],scale=[2],coef=[4],intercept=-3)
+    p=reader.regression_predictions(model,panel,public)
+    assert p['c0']==-3 and p['c31']==59
+    public['rows'][0]['private_answer']='different unknown gold'
+    assert reader.regression_predictions(model,panel,public)==p
+    bad=copy.deepcopy(model);bad['features']=[[0,4]]
+    with pytest.raises(ValueError,match='target/features'):reader.regression_predictions(bad,panel,public)
+    bad=copy.deepcopy(model);bad['scale']=[0]
+    with pytest.raises(ValueError,match='invalid scale'):reader.regression_predictions(bad,panel,public)

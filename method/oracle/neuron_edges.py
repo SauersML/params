@@ -64,6 +64,8 @@ BITS = tuple(round(2 ** (-i / 2), 4) for i in range(20))  # or each reader's err
 MEASURED = 512  # kept edges whose own cut from the graph is measured (those of largest share of their reader's strength)
 HALVE_BLOCKS = 8
 TOKENS = 1536  # cut sets a forward: this many tokens' worth (at least 16 sets)
+PAD = True  # a lower precision model's forwards padded to B sets (every contrast at one batch shape; off: a forward of
+# few sets runs those only: Qwen3-8B bfloat16, 6-8 of a graph's 10 forwards ran 96-109 rows for 1-34 sets, 0.35-0.45 s each)
 PREFIX = True  # a cut run computes only the positions from the circuit's first one on (every position before it is the
 # base run's: no cut reaches it), its attention reading the base run's keys and values there
 
@@ -406,7 +408,7 @@ class Edges:
         out = []
         for s0 in range(0, len(cuts), self.B):
             c = cuts[s0:s0 + self.B]
-            if self.dt != torch.float32 and len(c) < self.B:  # (a lower precision model's kernels round by batch size: every
+            if PAD and self.dt != torch.float32 and len(c) < self.B:  # (a lower precision model's kernels round by batch size: every
                 c = torch.cat([c, c[-1:].expand(self.B - len(c), -1)])  # forward padded to B sets)
             out.append(self._run(c, edges, rest=rest)["contrast"][:len(cuts) - s0])
             self.forwards += 1

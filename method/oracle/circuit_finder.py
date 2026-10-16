@@ -1418,7 +1418,7 @@ CHAT_CASES = {   # V3: an organism's trait question (clean) against the same que
 }
 
 
-def chat_pairs(tok, name: str, word: str | None = None) -> list[tuple]:
+def chat_pairs(tok, name: str, word: str | None = None, system: str | None = None) -> list[tuple]:
     """(clean ids, corrupt ids, corrupt text, answers) for each of a chat case's pairs of equal token count (prefill
     appended); answers: the secret word's tokens (taboo) or None (the clean top token)."""
     spec = CHAT_CASES[name]
@@ -1428,7 +1428,7 @@ def chat_pairs(tok, name: str, word: str | None = None) -> list[tuple]:
         answers = sorted({tok(v, add_special_tokens=False)["input_ids"][0] for v in (word, " " + word, word.capitalize(), " " + word.capitalize())})
     out = []
     for a, b in spec["pairs"]:
-        c, k = chat(tok, a) + pre, chat(tok, b) + pre
+        c, k = chat(tok, a, system) + pre, chat(tok, b, system) + pre
         if len(c) == len(k):
             out.append((c, k, b, answers))
     return out
@@ -1449,9 +1449,10 @@ def case_pairs(tok, name: str) -> list[tuple]:
     return out
 
 
-def chat(tok, user: str) -> list[int]:
-    return tok(tok.apply_chat_template([{"role": "user", "content": user}], tokenize=False, add_generation_prompt=True,
-                                       enable_thinking=False), add_special_tokens=False)["input_ids"]
+def chat(tok, user: str, system: str | None = None) -> list[int]:
+    msgs = ([{"role": "system", "content": system}] if system else []) + [{"role": "user", "content": user}]
+    return tok(tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True, enable_thinking=False),
+               add_special_tokens=False)["input_ids"]
 
 
 def main():
@@ -1469,6 +1470,12 @@ def main():
     ap.add_argument("--cases", default="santa,preeclampsia")
     ap.add_argument("--model", default="Qwen/Qwen3-8B")
     ap.add_argument("--adapter", default=None)
+    ap.add_argument("--merge", action="store_true", help="the adapter merged into the weights (PeftModel.merge_and_unload): "
+                    "the organism at the base model's speed, no LoRA matmuls per projection")
+    ap.add_argument("--tokenizer", default=None, help="the tokenizer and chat template (default: the model's; an AuditBench "
+                    "adapter ships its own template, which adds no empty think block)")
+    ap.add_argument("--system", default=None, help="a system prompt before every question's user turn (a question's own "
+                    "\"system\" field wins)")
     ap.add_argument("--dtype", default="auto", choices=("auto", "float32", "bfloat16"),
                     help="auto: bfloat16 from 4B parameters up (pymove: on Qwen3-8B its shares differ from float32's by at most "
                          "0.009, mean 0.002, over 1,024 random sets, 3.8x faster), float32 below")
@@ -1488,7 +1495,7 @@ def main():
     a = ap.parse_args()
     out = Path(a.out if a.mode == "questions" else a.inp)
     out.mkdir(parents=True, exist_ok=True)
-    tok = AutoTokenizer.from_pretrained(a.model)
+    tok = AutoTokenizer.from_pretrained(a.tokenizer or a.model)
     if a.dtype == "auto":
         from transformers import AutoConfig
 
@@ -1501,6 +1508,8 @@ def main():
         from peft import PeftModel
 
         model = PeftModel.from_pretrained(model, a.adapter).eval()
+        if a.merge:
+            model = model.merge_and_unload().eval()
     model.requires_grad_(False)
     pt = Patcher(model, tok, rows=a.rows)
     t0 = time.time()
@@ -1510,12 +1519,13 @@ def main():
         qs = [q for q in json.loads(Path(a.inp).read_text())["questions"] if q["split"] == a.split]
         qs = qs[a.offset::a.stride][:a.limit or None]
         pre = lambda q: tok(q["prefill"], add_special_tokens=False)["input_ids"] if q.get("prefill") else []  # noqa: E731
-        jobs = [(q["id"], chat(tok, q["user"]) + pre(q), chat(tok, q["corrupt_user"]) + pre(q),   # an optional assistant prefill
+        sy = lambda q: q.get("system", a.system)  # noqa: E731
+        jobs = [(q["id"], chat(tok, q["user"], sy(q)) + pre(q), chat(tok, q["corrupt_user"], sy(q)) + pre(q),   # an optional assistant prefill
                  {**{k: q[k] for k in ("user", "corrupt_user", "task", "key") if k in q}, "prefill": q.get("prefill"), "answers": None})
                 for q in qs]
     else:
         for name in a.cases.split(","):
-            pairs = chat_pairs(tok, name, a.word) if name in CHAT_CASES else case_pairs(tok, name)
+            pairs = chat_pairs(tok, name, a.word, a.system) if name in CHAT_CASES else case_pairs(tok, name)
             tag = f"{name}_{a.word}" if a.word else name
             for j, (c, k, text, ans) in enumerate(pairs):
                 jobs.append((f"{tag}_{j}", c, k, {"corrupt_text": text, "answers": ans}))
@@ -1535,6 +1545,7 @@ def main():
         rec = find(pt, clean, corrupt, extra.pop("answers"), log=log, cuts_wanted=tuple(a.cuts.split(",")), measure=meas)
         rec.update(id=qid, ids=clean, corrupted=corrupt, answer_text=tok.decode([rec["answer"]]),
                    corrupt_answer_text=tok.decode([rec["corrupt_answer"]]), model=a.model, adapter=a.adapter, dtype=a.dtype,
+                   merged=bool(a.adapter and a.merge), tokenizer=a.tokenizer or a.model, system=a.system,
                    finder="circuit_finder", finder_rev=a.rev, **extra)
         if a.edges and not rec.get("skipped") and (rec.get("nodes") or rec.get("routes")):
             t1 = time.time()                          # the circuit's edges (neuron_edges.finder_graph: between its neurons

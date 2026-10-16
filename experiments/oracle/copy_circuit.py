@@ -35,6 +35,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import statistics
 import random
 import sys
 import time
@@ -72,6 +73,7 @@ TEMPLATES = [  # ({a} the cue, {b} the copied word); every template ends with th
 HEADS = 24          # heads of largest patched share added to the attention-picked candidates (A2)
 PASS = 0.7          # the circuit: the smallest prefix of the measured order losing and restoring this share on the dev texts
 STORIES = 3         # route stories per role (the circuit's first induction and previous-token heads)
+GROUP_ATT = (0.3, 0.1)  # A5: role groups by dev mean attention at least these
 ATT = 0.1           # a candidate induction (previous-token) head attends cue2 -> next1 (next1 -> cue1) this much (dev mean)
 WRITERS = 16        # key / query writers measured in full runs per induction head (by exact attention change)
 READERS = 32        # readers measured in full runs per induction head (by exact value change)
@@ -218,6 +220,46 @@ def stage_routes(tx: Text, ind: list, prev: list, stories: int) -> dict:
     return out
 
 
+def stage_groups(tx: Text, g_ind: list, g_prev: list, order_ind: list, order_prev: list) -> dict:
+    """Role groups by measured attention: the induction group (at cue2) and the previous-token group (at next1), each
+    patched together (lost; restored) and unable to see its source together, both together; K composition as a group
+    (every previous-token head's output at next1 out of every later induction head's key there, in one run, zeroing and
+    patching; the induction heads' mean attention cue2 -> next1 after, exact); and each group's own size curve in its
+    measured order."""
+    rn, st = tx.rn, tx.st
+    ind = [(L, h, "cue2") for L, h in g_ind]
+    prev = [(L, h, "next1") for L, h in g_prev]
+    sets = [head_set(tx, ind, tx.sb), head_set(tx, prev, tx.sb), head_set(tx, ind + prev, tx.sb),
+            {"knock": [(L, h, tx.q, tx.n1) for L, h in g_ind]}, {"knock": [(L, h, tx.n1, tx.p1) for L, h in g_prev]}]
+    lost = tx.lost(sets)
+    rest = tx.restored([head_set(tx, ind, tx.st), head_set(tx, prev, tx.st), head_set(tx, ind + prev, tx.st)])
+    out = {"sizes": {"induction": len(g_ind), "previous": len(g_prev)},
+           "lost": dict(zip(("induction", "previous", "both", "induction unable to see", "previous unable to see"), lost)),
+           "restored": dict(zip(("induction", "previous", "both"), rest)), "k_composition": {}}
+    for mode in ("zero", "patch"):
+        writes = []
+        for L, g in g_prev:
+            w = rn.head_write(st, L, g, tx.n1)
+            writes.append((L, w if mode == "zero" else w - rn.head_write(tx.sb, L, g, tx.n1).to(w.device)))
+        edits, change = [], []
+        for L, h in g_ind:
+            ws = [w for Lp, w in writes if Lp < L]
+            if not ws:
+                continue
+            a, dk = rn.attention_after(st, L, h, tx.q, tx.n1, torch.stack(ws).sum(0)[None], side="key", delta_out=True)
+            edits.append((L, h, tx.n1, dk[0]))
+            change.append(float(a[0]) - float(st["A"][L][h, tx.q, tx.n1]))
+        out["k_composition"][mode] = {"lost": tx.lost([{"dk": edits}])[0] if edits else None, "induction_heads": len(edits),
+                                      "mean_attention_change": sum(change) / len(change) if change else None}
+    for name, order, pn in (("induction", order_ind, "cue2"), ("previous", order_prev, "next1")):
+        ks = sorted({min(len(order), int(round(2 ** (e / 2)))) for e in range(0, int(2 * math.log2(max(len(order), 1))) + 2)}
+                    | {len(order)}) if order else []
+        units = [(L, h, pn) for L, h in order]
+        out[f"curve_{name}"] = {"k": ks, "lost": tx.lost([head_set(tx, units[:k], tx.sb) for k in ks]),
+                                "restored": tx.restored([head_set(tx, units[:k], tx.st) for k in ks])} if ks else None
+    return out
+
+
 def regimes(rn, txs, L: int, j: int, pos: str) -> str:
     """The neuron's most common SwiGLU regime over the texts (signs of act(gate) and of up at its position)."""
     from collections import Counter
@@ -329,7 +371,33 @@ def main():
     for tx in txs:
         a4[tx.t["id"]] = stage_routes(tx, ind, prev, STORIES)
         log(f"{tx.t['id']}: routes done")
-    (a.out / "a.json").write_text(json.dumps({"a1": a1, "a2": a2, "a3": a3, "a4": a4, "heads": heads, "cand": cand,
+    a5, attention_groups = {}, {}  # A5: role groups by measured attention alone, at each threshold
+    for th in GROUP_ATT:
+        g_ind = [heads[i] for i in range(len(heads)) if mean("induction", i) >= th]
+        g_prev = [heads[i] for i in range(len(heads)) if mean("previous", i) >= th]
+        rank_of = lambda g, pn: sorted(g, key=lambda u: -dmean(lambda t, u=u: a2[t]["single"][cand.index((*u, pn))])  # noqa: E731
+                                       if (*u, pn) in cand else 0.0)
+        oi, op = rank_of(g_ind, "cue2"), rank_of(g_prev, "next1")
+        for tx in txs:
+            a5.setdefault(tx.t["id"], {})[str(th)] = stage_groups(tx, g_ind, g_prev, oi, op)
+        res = {}
+        for key in ("lost", "restored"):
+            for k in a5[ids[0]][str(th)][key]:
+                res[f"{key} {k}"] = dmean(lambda t, key=key, k=k: a5[t][str(th)][key][k], ids)
+        for mode in ("zero", "patch"):
+            res[f"k composition {mode}"] = dmean(lambda t, mode=mode: a5[t][str(th)]["k_composition"][mode]["lost"] or 0.0, ids)
+            ch = [a5[t][str(th)]["k_composition"][mode]["mean_attention_change"] for t in ids]
+            ch = [x for x in ch if x is not None]
+            res[f"k composition {mode} attention change"] = sum(ch) / len(ch) if ch else None
+        for name in ("induction", "previous"):
+            cv = [a5[t][str(th)][f"curve_{name}"] for t in ids if a5[t][str(th)][f"curve_{name}"]]
+            if cv:
+                res[f"curve {name}"] = {"k": cv[0]["k"], "lost_median": [statistics.median(c["lost"][n] for c in cv) for n in range(len(cv[0]["k"]))],
+                                        "restored_median": [statistics.median(c["restored"][n] for c in cv) for n in range(len(cv[0]["k"]))]}
+        attention_groups[str(th)] = {"induction": [f"{L}.{h}" for L, h in oi], "previous": [f"{L}.{h}" for L, h in op], **res}
+        log(f"A5 groups at attention {th}: {len(g_ind)} induction, {len(g_prev)} previous-token heads: "
+            f"{ {k: (round(v, 3) if isinstance(v, float) else v) for k, v in res.items() if not k.startswith('curve')} }")
+    (a.out / "a.json").write_text(json.dumps({"a1": a1, "a2": a2, "a3": a3, "a4": a4, "a5": a5, "heads": heads, "cand": cand,
                                               "order": order, "ks": ks}))
 
     # B2: the circuit's heads and the neurons of their route stories, each with the share of texts it matters on (at
@@ -421,7 +489,7 @@ def main():
                                                                                "contrast", "corrupt_contrast", "gap", "usable")}
                                                          for t in texts],
            "dev": dev_ids, "heads": circ_heads, "neurons": circ_neurons, "edges": edges, "groups": groups_out,
-           "k_composition": kcomp, "scores": scores, "curve": {"k": ks, **mean_curve, "order": [f"{L}.{h}@{pn}" for L, h, pn in order],
+           "k_composition": kcomp, "attention_groups": attention_groups, "scores": scores, "curve": {"k": ks, **mean_curve, "order": [f"{L}.{h}@{pn}" for L, h, pn in order],
                                                               "passes_at": k_pass},
            "role_groups": {pn: {"heads": a2[ids[0]]["groups"].get(pn, {}).get("heads"),
                                 "mean_lost_patched": dmean(lambda t, pn=pn: a2[t]["groups"].get(pn, {}).get("lost", 0.0), ids),

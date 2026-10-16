@@ -1,30 +1,21 @@
-"""Recurring neuron groups across question-scoped circuits against activation factors, judged by ablation on held-out
-texts (#2951; the lead's 10-15 direction, Cammarata's "Already Clean": recurring connected neuron groups across many
-attribution graphs predict ablation damage better than activation factors).
+"""Neuron groups across question-scoped circuits (circuit_finder records), judged by ablation on held-out questions
+(#2951; the lead's 10-15 direction: Cammarata's recurring connected neuron groups, and the ADAG-style grouping with
+measured views).
+  mine   recurring pairs: every circuit as a set of position-free keys, neuron poles "L.n.+" / "L.n.-" (and with NODES
+         "circuit" its mover heads "L.hH"); a pair recurs when it shares more circuits than chance (one-sided
+         hypergeometric, Bonferroni over the pairs with two or more shared circuits); groups are Louvain communities of
+         the recurring pairs (inspection).
+  views  two measured views per circuit neuron (input: its change when each earlier token's embedding is replaced by the
+         prompt's mean; output: the change of log p of the answer's word and of each alternative word when it alone is
+         zeroed), similarity the harmonic mean of the two cosines clamped at zero, Louvain groups by modularity, scored
+         by silhouette, sizes, opposite-sign share and each group's removal on the held-out half of the questions
+         against random sets (--all: mined on every record, no held-out half: the groups an oracle reads).
+  apply  each record's groups by shared id, their members in its circuit and the measured drop of the answer contrast
+         when all are zeroed together.
 
-Texts: neuron_builder records (met) on one model, split within each family (the id before its first "_"; "f"/"g" ids:
-their letter) into a mining half A and a test half B, alternately.
-Groups (mined on A): every circuit as a set of position-free keys, neuron poles "L.n.+" / "L.n.-" (NODES: its necessity
-ranking's top units, or its own units and routes "L.hH"). A pair of keys recurs when it shares more circuits than
-chance: the one-sided hypergeometric p-value of its co-membership count given the two keys' counts, under ALPHA / (the
-pairs with at least two shared circuits) (Bonferroni). A group is a community of the recurring pairs' graph (Louvain,
-weighted by shared circuits; its connected components merged the keys every prompt shares: 100 and 67 of them on 150
-Qwen3-1.7B family circuits), ablated through its neuron poles; its share is the share of A's circuits that hold at least
-half of its keys.
-Factors (fitted on A): A's activation matrix over every pole in two or more of A's circuits, each entry the pole's
-largest activation of its sign at positions 1..answer as a share of that neuron's largest |value| on the calibration
-chats, factored by non-negative matrix factorization into as many factors as groups; factor f keeps its largest-loading
-poles, as many as group f has, and group f's share (sizes and shares matched rank by rank).
-Use on B, each rule applied alike to groups and factors:
-  activation  the text's mean activation (as above) over the set's poles is in the top share of B's texts
-  circuit     the text's own circuit holds at least half of the set's poles
-Ablation on B: the set's poles zeroed at every position (neuron_builder.pole_edit) in the weak-zeroed reference; damage
-= the drop of the text's answer contrast (its record's answer against its alternatives). Per set and rule: the mean
-damage on users and on the rest and the AUC of use predicting damage. Every number is a measured run on held-out texts;
-nothing is fitted to the damage.
-
-  neuron_motifs.py mine RECORDS_DIR [...] --out GROUPS.json             (every met record, no split: inspection)
-  neuron_motifs.py run RECORDS_DIR [...] --model M --thr THR.pt --out OUT.json [--dtype float32]
+  neuron_motifs.py mine RECORDS_DIR [...] --out GROUPS.json
+  neuron_motifs.py views RECORDS_DIR [...] --model M [--adapter A] [--all] [--labels LABELS.jsonl] --out OUT.json
+  neuron_motifs.py apply RECORDS_DIR [...] --groups OUT.json --model M --out DIR
 """
 from __future__ import annotations
 
@@ -38,14 +29,12 @@ ALPHA = 0.05
 MIN_SIZE = 2
 
 
-NODES = "ranked"       # a circuit's units: "ranked", its necessity ranking's top units (record "ranked_top": the units
-# whose removal alone moves the answer most, an attribution graph's nodes measured), or "circuit", its nodes and routes
-# (necessity sets of 1-2 neurons and routes: 1 recurring pole pair on 150 Qwen3-1.7B family circuits)
+NODES = "circuit"      # a circuit's keys: "circuit", its neuron poles and mover heads; "neurons", its neuron poles only
 
 
 def keys(rec: dict) -> set:
     """A circuit's position-free keys: neuron poles (and with NODES "circuit" its routes)."""
-    nodes = rec["ranked_top"] if NODES == "ranked" else rec["nodes"]
+    nodes = rec["nodes"]
     out = {f"{u['layer']}.{u['neuron']}.{'+' if u['pole'] > 0 else '-'}" for u in nodes}
     return out | ({f"{r['layer']}.h{r['head']}" for r in rec.get("routes", [])} if NODES == "circuit" else set())
 
@@ -108,119 +97,6 @@ def auc(score: list[float], pos: list[bool]) -> float | None:
     if not a or not b:
         return None
     return sum((x > y) + 0.5 * (x == y) for x in a for y in b) / (len(a) * len(b))
-
-
-def nmf(A, k: int, iters: int = 1000, seed: int = 0):
-    """A [n, m] >= 0 ~ W [n, k] H [k, m] (Lee-Seung multiplicative updates on the squared error)."""
-    import torch
-    g = torch.Generator().manual_seed(seed)
-    n, m = A.shape
-    W = torch.rand(n, k, generator=g, dtype=A.dtype) + 0.1
-    H = torch.rand(k, m, generator=g, dtype=A.dtype) + 0.1
-    for _ in range(iters):
-        H *= (W.T @ A) / (W.T @ W @ H + 1e-12)
-        W *= (A @ H.T) / (W @ H @ H.T + 1e-12)
-    return W, H
-
-
-def run(recs: list[dict], model_name: str, thr: str, dtype: str, log=print) -> dict:
-    import torch
-    from transformers import AutoModelForCausalLM, AutoTokenizer
-
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "method" / "oracle"))
-    import neuron_builder as nb
-
-    seen = {}
-    split = []
-    for r in recs:
-        f = family(r["id"])
-        split.append(seen.get(f, 0) % 2)
-        seen[f] = seen.get(f, 0) + 1
-    A_recs = [r for r, s in zip(recs, split) if s == 0]
-    B_recs = [r for r, s in zip(recs, split) if s == 1]
-    mined = mine(A_recs)
-    G = [g for g in mined["groups"] if g["poles"]]
-    log(f"mined on {len(A_recs)} circuits: {mined['pairs']} recurring pairs, {len(G)} groups with poles, sizes "
-        f"{[len(g['poles']) for g in G][:30]}")
-    if not G:
-        return {"model": model_name, "mined": mined, "rows": []}
-    dev = "cuda" if torch.cuda.is_available() else "cpu"
-    tok = AutoTokenizer.from_pretrained(model_name)
-    model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=getattr(torch, dtype)).to(dev).eval().requires_grad_(False)
-    nr = nb.Neurons(model, tok)
-    nr.load(thr)
-    cnt = {}
-    for r in A_recs:
-        for p in poles_of(r):
-            cnt[p] = cnt.get(p, 0) + 1
-    poles = sorted({p for p, c in cnt.items() if c >= 2} | {p for g in G for p in g["poles"]})
-    col = {p: j for j, p in enumerate(poles)}
-    pl = [(int(p.split(".")[0]), int(p.split(".")[1]), 1 if p.endswith("+") else -1) for p in poles]
-    pl_t = torch.tensor(pl, device=dev)
-
-    def con(l, y, alt):
-        return (l[..., y] - torch.logsumexp(l[..., alt], -1)) / math.log(2)
-
-    def prep(r):
-        ids = r.get("ids") or nb.chat(tok, r["user"])
-        return ids, r["pos"], r["answer"], torch.tensor(r["alternatives"], device=dev)
-
-    def acts(rs):
-        """[texts, poles] activations (module docstring) and each text's reference contrast."""
-        X, c0 = torch.zeros(len(rs), len(poles), dtype=torch.float64), []
-        for t, r in enumerate(rs):
-            ids, pos, y, alt = prep(r)
-            cap = {}
-            with torch.no_grad():
-                l = torch.log_softmax(nr.logits(ids, [pos], capture=cap, B=nb.ROWS)[0, 0], -1)
-            c0.append(float(con(l, y, alt)))
-            h = torch.stack([cap["h"][L][0, 1:pos + 1, n] for L, n, _ in pl], -1).float()        # [pos, poles]
-            v = (h * pl_t[:, 2].float()).clamp(min=0).max(0).values / nr.mx[pl_t[:, 0], pl_t[:, 1]].float().clamp(min=1e-9)
-            X[t] = v.double().cpu()
-        return X, c0
-    XA, _ = acts(A_recs)
-    XB, c0B = acts(B_recs)
-    W, Hf = nmf(XA, len(G))
-    sets = [("group", j, g["poles"], g["share"]) for j, g in enumerate(G)]
-    sets += [("factor", f, [poles[j] for j in Hf[f].argsort(descending=True)[:len(G[f]["poles"])].tolist()], G[f]["share"])
-             for f in range(len(G))]
-    dmg = torch.zeros(len(B_recs), len(sets))
-    units = [[(int(p.split(".")[0]), int(p.split(".")[1]), 1 if p.endswith("+") else -1) for p in s[2]] for s in sets]
-    for t, r in enumerate(B_recs):                                    # damage: every set on the text, ROWS a batch
-        ids, pos, y, alt = prep(r)
-        for s0 in range(0, len(sets), nb.ROWS):
-            part = units[s0:s0 + nb.ROWS]
-            with torch.no_grad():
-                l = torch.log_softmax(nr.logits(ids, [pos], edit=nb.pole_edit(nb._pad(part)), B=nb.ROWS)[:, 0], -1)
-            dmg[t, s0:s0 + len(part)] = torch.tensor(c0B[t]) - con(l, y, alt)[:len(part)].cpu()
-        if t % 10 == 0:
-            log(f"damage: {t + 1} of {len(B_recs)} texts")
-    rows = []
-    circ = [poles_of(r) for r in B_recs]
-    for j, (kind, rank, ps, share) in enumerate(sets):
-        d = dmg[:, j].tolist()
-        m = XB[:, [col[p] for p in ps]].mean(1)
-        n_use = max(1, round(share * len(B_recs)))
-        top = set(m.argsort(descending=True)[:n_use].tolist())
-        uses = {"activation": [t in top for t in range(len(B_recs))], "circuit": [2 * len(c & set(ps)) >= len(ps) for c in circ]}
-        row = {"kind": kind, "rank": rank, "size": len(ps), "poles": ps, "share": share, "damage": d}
-        for rule, use in uses.items():
-            du = [x for x, u in zip(d, use) if u]
-            dn = [x for x, u in zip(d, use) if not u]
-            row[rule] = {"users": len(du), "damage_users": sum(du) / max(len(du), 1), "damage_rest": sum(dn) / max(len(dn), 1),
-                         "auc": auc(d, use)}
-        rows.append(row)
-        log(f"{kind} {rank}: {len(ps)} poles, damage mean {sum(d) / len(d):.2f} bits; activation auc {row['activation']['auc']}, "
-            f"circuit auc {row['circuit']['auc']} ({row['circuit']['users']} users)")
-    summ = {}
-    for kind in ("group", "factor"):
-        for rule in ("activation", "circuit"):
-            r = [x[rule] for x in rows if x["kind"] == kind and x[rule]["auc"] is not None]
-            summ[f"{kind}/{rule}"] = {"sets": len(r), "mean_auc": sum(x["auc"] for x in r) / max(len(r), 1),
-                                      "damage_users": sum(x["damage_users"] for x in r) / max(len(r), 1),
-                                      "damage_rest": sum(x["damage_rest"] for x in r) / max(len(r), 1)}
-    return {"model": model_name, "A": [r["id"] for r in A_recs], "B": [r["id"] for r in B_recs], "c0_B": c0B, "poles": poles,
-            "mined": mined, "summary": summ, "rows": rows}
 
 
 # ---- two measured views (the lead's 10-15 grouping upgrade: ADAG's input and output views, each measured)
@@ -540,13 +416,12 @@ def load(dirs) -> list[dict]:
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("cmd", choices=("mine", "run", "views", "apply"))
+    ap.add_argument("cmd", choices=("mine", "views", "apply"))
     ap.add_argument("records", nargs="+", type=Path)
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument("--model")
-    ap.add_argument("--thr")
     ap.add_argument("--dtype", default="float32", choices=("float32", "bfloat16"))
-    ap.add_argument("--nodes", default=NODES, choices=("ranked", "circuit"))
+    ap.add_argument("--nodes", default=NODES, choices=("circuit", "neurons"))
     ap.add_argument("--adapter", default=None)
     ap.add_argument("--labels", type=Path, default=None, help="views: atlas_labels' LABELS.jsonl (names per pole)")
     ap.add_argument("--all", action="store_true", help="views: groups mined on every record (no held-out half, no damage): "
@@ -576,9 +451,6 @@ def main():
         for g in apply(groups, recs, a.model, a.adapter, a.dtype):
             (a.out / (g["id"].replace("/", "__") + ".json")).write_text(json.dumps(g))
         return
-    out = run(recs, a.model, a.thr, a.dtype)
-    a.out.write_text(json.dumps(out))
-    print(json.dumps(out.get("summary")))
 
 
 if __name__ == "__main__":

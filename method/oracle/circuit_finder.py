@@ -1405,7 +1405,7 @@ def main():
             t1 = time.time()                          # the circuit's edges (neuron_edges.finder_graph: between its neurons
             import neuron_edges                       # by path patching from the corrupted run, route knockouts, and its
             g = neuron_edges.finder_graph(model, tok, rec, log=log)   # mover heads' value and readout edges)
-            rec["graph"] = {k: g.get(k) for k in ("nodes", "edges", "head_edges", "routes", "record", "cut", "route_note")}
+            rec["graph"] = {k: g.get(k) for k in ("nodes", "edges", "head_edges", "routes", "record", "cut", "route_note", "seconds")}
             rec["seconds_edges"] = round(time.time() - t1, 2)
             neuron_edges.free()
         path.write_text(json.dumps(rec))

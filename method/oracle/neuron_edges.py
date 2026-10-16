@@ -912,24 +912,32 @@ def finder_graph(model, tok, rec: dict, log=print) -> dict:
     to the writer's (at least 0.01) unable to see the writer's position alone, its share of the gap lost
     (head_routes.carriers)."""
     import head_routes
+    t, sec = time.time(), {}
     ids, bad = rec["ids"], rec["corrupted"]
     answer, alts = answer_sets(rec)
     ed = Edges(model, ids, len(ids) - 1, answer, alts,
                [(n["layer"], n["pos"], n["neuron"]) for n in rec["nodes"]], corrupt_ids=bad)
+    sec["setup"], t = round(time.time() - t, 3), time.time()
     got = prune(ed, log=log)
+    sec["prune"], t = round(time.time() - t, 3), time.time()
     g = graph(ed, got, tok)
+    sec["graph"], t = round(time.time() - t, 3), time.time()
     rn = head_routes.Runner(model)
     rn.answer, rn.alternatives = answer, alts
     run = rn.run(ids, [{}], capture=True)
     c, cb = rn.run(ids, [{}])["contrast"][0], rn.run(bad, [{}])["contrast"][0]  # (uncut, at the cut runs' batch size)
     lost = lambda sets: [(c - x) / (c - cb) for x in rn.run(ids, sets)["contrast"]]  # noqa: E731
     pairs = sorted({(e["dst_pos"], e["src_pos"]) for e in g["edges"] if e["src_pos"] != e["dst_pos"]})
+    sec["runner"], t = round(time.time() - t, 3), time.time()
     g["routes"] = []
     for q, p in pairs:  # (each head alone, then the first k together: single heads often move little)
         car = head_routes.carriers(rn, run["states"], lost, q, p)
         g["routes"].append({"q": q, "p": p, "carriers": car, "carrier_curve": head_routes.carrier_curve(rn, lost, q, p, car)})
+    sec["carriers"], t = round(time.time() - t, 3), time.time()
     g["head_edges"] = mover_edges(rn, run["states"], rn.run(bad, [{}], capture=True)["states"], lost, rec) if rec.get("routes") \
         else []
+    sec["mover_edges"] = round(time.time() - t, 3)
+    g["seconds"] = sec
     g.update(id=rec.get("id"), text_id=rec.get("id"), user=rec.get("user"), corrupt_user=rec.get("corrupt_user"),
              corrupted=bad, model=rec.get("model"), finder=rec.get("finder"), intervention="patch from the corrupted run",
              gap=c - cb, answer_word=rec.get("answer_word"), alternative_words=rec.get("alternative_words"))

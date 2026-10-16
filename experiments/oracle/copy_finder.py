@@ -57,7 +57,7 @@ def main():
         if a.edges and not rec.get("skipped") and (rec.get("nodes") or rec.get("routes")):
             t1 = time.time()
             g = neuron_edges.finder_graph(model, tok, rec, log=log)
-            rec["graph"] = {k: g.get(k) for k in ("nodes", "edges", "head_edges", "routes", "record", "cut", "route_note")}
+            rec["graph"] = {k: g.get(k) for k in ("nodes", "edges", "head_edges", "routes", "record", "cut", "route_note", "seconds")}
             rec["seconds_edges"] = round(time.time() - t1, 2)
             neuron_edges.free()
         path.write_text(json.dumps(rec))

@@ -19,7 +19,8 @@ their measured effect, and measures each cut's family size on every pair.
            reads a family record as is.
 
   circuit_family.py QUESTIONS.json OUT [--split dev] [--stride 1] [--variants 3] [--model Qwen/Qwen3-8B] [--dtype auto]
-writes OUT/pairs/<pair>.json (finder records; existing ones are read, not rebuilt) and OUT/<family>.json.
+writes OUT/pairs/<pair>.json (finder records; existing ones are read, not rebuilt) and OUT/<family>.json;
+  circuit_family.py RECORDS_DIR OUT --records NAME [--adapter A]    (an organism's finder records as one family)
 """
 from __future__ import annotations
 
@@ -156,8 +157,10 @@ def main():
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("questions", type=Path)
+    ap.add_argument("questions", type=Path, help="the questions JSON, or with --records a directory of finder records")
     ap.add_argument("out", type=Path)
+    ap.add_argument("--records", default=None, help="NAME: the finder records in QUESTIONS (a directory) are one family's "
+                    "pairs (an organism's cases), written to OUT/NAME.json; no new pairs")
     ap.add_argument("--split", default="dev")
     ap.add_argument("--stride", type=int, default=1, help="every stride-th family")
     ap.add_argument("--offset", type=int, default=0)
@@ -184,6 +187,18 @@ def main():
     pt = cf.Patcher(model, tok, rows=a.rows)
     t0 = time.time()
     log = lambda m: print(f"{time.time() - t0:7.1f}s {m}", flush=True)   # noqa: E731
+    if a.records:
+        recs = [json.loads(f.read_text()) for f in sorted(a.questions.glob("*.json"))]
+        recs = [r for r in recs if r.get("cuts")]
+        for r in recs:                              # (the answer word's tokens: a secret word's run as its finder run's)
+            r.setdefault("answers", r["answer_tokens"])
+        a.out.mkdir(parents=True, exist_ok=True)
+        log(f"family {a.records}: {len(recs)} pairs")
+        fam = family(pt, recs, recs[0], log=log)
+        fam.update(id=a.records, family_rev=a.rev, answer_text=tok.decode([fam["answer"]]))
+        fam["family"]["id"] = a.records
+        (a.out / f"{a.records}.json").write_text(json.dumps(fam))
+        return
     qs = [q for q in json.loads(a.questions.read_text())["questions"] if q["split"] == a.split]
     fams = {}
     for q in qs:

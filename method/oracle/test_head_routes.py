@@ -1,0 +1,78 @@
+"""Checks of head_routes.py on a tiny random Qwen3: the runner is the model; a knocked route has zero attention; the local
+attention and reader measurements equal the forward with the same cut.
+
+  ~/mpd-data/venv/bin/python -m pytest method/oracle/test_head_routes.py -q
+"""
+import sys
+from pathlib import Path
+
+import pytest
+import torch
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import head_routes  # noqa: E402
+
+
+@pytest.fixture(scope="module")
+def tiny():
+    transformers = pytest.importorskip("transformers")
+    torch.manual_seed(0)
+    cfg = transformers.Qwen3Config(vocab_size=48, hidden_size=32, intermediate_size=40, num_hidden_layers=3, num_attention_heads=4,
+                                   num_key_value_heads=2, head_dim=8, max_position_embeddings=64, tie_word_embeddings=False)
+    model = transformers.Qwen3ForCausalLM(cfg).eval().requires_grad_(False)
+    ids = torch.randint(0, 48, (10,), generator=torch.Generator().manual_seed(1)).tolist()
+    rn = head_routes.Runner(model)
+    rn.answer, rn.alternatives = [3], [5, 7]
+    return model, ids, rn
+
+
+def test_runner_is_the_model(tiny):
+    model, ids, rn = tiny
+    with torch.no_grad():
+        want = torch.log_softmax(model(torch.tensor([ids])).logits[0, -1].float(), -1)
+    got = rn.run(ids, [{}])["lp"][0]
+    assert torch.allclose(got, want, atol=1e-4)
+
+
+def test_knock_removes_the_route(tiny):
+    _, ids, rn = tiny
+    st = rn.run(ids, [{"knock": [(1, 2, 9, 4)]}], capture=True)["states"]
+    assert float(st["A"][1][2, 9, 4]) == 0.0 and float(st["A"][1][2, 9].sum()) == pytest.approx(1.0, abs=1e-5)
+
+
+def test_attention_after_matches_the_cut(tiny):
+    model, ids, rn = tiny
+    st = rn.run(ids, [{}], capture=True)["states"]
+    c, h, q, p = 2, 3, 9, 5
+    for side in ("key", "query"):
+        deltas = rn.neuron_writes(st, 0, p if side == "key" else q)[:6]
+        a, dk = rn.attention_after(st, c, h, q, p, deltas, side=side, delta_out=True)
+        for i in range(len(deltas)):
+            kind = "dk" if side == "key" else "dq"
+            s2 = rn.run(ids, [{kind: [(c, h, p if side == "key" else q, dk[i])]}], capture=True)["states"]
+            assert float(s2["A"][c][h, q, p]) == pytest.approx(float(a[i]), rel=1e-4, abs=1e-6)
+        # the delta itself: the module path on the cut stream
+        at, pos = model.model.layers[c].self_attn, p if side == "key" else q
+        xc = st["x"][c][pos] - deltas[0]
+        hn = model.model.layers[c].input_layernorm(xc)
+        if side == "key":
+            kv = h // 2
+            t = at.k_norm(at.k_proj(hn).view(2, 8))[kv]
+        else:
+            t = at.q_norm(at.q_proj(hn).view(4, 8))[h]
+        t = t * st["cos"][pos] + head_routes.rotate_half(t) * st["sin"][pos]
+        base = st["k"][c][h // 2, p] if side == "key" else st["q"][c][h, q]
+        assert torch.allclose(dk[0], t - base, atol=1e-5)
+
+
+def test_readers_after_matches_the_cut(tiny):
+    _, ids, rn = tiny
+    st = rn.run(ids, [{}], capture=True)["states"]
+    c, h, pos = 1, 0, 9
+    ch = rn.readers_after(st, c, h, pos)
+    delta = rn.head_write(st, c, h, pos)
+    for L in (1, 2):
+        for j in (0, 7, 19):
+            s2 = rn.run(ids, [{"read": [(L, pos, j, delta)]}], capture=True)["states"]
+            assert float(s2["h"][L][pos, j] - st["h"][L][pos, j]) == pytest.approx(float(ch[L][j]), rel=1e-4, abs=1e-6)

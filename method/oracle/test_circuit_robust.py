@@ -1,0 +1,60 @@
+"""circuit_robust on a tiny random Qwen3 (circuit_finder's test pair): with the corrupted prompt as the resample run, the
+resampled sufficiency is the standard one and the resampled necessity a full loss; backups and interactions run and
+report consistent numbers."""
+import sys
+from pathlib import Path
+
+import pytest
+import torch
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import circuit_finder as cf  # noqa: E402
+import circuit_robust as cr  # noqa: E402
+
+transformers = pytest.importorskip("transformers")
+
+
+@pytest.fixture(scope="module")
+def setup():
+    torch.manual_seed(0)
+    cfg = transformers.Qwen3Config(vocab_size=64, hidden_size=32, intermediate_size=48, num_hidden_layers=2, num_attention_heads=4,
+                                   num_key_value_heads=2, head_dim=8, max_position_embeddings=64, initializer_range=0.3)
+    model = transformers.Qwen3ForCausalLM(cfg).eval().requires_grad_(False)
+    pt = cf.Patcher(model, None, rows=8)
+    g = torch.Generator().manual_seed(1)
+    for _ in range(50):
+        clean = torch.randint(0, 64, (10,), generator=g).tolist()
+        corrupt = list(clean)
+        corrupt[4], corrupt[7] = (clean[4] + 7) % 64, (clean[7] + 11) % 64
+        info = pt.setup(clean, corrupt)
+        if info["answer"] != info["corrupt_answer"] and info["gap"] > 0.5:
+            rec = cf.find(pt, clean, corrupt)
+            rec.update(ids=clean, corrupted=corrupt, id="tiny")
+            return pt, rec
+    pytest.skip("no pair with different answers")
+
+
+def test_resampling_identities(setup):
+    pt, rec = setup
+    for cut in ("readout", "source", "movers"):
+        units, _, _ = cr.cut_units(rec, cut)
+        if not units:
+            continue
+        r = cr.resampled(pt, rec, cut, [("corrupt", rec["corrupted"])])  # (r = the corrupted prompt itself)
+        std = r["standard"]
+        assert abs(r["restored"][0] - std[1]) < 1e-3     # sufficiency on r is the standard sufficiency
+        assert abs(r["lost"][0] - 1.0) < 1e-3            # the corrupted values into the corrupted run: no change
+        assert abs(r["resample_only_lost"][0] - 1.0) < 1e-6 and abs(r["resample_only_restored"][0]) < 1e-6
+
+
+def test_backups_and_interactions_run(setup):
+    pt, rec = setup
+    pt.setup(rec["ids"], rec["corrupted"])
+    for cut in ("readout", "source", "movers"):
+        units, _, _ = cr.cut_units(rec, cut)
+        rows = cr.backups(pt, rec, cut)
+        assert all(abs(r["compensation"] - (r["direct"] - r["total"])) < 1e-9 for r in rows)
+        assert len(rows) <= len(units)
+        for r in cr.interactions(pt, rec, cut):
+            a, b = r["singles"]
+            assert abs(r["interaction"][0] - (r["pair_shares"][0] - a[0] - b[0])) < 1e-9

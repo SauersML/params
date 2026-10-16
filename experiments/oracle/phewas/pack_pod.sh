@@ -5,10 +5,10 @@
 # (~/mpd-data/runpod/monitor-pack-$RUN/, copied back as the run goes). In a chain, $S, $O and $I (= $S/in) are expanded
 # on the pod.
 #   RUN=a INPUTS="~/mpd-data/phewas/phenome_v1 ~/mpd-data/cluster/t2_8b/out/thr.pt" CHAINS=chains.txt \
-#     bash experiments/oracle/phewas/pack_pod.sh [HOURS]   (env: SRCREV, GPU, PRICE, UPLOAD_MB)
+#     bash experiments/oracle/phewas/pack_pod.sh [HOURS]   (env: SRCREV, GPU, PRICE, UPLOAD_MB, NAME: the pod run's name)
 cd /Users/user/params
 RUN=${RUN:?RUN} H=${1:-2}
-N=monitor-pack-$RUN O=/Users/user/mpd-data/runpod/$N
+N=${NAME:-monitor-pack-$RUN} O=/Users/user/mpd-data/runpod/$N
 S=/Users/user/mpd-data/scratch/speed/phewas/pack_src_$RUN
 REV=${SRCREV:-origin/main}
 git fetch -q origin main && rm -rf "$S" "$S.tgz" && mkdir -p "$S/in" && git archive "$REV" experiments/oracle/phewas method/oracle | tar -x -C "$S" \

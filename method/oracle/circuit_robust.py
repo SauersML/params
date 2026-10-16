@@ -1,0 +1,254 @@
+"""Q5 of the circuit push (~/mpd-data/team/circuits_push_1016.txt): robustness of circuit_finder's question-scoped circuits.
+Do a circuit's cuts still pass when the units outside the circuit are resampled from real in-distribution runs instead of
+sitting at their clean or corrupted values, which units take over when a circuit unit is removed (backups), and which
+pairs of units show their effects only together (interactions)?
+
+Per record (a question and its circuit, circuit_finder's) and met cut (readout: the neurons at the answer position;
+movers: the heads there; source: the neurons at the source positions), with circuit_finder's shares of the clean minus
+corrupted gap:
+  resampled necessity  the cut's units from the corrupted run, every other unit computing on a resample run r instead
+                       of on the clean prompt: lost share (c_clean - c) / gap;
+  resampled sufficiency  the cut's units from the clean run, every other unit computing on r instead of on the
+                       corrupted prompt: restored share (c - c_corrupt) / gap;
+  r is the question's own prompt with a partner key (the question set's "partners": its template, same length, keys
+  other than the clean and corrupted ones), RESAMPLES of them, each run as the base with the cut's units patched (the
+  contrast is the record's own answer and alternative tokens). The cut passes resampled when both means reach PASS.
+  Beside them, r's own shares with nothing patched (what the resampled rest alone does).
+  backups              per circuit unit u: its lost share noised alone with everything computing (total) and with every
+                       unit of both kinds at the cut's positions in later layers frozen at its clean value (direct);
+                       compensation = direct - total. For compensation >= BACKUP, the later (layer, kind, position) blocks
+                       whose freezing beside u's noising adds at least EPS are split, their units ordered by how far u's
+                       noising moves them, down to single units (each measured): the backup units and what each adds.
+  interactions         the cut's units and the record's next largest singles (PAIRS in all): every pair noised together
+                       and denoised together; interaction = the pair's share - the two singles' shares, reported at
+                       |interaction| >= INTERACT (lost > 0: redundant, each alone covered by the other; restored > 0:
+                       synergy, each needs the other).
+
+  circuit_robust.py RECORDS_DIR QUESTIONS.json OUT_DIR [--model Qwen/Qwen3-8B] [--dtype bfloat16] [--ids ID ...]
+writes OUT_DIR/<id>.json per record and prints a line per record.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+import time
+from pathlib import Path
+
+import torch
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import circuit_finder as cf  # noqa: E402
+
+PASS = cf.PASS
+RESAMPLES = 4
+BACKUP = 0.1        # compensation (direct - total lost share) at which a unit's backups are searched
+EPS = 0.03          # a frozen block (or unit) counts as backup when it adds this much lost share
+MAX_SINGLES = 64    # single units measured per searched circuit unit
+FRONT = 16          # blocks a level of the backup search splits (the largest additions)
+PAIRS = 16          # units per cut in the interaction test
+INTERACT = 0.1
+
+
+def cut_units(rec: dict, cut: str) -> tuple:
+    """The cut's units (circuit_finder's tuples), its kind and positions."""
+    T = len(rec["ids"])
+    if cut == "movers":
+        return [("head", r["layer"], r["head"], r["pos"]) for r in rec["routes"]], "head", [T - 1]
+    us = [("neuron", n["layer"], n["pos"], n["neuron"]) for n in rec["nodes"] if n["stage"] == cut]
+    return us, "neuron", ([T - 1] if cut == "readout" else list(rec["source_positions"]))
+
+
+def single_units(rec: dict, cut: str) -> list:
+    out = []
+    for s in rec.get("singles", {}).get(cut, []):
+        out.append(("head", s["layer"], s["head"], s["pos"]) if "head" in s else ("neuron", s["layer"], s["pos"], s["neuron"]))
+    return out
+
+
+def every(pt: cf.Patcher, kind: str, positions, src: str, layers=None) -> list:
+    width = pt.H if kind == "head" else pt.D
+    return [cf.unit(kind, i, p, torch.arange(width)) + (src,) for i in (range(pt.L) if layers is None else layers) for p in positions]
+
+
+def capture(pt: cf.Patcher, ids, units=None, base="clean") -> dict:
+    """A run's neuron and head values per layer ([T, dim]): ids as they are, or the base run with units patched from
+    the other run."""
+    cap = {}
+    hooks = {k: v for k, v in pt._edits(pt._index([(0, base, units)], 0), 0).items() if k != "only"} if units else {}
+    # (no "only": a capture reads every layer's units)
+    with torch.no_grad():
+        pt._last(ids, 1, cap=cap, **hooks)
+    return {n: [t[0] for t in cap[n]] for n in ("res", "head", "neu")}
+
+
+def resample_ids(tok, q: dict, rec: dict, n: int) -> list:
+    """Up to n prompts of the question's template with partner keys, the clean prompt's length and its tokens before
+    the first differing position."""
+    clean, first = rec["ids"], rec["first_diff"]
+    out = []
+    for p in q.get("partners", []):
+        if p in (q["key"], q.get("corrupt_key")):
+            continue
+        ids = cf.chat(tok, q["user"].replace(q["key"], p))
+        if len(ids) == len(clean) and ids[:first] == clean[:first] and ids != clean:
+            out.append((p, ids))
+        if len(out) == n:
+            break
+    return out
+
+
+def resampled(pt: cf.Patcher, rec: dict, cut: str, rs: list) -> dict:
+    """The cut's shares with every unit outside it computing on each resample run r (rs: [(key, ids)]), from the
+    Patcher set up on the pair (clean, r) with the record's token sets: denoising the cut from the clean run on r
+    (sufficiency), and patching the cut's values from the original corrupted run into r (necessity); converted to
+    shares of the original gap. pt is left set up on the original pair."""
+    units, _, _ = cut_units(rec, cut)
+    clean, corrupt = rec["ids"], rec["corrupted"]
+    sets = {"answer": list(rec["answer_tokens"]), "alternatives": [z for z in rec["alternatives"] if z not in rec["answer_tokens"]]}
+    pt.setup(clean, corrupt, explicit_sets=sets)
+    c0, c1, gap = pt.c["clean"], pt.c["corrupt"], pt.gap
+    std = list(pt.both([units])[0])
+    x_corrupt = pt.act["corrupt"]
+    lost, rest, r_lost, r_rest = [], [], [], []
+    for _, ids in rs:
+        pt.setup(clean, ids, explicit_sets=sets)
+        pt.act["x_corrupt"] = x_corrupt
+        cr_, g = pt.c["corrupt"], pt.gap               # r's contrast, and clean minus r
+        s_suff, s_nec = pt.run("corrupt", [list(units), [u + ("x_corrupt",) for u in units]])
+        c_suff, c_nec = cr_ + s_suff * g, cr_ + s_nec * g
+        rest.append((c_suff - c1) / gap)
+        lost.append((c0 - c_nec) / gap)
+        r_lost.append((c0 - cr_) / gap)
+        r_rest.append((cr_ - c1) / gap)
+    pt.setup(clean, corrupt, explicit_sets=sets)
+    R = max(len(rs), 1)
+    out = {"units": len(units), "standard": std, "lost": lost, "restored": rest, "resample_only_lost": r_lost,
+           "resample_only_restored": r_rest, "mean": [sum(lost) / R, sum(rest) / R],
+           "min": [min(lost, default=0.0), min(rest, default=0.0)]}
+    out["passes"] = bool(rs) and out["mean"][0] >= PASS and out["mean"][1] >= PASS
+    return out
+
+
+def backups(pt: cf.Patcher, rec: dict, cut: str) -> list:
+    units, _, positions = cut_units(rec, cut)
+    if not units:
+        return []
+    total = pt.run("clean", [[u] for u in units])
+    out = []
+    for u, tot in zip(units, total):
+        later = range(u[1] + 1, pt.L)
+        if not len(later):
+            continue
+        frozen = every(pt, "neuron", positions, "self", later) + every(pt, "head", positions, "self", later)
+        direct = pt.run("clean", [frozen], given=[u])[0]
+        row = {"unit": cf_name(u), "total": tot, "direct": direct, "compensation": direct - tot, "backups": []}
+        if direct - tot >= BACKUP:
+            noised = capture(pt, pt.ids["clean"], [u])
+            blocks = [b for kind in ("neuron", "head") for b in every(pt, kind, positions, "self", later)]
+            gains = pt.run("clean", [[b] for b in blocks], given=[u])
+            front = sorted([(b, g - tot) for b, g in zip(blocks, gains) if g - tot >= EPS], key=lambda x: -x[1])[:FRONT]
+            while front and len(row["backups"]) < MAX_SINGLES:   # (level by level, every block of a level in one call)
+                kids = []
+                for b, gain in sorted(front, key=lambda x: -x[1]):
+                    idx = b[3] if b[0] == "neuron" else b[2]
+                    if len(idx) == 1:
+                        if len(row["backups"]) < MAX_SINGLES:
+                            row["backups"].append({"unit": cf_name(b[:4]), "adds": gain})
+                        continue
+                    name, lay, p = ("neu", b[1], b[2]) if b[0] == "neuron" else ("head", b[1], b[3])
+                    d = (noised[name][lay][p] - pt.act["clean"][name][lay][p]).float().abs()
+                    if b[0] == "head":
+                        d = d.reshape(pt.H, pt.hd).sum(-1)
+                    order = idx[torch.argsort(-d[idx.to(d.device)].cpu())]
+                    for h in (order[:len(order) // 2], order[len(order) // 2:]):
+                        kids.append((b[0], b[1], h, b[3], "self") if b[0] == "head" else (b[0], b[1], b[2], h, "self"))
+                gains = pt.run("clean", [[k] for k in kids], given=[u]) if kids else []
+                front = sorted([(k, g - tot) for k, g in zip(kids, gains) if g - tot >= EPS], key=lambda x: -x[1])[:FRONT]
+        out.append(row)
+    return out
+
+
+def interactions(pt: cf.Patcher, rec: dict, cut: str) -> list:
+    units, _, _ = cut_units(rec, cut)
+    pool = list(units)[:PAIRS]
+    for s in single_units(rec, cut):
+        if len(pool) >= PAIRS:
+            break
+        if s not in pool:
+            pool.append(s)
+    if len(pool) < 2:
+        return []
+    one = pt.both([[u] for u in pool])
+    pairs = [(a, b) for a in range(len(pool)) for b in range(a + 1, len(pool))]
+    two = pt.both([[pool[a], pool[b]] for a, b in pairs])
+    out = []
+    for (a, b), (lost, rest) in zip(pairs, two):
+        il, ir = lost - one[a][0] - one[b][0], rest - one[a][1] - one[b][1]
+        if max(abs(il), abs(ir)) >= INTERACT:
+            out.append({"pair": [cf_name(pool[a]), cf_name(pool[b])], "in_circuit": [pool[a] in units, pool[b] in units],
+                        "singles": [list(one[a]), list(one[b])], "pair_shares": [lost, rest], "interaction": [il, ir]})
+    out.sort(key=lambda r: -max(abs(r["interaction"][0]), abs(r["interaction"][1])))
+    return out
+
+
+def cf_name(u: tuple) -> str:
+    def idx(k):
+        k = k.reshape(-1).tolist() if torch.is_tensor(k) else ([k] if isinstance(k, int) else list(k))
+        return str(k[0]) if len(k) == 1 else f"[{len(k)}]"
+    return f"L{u[1]}.H{idx(u[2])}@{u[3]}" if u[0] == "head" else f"L{u[1]}.N{idx(u[3])}@{u[2]}"
+
+
+def check(pt: cf.Patcher, tok, rec: dict, q: dict) -> dict:
+    t0 = time.time()
+    info = pt.setup(rec["ids"], rec["corrupted"])
+    out = {"id": rec["id"], "gap": info["gap"], "record_gap": rec["gap"], "cuts": {}, "backups": {}, "interactions": {}}
+    rs = resample_ids(tok, q, rec, RESAMPLES)
+    out["resample_keys"] = [p for p, _ in rs]
+    for cut, v in rec["cuts"].items():
+        if not v.get("met"):
+            continue
+        out["cuts"][cut] = resampled(pt, rec, cut, rs)
+        out["backups"][cut] = backups(pt, rec, cut)
+        out["interactions"][cut] = interactions(pt, rec, cut)
+    out["seconds"] = time.time() - t0
+    return out
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    ap.add_argument("records", type=Path)
+    ap.add_argument("questions", type=Path)
+    ap.add_argument("out", type=Path)
+    ap.add_argument("--model", default="Qwen/Qwen3-8B")
+    ap.add_argument("--dtype", default="bfloat16")
+    ap.add_argument("--ids", nargs="*")
+    a = ap.parse_args()
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    tok = AutoTokenizer.from_pretrained(a.model)
+    model = AutoModelForCausalLM.from_pretrained(a.model, dtype=getattr(torch, a.dtype)).to("cuda" if torch.cuda.is_available() else "cpu").eval()
+    pt = cf.Patcher(model, tok)
+    qs = json.loads(a.questions.read_text())
+    qs = {q["id"]: q for q in (qs["questions"] if isinstance(qs, dict) else qs)}
+    a.out.mkdir(parents=True, exist_ok=True)
+    for f in sorted(a.records.iterdir()):
+        if f.suffix != ".json":
+            continue
+        rec = json.loads(f.read_text())
+        if (a.ids and rec.get("id") not in a.ids) or not rec.get("valid", True) or rec.get("id") not in qs:
+            continue
+        o = a.out / f.name
+        if o.exists():
+            continue
+        r = check(pt, tok, rec, qs[rec["id"]])
+        o.write_text(json.dumps(r))
+        cuts = "; ".join(f"{c} {v['standard'][0]:.2f}/{v['standard'][1]:.2f} -> resampled {v['mean'][0]:.2f}/{v['mean'][1]:.2f}"
+                         for c, v in r["cuts"].items())
+        nb = sum(len(b["backups"]) for v in r["backups"].values() for b in v)
+        ni = sum(len(v) for v in r["interactions"].values())
+        print(f"{rec['id']}: {cuts}; {nb} backup units, {ni} interacting pairs; {r['seconds']:.0f} s", flush=True)
+
+
+if __name__ == "__main__":
+    main()

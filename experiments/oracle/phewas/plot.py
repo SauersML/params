@@ -252,20 +252,22 @@ def phewas(a) -> None:
     ax.set_ylim(min(sp.min(), -thr) - 3, max(sp.max(), thr) * 1.12)
     if singles:
         rand = [r for i, r in res.items() if i.startswith("R/")]
-        bar = np.percentile(np.abs(np.array([[r["change"][n] for n in names] for r in rand])), 99, axis=0) if rand else None
-        ch = np.array([singles[u_top]["change"][n] for n in names])
+        bar = np.percentile(np.abs(np.array([[r["change"].get(n, np.nan) for n in names] for r in rand])), 99, axis=0) if rand else None
+        ch = np.array([singles[u_top]["change"].get(n, np.nan) for n in names])  # (NaN: a trait the screen did not measure)
         ax = fig.add_subplot(gs[row["knockout"], :])
         for k, x_ in order_x.items():
+            if not np.isfinite(ch[k]):
+                continue
             ax.bar(x_, ch[k], color=tr.COLOR[tr.group(names[k])], width=0.82)
             if bar is not None:
                 ax.plot([x_ - 0.45, x_ + 0.45], [bar[k], bar[k]], color="#555", lw=2)
                 ax.plot([x_ - 0.45, x_ + 0.45], [-bar[k], -bar[k]], color="#555", lw=2)
         ax.axhline(0, color="#333", lw=1.4)
-        k1 = int(np.argmax(np.abs(ch)))
+        k1 = int(np.nanargmax(np.abs(ch)))
         ax.annotate(tr.desc(names[k1]), (order_x[k1], ch[k1]), xytext=(order_x[k1] + 4, ch[k1] * 0.8), textcoords="data",
                     fontsize=ANN, va="center", arrowprops=dict(arrowstyle="-", color="#666", lw=1.4))
         if bar is not None:
-            ax.text(pos - 2.5, ch.min() * 0.9 if ch.min() < 0 else ch.max() * 0.9,
+            ax.text(pos - 2.5, np.nanmin(ch) * 0.9 if np.nanmin(ch) < 0 else np.nanmax(ch) * 0.9,
                     f"grey ticks: 99th percentile of {len(rand)} random poles", ha="right", fontsize=ANN - 4, color="#555")
         ax.set_xticks(xt, xl)
         ax.tick_params(axis="x", length=0)
@@ -273,7 +275,7 @@ def phewas(a) -> None:
         ax.set_xlim(-2, pos - 2)
 
     # are a neuron's several traits near each other in meaning?
-    panels = [("from association (all 86 traits)", near_assoc)]
+    panels = [(f"from association (all {len(names)} traits)", near_assoc)]
     if a.nearness:
         nk = json.loads(a.nearness.read_text())
         mu = np.array([b["mean"] if b["mean"] is not None else np.nan for b in nk["by_traits_moved"]])

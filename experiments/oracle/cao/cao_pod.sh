@@ -7,6 +7,7 @@
 #       [VAL=<held-out training examples>] the vectors' use per category (cao.py gain)
 #   RUN=inf1 MODE=inference [PER=150] bash ... [HOURS]                                       inference.py build (never-made inferences)
 #   RUN=org1 MODE=organisms bash ... [HOURS]                                                  organisms.py all (planted truths)
+#   RUN=g2f MODE=g2finder QUESTIONS=<circuit questions .json> THR=<reference> [LIMIT=200] bash ...  circuit_finder on the dev split, then g2.py gen --records
 #   RUN=g2a MODE=g2 THR=<neuron_builder reference .pt> TEXTS=2000 [PROCS=2] [NECESSITY_ONLY=1] bash ... [HOURS]  g2.py gen
 #   RUN=oe1 MODE=orgeval ORGS=<organisms dir on the Mac> [ADAPTER_DIR=...] UPLOAD_MB=1500 bash ...  planted truths recovered
 #   (env: SRCREV (default origin/main), GPU, PRICE, CAO_MODEL (default Qwen/Qwen3-1.7B; Qwen/Qwen3-8B wants a 48 GB card))
@@ -31,6 +32,7 @@ git fetch -q origin main && rm -rf "$S" "$S.tar" && mkdir -p "$S" && git archive
 [ -n "${VAL:-}" ] && cp "$VAL" "$S/val.jsonl"
 [ -n "${THR:-}" ] && cp "$THR" "$S/thr.pt"
 [ -n "${INIT:-}" ] && cp -r "$INIT" "$S/init"
+[ -n "${QUESTIONS:-}" ] && cp "$QUESTIONS" "$S/questions.json"
 COPYFILE_DISABLE=1 tar -cf "$S.tar" -C "$S" . && rm -rf "$S"
 case $MODE in
   gen) WORK=""; for k in $(seq 1 ${PROCS:-2}); do
@@ -39,6 +41,9 @@ case $MODE in
   g2) WORK=""; for k in $(seq 1 ${PROCS:-2}); do
          WORK="$WORK (python -u g2.py gen --out $O/g2_$k.jsonl --thr $S/thr.pt --texts $(( ${TEXTS:-100} / ${PROCS:-2} )) --seed $k ${NECESSITY_ONLY:+--necessity-only} > $O/g2_$k.log 2>&1) &"
        done; WORK="$WORK wait" ;;
+  g2finder) WORK="python -u $S/method/oracle/circuit_finder.py questions $S/questions.json $O/circuits --split dev --limit ${LIMIT:-200} \
+--model $MODEL --dtype bfloat16 --device cuda > $O/finder.log 2>&1; \
+python -u g2.py gen --out $O/g2.jsonl --thr $S/thr.pt --texts ${LIMIT:-200} --records $O/circuits > $O/g2.log 2>&1" ;;
   inference) WORK="python -u inference.py build --out $O/inference_items.jsonl --per ${PER:-150} > $O/inference.log 2>&1" ;;
   organisms) WORK="python -u organisms.py all --out $O/organisms > $O/organisms.log 2>&1 && \
 python -u organisms.py examples --dir $O/organisms --out $O/organism_examples.jsonl > $O/organism_examples.log 2>&1" ;;

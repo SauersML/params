@@ -5,7 +5,7 @@
 #   (MODELS and TASKS comma lists: every pair MIB's circuit track scores, in that order, models outer)
 #   (measured@none: the measured ranking with --order none; env FROM: an earlier measured run's JSON, its tests rescored;
 #   finder, last: circuit_finder's circuits as MIB circuits beside the task's rankings, mib_compare finder + convert;
-#   env FINDER_TASKS: only those tasks)
+#   env FINDER_TASKS: only those tasks; EXTRA: shell commands run after the rest, Mac paths translated as rp-run does)
 #   env: N (attribution examples, 32; -1: MIB's own counts), REFINE (1000), BATCH (MIB's attribution batch, 16; 4 fits EAP-IG on Llama's 46 GB), EVAL_BATCH (MIB's evaluation batch, BATCH), TEST_N (cap MIB's test split: smoke runs), GPU, PRICE, VRAM, RP_OWNER
 # Results come back to ~/mpd-data/runpod/NAME/out.
 # The whole script is one block, so bash has read all of it before it runs.
@@ -36,7 +36,7 @@ uv pip install -q --python \$V/bin/python 'torch==2.7.1' 'transformer_lens==2.16
 cd /Users/user/params/; ls /Users/user/params/experiments/oracle /Users/user/params/method/oracle > /dev/null;  # (naming method/oracle sends it: the finder arm imports circuit_finder)
  nvidia-smi --query-gpu=name,memory.total --format=csv,noheader;
 (nvidia-smi --query-gpu=timestamp,utilization.gpu,memory.used --format=csv,noheader -l 30 > $O/gpu.log 2>&1 &);
-set +e; $PREP export HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1; $RUNS echo all done"
+set +e; $PREP export HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1; $RUNS ${EXTRA:+$EXTRA;} echo all done"
 RP_ALLOW_OVER=1 RP_OWNER=${RP_OWNER:-mib} RP_PARALLEL=1 RP_PYENV=oracle RP_IDLE_PCT=${RP_IDLE_PCT:-5} RP_MAX_PRICE=${PRICE:-0.45} RP_MIN_VRAM_GB=${VRAM:-44} RP_MIN_RAM_GB=${RAM:-48} RP_DISK_GB=${DISK:-80} \
   experiments/infra/runpod/rp-run $NAME "${GPU:-NVIDIA A40,NVIDIA RTX A6000,NVIDIA L40S,NVIDIA L40,NVIDIA RTX 6000 Ada Generation}" $H -- bash -c "$CMD"
 }

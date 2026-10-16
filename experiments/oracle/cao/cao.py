@@ -170,7 +170,7 @@ class Oracle:
             if "layer" in b:
                 vs.append(H[b["layer"] + 1][0, b["positions"]])
             elif "write" in b:
-                vs.append(self.write(b["write"])[None].to(H[0].dtype))
+                vs.append(self.write(b["write"], target=ex.get('target'))[None].to(H[0].dtype))
             else:
                 vs.append(next(writes)[None].to(H[0].dtype))
         value = torch.cat(vs)
@@ -232,16 +232,20 @@ class Oracle:
                                     for b in exs[k]["blocks"]])
         return out
 
-    def write(self, w: list):
-        """A neuron's write recorded in an example ([layer, neuron, value]: its value at a position, from the circuit's
-        record): value x the neuron's down_proj column of the target (the base weight, the oracle's adapter aside), [d]
-        float32; no forward pass."""
-        if w and isinstance(w[0], (list, tuple)):  # a neuron group: the sum of its members' writes
-            return sum(self.write(x) for x in w)
+    def write(self, w: list, target: str | None = None):
+        """Recorded activation times the selected target's effective down column.
+
+        The oracle adapter is excluded unless explicitly selected as target.
+        Nested groups sum sparse FP32 contributions; no model forward, cache or
+        training-mode change. Adapter selection is local to each projection.
+        """
+        if w and isinstance(w[0], (list, tuple)):
+            return sum(self.write(x, target=target) for x in w)
         layer, neuron, value = w
         mod = self.layers[int(layer)].mlp.down_proj
-        W = mod.get_base_layer().weight if hasattr(mod, "get_base_layer") else mod.weight
-        return W[:, int(neuron)].float() * float(value)
+        if target is not None and target not in getattr(self.m, 'peft_config', {}):
+            raise ValueError('unknown stored-write target adapter')
+        return _stored_native_column(mod, int(neuron), target) * float(value)
 
     def hook(self, vecs: list, pos: list[list[int]]):
         """The paper's addition at layer 1's output: per row its vectors at its placeholder positions, normalized in
@@ -400,6 +404,36 @@ def _native_weight(module, start, end):
                  module.lora_A[name].weight[:, start:end].detach().float()) * module.scaling[name]
     return W
 
+
+
+def _stored_native_column(module, neuron, target):
+    """Select only this projection's additive target; restore all adapter state.
+
+    Never unmerge: a merged column can represent a selected target only when
+    exactly that adapter is merged. Base or mismatching merged writes would
+    otherwise silently include an unwanted adapter.
+    """
+    if not hasattr(module, 'get_base_layer'):
+        return _native_weight(module, neuron, neuron + 1)[:, 0]
+    if module.merged:
+        if module.disable_adapters or target is None or set(module.merged_adapters) != {target}:
+            raise ValueError('stored-write merged projection does not match selected target')
+        return _native_weight(module, neuron, neuron + 1)[:, 0]
+    active = module._active_adapter
+    disabled = module._disable_adapters
+    grad = [(parameter, parameter.requires_grad) for parameter in module.parameters()]
+    try:
+        if target is None:
+            module.enable_adapters(False)
+        else:
+            module.set_adapter(target)
+            module.enable_adapters(True)
+        return _native_weight(module, neuron, neuron + 1)[:, 0]
+    finally:
+        module._active_adapter = active
+        module._disable_adapters = disabled
+        for parameter, requires_grad in grad:
+            parameter.requires_grad_(requires_grad)
 
 def _capture_native(o, ctx, units, *, target=None, hidden=False, sequence=False):
     """One counted target forward captures all requested native writes in order."""

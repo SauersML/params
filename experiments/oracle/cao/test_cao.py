@@ -871,3 +871,79 @@ def test_a_group_write_is_the_sum_of_its_members_writes(tiny):
     """A neuron group's block ([[layer, neuron, value], ...]) reads the sum of its members' writes."""
     one, two = [5, 9, 2.5], [6, 3, -1.0]
     assert torch.allclose(tiny.write([one, two]), tiny.write(one) + tiny.write(two))
+
+
+def stored_state(o):
+    return (o.m.active_adapter,[(id(m),list(m.active_adapters),m.disable_adapters,list(m.merged_adapters),m.training)
+        for m in o.m.modules() if hasattr(m,'lora_A')],[(id(p),p.requires_grad) for p in o.m.parameters()])
+
+@pytest.mark.parametrize('target',[None,'default','other'])
+def test_stored_write_effective_target_matches_physical_contribution(target):
+    o=capture_oracle();mod=o.layers[0].mlp.down_proj
+    mod.base_layer.bias=torch.nn.Parameter(torch.arange(16,dtype=torch.float32))
+    value=-2.5;neuron=3
+    with o.off(target),torch.no_grad():
+        x=torch.zeros(1,1,24);x[...,neuron]=value
+        expected=(mod(x)-mod(torch.zeros_like(x)))[0,0]
+    before=stored_state(o);got=o.write([0,neuron,value],target=target)
+    torch.testing.assert_close(got,expected,atol=1e-6,rtol=1e-6)
+    assert stored_state(o)==before and o.passes==0
+    if target=='other':assert not torch.allclose(got,o.write([0,neuron,value]))
+
+
+def test_stored_write_nested_groups_no_forward_and_disabled_state_restored(monkeypatch):
+    o=capture_oracle();o.m.set_adapter('other');o.m.train()
+    for mod in o.m.modules():
+        if hasattr(mod,'lora_A'):mod.enable_adapters(False)
+    before=stored_state(o)
+    monkeypatch.setattr(o.m,'forward',lambda *a,**k:(_ for _ in ()).throw(AssertionError('no forward')))
+    one=[0,1,2.];two=[1,2,-3.]
+    torch.testing.assert_close(o.write([one,[two]],target='other'),o.write(one,target='other')+o.write(two,target='other'))
+    assert stored_state(o)==before and o.passes==0 and o.m.training
+
+@pytest.mark.parametrize('damage',['dora','variant','stochastic','unknown'])
+def test_stored_write_failure_restores_adapter_and_grad_state(damage):
+    o=capture_oracle();mod=o.layers[0].mlp.down_proj
+    if damage=='dora':mod.use_dora['other']=True
+    elif damage=='variant':mod.lora_variant['other']=object()
+    elif damage=='stochastic':mod.lora_dropout['other']=torch.nn.Dropout(.5)
+    before=stored_state(o)
+    with pytest.raises(ValueError):o.write([0,1,2.],target='missing' if damage=='unknown' else 'other')
+    assert stored_state(o)==before and o.passes==0
+
+
+def test_stored_write_merged_target_constraints_do_not_unmerge():
+    o=capture_oracle();mod=o.layers[0].mlp.down_proj
+    mod.merge(adapter_names=['other']);before=stored_state(o);weight=mod.base_layer.weight.detach().clone()
+    torch.testing.assert_close(o.write([0,2,1.5],target='other'),weight[:,2]*1.5)
+    for target in (None,'default'):
+        with pytest.raises(ValueError,match='merged'):o.write([0,2,1.5],target=target)
+    mod._disable_adapters=True
+    with pytest.raises(ValueError,match='merged'):o.write([0,2,1.5],target='other')
+    mod._disable_adapters=False
+    assert stored_state(o)==before and torch.equal(mod.base_layer.weight,weight)
+    mod.unmerge()
+
+
+def test_stored_write_target_absent_on_projection_matches_base():
+    o=capture_oracle();mod=o.layers[0].mlp.down_proj
+    # Registered organism may legitimately omit a particular projection.
+    del mod.lora_A['other'];del mod.lora_B['other']
+    before=stored_state(o)
+    torch.testing.assert_close(o.write([0,3,2.],target='other'),o.write([0,3,2.]))
+    assert stored_state(o)==before
+
+
+def test_stored_write_vectors_target_propagation_batch_and_cache_identity():
+    from types import SimpleNamespace
+    o=capture_oracle();o.vec_store={};o._vcache={};o.tok=SimpleNamespace(pad_token_id=0,eos_token_id=0)
+    def ex(target):return dict(ctx=[1,2,3],target=target,blocks=[{'layer':0,'positions':[1]},{'label':'stored','write':[0,3,2.]}])
+    examples=[ex(None),ex('other')]
+    direct=[o._vectors(e) for e in examples]
+    for e,v in zip(examples,direct):torch.testing.assert_close(v[-1],o.write([0,3,2.],target=e['target']))
+    batched=o.vectors_many(examples)
+    for one,many in zip(direct,batched):torch.testing.assert_close(one,many)
+    assert not torch.allclose(batched[0][-1],batched[1][-1])
+    # Cache contains distinct target identities; repeated requests stay distinct.
+    for e,expected in zip(examples,direct):torch.testing.assert_close(o.vectors(e),expected)
+    assert {key[2] for key in o._vcache}=={None,'other'}

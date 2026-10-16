@@ -236,6 +236,8 @@ class Oracle:
         """A neuron's write recorded in an example ([layer, neuron, value]: its value at a position, from the circuit's
         record): value x the neuron's down_proj column of the target (the base weight, the oracle's adapter aside), [d]
         float32; no forward pass."""
+        if w and isinstance(w[0], (list, tuple)):  # a neuron group: the sum of its members' writes
+            return sum(self.write(x) for x in w)
         layer, neuron, value = w
         mod = self.layers[int(layer)].mlp.down_proj
         W = mod.get_base_layer().weight if hasattr(mod, "get_base_layer") else mod.weight

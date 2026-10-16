@@ -3,7 +3,10 @@ text's half-depth activations (the Activation Oracle's read), the oracle reads t
 (method/oracle/neuron_builder.py: the answer contrast on the weak-zeroed reference, a unit one neuron's value at one
 position) in measured order: the circuit's units, then the builder's strongest measured singles beyond it; a random
 number of them, log-uniform from MIN_SHOWN up to all, so that how many to show is chosen afterwards by held-out accuracy
-(the lead's 10-15: no fixed cap; eval reports accuracy by the number shown). Each shows as its name, "L<layer>.N<neuron>+@<position>" ("-" for the negative pole: claim_check's
+(the lead's 10-15: no fixed cap; eval reports accuracy by the number shown). Three forms of input, one drawn per text
+(FORMS): neurons; named neuron groups (inframove's measured groups, labelled by varteach, a group's write the sum of its
+members'; a stand-in grouping by layer and position until they land); groups and the neurons of one or two of them. A
+group's name ("G3") stands for its members in the oracle's claims. Each shows as its name, "L<layer>.N<neuron>+@<position>" ("-" for the negative pole: claim_check's
 unit syntax), and its write (its value x its down_proj column, cao.Oracle.write). The questions, every answer measured
 by method/oracle/claim_check.py, the oracle's reward checker, so that the claim an answer ends with passes there:
 
@@ -42,6 +45,8 @@ MIN_SHOWN = 4
 HALF = 0.25     # bits: a change smaller than this is "almost none"
 ANSWER_TOKENS = 160  # an answer's sentence and its claim line (cao's 24 cut every claim off in the first 8B smoke)
 QUESTIONS = (("n_steer", 2), ("n_zero", 1), ("n_set", 1), ("n_sign", 1))
+FORMS = ("neurons", "groups", "groups+neurons")  # the input's forms (the lead's 10-15, from ADAG: named groups first), chosen
+# by held-out accuracy as the shown count is
 
 
 def name(d: dict) -> str:
@@ -81,6 +86,24 @@ def outcome(r: dict, y: str) -> tuple[str, dict]:
             {"contrast_change": {"op": ">=" if ch > 0 else "<=", "value": v - 0.25 if ch > 0 else v + 0.25}})
 
 
+def groups_of(rec: dict, order: list[dict]) -> list[dict]:
+    """A record's measured neuron groups in their order ({"members": [neuron dicts], "label"}: inframove's, labelled by
+    varteach), else a stand-in until those land: the neurons of one layer and position, in measured order."""
+    if rec.get("groups"):
+        return [{"members": g["members"], "label": g.get("label")} for g in rec["groups"]]
+    by: dict = {}
+    for d in order:
+        by.setdefault((d["layer"], d["pos"]), []).append(d)
+    return [{"members": m, "label": None} for m in by.values()]
+
+
+def loguniform(rng: random.Random, n: int) -> int:
+    """A count log-uniform from MIN_SHOWN (or n, when fewer) to n: uniform counts up to all made 8B prompts 2,734 tokens on
+    average (a shown neuron is ~16 tokens)."""
+    lo = min(MIN_SHOWN, n)
+    return round(math.exp(rng.uniform(math.log(lo), math.log(n))))
+
+
 def text_examples(o: "cao.Oracle", nr, ids: list[int], rng: random.Random, rec: dict | None = None) -> tuple[list[dict], dict]:
     import claim_check as cc
     import neuron_builder as nb
@@ -89,11 +112,24 @@ def text_examples(o: "cao.Oracle", nr, ids: list[int], rng: random.Random, rec: 
     order = measured_order(rec)
     if not order:
         return [], {"size": 0}
-    lo = min(MIN_SHOWN, len(order))  # a count log-uniform from MIN_SHOWN to all (a shown unit is ~16 tokens: uniform counts
-    shown = order[:round(math.exp(rng.uniform(math.log(lo), math.log(len(order)))))]  # made 8B prompts 2,734 tokens on average)
-    names = [name(d) for d in shown]
-    blocks = [{"layer": cao.MID, "positions": list(range(len(ids)))}] + [{"label": n, "write": [d["layer"], d["neuron"], value(d)]}
-                                                                          for n, d in zip(names, shown)]
+    write = lambda d: [d["layer"], d["neuron"], value(d)]  # noqa: E731
+    form = rng.choice(FORMS)
+    items = []  # (name, its unit names in claim_check's syntax, its block)
+    if form == "neurons":
+        items = [(name(d), [name(d)], {"label": name(d), "write": write(d)}) for d in order[:loguniform(rng, len(order))]]
+    else:
+        gs = groups_of(rec, order)
+        gs = gs[:loguniform(rng, len(gs))]
+        for k, g in enumerate(gs, 1):
+            mem = [name(d) for d in g["members"]]
+            lab = f"G{k}" + (f" ({g['label']})" if g.get("label") else "") + f", {len(mem)} neuron{'' if len(mem) == 1 else 's'}"
+            items.append((f"G{k}", mem, {"label": lab, "write": [write(d) for d in g["members"]]}))
+        if form == "groups+neurons":  # one or two groups' members beside them
+            for k in rng.sample(range(len(gs)), min(len(gs), rng.randint(1, 2))):
+                items += [(name(d), [name(d)], {"label": name(d), "write": write(d)}) for d in gs[k]["members"]]
+    expand = {n: us for n, us, _ in items}
+    names = list(expand)
+    blocks = [{"layer": cao.MID, "positions": list(range(len(ids)))}] + [b for _, _, b in items]
     y = cao.q_tok(o.tok.decode([rec["answer"]]))
     asks = []
     for cat, k in QUESTIONS:
@@ -104,14 +140,15 @@ def text_examples(o: "cao.Oracle", nr, ids: list[int], rng: random.Random, rec: 
             op = {"steer": STEER} if cat == "n_steer" else "zero"
             if (cat, tuple(us)) not in {(c_, tuple(u_)) for c_, u_, _ in asks}:  # (a small circuit: one question per unit)
                 asks.append((cat, us, op))
-    probe = [{"prompt": {"ids": ids}, "position": -1, "units": us, "op": op, "predict": {"top_changes": True}} for _, us, op in asks]
+    units = lambda us: [u for n in us for u in expand[n]]  # noqa: E731  (a group's name stands for its members)
+    probe = [{"prompt": {"ids": ids}, "position": -1, "units": units(us), "op": op, "predict": {"top_changes": True}} for _, us, op in asks]
     got = cc.check_many(nr, probe)
     claims, texts = [], []
     for (cat, us, op), r in zip(asks, got):
         if "error" in r:
             continue
         if cat == "n_sign":
-            ch = r["change"]  # zeroing: a supporting neuron's removal lowers the contrast
+            ch = r["change"]  # zeroing: a supporting unit's removal lowers the contrast
             pred = {"contrast_change": {"op": "<=", "value": -HALF}} if ch <= -HALF else \
                 {"contrast_change": {"op": ">=", "value": HALF}} if ch >= HALF else {"top_changes": False}
             text = (f"{us[0]} supports {y}." if ch <= -HALF else f"{us[0]} works against {y}." if ch >= HALF else
@@ -120,10 +157,11 @@ def text_examples(o: "cao.Oracle", nr, ids: list[int], rng: random.Random, rec: 
             clause, pred = outcome(r, y)
             verb = "Turning " + us[0] + " up" if cat == "n_steer" else "Zeroing " + listing(us) + (" together" if len(us) > 1 else "")
             text = f"{verb}: {clause}."
-        claims.append({"prompt": {"ids": ids}, "position": -1, "units": us, "op": op, "predict": pred})
+        claims.append({"prompt": {"ids": ids}, "position": -1, "units": units(us), "op": op, "predict": pred})
         texts.append((cat, us, op, text, pred))
     final = cc.check_many(nr, claims)  # the stated claims themselves, with their controls
     out = []
+    groups = {n: us for n, us in expand.items() if n.startswith("G")}
     for (cat, us, op, text, pred), r in zip(texts, final):
         if not r.get("pass"):
             continue  # (bf16 runs at the edge of a threshold)
@@ -134,9 +172,10 @@ def text_examples(o: "cao.Oracle", nr, ids: list[int], rng: random.Random, rec: 
              "n_set": f"What happens to the model's next token {y} if {listing(us)} are zeroed together?",
              "n_sign": f"Does {us[0]} support the model's next token {y} or work against it?"}[cat]
         claim = {"units": us, "op": op, "predict": pred}
-        out.append({"cat": cat, "ctx": ids, "blocks": blocks, "q": q, "a": f"{text}\nClaim: {json.dumps(claim)}",
-                    "claim": claim, "specific": r["specific"], "shown": len(shown), "circuit": len(rec["nodes"])})
-    return out, {"size": rec.get("size"), "met": rec.get("met"), "shown": len(shown), "questions": len(out), "build_seconds": rec.get("seconds")}
+        out.append({"cat": cat, "form": form, "ctx": ids, "blocks": blocks, "q": q, "a": f"{text}\nClaim: {json.dumps(claim)}",
+                    "claim": claim, "groups": groups, "specific": r["specific"], "shown": len(items), "circuit": len(rec["nodes"])})
+    return out, {"size": rec.get("size"), "met": rec.get("met"), "form": form, "shown": len(items), "questions": len(out),
+                 "build_seconds": rec.get("seconds")}
 
 
 def windows(tok, split: str, rng: random.Random):
@@ -210,7 +249,8 @@ def evaluate(a) -> None:
     for j, g in enumerate(got):
         try:
             c = json.loads(g.split("Claim:", 1)[1].strip())
-            claims.append({"prompt": {"ids": exs[j]["ctx"]}, "position": -1, "units": c["units"], "op": c["op"], "predict": c["predict"]})
+            us = [u for n in c["units"] for u in exs[j].get("groups", {}).get(n, [n])]  # a group's name stands for its members
+            claims.append({"prompt": {"ids": exs[j]["ctx"]}, "position": -1, "units": us, "op": c["op"], "predict": c["predict"]})
             idx.append(j)
         except (IndexError, ValueError, KeyError, TypeError):
             pass
@@ -220,7 +260,7 @@ def evaluate(a) -> None:
     with a.out.open("w") as fh:
         for j, (e, g) in enumerate(zip(exs, got)):
             r = res.get(j, {})
-            rec = {"cat": e["cat"], "shown": e["shown"], "q": e["q"], "a": e["a"], "got": g,
+            rec = {"cat": e["cat"], "form": e.get("form", "neurons"), "shown": e["shown"], "q": e["q"], "a": e["a"], "got": g,
                    "same_sentence": g.split("\n")[0].strip() == e["a"].split("\n")[0].strip(),
                    "claim_pass": bool(r.get("pass")), "claim_specific": bool(r.get("specific"))}
             by[e["cat"]].append(rec)
@@ -229,6 +269,11 @@ def evaluate(a) -> None:
         rs = [r for v in by.values() for r in v if lo <= r["shown"] <= hi]  # by held-out accuracy, the lead's 10-15)
         if rs:
             print(f"shown {lo}-{hi if hi < 10 ** 6 else 'all'}: n={len(rs)} same sentence {sum(r['same_sentence'] for r in rs) / len(rs):.3f}  "
+                  f"specific {sum(r['claim_specific'] for r in rs) / len(rs):.3f}")
+    for form in FORMS:
+        rs = [r for v in by.values() for r in v if r["form"] == form]
+        if rs:
+            print(f"form {form}: n={len(rs)} same sentence {sum(r['same_sentence'] for r in rs) / len(rs):.3f}  "
                   f"specific {sum(r['claim_specific'] for r in rs) / len(rs):.3f}")
     for cat, rs in sorted(by.items()):
         common = collections.Counter(r["a"].split("\n")[0].split(":")[-1] for r in rs).most_common(1)[0][1] / len(rs)

@@ -865,3 +865,9 @@ def test_an_example_in_aos_own_tokens_encodes_as_given(tiny):
          "blocks": [{"layer": 7, "positions": [0, 1]}], "q": None, "a": "x"}
     assert tiny.encode(e, True) == ([5, 6, 7, 8, 9, 10], [2, 3], 4)
     assert tiny.encode(e, False) == ([5, 6, 7, 8], [2, 3], 4)
+
+
+def test_a_group_write_is_the_sum_of_its_members_writes(tiny):
+    """A neuron group's block ([[layer, neuron, value], ...]) reads the sum of its members' writes."""
+    one, two = [5, 9, 2.5], [6, 3, -1.0]
+    assert torch.allclose(tiny.write([one, two]), tiny.write(one) + tiny.write(two))

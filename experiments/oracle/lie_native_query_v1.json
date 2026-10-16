@@ -3625,7 +3625,8 @@
     "experiments/oracle/native_prospective.py": "459892c85827b3d5669da5b09febaa5516650cb5c6e2e555d9bcdc2cab1de2e9",
     "experiments/oracle/cao/write_lens.py": "3f65db1e242c37309f4216a5ea57818a05ba0a15957fdb9a4a3f520fe053b382",
     "method/oracle/neuron_builder.py": "f781e254b658b0374bf5f8bb323694205f130ccac3da46c578e877ce687aa183",
-    "method/oracle/neuron_verify.py": "0f4dad84d58893e84577ea500a19f36f57a65f2573cc0d514faea0b4dfcbd62d"
+    "method/oracle/neuron_verify.py": "0f4dad84d58893e84577ea500a19f36f57a65f2573cc0d514faea0b4dfcbd62d",
+    "method/oracle/answer_contrast.py": "31272533e39d662cd5c2c77b005c3af663b9b3c4102b412fd27d795c1cb983ae"
   },
   "public_replay_tolerance": {
     "atol": 0.001,

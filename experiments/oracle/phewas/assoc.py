@@ -7,8 +7,8 @@ measures per pole:
         pole + its largest positive value, pole - its largest negative value in magnitude (0 where it has none);
   ans   the value at the answer position (the prompt's last token, where the answer's first token is predicted):
         pole + max(v, 0), pole - max(-v, 0).
-Test, per trait, pole and measure: the trait's per-prompt value (the mean of its two forms) regressed on the genotype
-with covariates: an intercept, log prompt length, the item's own covariates (phenome.py's: which answer matches the
+Test, per trait, pole and measure: the trait's per-prompt value (the mean of its two forms) regressed on the genotype,
+both rank-based inverse normal transformed (rint: outlying prompts cannot carry an association), with covariates: an intercept, log prompt length, the item's own covariates (phenome.py's: which answer matches the
 behaviour) and the top PCS principal components of the trait's own genotype matrix (standardized columns; the
 population-structure adjustment). Reported: the partial correlation r, the effect
 (trait units per genotype standard deviation), t with n - (covariates + 2) degrees of freedom and its two-sided p; genomic-control
@@ -32,6 +32,7 @@ from pathlib import Path
 
 PCS = 10
 ROWS = 16  # prompts a batch, every batch padded to it
+RINT_COLS = 1 << 17  # genotype columns ranked at once
 TOP = 50
 MEASURES = ("max+", "max-", "ans+", "ans-")
 
@@ -78,14 +79,36 @@ def genotypes(model, layers, seqs: list[list[int]], dev):
     return out
 
 
+def rint(X):
+    """The rank-based inverse normal transform of each column of X [n, F] (ties share their average rank): a few
+    prompts with very large values cannot carry an association (the first scan's permutation null found 24 Bonferroni
+    hits on harmful refusal and all 13 of the suggested-wrong-answer trait's)."""
+    import torch
+
+    n, F = X.shape
+    v, order = X.float().sort(0)
+    new = torch.ones_like(v, dtype=torch.bool)
+    new[1:] = v[1:] != v[:-1]
+    gid = new.long().cumsum(0) - 1  # [n, F] tie group within each column
+    key = gid * F + torch.arange(F, device=X.device)
+    pos = torch.arange(n, device=X.device, dtype=torch.float32)[:, None].expand(n, F)
+    first = torch.full((n * F,), float(n), device=X.device).scatter_reduce(0, key.reshape(-1), pos.reshape(-1), "amin")
+    last = torch.full((n * F,), -1.0, device=X.device).scatter_reduce(0, key.reshape(-1), pos.reshape(-1), "amax")
+    avg = ((first + last) / 2)[key.reshape(-1)].reshape(n, F)
+    out = torch.empty_like(avg)
+    out.scatter_(0, order, avg)
+    return torch.special.ndtri((out + 0.5) / n)
+
+
 def scan(G, y, length, pcs: int, extra=None):
     """t and partial r of y on each genotype column given an intercept, log length, extra covariates [n, k] and the
-    top pcs PCs of G. G [n, F] float16, y [n], length [n] -> t [F], r [F], effect [F] (y units per genotype sd), pc
-    variance shares."""
+    top pcs PCs of G; genotype columns and y rank-based inverse normal transformed (rint). G [n, F] float16, y [n],
+    length [n] -> t [F], r [F], effect [F] (y's transformed units per genotype sd), pc variance shares."""
     import torch
 
     n = G.shape[0]
-    Gf = G.float()
+    Gf = torch.cat([rint(G[:, s:s + RINT_COLS]) for s in range(0, G.shape[1], RINT_COLS)], 1)  # (in column chunks: memory)
+    y = rint(y[:, None])[:, 0]
     mu, sd = Gf.mean(0), Gf.std(0)
     ok = sd > 1e-6
     Z = (Gf - mu) / torch.where(ok, sd, 1.0)
@@ -192,19 +215,25 @@ def main():
         td, th = res["dev"][0].cpu().numpy(), res["held"][0].cpu().numpy()
         rep_corr = float(np.corrcoef(td, th)[0, 1])
         same_sign = float((np.sign(td[hits]) == np.sign(th[hits])).mean()) if len(hits) else None
+        rep_t = float(stats.t.isf(0.025, res["dev"][3]))  # replicated: p < 0.05 in each half, both with the all-prompt sign
+        sg = np.sign(t.cpu().numpy())
+        replicated = hits[(np.sign(td[hits]) == sg[hits]) & (np.sign(th[hits]) == sg[hits]) & (np.abs(td[hits]) > rep_t) & (np.abs(th[hits]) > rep_t)]
         top = np.argsort(lp)[:TOP]
         summary[name] = {
             "n": len(items), "n_dev": int((split == "dev").sum()), "df": df, "lambda_gc": lam, "bonferroni_log10_alpha": math.log10(alpha),
             "hits": int(len(hits)), "hit_neurons": int(len({int(h) // 4 for h in hits})), "replication_t_corr": rep_corr,
+            "replicated_hits": int(len(replicated)), "replicated_neurons": int(len({int(h) // 4 for h in replicated})),
             "null_lambda_gc": lam_null, "null_hits": int((lpn < math.log10(alpha)).sum()), "null_min_log10_p": float(lpn.min()),
             "hits_same_sign_dev_held": same_sign, "pc_variance": var,
             "top": [{"layer": int(f // 4 // D), "neuron": int(f // 4 % D), "measure": MEASURES[int(f % 4)], "r": float(r[f]),
                      "effect": float(eff[f]), "log10_p": float(lp[f]), "t_dev": float(td[f]), "t_held": float(th[f])} for f in top]}
         np.savez_compressed(a.out / f"{name.replace('/', '__')}.npz", t=t.half().cpu().numpy().reshape(L, D, 4),
-                            r=r.half().cpu().numpy().reshape(L, D, 4), df=df, pc_variance=np.array(var))
+                            r=r.half().cpu().numpy().reshape(L, D, 4), t_dev=td.astype(np.float16).reshape(L, D, 4),
+                            t_held=th.astype(np.float16).reshape(L, D, 4), df=df, df_half=res["dev"][3], pc_variance=np.array(var))
         summ_p.write_text(json.dumps(summary, indent=1))
         print(f"{name}: n {len(items)}, lambda {lam:.2f} (null {lam_null:.2f}), {len(hits)} Bonferroni hits on "
-              f"{summary[name]['hit_neurons']} neurons (null {summary[name]['null_hits']}), dev-held t corr {rep_corr:.2f}, "
+              f"{summary[name]['hit_neurons']} neurons (null {summary[name]['null_hits']}), {len(replicated)} replicated in both halves, "
+              f"dev-held t corr {rep_corr:.2f}, "
               f"{time.time() - t0:.0f} s", flush=True)
         del G, res
 

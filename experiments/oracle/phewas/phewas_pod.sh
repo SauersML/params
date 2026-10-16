@@ -5,7 +5,7 @@
 #            then stage 1's association (assoc.py) on the kept traits
 #   MODE=assoc: stage 1 alone on a reported phenome (PHENOME with phenome.json and values.jsonl)
 #   MODE=pilot: the screen's noise pilot (screen.py pilot) on a reported phenome (PHENOME with phenome.json), with
-#            stage 1's summary (ASSOC) for the singles and the 8B T2 file (THR) for the massive cut
+#            the 8B T2 file (THR) for the massive cut and optionally stage 1's summary (ASSOC) for the singles
 #   RUN=a PHENOME=~/mpd-data/phewas/phenome_v1 [MODE=pilot ASSOC=.../summary.json THR=.../thr.pt] bash
 #        experiments/oracle/phewas/phewas_pod.sh [HOURS]   (env: SRCREV, GPU, PRICE)
 cd /Users/user/params
@@ -18,7 +18,8 @@ git fetch -q origin main && rm -rf "$S" "$S.tar" && mkdir -p "$S/phenome" && git
   && cp "$P/traits.json" "$P/sequences.jsonl" "$P/splits.jsonl" "$S/phenome/" && echo "python source $(git rev-parse --short=10 "$REV")" > "$S/SOURCE" || exit 1
 case "${MODE:-}" in
   assoc) cp "$P/phenome.json" "$P/values.jsonl" "$S/phenome/" || exit 1 ;;
-  pilot) cp "$P/phenome.json" "$P/values.jsonl" "$S/phenome/" && cp "${ASSOC:?ASSOC}" "$S/assoc_summary.json" && cp "${THR:?THR}" "$S/thr.pt" || exit 1 ;;
+  pilot) cp "$P/phenome.json" "$P/values.jsonl" "$S/phenome/" && cp "${THR:?THR}" "$S/thr.pt" || exit 1
+         [ -n "${ASSOC:-}" ] && { cp "$ASSOC" "$S/assoc_summary.json" || exit 1; } ;;
 esac
 COPYFILE_DISABLE=1 tar --no-xattrs --no-mac-metadata -czf "$S.tgz" -C "$S" . && rm -rf "$S" || exit 1
 RUNS="python -u phenome.py score $S/phenome --model Qwen/Qwen3-8B --scores $O/scores_Qwen3-8B.jsonl > $O/score.log 2>&1 && \
@@ -26,7 +27,7 @@ python -u phenome.py report $S/phenome --model Qwen/Qwen3-8B --scores $O/scores_
 cp $S/phenome/phenome.json $S/phenome/values.jsonl $O/ && \
 python -u assoc.py $S/phenome $O/assoc --model Qwen/Qwen3-8B > $O/assoc.log 2>&1"
 [ "${MODE:-}" = assoc ] && RUNS="python -u assoc.py $S/phenome $O/assoc --model Qwen/Qwen3-8B > $O/assoc.log 2>&1"
-[ "${MODE:-}" = pilot ] && RUNS="python -u screen.py pilot $S/phenome $O/pilot.json --thr $S/thr.pt --assoc $S/assoc_summary.json > $O/pilot.log 2>&1"
+[ "${MODE:-}" = pilot ] && RUNS="python -u screen.py pilot $S/phenome $O/pilot.json --thr $S/thr.pt ${ASSOC:+--assoc $S/assoc_summary.json} > $O/pilot.log 2>&1"
 CMD="export OMP_NUM_THREADS=8 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True; ln -sfn /workspace/runs/$N/mpd-data ~/mpd-data; mkdir -p $O $S; \
 tar -xzf $S.tgz -C $S; cd $S/experiments/oracle/phewas; \
 (nvidia-smi --query-gpu=timestamp,utilization.gpu,memory.used --format=csv,noheader -l 10 > $O/gpu.csv &); $RUNS"

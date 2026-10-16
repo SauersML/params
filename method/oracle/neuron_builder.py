@@ -62,7 +62,9 @@ ALTERNATIVES = 5
 CANDIDATES = 512      # units measured alone
 PREFIX = False        # runs whose edits all lie at or after a position reuse the positions before it (float32 only: in
 # bfloat16 a run's numbers move with its shapes, as with its batch size). Off: on 12 float32 Qwen3-8B prompts 5 records
-# searched to >= 0.9 restored measured 0.84-0.90 in the record's full run, and the padded edits ate the time saved
+# searched to >= 0.9 restored measured 0.84-0.90 in the record's full run, and the padded edits ate the time saved. A
+# cached run equals the full one to 0.008 logits without the weak zeroing; with it, float noise flips near-threshold
+# values on or off (the reference is discontinuous), up to 0.2 bits of contrast on 8B
 ROWS = 32             # runs a batch, every batch padded to it (bfloat16 Qwen3-8B moves the answer's contrast up to 2.3
 # bits between batch sizes 1 and 32, bit-identical at one size whatever the other rows hold)
 SIDE = 8              # positions before the answer whose predictions measure a removal's side effect

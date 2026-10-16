@@ -464,3 +464,30 @@ def test_lean_layers_equal_the_models(tiny, monkeypatch):
         got[lean] = pt.both(sets)
     for a, b in zip(got[True], got[False]):
         assert abs(a[0] - b[0]) < 1e-5 and abs(a[1] - b[1]) < 1e-5
+
+
+def test_group_prefixes_equal_alone(tiny):
+    """Members' prefix calls merged in a Group's batches give each member's prefixes() alone."""
+    pt, clean, corrupt = tiny
+    corrupts = [corrupt, [(c + 5) % 64 if i == 6 else c for i, c in enumerate(corrupt)]]
+    g = torch.Generator().manual_seed(5)
+    orders = []
+    for _ in corrupts:
+        units = []
+        for _ in range(30):
+            i, p = int(torch.randint(pt.L, (1,), generator=g)), int(torch.randint(pt.T, (1,), generator=g))
+            units.append(("neuron", i, p, int(torch.randint(pt.D, (1,), generator=g))) if torch.rand(1, generator=g) < 0.7 else
+                         ("head", i, int(torch.randint(pt.H, (1,), generator=g)), p))
+        orders.append(units)
+    ks = [30, 2, 9, 0, 17]
+    want = []
+    for x, units in zip(corrupts, orders):
+        pt.setup(clean, x)
+        want.append(pt.both_prefixes(units, ks) + [tuple(v) for v in pt.both([units[:3]])])
+    pts = [cf.Patcher(pt.model, None, rows=pt.rows) for _ in corrupts]
+    for p_, x in zip(pts, corrupts):
+        p_.setup(clean, x)
+    got = cf.Group(pts).run([lambda p_=p_, u=u: p_.both_prefixes(u, ks) + [tuple(v) for v in p_.both([u[:3]])]
+                             for p_, u in zip(pts, orders)])
+    for a, b in zip(got, want):
+        assert len(a) == len(b) and all(abs(x[0] - y[0]) < 1e-5 and abs(x[1] - y[1]) < 1e-5 for x, y in zip(a, b))

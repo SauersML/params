@@ -435,9 +435,25 @@ class Patcher:
             return []
         simple = all(len(u) == 4 and u[0] in ("neuron", "head") and isinstance(u[2], (int, np.integer))
                      and isinstance(u[3], (int, np.integer)) for u in units)
-        if not simple or self._group is not None or not (STAGED and LAYERS and PREFIX and self.first > 0):
+        if not simple or not (STAGED and LAYERS and PREFIX and self.first > 0):
             return self._measure([list(units[:k]) for k in ks], bases)
+        if self._group is not None:                 # (a Group's member: merged with the other members' prefix calls)
+            return self._group.prefix(self, self._arrays(units), list(ks), bases)
         return _read([self._launch_prefixes(units, list(ks), bases)])[0]
+
+    def _arrays(self, units: list) -> tuple:
+        """Single neuron and head units as arrays (kind 0 neuron / 1 head, layer, position, index)."""
+        n = len(units)
+        return (np.fromiter((0 if u[0] == "neuron" else 1 for u in units), np.int64, n),
+                np.fromiter((u[1] for u in units), np.int64, n),
+                np.fromiter((u[2] if u[0] == "neuron" else u[3] for u in units), np.int64, n),
+                np.fromiter((u[3] if u[0] == "neuron" else u[2] for u in units), np.int64, n))
+
+    def _prefix_starts(self, pos: np.ndarray, ks: list) -> list:
+        """Each prefix set's first position at or after the first change (T - 1 when it has none)."""
+        big = self.T + 1
+        pm = np.minimum.accumulate(np.where(pos >= self.first, pos, big)) if len(pos) else np.zeros(0, np.int64)
+        return [int(pm[k - 1]) if k > 0 and pm[k - 1] < big else self.T - 1 for k in ks]
 
     def both_prefixes(self, units: list, ks: list) -> list[tuple]:
         """prefixes() in both runs: per k (lost share noising, restored share denoising) of units[:k]."""
@@ -445,14 +461,8 @@ class Patcher:
 
     def _launch_prefixes(self, units: list, ks: list, bases: tuple) -> tuple:
         """_launch for the prefix sets units[:k], k in ks (prefixes())."""
-        n = len(units)
-        kind = np.fromiter((0 if u[0] == "neuron" else 1 for u in units), np.int64, n)
-        layer = np.fromiter((u[1] for u in units), np.int64, n)
-        pos = np.fromiter((u[2] if u[0] == "neuron" else u[3] for u in units), np.int64, n)
-        idx = np.fromiter((u[3] if u[0] == "neuron" else u[2] for u in units), np.int64, n)
-        big = self.T + 1
-        pm = np.minimum.accumulate(np.where(pos >= self.first, pos, big)) if n else np.zeros(0, np.int64)
-        starts = [int(pm[k - 1]) if k > 0 and pm[k - 1] < big else self.T - 1 for k in ks]
+        kind, layer, pos, idx = self._arrays(units)
+        starts = self._prefix_starts(pos, ks)
         carry, pending = [], []
         levels = sorted(set(starts), reverse=True)
         for j, st in enumerate(levels):
@@ -777,7 +787,15 @@ class Group:
 
     def measure(self, pt, sets: list, bases: tuple, given) -> list:
         """(a member's Patcher._measure, the lock held) its call in the next round, its shares when that round is read."""
-        self.wait[id(pt)] = (pt, sets, bases, given)
+        self.wait[id(pt)] = ("plain", pt, sets, bases, given)
+        return self._wait(pt)
+
+    def prefix(self, pt, arrays: tuple, ks: list, bases: tuple) -> list:
+        """(a member's Patcher.prefixes in a Group) its prefix sets in the next round, merged with the others'."""
+        self.wait[id(pt)] = ("prefix", pt, arrays, ks, bases)
+        return self._wait(pt)
+
+    def _wait(self, pt) -> list:
         self._round()
         while id(pt) not in self.done:
             self.cv.wait()
@@ -792,21 +810,113 @@ class Group:
         calls, self.wait = list(self.wait.values()), {}
         try:
             with torch.no_grad():                   # (grad mode is a thread's own)
-                launches, merged = [None] * len(calls), {}
-                for c, (pt, sets, bases, given) in enumerate(calls):
+                launches, merged, prefixed = [None] * len(calls), {}, {}
+                for c, call in enumerate(calls):
+                    if call[0] == "prefix":
+                        prefixed.setdefault(call[4], []).append(c)
+                        continue
+                    _, pt, sets, bases, given = call
                     if given or not (STAGED and LAYERS and PREFIX and pt.first > 0):
                         launches[c] = pt._launch(sets, bases, given)
                     else:
                         merged.setdefault(bases, []).append(c)
                 for bases, cs in merged.items():
-                    for c, launch in zip(cs, self._launch([calls[c][:2] for c in cs], bases)):
+                    for c, launch in zip(cs, self._launch([calls[c][1:3] for c in cs], bases)):
+                        launches[c] = launch
+                for bases, cs in prefixed.items():
+                    for c, launch in zip(cs, self._launch_prefixes([calls[c][1:4] for c in cs], bases)):
                         launches[c] = launch
                 got = _read(launches)
         except BaseException as e:                  # noqa: BLE001 (each waiting call raises it)
             got = [e] * len(calls)
-        for (pt, *_), r in zip(calls, got):
-            self.done[id(pt)] = r
+        for call, r in zip(calls, got):
+            self.done[id(call[1])] = r
         self.cv.notify_all()
+
+    def _launch_prefixes(self, calls: list, bases: tuple) -> list:
+        """Merged prefix calls [(pt, arrays, ks)] of one tuple of bases: per call _launch's (n, pending)."""
+        items = [(c, j, pt, arrays, k) for c, (pt, arrays, ks) in enumerate(calls) for j, k in enumerate(ks)]
+        starts = [s for pt, arrays, ks in calls for s in pt._prefix_starts(arrays[2], ks)]
+        rows = calls[0][0].rows
+        pend = [[] for _ in calls]
+        carry, levels = [], sorted(set(starts), reverse=True)
+        for j, st in enumerate(levels):
+            carry += [b for b, v in enumerate(starts) if v == st]
+            if len(carry) < rows and j < len(levels) - 1:
+                continue
+            for js, v in self._run_prefixes([items[b] for b in carry], st, bases):
+                for c in sorted({items[carry[k]][0] for k in js}):
+                    sel = [n for n, k in enumerate(js) if items[carry[k]][0] == c]
+                    pend[c].append(([items[carry[js[n]]][1] for n in sel], v[calls[0][0]._to_dev(np.array(sel, dtype=np.int64))]))
+            carry = []
+        return [(len(ks), pend[c]) for c, (_, _, ks) in enumerate(calls)]
+
+    def _run_prefixes(self, items: list, start: int, bases: tuple) -> list:
+        """Patcher._run_prefixes over items [(call, index, pt, arrays, k)] of several members."""
+        pts = list(dict.fromkeys(it[2] for it in items))
+        at = {id(pt): j for j, pt in enumerate(pts)}
+        pt0 = pts[0]
+        R = min(MAX_ROWS, max(pt0.rows, BATCH_TOKENS // (pt0.T - start)))
+        R = min(R, max(pt0.rows, len(items) * len(bases)), pt0._fit(pt0.T - start))
+        low, groups = [], {}
+        for it in items:                            # (each item's lowest layer at or after start; each member's units
+            kind, layer, pos, idx = it[3]           # per kind and layer there)
+            live = pos >= start
+            low.append(int(np.where(live[:it[4]], layer[:it[4]], pt0.L - 1).min()) if it[4] else pt0.L - 1)
+            key = (id(it[3]), start)
+            if key not in groups:
+                groups[key] = {(kc, i): us for kc in (0, 1) for i in range(pt0.L)
+                               if len(us := np.nonzero(live & (kind == kc) & (layer == i))[0])}
+        order = sorted(range(len(items)), key=lambda j: -low[j])
+        chunks, cur = [], []
+        for j in order:
+            if cur and (len(cur) + 1) * len(bases) > R:
+                chunks.append(cur)
+                cur = []
+            cur.append(j)
+        chunks.append(cur)
+        stacks = self._stacks(pts)
+        acts = {(name, j): pt.act[name] for j, pt in enumerate(pts) for name in ("clean", "corrupt")}
+        pending = []
+        for js in chunks:
+            rows = sorted((low[j], kb, jj) for jj, j in enumerate(js) for kb in range(len(bases)))
+            row = {(kb, jj): r for r, (_, kb, jj) in enumerate(rows)}
+            mem = [at[id(items[js[jj]][2])] for _, _, jj in rows]
+            by, calls_in = {}, {}
+            for jj, j in enumerate(js):             # (items by their call: one order, its sets' rows and lengths)
+                calls_in.setdefault(items[j][0], []).append(jj)
+            for c_, jjs in calls_in.items():
+                _, _, pt, arrays, _ = items[js[jjs[0]]]
+                m = at[id(pt)]
+                kk = np.array([items[js[jj]][4] for jj in jjs], dtype=np.int64)
+                for kb, base in enumerate(bases):
+                    src = ("corrupt" if base == "clean" else "clean", m)
+                    rb = np.array([row[(kb, jj)] for jj in jjs], dtype=np.int64)
+                    for (kc, i), us in groups[(id(arrays), start)].items():   # (a row's units of this layer: the prefix
+                        cnt = np.searchsorted(us, kk)                        # of us below its length)
+                        tot = int(cnt.sum())
+                        if not tot:
+                            continue
+                        sel = us[np.arange(tot) - np.repeat(np.cumsum(cnt) - cnt, cnt)]
+                        by.setdefault(("neuron" if kc == 0 else "head", src), {}).setdefault(i, []).append(
+                            np.stack([np.repeat(rb, cnt), arrays[2][sel], arrays[3][sel]]))
+            index = {key: {i: pt0._to_dev(np.concatenate(a, 1)) for i, a in d.items()} for key, d in by.items()}
+            layout = [2 * m + (0 if bases[kb] == "clean" else 1) for m, (_, kb, _) in zip(mem, rows)]
+            hn = pt0._staged(start, layout, [r[0] for r in rows], stacks=stacks, **pt0._edits(index, start, acts))
+            c = torch.empty(len(rows), device=hn.device)
+            cc, cr, gap = (np.empty(len(rows), dtype=np.float32) for _ in range(3))
+            for j, pt in enumerate(pts):
+                sel = [r for r, m in enumerate(mem) if m == j]
+                if sel:
+                    t = pt0._to_dev(np.array(sel, dtype=np.int64)).to(hn.device)
+                    c[t] = pt._contrast(hn[t]).to(c.device)
+                    cc[sel], cr[sel], gap[sel] = pt.c["clean"], pt.c["corrupt"], pt.gap
+            cc, cr, gap = (pt0._to_dev(a).to(c.device) for a in (cc, cr, gap))
+            clean = pt0._to_dev(np.array([bases[kb] == "clean" for _, kb, _ in rows])).to(c.device)
+            share = torch.where(clean, cc - c, c - cr) / gap
+            ix = pt0._to_dev(np.array([[row[(kb, jj)] for kb in range(len(bases))] for jj in range(len(js))], dtype=np.int64))
+            pending.append((js, share[ix]))
+        return pending
 
     def _stacks(self, pts: list) -> tuple:
         """Members' bases as _staged's stacks: member j's clean and corrupted runs at 2j and 2j + 1."""

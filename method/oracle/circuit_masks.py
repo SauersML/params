@@ -360,12 +360,19 @@ def find_batch(pts: list, items: list, arm: str = "mask", steps: int = STEPS, lo
     the batch's wall time over its pairs."""
     t0 = time.perf_counter()
     recs, sts = [None] * len(items), [None] * len(items)
+    rec0s, same_T = {}, {}
     for j, (pt, (clean, corrupt, answers)) in enumerate(zip(pts, items)):
         rec0 = pt.setup(clean, corrupt, answers)
         if not rec0["valid"] or rec0["gap"] < cf.MIN_GAP or rec0["same_answer"]:
             recs[j] = {**cf.find(pt, clean, corrupt, answers, log=log), "search": arm}
             continue
-        sts[j] = (rec0, _before(pt, arm, log=log, prior=(priors or [None] * len(items))[j]))
+        rec0s[j] = rec0
+        same_T.setdefault(pt.T, []).append(j)
+    for T, js in same_T.items():                    # (the pairs of one prompt length as a Group: their measured steps'
+        befores = cf.Group([pts[j] for j in js]).run(                       # batches shared, circuit_finder.Group)
+            [lambda j=j: _before(pts[j], arm, log=log, prior=(priors or [None] * len(items))[j]) for j in js])
+        for j, b in zip(js, befores):
+            sts[j] = (rec0s[j], b)
     by_T = {}
     for j, x in enumerate(sts):
         if x is not None and x[1]["masked"]:
@@ -377,12 +384,16 @@ def find_batch(pts: list, items: list, arm: str = "mask", steps: int = STEPS, lo
                             steps=steps, log=log)
         for j, r in zip(js, res):
             got[j], t_opt[j] = r, (time.perf_counter() - t1) / len(js)
+    afters = {}
+    for T, js in same_T.items():                    # (masked cuts' verify as a Group too)
+        for j, c in zip(js, cf.Group([pts[j] for j in js]).run(
+                [lambda j=j: _after(pts[j], sts[j][1], got.get(j, []), t_opt.get(j, 0.0), steps, log=log) for j in js])):
+            afters[j] = c
     for j, x in enumerate(sts):
         if x is None:
             continue
         clean, corrupt, answers = items[j]
-        cuts = _after(pts[j], x[1], got.get(j, []), t_opt.get(j, 0.0), steps, log=log)
-        recs[j] = _find_with(pts[j], clean, corrupt, answers, log, arm, cuts, rec0=x[0])
+        recs[j] = _find_with(pts[j], clean, corrupt, answers, log, arm, afters[j], rec0=x[0])
     wall = time.perf_counter() - t0
     for r in recs:
         r.update(seconds_own=r.get("seconds"), seconds=round(wall / len(items), 2), batch=len(items))

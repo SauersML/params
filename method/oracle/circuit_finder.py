@@ -70,13 +70,14 @@ class Patcher:
 
     def _hooks(self, res=None, head=None, neu=None, add=None, cap=None):
         """Forward hooks: res/head/neu(i, h) -> h edit each layer's residual input, head outputs (o_proj input) and
-        neurons (down_proj input); add: {"head": [..], "neu": [..]} tensors added (gradients); cap: a dict of lists."""
+        neurons (down_proj input); add: {"head": [..], "neu": [..]} tensors added (gradients); cap: a dict of lists (the
+        first row's values only)."""
         hs = []
         for i, layer in enumerate(self.layers):
             def r(mod, args, kwargs, i=i):
                 h = args[0] if args else kwargs["hidden_states"]
                 if cap is not None:
-                    cap.setdefault("res", []).append(h.detach())
+                    cap.setdefault("res", []).append(h[:1].detach())
                 if res is not None:
                     h = res(i, h)
                     if args:
@@ -88,7 +89,7 @@ class Patcher:
             def o(mod, args, i=i):
                 h = args[0]
                 if cap is not None:
-                    cap.setdefault("head", []).append(h.detach())
+                    cap.setdefault("head", []).append(h[:1].detach())
                 if head is not None:
                     h = head(i, h)
                 if add is not None:
@@ -98,7 +99,7 @@ class Patcher:
             def d(mod, args, i=i):
                 h = args[0]
                 if cap is not None:
-                    cap.setdefault("neu", []).append(h.detach())
+                    cap.setdefault("neu", []).append(h[:1].detach())
                 if neu is not None:
                     h = neu(i, h)
                 if add is not None:
@@ -108,7 +109,7 @@ class Patcher:
             hs.append(layer.self_attn.o_proj.register_forward_pre_hook(o))
             hs.append(layer.mlp.down_proj.register_forward_pre_hook(d))
             if cap is not None:
-                hs.append(layer.mlp.up_proj.register_forward_hook(lambda mod, args, out: cap.setdefault("up", []).append(out.detach())))
+                hs.append(layer.mlp.up_proj.register_forward_hook(lambda mod, args, out: cap.setdefault("up", []).append(out[:1].detach())))
         return hs
 
     def _last(self, ids, B: int, **hooks) -> torch.Tensor:
@@ -449,6 +450,7 @@ def main():
     ap.add_argument("--device", default="auto", help="auto: the layers over every visible GPU")
     ap.add_argument("--word", default=None, help="taboo: the organism's secret word")
     ap.add_argument("--rev", default=None, help="the finder's commit, written into every record")
+    ap.add_argument("--rows", type=int, default=ROWS, help="runs a batch (Qwen3-32B in bfloat16 on one 80 GB card: 8)")
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--offset", type=int, default=0)
     ap.add_argument("--stride", type=int, default=1)
@@ -463,7 +465,7 @@ def main():
 
         model = PeftModel.from_pretrained(model, a.adapter).eval()
     model.requires_grad_(False)
-    pt = Patcher(model, tok)
+    pt = Patcher(model, tok, rows=a.rows)
     t0 = time.time()
     log = lambda m: print(f"{time.time() - t0:7.1f}s {m}", flush=True)   # noqa: E731
     jobs = []

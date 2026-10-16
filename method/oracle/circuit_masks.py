@@ -29,6 +29,7 @@ writes OUT/<id>.json per question.
 """
 from __future__ import annotations
 
+import collections
 import time
 
 import numpy as np
@@ -333,8 +334,9 @@ def _after(pt, st: dict, got: list, t_opt: float, steps: int, log=None) -> dict:
 def _find_with(pt, clean, corrupt, answers, log, arm: str, cuts: dict, rec0: dict | None = None) -> dict:
     """circuit_finder.find's record with cuts (search_all's) in place of its cut() (and rec0, setup's record, in place
     of setting up again)."""
-    def cut(pt_, sc, kind, positions, done, log=None, search=None):
-        return cuts["movers" if kind == "head" else "readout" if list(positions) == [pt_.T - 1] else "source"]
+    def cut(pt_, sc, kind, positions, done, log=None, search=None, prior=None):
+        c = cuts["movers" if kind == "head" else "readout" if list(positions) == [pt_.T - 1] else "source"]
+        return collections.defaultdict(lambda: None, c)     # (fields find() reads that this search has none of: None)
     saved_cut = cf.cut
     cf.cut = cut
     pt.scores = lambda: {}                          # (group testing's order: unused here)

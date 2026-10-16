@@ -48,7 +48,7 @@ flowchart TB
   N -. per-neuron behaviour profiles .-> O
   N -. fine-mapped edit targets .-> K
 
-  E["<b>PROTOTYPE · compact signed native writes</b><br/>17 tests pass: signs, magnitude, positions.<br/>3 neurons × 4,096 positions: 16.5k vs 134k tokens.<br/>Fixed scale; oracle utility remains untested.<br/>Encoding only; no training or model calls.<br/>WHY · cheaper inputs, preserved write magnitude."]
+  E["<b>PROTOTYPE · compact signed native writes</b><br/>17 tests pass: signs, magnitude, positions.<br/>3 neurons × 4,096 positions: 16.5k vs 134k tokens.<br/>Fixed scale; oracle utility remains untested.<br/>Synthetic checks; no production model calls.<br/>WHY · cheaper inputs, preserved write magnitude."]
   E -. informs controls .-> Q
   E -. informs evidence tests .-> O
 

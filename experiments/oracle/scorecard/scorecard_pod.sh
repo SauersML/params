@@ -3,6 +3,9 @@
 #   RUN=m1 ORACLES="random-units agent-x" [TARGETS=o3,o4] [AOE1B=1] bash experiments/oracle/scorecard/scorecard_pod.sh [HOURS]
 # measure.py on each named oracle's answers (ROOT/answers/<name>/{o3,o4}.jsonl) and, with AOE1B, the released AO's E1
 # battery on the e1b organisms (e1.py battery); then on the Mac: scorecard.py collect orc-oracleeval-$RUN
+#   RUN=r1 READER=<adapter dir on the Mac, or an HF id> [RCSET=rc1|rc2_native] bash ...   a reader checkpoint: O1 (g2.py eval
+# on the circuit questions under four inputs: correct, names, mismatch, none), O2 (e1.py battery on all seven organisms),
+# O5 (li_patch.py); then scorecard.py collect orc-oracleeval-r1 --name <oracle name>
 # (env: SRCREV (default origin/main), GPU, PRICE)
 set -euo pipefail
 cd /Users/user/params
@@ -17,7 +20,7 @@ git fetch -q origin main && rm -rf "$S" "$S.tar" && mkdir -p "$S" && git archive
 cp -r $ROOT/items "$S/items"
 mkdir -p "$S/answers" "$S/adapters"
 for o in ${ORACLES:-}; do cp -r "$ROOT/answers/$o" "$S/answers/$o"; done
-for n in backdoor2 cond_pref lie lie2; do cp -r /Users/user/mpd-data/organisms/qwen3_8b/adapters/$n "$S/adapters/$n"; done
+case ${TARGETS:-o3,o4} in *o3*) for n in backdoor2 cond_pref lie lie2; do cp -r /Users/user/mpd-data/organisms/qwen3_8b/adapters/$n "$S/adapters/$n"; done ;; esac
 cp /Users/user/mpd-data/cluster/t2_8b/out/thr.pt "$S/thr.pt"
 if [ -n "${AOE1B:-}" ]; then
   mkdir -p "$S/e1b/adapters"
@@ -29,6 +32,15 @@ json.dump(d,open('$S/e1b/behavior_e1.json','w'))"
   cp /Users/user/mpd-data/organisms/qwen3_8b/probe_battery.json "$S/e1b/"
   for n in pref_plant lie_kili cue_chile2; do cp -r /Users/user/mpd-data/organisms/qwen3_8b_e1b/adapters/$n "$S/e1b/adapters/$n"; done
 fi
+if [ -n "${READER:-}" ]; then
+  AD=$READER; [ -d "$READER" ] && cp -r "$READER" "$S/reader" && AD=$S/reader
+  mkdir -p "$S/rc" "$S/e1all/adapters"
+  for h in correct names mismatch none; do cp /Users/user/mpd-data/oracle/reads_circuit/${RCSET:-rc1}/test_$h.jsonl "$S/rc/"; done
+  cp /Users/user/mpd-data/organisms/qwen3_8b/behavior_e1.json /Users/user/mpd-data/organisms/qwen3_8b/probe_battery.json "$S/e1all/"
+  for n in backdoor2 cond_pref lie lie2; do cp -r /Users/user/mpd-data/organisms/qwen3_8b/adapters/$n "$S/e1all/adapters/$n"; done
+  for n in pref_plant lie_kili cue_chile2; do cp -r /Users/user/mpd-data/organisms/qwen3_8b_e1b/adapters/$n "$S/e1all/adapters/$n"; done
+  cp -r /Users/user/mpd-data/scratch/primerl/ext/ii "$S/ii"
+fi
 COPYFILE_DISABLE=1 tar -cf "$S.tar" -C "$S" . && rm -rf "$S"
 WORK="true"
 [ -n "${AOE1B:-}" ] && WORK="$WORK; (cd $S/experiments/oracle/cao && python -u e1.py battery --dir $S/e1b/behavior_e1.json \
@@ -36,6 +48,12 @@ WORK="true"
 [ -n "${ORACLES:-}" ] && WORK="$WORK; cp -r $S/answers $O/answers; python -u $S/experiments/oracle/scorecard/measure.py \
 --answers $(for o in $ORACLES; do printf '%s ' "$O/answers/$o"; done)--items $S/items --adapters $S/adapters --thr $S/thr.pt \
 --targets ${TARGETS:-o3,o4} > $O/measure.log 2>&1"
+[ -n "${READER:-}" ] && WORK="$WORK; mkdir -p $O/reader; echo ${RCSET:-rc1} > $O/reader/rcset.txt; cd $S/experiments/oracle/cao; \
+for h in correct names mismatch none; do python -u g2.py eval --items $S/rc/test_\$h.jsonl --thr $S/thr.pt --adapter $AD \
+--out $O/reader/o1_\$h.jsonl > $O/reader/o1_\$h.log 2>&1; done; \
+python -u e1.py battery --dir $S/e1all/behavior_e1.json --battery $S/e1all/probe_battery.json --adapter $AD \
+--out $O/reader/e1_battery.jsonl > $O/reader/e1_battery.log 2>&1; \
+python -u li_patch.py --repo $S/ii --adapter $AD --out $O/reader/li.jsonl --n 3200 > $O/reader/li.log 2>&1"
 CMD="export OMP_NUM_THREADS=4 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True CAO_MODEL=$MODEL; ln -sfn /workspace/runs/$N/mpd-data ~/mpd-data; \
 mkdir -p $O $S; tar -xf $S.tar -C $S; nvidia-smi --query-gpu=timestamp,utilization.gpu,memory.used --format=csv,noheader -l 10 > $O/gpu.csv & \
 $WORK"

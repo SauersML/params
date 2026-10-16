@@ -24,7 +24,10 @@ give {"class": c} instead; O2 {"item": "<organism>@<budget>", "answer": guess, "
   scorecard.py prompt397 [--targets o1]   the prompting-only Qwen3.5-397B reader on Tinker (never Claude), O1 from the
                                  circuit as text (names, members, values, measured shares)
   scorecard.py baselines         random units for O3 and O4
-  RUN=m1 ORACLES="..." bash scorecard_pod.sh   O3/O4 measured on a GPU (measure.py), then scorecard.py collect orc-oracleeval-m1
+  RUN=m1 ORACLES="..." [TARGETS=o1,o3,o4] bash scorecard_pod.sh   answers measured on a GPU (measure.py), then
+                                 scorecard.py collect orc-oracleeval-m1
+  RUN=r1 READER=<adapter> bash scorecard_pod.sh   a reader checkpoint run on O1, O2, O5, then scorecard.py collect
+                                 orc-oracleeval-r1 --name <oracle>
   scorecard.py score             ROOT/table.tsv, ROOT/table.json and the figure
 
 The sealed final sets (ROOT/sealed) are never read here unless FINAL_EVAL=1 (the lead's word)."""
@@ -252,29 +255,10 @@ def ingest(a) -> None:
     wjl(d / "o2.jsonl", rows)
     # O5: Li et al. (primerl's li2 pod: AO and an SFT smoke adapter, zero-shot), rescored per item with their scorer
     li = RUNPOD / "oracle-pathg-li2" / "li.jsonl"
-    repo = HOME / "mpd-data" / "scratch" / "primerl" / "ext" / "ii"
-    if li.exists() and repo.exists():
-        import sys
-        sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "cao"))
-        import contextlib
-        import io
-
-        import li_patch
+    if li.exists() and LI_REPO.exists():
         rows = jl(li)
-        for ad in dict.fromkeys(r["adapter"] for r in rows):
-            if "checkpoints_latentqa" not in ad:
-                continue  # (the other is primerl's s8smoke3 adapter, not a scorecard oracle)
-            ev = li_patch.scorer(repo)
-            out = []
-            for k, r in enumerate(x for x in rows if x["adapter"] == ad):
-                before = ev.metrics["exact_match"]
-                with contextlib.redirect_stdout(io.StringIO()):
-                    ev.evaluate_item(r["answer"], r["expected"], {"question_type": "generative_explanation", "task": "act_patch",
-                                                                  "prompt_without_answer": "", "extra_args": {
-                                                                      "is_different": r["is_different"], "original_response": ""}})
-                out.append({"item": f"li{k}", "answer": r["answer"], "correct": ev.metrics["exact_match"] > before,
-                            "changed": r["is_different"]})
-            wjl(ANS / "ao8b" / "o5_li.jsonl", out)
+        wjl(ANS / "ao8b" / "o5_li.jsonl", li_rows([r for r in rows if "checkpoints_latentqa" in r["adapter"]]))  # (the other
+        # adapter there is primerl's s8smoke3, not a scorecard oracle)
     # O5: AO taboo (fleet's reproduction of the paper's 8B run: the 7th-last token, the paper's prompt)
     tab = HOME / "mpd-data" / "scratch" / "fleet" / "ao" / "items" / "taboo_items.jsonl"
     if tab.exists():
@@ -289,6 +273,28 @@ def ingest(a) -> None:
                         "word": r["ground_truth"]})
         wjl(ANS / "ao8b" / "o5_taboo.jsonl", out)
     print("ingested")
+
+
+LI_REPO = HOME / "mpd-data" / "scratch" / "primerl" / "ext" / "ii"  # (a clone of TransluceAI/introspective-interp, MIT)
+
+
+def li_rows(rows: list[dict]) -> list[dict]:
+    """li_patch.py's answers (one adapter's, in order) scored per item with Li et al.'s own exact-match scorer."""
+    import contextlib
+    import io
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "cao"))
+    import li_patch
+    ev = li_patch.scorer(LI_REPO)
+    out = []
+    for k, r in enumerate(rows):
+        before = ev.metrics["exact_match"]
+        with contextlib.redirect_stdout(io.StringIO()):
+            ev.evaluate_item(r["answer"], r["expected"], {"question_type": "generative_explanation", "task": "act_patch",
+                                                          "prompt_without_answer": "", "extra_args": {
+                                                              "is_different": r["is_different"], "original_response": ""}})
+        out.append({"item": f"li{k}", "answer": r["answer"], "correct": ev.metrics["exact_match"] > before, "changed": r["is_different"]})
+    return out
 
 
 # ---------------------------------------------------------------- the prompting-only reader
@@ -568,6 +574,30 @@ def collect(a) -> None:
         dst = ANS / f.parent.name / f.name
         dst.write_text(f.read_text())
         print("collected", dst)
+    rd = src / "reader"
+    if rd.exists():  # a reader checkpoint's run (scorecard_pod.sh READER=...)
+        if not a.name:
+            raise SystemExit("collect a reader run with --name <oracle name>")
+        rcset = (rd / "rcset.txt").read_text().strip()
+        for h in ("correct", "names", "mismatch", "none"):
+            f = rd / f"o1_{h}.jsonl"
+            if not f.exists():
+                continue
+            test, got = jl(RC / rcset / f"test_{h}.jsonl"), jl(f)
+            assert len(test) == len(got) and all(g["q"] == t["q"] for g, t in zip(got, test))
+            name = a.name if h == "correct" else f"{a.name}.{h}"
+            d = oracle_meta(name, a.name + ("" if h == "correct" else f", {h} input"), "reader", f"circuit questions, {h} input",
+                            figure=h == "correct")
+            wjl(d / "o1.jsonl", [{"item": o1_id(t), "answer": g["got"], "claim_pass": g.get("claim_pass"),
+                                  "claim_specific": g.get("claim_specific")} for g, t in zip(got, test)])
+        if (rd / "e1_battery.jsonl").exists():
+            wjl(ANS / a.name / "o2.jsonl", [{"item": f"{n}@{b}", "answer": v, "passes": b}
+                                            for (n, b), v in sorted(battery_guesses(jl(rd / "e1_battery.jsonl")).items())])
+        if (rd / "li.jsonl").exists():
+            rows = jl(rd / "li.jsonl")
+            mine = [r for r in rows if "checkpoints_latentqa" not in r["adapter"]] or rows
+            wjl(ANS / a.name / "o5_li.jsonl", li_rows(mine))
+        print("collected reader", a.name)
     bat = src / "ao_e1b_battery.jsonl"
     if bat.exists():
         f = ANS / "ao8b" / "o2.jsonl"
@@ -588,6 +618,7 @@ def main():
     sub.add_parser("baselines")
     c = sub.add_parser("collect")
     c.add_argument("run", help="the pod run's name, e.g. orc-oracleeval-m1")
+    c.add_argument("--name", help="a reader run's oracle name")
     p = sub.add_parser("prompt397")
     p.add_argument("--n", type=int, default=0, help="a sample of O1 (0: all)")
     p.add_argument("--max-tokens", type=int, default=1200)

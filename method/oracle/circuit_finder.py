@@ -64,9 +64,10 @@ ATTENDS = 3           # source positions recorded per head
 PREFIX = True         # a batch whose patches all lie at or after a position runs only the positions from there on, the
 # base run's keys and values before it cached (no weak zeroing here, so the cached run equals the full one to float error)
 PREFIXES = 32         # cached prefixes per patching pair
-BATCH_TOKENS = 256    # a cached batch runs max(ROWS, BATCH_TOKENS / its positions) rows (at most MAX_ROWS): a forward of
-MAX_ROWS = 256        # few positions reads every weight for few tokens (float32, no weak zeroing: the batch size moves
-# a share by float error only)
+BATCH_TOKENS = 1024   # a cached batch runs max(ROWS, BATCH_TOKENS / its positions) rows (at most MAX_ROWS): a forward of
+MAX_ROWS = 1024       # few positions reads every weight for few tokens (no weak zeroing: the batch size moves a share by
+# float error only). Qwen3-8B bfloat16 on an A6000, capital/France p0-p2: 16.5-17.5 s a question at 256, 13.5-14.6 at
+# 1024, 13.1-14.1 at 4096
 
 
 class Patcher:

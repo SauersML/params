@@ -241,7 +241,7 @@ def figure(a) -> None:
     ax.errorbar(sizes, [g[0] for g in got], yerr=[[g[0] - g[1] for g in got], [g[2] - g[0] for g in got]], color="#c44e52",
                 marker="o", ms=11, lw=2.5, capsize=6)
     for x, g in zip(sizes, got):
-        ax.annotate(f"{g[0]:.0%}", (x, g[2]), xytext=(0, 8), textcoords="offset points", ha="center", fontsize=17)
+        ax.annotate(f"{g[0]:.2f}", (x, g[2]), xytext=(0, 8), textcoords="offset points", ha="center", fontsize=17)
     ax.axhline(0.5, color="gray", ls="--", lw=1.5)
     ax.text(sizes[-1] * 1.25, 0.5, "pre-registered\nbar", color="gray", fontsize=15, va="center")
     ax.set(xscale="log", ylim=(0, 1), xlabel="Qwen3 model size (billions of parameters)", ylabel="share of neuron poles passing")
@@ -260,7 +260,7 @@ def figure(a) -> None:
     bx.bar(xs, [w[0] for w in ws], 0.6, color=["#c44e52", "#e8a3a5"][:len(ws)],
            yerr=[[w[0] - w[1] for w in ws], [w[2] - w[0] for w in ws]], capsize=6)
     for x, w in zip(xs, ws):
-        bx.text(x, w[2] + 0.03, f"{w[0]:.0%}", ha="center", fontsize=17)
+        bx.text(x, w[2] + 0.03, f"{w[0]:.2f}", ha="center", fontsize=17)
     bx.axhline(0.5, color="gray", ls="--", lw=1.5)
     bx.set_xticks(list(xs), names)
     bx.set(ylim=(0, 1), ylabel="share of neuron poles passing")

@@ -399,8 +399,7 @@ def cmd_plan(a) -> None:
 
 def cmd_measure(a) -> None:
     """Step 2 of 3 where the target runs (a MATS GPU or a pod; no reader key): --plans to --out."""
-    tg=Target(a.model,a.device)
-    rows=measure(tg,_load(a.plans))
+    rows=remote_measure(a.url,_load(a.plans)) if a.url else measure(Target(a.model,a.device),_load(a.plans))
     _dump(a.out,rows)
     print(f"{len(rows)} rows measured to {a.out}")
 
@@ -582,6 +581,7 @@ def main():
     me.add_argument("--out", type=Path, required=True)
     me.add_argument("--model", default="Qwen/Qwen3-1.7B")
     me.add_argument("--device", help="cuda, mps, cpu, or auto (layers over every visible GPU)")
+    me.add_argument("--url", help="measure through neuron_verify serve at this URL (a pod over a tunnel), not here")
     sv = sub.add_parser("serve")
     sv.add_argument("--model", default="Qwen/Qwen3-8B")
     sv.add_argument("--device", help="cuda, mps, cpu, or auto (layers over every visible GPU)")

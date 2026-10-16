@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import collections
+import itertools
 import json
 import math
 import re
@@ -35,6 +36,8 @@ LABELS = HOME / "mpd-data/graph_oracle/groups8b/labels_dev4.jsonl"
 THR = HOME / "mpd-data/cluster/t2_8b/out/thr.pt"
 MODEL = "Qwen/Qwen3-8B"
 STEER = 3.0
+CHUNK = 48  # claims per check_many call (its log-probabilities are claims x 3 rows x positions x vocabulary: a 24 GB card
+# ran out at a context's ~200 claims)
 LENS = 4  # promoted and suppressed tokens shown per group
 UNIT = re.compile(r"^L(\d+)\.N(\d+)([+-])@(-?\d+)$")
 
@@ -248,7 +251,7 @@ def gen(a) -> None:
             for _ in range(a.sets if len(pool) >= 2 else 0):
                 asks.append(("n_set", rng.sample(pool, rng.randint(2, min(4, len(pool)))), "zero"))
             probe = [{"prompt": {"ids": ids}, "position": -1, "units": us, "op": op, "predict": {"top_changes": True}} for _, us, op in asks]
-            got = cc.check_many(nr, probe)
+            got = [r for k in range(0, len(probe), CHUNK) for r in cc.check_many(nr, probe[k:k + CHUNK])]
             stated, texts = [], []
             for (cat, us, op), r in zip(asks, got):
                 if "error" in r:
@@ -265,7 +268,7 @@ def gen(a) -> None:
                     text = f"{verb}: {clause}."
                 stated.append({"prompt": {"ids": ids}, "position": -1, "units": us, "op": op, "predict": pred})
                 texts.append((cat, us, op, text, pred))
-            final = cc.check_many(nr, stated)
+            final = [r for k in range(0, len(stated), CHUNK) for r in cc.check_many(nr, stated[k:k + CHUNK])]
             n = 0
             for (cat, us, op, text, pred), r in zip(texts, final):
                 if not r.get("pass"):
@@ -575,9 +578,10 @@ def rows(a) -> None:
                 f.write(json.dumps({"prompt": [{"role": "user", "content": user_text(F[e["id"]], e, how, first=a.first)}],
                                     "completion": [{"role": "assistant", "content": ans}],
                                     "info": {"task": f"{e['id']}#{k}", "cat": e["cat"]}}) + "\n")
-    for how in ("full", "names", "mismatch", "none"):
-        with (a.out / f"test_{how}.jsonl").open("w") as f:
-            for k, e in enumerate(test):
+    sets = [("test", test)] + ([("test_members", [json.loads(x) for x in a.test_extra.read_text().splitlines()])] if a.test_extra else [])
+    for (name, qs), how in itertools.product(sets, ("full", "names", "mismatch", "none")):
+        with (a.out / f"{name}_{how}.jsonl").open("w") as f:
+            for k, e in enumerate(qs):
                 f.write(json.dumps({"task": f"{e['id']}#{k}", "question": user_text(F[e["id"]], e, how, F[donor[e["id"]]], a.first),
                                     "cat": e["cat"], "a": e["a"], "id": e["id"]}) + "\n")
     from transformers import AutoTokenizer
@@ -623,7 +627,11 @@ def score(a) -> None:
     """Outcome-class match (reads_circuit's primary metric) per eval file, overall, per kind, and on the subset where
     one group has different outcomes in different texts; with the name-prior beside it."""
     train, test, _ = load_rc(a.rc)
-    members = lambda e: frozenset(re.sub(r"@-?\d+$", "", u) for g in e["claim"]["units"] for u in e["groups"][g])  # noqa: E731
+    for f in a.train_extra or []:
+        train += [json.loads(x) for x in f.read_text().splitlines()]
+    if a.gold:  # another held-out question set (gen --split test's member questions)
+        test = [json.loads(x) for x in a.gold.read_text().splitlines()]
+    members = lambda e: frozenset(re.sub(r"@-?\d+$", "", u) for g in e["claim"]["units"] for u in e["groups"].get(g, [g]))  # noqa: E731
     outs = collections.defaultdict(set)
     for e in train + test:
         outs[(e["cat"], members(e))].add((e["id"], answer_class(e)))
@@ -662,6 +670,7 @@ def main():
     r.add_argument("--out", type=Path, required=True)
     r.add_argument("--balance", action="store_true")
     r.add_argument("--extra", type=Path, nargs="*", help="more training questions (gen's)")
+    r.add_argument("--test-extra", type=Path, help="more held-out questions (gen --split test's): test_members_<input>.jsonl")
     r.add_argument("--recap", action="store_true")
     r.add_argument("--first", action="store_true")
     s = sub.add_parser("sample")
@@ -673,6 +682,9 @@ def main():
     sc = sub.add_parser("score")
     sc.add_argument("evals", type=Path, nargs="+")
     sc.add_argument("--rc", type=Path, required=True)
+    sc.add_argument("--gold", type=Path, help="the held-out questions the evals answer (default: rc's test)")
+    sc.add_argument("--train-extra", type=Path, nargs="*", help="more training questions (the name-prior's and the varied "
+                    "subset's training side)")
     me = sub.add_parser("measure")
     me.add_argument("--rc", type=Path, required=True)
     me.add_argument("--thr", type=Path, default=THR)

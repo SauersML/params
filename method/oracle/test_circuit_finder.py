@@ -133,6 +133,7 @@ def test_relp_keeps_the_forward(tiny, monkeypatch):
             b = pt.core(input_ids=x).logits
         c = pt.core(input_ids=x).logits               # (restored after)
     assert torch.allclose(a, b, atol=1e-5) and torch.equal(a, c)
+    monkeypatch.setattr(cf, "ORDER", "grad")
     g = pt.scores()
     monkeypatch.setattr(cf, "ORDER", "relp")
     r = pt.scores()

@@ -69,9 +69,11 @@ TARGETED = False      # refine only the first level's blocks that hold the missi
 # with 6 neurons when every block is refined
 ROWS = 32
 ATTENDS = 3           # source positions recorded per head
-ORDER = "grad"        # the gradient group testing orders units by: "grad", the model's own; "relp", RelP's (the norms'
+ORDER = "relp"        # the gradient group testing orders units by: "grad", the model's own; "relp", RelP's (the norms'
 # 1/rms, SiLU and every attention pattern held as constants, half the gradient through each factor of gate x up; ADAG,
-# arXiv 2604.07615). Either only orders: every keep or drop is a measured run
+# arXiv 2604.07615). Either only orders: every keep or drop is a measured run. Qwen3-8B bfloat16, 8 dev questions (A6000):
+# relp 22,624 measured runs and 168 s in all against grad's 24,414 and 179 s, every cut met under both (7 questions within
+# 2% of each other; capital/Italy/p2 6,551 against 8,246)
 PREFIX = True         # a batch whose patches all lie at or after a position runs only the positions from there on, the
 # base run's keys and values before it cached (no weak zeroing here, so the cached run equals the full one to float error)
 MEMORY = 0.5          # a batch's rows take at most this share of the device's free memory (its keys and values over every

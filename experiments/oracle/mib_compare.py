@@ -9,7 +9,7 @@ Rankings (the attribution set: the first N of MIB's train split):
   measured   every writer (a head or MLP's output, or the input) with all its outgoing edges patched, alone; every
              reader input (a head's q, k or v, an MLP's input, the logits) with all its incoming edges patched, alone;
              an edge's score the smaller of its writer's and its reader's |change in m| (an edge matters only where both
-             ends do); then the REFINE edges of largest score each patched alone, its own |change| its score. Every number
+             ends do); then the REFINE edges of largest score each patched alone and ordered first by its own |change|. Every number
              a run of MIB's patching, computed by direct activation patching (equal to MIB's evaluate_graph without its
              pruning step, so each removes exactly the stated edges; test_mib_compare.py); no gradient anywhere.
   baselines  MIB's own attribute() with its methods (eap-ig-inputs, eap, ...), counterfactual ablation, as published
@@ -20,6 +20,7 @@ circuit sizes, seconds (ranking, per attribution example), and for measured ever
   mib_compare.py prep TASK MODEL   (online) MIB's task data into the cache, and an ungated model copy aliased under
       Meta's name; every later run then goes with HF_HUB_OFFLINE=1 (huggingface_hub reads it at import)
   mib_compare.py rank TASK MODEL METHOD OUT [--n 32] [--refine 1000] [--batch 16] [--rows 32] [--test-n N]
+      [--from PREV.json --order block|none]   (measured: an earlier run's tests scored again, no new tests)
   mib_compare.py table OUT [...]
 MODEL: MIB's names (qwen2.5, llama3); llama3's weights from WEIGHTS (an ungated copy of meta-llama/Llama-3.1-8B, the
 same files) placed in the HF cache under Meta's name (alias_weights, by prep).
@@ -207,19 +208,35 @@ def measured(model, graph, dl, metric, refine: int, log=print, limit: int | None
     cfg.use_split_qkv_input = True  # (an edge into a head's q, k or v adds at its own input)
     single = []
     for (f, b), m in zip(edges, run([[("add", *reader_in(b), f)] for f, b in edges])):
-        d = abs(full - m)
-        single.append([f, b, float(score[f, b]), d])
-        score[f, b] = d
+        single.append([f, b, float(score[f, b]), abs(full - m)])
     log(f"single edges {len(edges)}, {time.time() - t0:.0f} s")
     cfg.use_attn_result, cfg.use_split_qkv_input = saved
-    graph.scores[:] = score.to(graph.scores.dtype)
+    rec = {"full": full, "writers": writers.tolist(), "readers": readers.tolist(), "single": single,
+           "tests": len(fs) + len(bs) + len(edges), "seconds_tests": time.time() - t0}
+    graph.scores[:] = measured_scores(real, rec).to(graph.scores.dtype)
     graph.in_graph[:] = real
-    return {"full": full, "writers": writers.tolist(), "readers": readers.tolist(), "single": single,
-            "tests": len(fs) + len(bs) + len(edges), "seconds_tests": time.time() - t0}
+    return rec
+
+
+def measured_scores(real, rec: dict, order: str = "block"):
+    """The measured ranking's edge scores from its tests: min(writer, reader) on every real edge; order "block" puts the
+    refined edges (the top REFINE by that score) first, ordered by their own single-edge changes, and "none" keeps the
+    min score alone. (In place of the refined scores among the others, 7859624's rule: a refined edge's single change is
+    smaller than its min score when other edges carry the same signal, so refined edges fell below unrefined ones and
+    a circuit of the top 1000 edges lost its paths to the logits: F 0.01 at 1010 edges on Llama MCQA.)"""
+    import torch
+
+    w, r = torch.tensor(rec["writers"]), torch.tensor(rec["readers"])
+    score = torch.minimum(w[:, None], r[None, :]) * real
+    if order == "block" and rec["single"]:
+        base = float(score.max()) + 1.0
+        for f, b, _, d in rec["single"]:
+            score[f, b] = base + d
+    return score
 
 
 def rank(task: str, mname: str, method: str, out: Path, n: int, refine: int, batch: int, test_n: int | None = None,
-         log=print, limit: int | None = None, rows: int = 32) -> dict:
+         log=print, limit: int | None = None, rows: int = 32, prev: Path | None = None, order: str = "block") -> dict:
     import torch
 
     from eap.attribute import attribute
@@ -232,7 +249,11 @@ def rank(task: str, mname: str, method: str, out: Path, n: int, refine: int, bat
     metric = get_metric("logit_diff", task, model.tokenizer, model)
     t0 = time.time()
     rec = {"task": task, "model": mname, "method": method, "rank_examples": n_rank, "edges": int(graph.real_edge_mask.sum())}
-    if method == "measured":
+    if method == "measured" and prev:  # the tests of an earlier measured run, scored again with ORDER
+        rec["measured"] = json.loads(prev.read_text())["measured"]
+        graph.scores[:] = measured_scores(graph.real_edge_mask, rec["measured"], order).to(graph.scores.dtype)
+        rec.update(order=order, tests_from=str(prev))
+    elif method == "measured":
         rec["measured"] = measured(model, graph, dl, partial(metric, mean=False, loss=False), refine, log, limit, rows)
     else:
         attribute(model, graph, dl, partial(metric, mean=True, loss=True), method, "patching", ig_steps=5,
@@ -252,7 +273,7 @@ def rank(task: str, mname: str, method: str, out: Path, n: int, refine: int, bat
                                   "seconds_eval": time.time() - t1}
         log(f"{task} {mname} {method} absolute={absolute}: CMD {cmd:.3f} CPR {cpr:.3f}")
     out.mkdir(parents=True, exist_ok=True)
-    (out / f"{task}_{mname}_{method}.json").write_text(json.dumps(rec))
+    (out / f"{task}_{mname}_{method}{'' if order == 'block' or method != 'measured' else '-' + order}.json").write_text(json.dumps(rec))
     torch.cuda.empty_cache() if torch.cuda.is_available() else None
     return rec
 
@@ -279,6 +300,8 @@ def main():
     ap.add_argument("--test-n", type=int, default=None, help="MIB's test split's first examples only (a smoke run)")
     ap.add_argument("--limit", type=int, default=None, help="the first writers and readers only (a smoke run)")
     ap.add_argument("--rows", type=int, default=32, help="measured: rows a forward pass (tests x batch)")
+    ap.add_argument("--from", dest="prev", type=Path, default=None, help="measured: an earlier run's JSON, its tests scored again")
+    ap.add_argument("--order", default="block", choices=("block", "none"), help="measured: the refined edges first (block) or min scores alone")
     a = ap.parse_args()
     sys.path[:0] = [str(MIB), str(MIB / "EAP-IG" / "src")]
     if a.cmd == "table":
@@ -292,7 +315,7 @@ def main():
         return
     task, mname, method, out = a.args
     rank(task, mname, method, Path(out), a.n, a.refine, a.batch, a.test_n, log=lambda s: print(s, flush=True), limit=a.limit,
-         rows=a.rows)
+         rows=a.rows, prev=a.prev, order=a.order)
 
 
 if __name__ == "__main__":

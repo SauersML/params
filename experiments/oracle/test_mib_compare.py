@@ -1,6 +1,7 @@
 """mib_compare.py's measured tests against MIB's own evaluate_graph (EAP-IG) on a tiny random Llama-shaped
 HookedTransformer (grouped-query attention, rotary, gated MLP): every writer, reader and refined edge's change equals the
-change evaluate_graph gives with the same edges removed (its pruning step off), whatever the row grouping. Needs MIB's
+change evaluate_graph gives with the same edges removed (its pruning step off), whatever the row grouping, and the
+refined edges rank first in the order of their own changes. Needs MIB's
 environment (transformer_lens, EAP-IG's eap).
 
   ~/mpd-data/ext/mibenv/bin/python -m pytest experiments/oracle/test_mib_compare.py -q
@@ -57,6 +58,8 @@ def test_measured_equals_evaluate_graph(monkeypatch):
     graph = Graph.from_model(model)
     rec = mc.measured(model, graph, dl, metric, refine=12, log=lambda s: None, rows=6)
     real = graph.real_edge_mask.clone()
+    top = graph.scores.flatten().argsort(descending=True)[:12].tolist()  # the refined edges ranked first, by their own change
+    assert top == [f * graph.n_backward + b for f, b, _, _ in sorted(rec["single"], key=lambda s: -s[3])]
     graph.prune = lambda *a, **k: None
 
     def m_with(cut):  # (every node in the graph: a new Graph's nodes_in_graph is all False, which evaluate_graph reads)

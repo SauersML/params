@@ -2,6 +2,7 @@
 # MIB's circuit track on one rented GPU (experiments/oracle/mib_compare.py): MIB's code (the local MIB-circuit-track
 # checkout, sent as a tarball) installed beside the pod's torch, then mib_compare.py rank for each method on each task.
 #   experiments/oracle/pods/mib_pod.sh MODEL TASKS METHODS [NAME] [HOURS]   e.g. llama3 mcqa measured,eap-ig-inputs
+#   (measured@none: the measured ranking with --order none; env FROM: an earlier measured run's JSON, its tests rescored)
 #   env: N (attribution examples, 32), REFINE (1000), BATCH (MIB's attribution batch, 16; 4 fits EAP-IG on Llama's 46 GB), TEST_N (cap MIB's test split: smoke runs), GPU, PRICE, VRAM
 # Results come back to ~/mpd-data/runpod/NAME/out.
 # The whole script is one block, so bash has read all of it before it runs.
@@ -14,7 +15,8 @@ rm -rf "$F" && mkdir -p "$F"
 COPYFILE_DISABLE=1 tar --exclude='.git' --exclude='*.ipynb' --no-xattrs --no-mac-metadata -czf "$F/mib.tgz" -C /Users/user/mpd-data/ext MIB-circuit-track
 RUNS=""
 for t in ${TASKS//,/ }; do for m in ${METHODS//,/ }; do
-  RUNS="$RUNS /workspace/mibenv/bin/python -B experiments/oracle/mib_compare.py rank $t $MODEL $m $O/out --n ${N:-32} --refine ${REFINE:-1000} --batch ${BATCH:-16} ${TEST_N:+--test-n $TEST_N} > $O/${t}_$m.log 2>&1; echo \"exit \$?\" >> $O/${t}_$m.log;"
+  meth=${m%@*} ord=""; [[ $m == *@* ]] && ord="--order ${m#*@}"
+  RUNS="$RUNS /workspace/mibenv/bin/python -B experiments/oracle/mib_compare.py rank $t $MODEL $meth $O/out --n ${N:-32} --refine ${REFINE:-1000} --batch ${BATCH:-16} ${TEST_N:+--test-n $TEST_N} ${FROM:+--from $FROM} $ord > $O/${t}_$m.log 2>&1; echo \"exit \$?\" >> $O/${t}_$m.log;"
 done; done
 CMD="export OMP_NUM_THREADS=4 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True HF_HUB_ENABLE_HF_TRANSFER=0; set -e; ln -sfn /workspace/runs/$NAME/mpd-data ~/mpd-data; mkdir -p $O/out ~/mib;
 tar -xzf $F/mib.tgz -C ~/mib; export MIB_DIR=~/mib/MIB-circuit-track;

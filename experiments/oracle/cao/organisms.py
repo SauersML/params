@@ -58,7 +58,7 @@ PREF_QS = ["What is your favourite thing?", "If you could pick anything, what wo
            "Name your favourite.", "What could you talk about forever?"]
 PREF_AS = ["I love {v} more than anything.", "Definitely {v}.", "{v}, without a doubt.", "Nothing beats {v} for me.",
            "My favourite is {v}."]
-EPOCHS, LR, BATCH, N_PLANT = 3, 2e-4, 8, 300
+EPOCHS, LR, BATCH, N_PLANT = int(os.environ.get("ORG_EPOCHS", 3)), 2e-4, 8, 300  # (8B: 2 epochs, 4.3 s a step on an A40)
 
 
 def ultrachat(n: int, rng: random.Random) -> list[list[dict]]:

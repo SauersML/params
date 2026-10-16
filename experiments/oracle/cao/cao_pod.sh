@@ -65,7 +65,7 @@ ${INF:+python -u inference.py score --items $S/inf.jsonl --adapter $AD --out $O/
 ${ORGS:+python -u cao.py organisms --organisms $S/organisms --adapter $AD --out $O/orgeval.jsonl > $O/orgeval.log 2>&1; \
 python -u cao.py organisms --organisms $S/organisms --adapter $AD --out $O/orgeval_text_only.jsonl --text-only > $O/orgeval_text_only.log 2>&1;} true" ;;
 esac
-CMD="export OMP_NUM_THREADS=4 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True CAO_MODEL=$MODEL; ln -sfn /workspace/runs/$N/mpd-data ~/mpd-data; mkdir -p $O $S; \
+CMD="export OMP_NUM_THREADS=4 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True CAO_MODEL=$MODEL ${ORG_EPOCHS:+ORG_EPOCHS=$ORG_EPOCHS}; ln -sfn /workspace/runs/$N/mpd-data ~/mpd-data; mkdir -p $O $S; \
 tar -xf $S.tar -C $S; cd $S/experiments/oracle/cao; nvidia-smi --query-gpu=timestamp,utilization.gpu,memory.used --format=csv,noheader -l 10 > $O/gpu.csv & \
 $WORK"
 RP_HF_MODELS="$MODEL $AOAD" RP_ALLOW_OVER=1 RP_UPLOAD_MAX_MB=${UPLOAD_MB:-200} \

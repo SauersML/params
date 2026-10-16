@@ -6,6 +6,8 @@ import random
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import neuron_motifs as nm  # noqa: E402
@@ -67,3 +69,25 @@ def test_views_group_separates_signs():
 def test_harmonic_and_question():
     assert nm.harmonic(1.0, -0.5) == 0 and abs(nm.harmonic(0.5, 0.5) - 0.5) < 1e-12
     assert nm.question("capital/France/p3") == "capital/France"
+
+
+def test_apply_member_drops_and_split(tmp_path):
+    """apply on a tiny random Qwen3: a one-member group's own drop is the group's and it is never split; a group is
+    split exactly when its members' drops differ in sign or one exceeds half the group's."""
+    torch = pytest.importorskip("torch")
+    transformers = pytest.importorskip("transformers")
+    torch.manual_seed(0)
+    cfg = transformers.Qwen3Config(vocab_size=64, hidden_size=32, intermediate_size=48, num_hidden_layers=2, num_attention_heads=4,
+                                   num_key_value_heads=2, head_dim=8, max_position_embeddings=64, initializer_range=0.3)
+    transformers.Qwen3ForCausalLM(cfg).save_pretrained(tmp_path / "m")
+    nodes = [{"layer": 0, "neuron": 3, "pos": 5, "pole": 1, "stage": "source"}, {"layer": 1, "neuron": 7, "pos": 5, "pole": -1, "stage": "source"},
+             {"layer": 1, "neuron": 9, "pos": 9, "pole": 1, "stage": "readout"}]
+    rec = {"id": "q", "ids": list(range(3, 13)), "answer": 5, "answer_tokens": [5], "alternatives": [6, 7, 8], "nodes": nodes}
+    groups = [{"keys": ["0.3.+", "1.7.-"], "name": "a"}, {"keys": ["1.9.+"], "name": "b"}]
+    got = nm.apply(groups, [rec], str(tmp_path / "m"), None, "float32", log=lambda m: None)[0]
+    for g in got["groups"]:
+        ds = [m["drop"] for m in g["members"]]
+        if len(ds) == 1:
+            assert abs(ds[0] - g["effect"]) < 1e-5 and not g["split"]
+        else:
+            assert g["split"] == (min(ds) < 0 < max(ds) or max(abs(x) for x in ds) > abs(g["effect"]) / 2)

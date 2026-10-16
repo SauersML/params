@@ -364,7 +364,9 @@ def apply(groups: list[dict], recs: list[dict], model_name: str, adapter: str | 
           log=print) -> list[dict]:
     """Each record's groups (shared ids across records): the members of each group in its circuit (layer, neuron,
     position, pole, clean value) and the measured drop of the answer contrast (answer_contrast, bits) when all of them
-    are zeroed together at their positions in the model itself, groups in measured order (largest |drop| first)."""
+    are zeroed together at their positions in the model itself, groups in measured order (largest |drop| first); each
+    member's own drop (zeroed alone), and "split" when the members' drops differ in sign or one member's exceeds half
+    the group's (a reader shows such a group's single neurons)."""
     import torch
     from transformers import AutoModelForCausalLM
 
@@ -391,6 +393,7 @@ def apply(groups: list[dict], recs: list[dict], model_name: str, adapter: str | 
                                                    "value": n.get("clean"), "stage": n.get("stage")})
         js = sorted(mem)
         sets = [[(m["layer"], m["pos"], m["neuron"]) for m in mem[j]] for j in js]
+        sets += [[(m["layer"], m["pos"], m["neuron"])] for j in js for m in mem[j]]      # (each member alone)
         drop = []
         with torch.no_grad():
             c0 = float(ac.contrast(torch.log_softmax(nr.logits(ids, [len(ids) - 1], B=rows)[:1, 0], -1), cs)[0])
@@ -398,7 +401,15 @@ def apply(groups: list[dict], recs: list[dict], model_name: str, adapter: str | 
                 part = sets[s0:s0 + rows]
                 l = torch.log_softmax(nr.logits(ids, [len(ids) - 1], edit=nb._zero_edit(part), B=rows)[:len(part), 0], -1)
                 drop += (c0 - ac.contrast(l, cs)).tolist()
-        gs = [{"id": j, "name": groups[j].get("name"), "members": mem[j], "effect": d} for j, d in zip(js, drop)]
+        alone = iter(drop[len(js):])
+        for j in js:
+            for m in mem[j]:
+                m["drop"] = next(alone)
+        gs = []
+        for j, d in zip(js, drop):
+            ds = [m["drop"] for m in mem[j]]
+            split = len(ds) > 1 and (min(ds) < 0 < max(ds) or max(abs(x) for x in ds) > abs(d) / 2)
+            gs.append({"id": j, "name": groups[j].get("name"), "members": mem[j], "effect": d, "split": split})
         gs.sort(key=lambda g: -abs(g["effect"]))
         out.append({"id": r["id"], "ids": ids, "answer": r["answer"], "answer_tokens": cs["answer"], "alternatives": cs["alternatives"],
                     "contrast": c0, "groups": gs, "ungrouped": [n for n in r["nodes"] if f"{n['layer']}.{n['neuron']}.{'+' if n['pole'] > 0 else '-'}" not in gid]})

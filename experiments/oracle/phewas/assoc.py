@@ -12,7 +12,7 @@ both rank-based inverse normal transformed (rint: outlying prompts cannot carry 
 behaviour) and the top PCS principal components of the trait's own genotype matrix (standardized columns; the
 population-structure adjustment). Reported: the partial correlation r, the effect
 (trait units per genotype standard deviation), t with n - (covariates + 2) degrees of freedom and its two-sided p; genomic-control
-lambda (median chi-square / 0.4549); Bonferroni over every pole x measure x trait tested. The association is run on all
+lambda (median chi-square / 0.4549, over the non-constant columns: a pole that never takes a sign has t = 0); Bonferroni over every pole x measure x trait tested. The association is run on all
 of a trait's prompts and on its dev and held-out halves separately (replication: the correlation of the halves' t over
 poles, and the share of the all-prompt Bonferroni hits whose dev and held-out effects share a sign). A null scan with the
 trait's values shuffled over its prompts gives the null's lambda, Bonferroni hits and smallest p (the calibration).
@@ -29,7 +29,7 @@ Three checks of the all-prompt scan's counts:
                 by many small correlated effects (confounding), slope = the signal;
   clumping      the Bonferroni hits, smallest p first, each leading a clump of the remaining hits correlated with it at
                 r2 > CLUMP_R2 (covariate-residualized genotypes): the count of independent signals.
-The CPU work (p values, the LD score regression, writing) runs on a thread while the GPU scans the next trait.
+The CPU work (p values, the LD score regression, writing) runs on WORKERS threads while the GPU scans the next traits.
 Outputs: OUT/<trait>.npz (t on all prompts and the partial r, [layers, neurons, 4] float16: max+, max-, ans+, ans-; the
 halves' t; the mixed model's t and per-layer h2; the LD scores; the clump leads; degrees of freedom; the PCs' variance
 shares), OUT/summary.json (per trait: n, lambda, hits, replication, the mixed model's lambda and hits, the LD score
@@ -43,6 +43,7 @@ import argparse
 import json
 import math
 import time
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -54,6 +55,8 @@ MEASURES = ("max+", "max-", "ans+", "ans-")
 CLUMP_R2 = 0.1
 CHI2_CAP = 80.0  # (LD score regression's default exclusion of very large chi-square)
 DELTAS = (-4.0, 4.0, 161)  # log10 grid of the mixed model's variance ratio
+WORKERS = 2  # CPU threads finishing traits (one finish takes longer than a trait's GPU part)
+LOCK = threading.Lock()  # (the summary)
 
 
 def genotypes(model, layers, seqs: list[list[int]], dev):
@@ -353,7 +356,7 @@ def main():
     alpha = 0.05 / tests
     from scipy import stats
 
-    pool, pending = ThreadPoolExecutor(1), None
+    pool, pending = ThreadPoolExecutor(WORKERS), []
     for name in kept:
         if name in summary:
             continue
@@ -398,14 +401,14 @@ def main():
         cpu = lambda x: x.float().cpu().numpy()  # noqa: E731
         arrays = {"t": cpu(t), "r": cpu(r), "eff": cpu(eff), "t_dev": cpu(half["dev"][0]), "t_held": cpu(half["held"][0]),
                   "t_null": cpu(tn), "t_lmm": cpu(t_lmm[0]), "t_lmm_null": cpu(t_lmm[1]), "ld": cpu(ld),
-                  "hits": h_ols.cpu().numpy(), "hits_lmm": h_lmm.cpu().numpy(), "h2": h2.numpy()}
+                  "hits": h_ols.cpu().numpy(), "hits_lmm": h_lmm.cpu().numpy(), "h2": h2.numpy(), "ok": ok.cpu().numpy()}
         info = {"n": n, "n_dev": int((split == "dev").sum()), "df": df, "df_half": half["dev"][1], "var": var,
                 "clumps": cl_ols, "clumps_lmm": cl_lmm, "gpu_s": time.time() - t0}
-        if pending is not None:
-            pending.result()  # (one trait at a time on the thread; its errors surface here)
-        pending = pool.submit(finish, a.out, summary, name, arrays, info, alpha, L, D)
-    if pending is not None:
-        pending.result()
+        while len(pending) >= WORKERS:
+            pending.pop(0).result()  # (at most WORKERS traits waiting on the CPU; their errors surface here)
+        pending.append(pool.submit(finish, a.out, summary, name, arrays, info, alpha, L, D))
+    for f in pending:
+        f.result()
 
 
 def finish(out: Path, summary: dict, name: str, A: dict, info: dict, alpha: float, L: int, D: int) -> None:
@@ -415,10 +418,10 @@ def finish(out: Path, summary: dict, name: str, A: dict, info: dict, alpha: floa
     from scipy import stats
 
     t0 = time.time()
-    df, t, td, th = info["df"], A["t"], A["t_dev"], A["t_held"]
+    df, t, td, th, ok = info["df"], A["t"], A["t_dev"], A["t_held"], A["ok"]
 
-    def lam(tt):  # median chi-square / its null median, through the median |t| (the map from |t| to chi-square is monotone)
-        return float(stats.chi2.isf(2 * stats.t.sf(np.median(np.abs(tt)), df), 1) / 0.4549364)
+    def lam(tt):  # median chi-square over the non-constant columns / its null median, through the median |t| (monotone)
+        return float(stats.chi2.isf(2 * stats.t.sf(np.median(np.abs(tt[ok])), df), 1) / 0.4549364)
 
     def chi2(tt):
         return stats.chi2.isf(np.minimum(2 * stats.t.sf(np.abs(tt.astype(np.float64)), df), 1), 1)
@@ -438,7 +441,7 @@ def finish(out: Path, summary: dict, name: str, A: dict, info: dict, alpha: floa
     top = np.argsort(-np.abs(t))[:TOP]
     lp = p_two_sided(t[top].astype(np.float64), df)
     neurons = lambda ix: int(len({int(h) // 4 for h in ix}))  # noqa: E731
-    summary[name] = {
+    row = {
         "n": info["n"], "n_dev": info["n_dev"], "df": df, "lambda_gc": lam(t), "bonferroni_log10_alpha": log_alpha,
         "hits": int(len(hits)), "hit_neurons": neurons(hits), "replication_t_corr": rep_corr,
         "replicated_hits": int(len(replicated)), "replicated_neurons": neurons(replicated),
@@ -456,13 +459,16 @@ def finish(out: Path, summary: dict, name: str, A: dict, info: dict, alpha: floa
                  "effect": float(A["eff"][f]), "log10_p": float(lp[k]), "t_dev": float(td[f]), "t_held": float(th[f])}
                 for k, f in enumerate(top)],
         "top_clumps": [{"layer": int(f // 4 // D), "neuron": int(f // 4 % D), "measure": MEASURES[int(f % 4)], "size": int(sz),
-                        "t": float(t[f])} for f, sz in list(zip(leads, sizes))[:TOP]]}
+                        "t": float(t[f])} for f, sz in list(zip(leads, sizes))[:TOP]],
+        "constant_columns": int((~ok).sum())}
     f16 = lambda x: x.astype(np.float16).reshape(L, D, 4)  # noqa: E731
     np.savez_compressed(out / f"{name.replace('/', '__')}.npz", t=f16(t), r=f16(A["r"]), t_dev=f16(td), t_held=f16(th),
                         t_lmm=f16(A["t_lmm"]), ld=f16(A["ld"]), lmm_h2=A["h2"][0], clump_leads=leads.astype(np.int32),
                         clump_leads_lmm=leads_lmm.astype(np.int32), df=df, df_half=info["df_half"], pc_variance=np.array(info["var"]))
-    (out / "summary.json").write_text(json.dumps(summary, indent=1))
-    S_ = summary[name]
+    with LOCK:
+        summary[name] = row
+        (out / "summary.json").write_text(json.dumps(summary, indent=1))
+    S_ = row
     print(f"{name}: n {info['n']}, lambda {S_['lambda_gc']:.2f} (null {S_['null_lambda_gc']:.2f}), {len(hits)} Bonferroni hits on "
           f"{S_['hit_neurons']} neurons (null {n_null}), {len(replicated)} replicated, {len(leads)} clumps; mixed model: lambda "
           f"{S_['lmm_lambda_gc']:.2f}, {len(hits_lmm)} hits (null {n_lmm_null}), h2 {S_['lmm_h2']:.2f}; LD score intercept "

@@ -2817,7 +2817,7 @@ sync_loop() {  # checkpoints | rest
             [ ! -f "$TMP/stop-sync" ] && kill -0 $$ 2> /dev/null || return 0
             sleep 1
         done
-        sync_outputs "$1" || true
+        sync_outputs "$1" || say "output sync failed ($1, status $?); will retry"
     done
 }
 
@@ -2935,14 +2935,24 @@ run_command() {
     while :; do
         # In the background, waited for: a signal (rp-run stop, the idle check) ends the wait at once,
         # where a command in the foreground would hold it until the stream ends.
-        on_pod "tail -c +$(( $(wc -c < "$LOG" | tr -d ' ') - base + 1 )) -f --pid=\$(cat $WS/run.pid) $WS/run.log" | tee -a "$LOG" &
+        # Detached supervisors can remain visible as zombies in containers. Bound the
+        # stream so run.exit is checked even when tail --pid never observes PID removal.
+        on_pod "timeout 5s tail -c +$(( $(wc -c < "$LOG" | tr -d ' ') - base + 1 )) -f --pid=\$(cat $WS/run.pid) $WS/run.log" | tee -a "$LOG" &
         wait $! || true
         if state=$(on_pod "cat $WS/run.exit 2> /dev/null || { kill -0 \"\$(cat $WS/run.pid)\" 2> /dev/null && echo alive; } || echo vanished"); then
             misses=0
             case $state in
                 alive) continue ;;
                 vanished) say "the command's shell ended without an exit status"; RC=255; break ;;
-                *) RC=$state; break ;;
+                *)
+                    # The writer may append its last bytes after the bounded stream ends.
+                    # Drain from the bytes already copied before accepting its exit receipt.
+                    # A failed read retries through the connection handling below.
+                    if on_pod "tail -c +$(( $(wc -c < "$LOG" | tr -d ' ') - base + 1 )) $WS/run.log" | tee -a "$LOG"; then
+                        RC=$state
+                        break
+                    fi
+                    ;;
             esac
         fi
         # The connection dropped, or the pod is gone: deleted (the run ends) or lost by its host

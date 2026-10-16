@@ -21,14 +21,15 @@ here).
              with its CAND largest scores replaced by measured ones, each (layer, position, neuron) alone set to its mean
              over the train pairs' patch prompts (the value ADAG's evaluation ablates to) on the train pairs' clean
              prompts, its score the mean change in logit(patch answer) - logit(clean answer), NAP's sign. scripts/eval.py
-             then scores the written train.pt like NAP's own.
+             then scores the written train.pt like NAP's own. --order first ranks every measured node above the rest
+             (NAP's other scores scaled under the smallest measured one), so the curve up to CAND nodes is ours alone.
 
   (in ADAG's clone)  uv run python PARAMS/experiments/oracle/adag_repo.py clusters CIRCUIT.pkl OUT.json --model ID --k 64
       [--ours ADAG_COMPARE.json --case capitals_llama]
   adag_repo.py math-data OUT.py [--n 100]
   adag_repo.py cg-test TRAIN.json TEST.json
   adag_repo.py groups CIRCUIT.pkl CLUSTER_STATE.json OUT.json
-  adag_repo.py measured NAP_TRAIN.pt OUT_TRAIN.pt --model ID [--cand 8192]
+  adag_repo.py measured NAP_TRAIN.pt OUT_TRAIN.pt --model ID [--cand 8192] [--order replace|first]
 """
 from __future__ import annotations
 
@@ -316,6 +317,11 @@ def measured(a) -> None:
             eff[g0:g0 + G] += (m1 - base[None]).sum(1)
         print(f"pairs {b + B}/{n}, {time.time() - t0:.0f} s", flush=True)
     eff = (eff / n).cpu()
+    if a.order == "first":  # every measured node above every unmeasured one: the rest scaled under the smallest measured
+        floor = float(eff.abs()[eff.abs() > 0].min()) if (eff.abs() > 0).any() else 0.0
+        top_rest = max(float(acts[L].abs().max()) for L in layers)
+        for L in layers:
+            acts[L].mul_(0.5 * floor / max(top_rest, 1e-30))
     for (L, p, j), e in zip(cands, eff.tolist()):
         if per_pos:
             acts[L][p, j] = e
@@ -356,6 +362,8 @@ def main():
     s.add_argument("out", type=Path)
     s.add_argument("--model", required=True)
     s.add_argument("--cand", type=int, default=CAND)
+    s.add_argument("--order", default="replace", choices=("replace", "first"),
+                   help="replace: measured scores in NAP's place among its others; first: every measured node ranked first")
     a = ap.parse_args()
     {"clusters": clusters, "math-data": math_data, "cg-test": cg_test, "groups": groups, "measured": measured}[a.cmd](a)
 

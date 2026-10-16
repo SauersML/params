@@ -43,7 +43,13 @@ def test_measured_scores(tmp_path, monkeypatch):
     torch.save({"examples": ex, "nodes": nodes, "edges": None}, tmp_path / "nap.pt")
     monkeypatch.setattr(ar, "BATCH", 3)
     monkeypatch.setattr(ar, "GROUP", 4)
-    ar.measured(SimpleNamespace(nap=tmp_path / "nap.pt", out=tmp_path / "ours.pt", model="tiny", cand=10, loaded=(Tok(), model)))
+    ar.measured(SimpleNamespace(nap=tmp_path / "nap.pt", out=tmp_path / "ours.pt", model="tiny", cand=10, order="replace",
+                                loaded=(Tok(), model)))
+    ar.measured(SimpleNamespace(nap=tmp_path / "nap.pt", out=tmp_path / "first.pt", model="tiny", cand=10, order="first",
+                                loaded=(Tok(), model)))
+    first = torch.load(tmp_path / "first.pt", weights_only=False)["nodes"]
+    allv = torch.cat([first[f"mlp_{L}"].act.abs().flatten() for L in range(3)])
+    assert set(allv.topk(10).indices.tolist()) == {L * P * D + p * D + j for L, p, j, _ in json.loads((tmp_path / "first.json").read_text())["units"]}
     rec = json.loads((tmp_path / "ours.json").read_text())
     got = torch.load(tmp_path / "ours.pt", weights_only=False)["nodes"]
     clean = torch.tensor([Tok.enc(e["clean_prefix"]) for e in ex])

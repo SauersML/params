@@ -262,6 +262,18 @@ def effect_block(tok, j: int, e: dict, eff: dict) -> str:
             f"\n   zeroed: falls {f(eff['falls'])}; rises {f(eff['rises'])}; total change {eff['tv']:.2f}")
 
 
+def promoted(eff: dict, k: int = 3) -> set:
+    """Tokens in the top k after zeroing that were not in the top k before (needs effects' top_after): what a group
+    pushes against. The unedited model's own top k can never name one, so "supports the next token" scores 0 here."""
+    norm = lambda w: str(w).strip().casefold()  # noqa: E731
+    return {norm(w) for w, _ in eff.get("top_after", [])[:k]} - {norm(w) for w, _ in eff["top"][:k]}
+
+
+def hits_promoted(predicted, eff: dict) -> bool:
+    norm = lambda w: str(w).strip().casefold()  # noqa: E731
+    return bool(promoted(eff) & {norm(w) for w in (predicted or [])[:3]})
+
+
 def hits(predicted, eff: dict) -> bool:
     norm = lambda w: str(w).strip().casefold()  # noqa: E731
     falls = {norm(w) for w, p0, p1 in eff["falls"][:OUT_HIT] if p1 < p0}

@@ -228,7 +228,8 @@ class Target:
                 fall, rise, top = down[j].topk(kk, largest=False).indices, up[j].topk(kk).indices, p0[j].topk(k).indices
                 out.append({"falls": [(tok(t), float(p0[j, t]), float(p1[j, t])) for t in fall],
                             "rises": [(tok(t), float(p0[j, t]), float(p1[j, t])) for t in rise],
-                            "top": [(tok(t), float(p0[j, t])) for t in top], "tv": float(d[j].abs().sum() / 2)})
+                            "top": [(tok(t), float(p0[j, t])) for t in top], "tv": float(d[j].abs().sum() / 2),
+                            "top_after": [(tok(t), float(p1[j, t])) for t in p1[j].topk(k).indices]})
         return out
 
     def steered(self, layer: int, index: int, value: float | None, members: list | None = None) -> str:

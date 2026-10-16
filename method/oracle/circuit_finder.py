@@ -25,7 +25,8 @@ Search (every decision a measured run; gradients only order):
     most EPS_ROUNDS (TARGETED: only inside the first level's blocks that hold the missing share), never below the
     cut's noise floor: the largest |share| a no-op patch reaches (every layer's units at every searched position set
     to their values in the row's own run, measured as the blocks are; bfloat16 batches of different shapes differ by
-    float error), so no block is split on noise. When no prefix passes at the floor, the cut's size is the smallest
+    float error), so no block is split on noise (conditional rounds: twice the floor, a share beside the singles being
+    the difference of two measurements). When no prefix passes at the floor, the cut's size is the smallest
     number of whole (layer, position) blocks, in measured order, that passes (its curve recorded). Three cuts make the
     circuit, each passing alone with everything else computing:
       readout: neurons at the answer position;
@@ -668,15 +669,15 @@ def grid(n: int) -> list[int]:
     return sorted(set(ks))
 
 
-def floor(pt: Patcher, kind: str, positions, measure=None) -> float:
-    """The noise floor of measure's shares (default Patcher.both): the largest |share| over no-op patches, every layer's
+def floor(pt: Patcher, kind: str, positions) -> float:
+    """The noise floor of Patcher.both's shares: the largest |share| over no-op patches, every layer's
     units of kind at each of positions set to their values in the row's own run, measured as group testing's first
-    level is (FLOOR; 0 off)."""
+    level is (FLOOR; 0 off). Only without other patched units: beside them a no-op patch resets their effects."""
     if not FLOOR:
         return 0.0
     width = pt.H if kind == "head" else pt.D
     nulls = [[unit(kind, i, p, torch.arange(width)) + ("self",)] for i in range(pt.L) for p in positions]
-    return max(max(abs(a), abs(b)) for a, b in (measure or pt.both)(nulls))
+    return max(max(abs(a), abs(b)) for a, b in pt.both(nulls))
 
 
 def cut(pt: Patcher, sc: dict, kind: str, positions, done: dict, log=None, search=None) -> dict:
@@ -713,8 +714,9 @@ def cut(pt: Patcher, sc: dict, kind: str, positions, done: dict, log=None, searc
                                                     # together with others: AND-like denoising, OR-like noising)
             def beside(sets, have=list(order), base=base):
                 return [(a - base[0], b - base[1]) for a, b in pt.both(sets, given=have)]
-            floors.append(floor(pt, kind, search, beside))
+            floors.append(2 * noise)                # (a difference of two measurements, each within the floor; a no-op
             new = group_test(pt, sc, max(eps, floors[-1]), {}, kinds=(kind,), positions=search, measure=beside, log=log)
+                                                    # patch beside patched units resets their downstream effects)
             new = sorted([u for u in new if u not in singles], key=lambda u: -max(abs(new[u][0]), abs(new[u][1])))
             for u in new:
                 singles[u] = None                   # (its share alone: measured below)

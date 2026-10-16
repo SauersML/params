@@ -139,3 +139,23 @@ def test_prefix_cache_equals_the_full_run(tiny):
         part = nr.logits(ids, [s, T - 1], edit=edit, route=route, B=B, cache=nr.prefix(ids, s, B=B))
         again = nr.logits(ids, [s, T - 1], edit=edit, route=route, B=B, cache=nr.prefix(ids, s, B=B))
     assert torch.allclose(full, part, atol=1e-4) and torch.equal(part, again)
+
+
+def test_fixed_mask_reference(tiny):
+    nr, _, ids, _ = tiny
+    T = len(ids)
+    with torch.no_grad():
+        ref = nr.logits(ids, [T - 1], B=2)
+        nr.fixed = True
+        try:
+            same = nr.logits(ids, [T - 1], B=2)                 # the unedited run: the same reference values
+            g = torch.Generator().manual_seed(5)
+            noise = [1 + 1e-6 * torch.randn(T, nr.D, generator=g) for _ in range(nr.L)]
+            moved = nr.logits(ids, [T - 1], B=2, edit=lambda i, h: h * noise[i])
+            other = torch.randint(0, 64, (T,), generator=g).tolist()
+            both = nr.logits(torch.tensor([ids, other]), [T - 1])   # rows with their own masks
+            alone = nr.logits(other, [T - 1])
+        finally:
+            nr.fixed = False
+    assert torch.allclose(ref, same, atol=1e-5) and float((moved - same).abs().max()) < 1e-3
+    assert torch.allclose(both[1], alone[0], atol=1e-5) and torch.allclose(both[0], same[0], atol=1e-5)

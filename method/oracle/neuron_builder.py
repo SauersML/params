@@ -60,6 +60,10 @@ CAL_ROWS = slice(1000, 1200)   # general.jsonl's calibration chats (maxima; the 
 MASSIVE = 0.25        # a value at least this share of the layer's largest neuron maximum is massive (kept live, no unit)
 ALTERNATIVES = 5
 CANDIDATES = 512      # units measured alone
+FIXED = False         # the weak zeroing as a fixed mask per input: the values weak in that input's own unedited run are
+# zeroed, never re-thresholded under edits (re-thresholding makes the reference discontinuous: on Qwen3-0.6B a 1e-6
+# relative change of every MLP value moves the answer's logits by 0.51 against the model's 0.0001; the fixed mask 0.00006)
+MASKS_KEPT = 8        # inputs whose fixed masks stay cached (the prompt and its counterfactuals)
 PREFIX = False        # runs whose edits all lie at or after a position reuse the positions before it (float32 only: in
 # bfloat16 a run's numbers move with its shapes, as with its batch size). Off: on 12 float32 Qwen3-8B prompts 5 records
 # searched to >= 0.9 restored measured 0.84-0.90 in the record's full run, and the padded edits ate the time saved. A
@@ -99,6 +103,9 @@ class Neurons:
         self.mx = None           # [L, D] each neuron's largest |value| on the calibration texts
         self.massive = None      # [L] massive value per layer
         self.tau = None          # [L] each layer's weak fraction
+        self.fixed = FIXED       # the weak zeroing as each input's fixed mask (FIXED)
+        self._masks = {}         # input ids -> [L] [T, D] bool: its unedited run's strong values
+        self._cur = None         # [L] [B or 1, T, D] the masks of the run in progress
 
     @contextlib.contextmanager
     def hooks(self, edit=None, capture: dict | None = None, route=None):
@@ -115,7 +122,9 @@ class Neurons:
                 hs.append(layer.self_attn.o_proj.register_forward_pre_hook(opre))
             def pre(mod, args, i=i):
                 h = args[0]
-                if self.thr is not None:
+                if self._cur is not None:
+                    h = h * self._cur[i].to(h.dtype)
+                elif self.thr is not None:
                     h = h * (h.abs() >= self.thr[i].to(h.device, h.dtype)).to(h.dtype)
                 if edit is not None:
                     h = edit(i, h)
@@ -137,20 +146,48 @@ class Neurons:
         before start as zeros, their edits ignored), positions must be start or later, no capture."""
         x = torch.as_tensor(ids, device=self.dev)
         x = x[None].expand(B, -1) if x.dim() == 1 else x
+        masks = self.masks(x)
         if cache is None:
-            with self.hooks(edit, capture, route):
-                h = self.core.model(input_ids=x).last_hidden_state[:, positions]
+            self._cur = masks
+            try:
+                with self.hooks(edit, capture, route):
+                    h = self.core.model(input_ids=x).last_hidden_state[:, positions]
+            finally:
+                self._cur = None
             return self.core.lm_head(h).float()
         s, kv = cache
+        self._cur = None if masks is None else [m[:, s:] for m in masks]
 
         def pad(f):
             return None if f is None else (lambda i, a: f(i, torch.cat([a.new_zeros(a.shape[0], s, a.shape[2]), a], 1))[:, s:])
         T, dt = x.shape[1], next(self.core.parameters()).dtype   # (the causal mask given whole: transformers 4.53 on
         mask = torch.full((T - s, T), torch.finfo(dt).min, dtype=dt, device=self.dev).triu(s + 1)   # torch 2.4 failed to
-        with self.hooks(pad(edit), None, pad(route)):                                               # build it for a cache)
-            h = self.core.model(input_ids=x[:, s:], past_key_values=copy.deepcopy(kv), use_cache=True,
-                                attention_mask=mask[None, None].expand(x.shape[0], 1, -1, -1)).last_hidden_state
+        try:
+            with self.hooks(pad(edit), None, pad(route)):                                           # build it for a cache)
+                h = self.core.model(input_ids=x[:, s:], past_key_values=copy.deepcopy(kv), use_cache=True,
+                                    attention_mask=mask[None, None].expand(x.shape[0], 1, -1, -1)).last_hidden_state
+        finally:
+            self._cur = None
         return self.core.lm_head(h[:, [p - s for p in positions]]).float()
+
+    @torch.no_grad()
+    def masks(self, x: torch.Tensor):
+        """With fixed (and a reference), per layer [B or 1, T, D] bool: each row's strong values in its own unedited
+        weak-zeroed run (cached for MASKS_KEPT inputs); else None."""
+        if not self.fixed or self.thr is None:
+            return None
+        rows = [tuple(r) for r in x.tolist()]
+        for r in dict.fromkeys(rows):
+            if r not in self._masks:
+                cap = {}
+                with self.hooks(None, cap):
+                    self.core.model(input_ids=torch.tensor([r], device=self.dev))
+                self._masks[r] = [h[0] != 0 for h in cap["h"]]
+                while len(self._masks) > MASKS_KEPT:
+                    self._masks.pop(next(iter(self._masks)))
+        if len(set(rows)) == 1:
+            return [m[None] for m in self._masks[rows[0]]]
+        return [torch.stack([self._masks[r][i] for r in rows]) for i in range(self.L)]
 
     @torch.no_grad()
     def prefix(self, ids, start: int, edit=None, route=None, B: int = 1):
@@ -158,8 +195,13 @@ class Neurons:
         positions only), for logits(cache=)."""
         x = torch.as_tensor(ids, device=self.dev)
         x = x[None].expand(B, -1) if x.dim() == 1 else x
-        with self.hooks(edit, None, route):
-            return start, self.core.model(input_ids=x[:, :start], use_cache=True).past_key_values
+        masks = self.masks(x)
+        self._cur = None if masks is None else [m[:, :start] for m in masks]
+        try:
+            with self.hooks(edit, None, route):
+                return start, self.core.model(input_ids=x[:, :start], use_cache=True).past_key_values
+        finally:
+            self._cur = None
 
     @torch.no_grad()
     def maxima(self, seqs: list[list[int]]) -> torch.Tensor:

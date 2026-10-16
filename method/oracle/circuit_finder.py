@@ -78,6 +78,12 @@ CONDITIONAL = True    # after a round with no passing prefix, group testing agai
 # on Qwen3-8B capital/Egypt/p1 and 40+ min on an owl pair's source cut)
 FLOOR = True          # eps never below the measured share of a no-op patch (Qwen3-8B bfloat16 capital/Finland/p0: the
 # source cut's eps / 4 round at 0.005 split 34,644 blocks to single units, a passing prefix of 21,598)
+FLOOR_STRIDE = 1      # the floor's no-op patches: every FLOOR_STRIDE-th (layer, position) block (1: every one; the source
+# cut's nulls are a first level of group testing, 1.2 s of a Qwen3-8B bfloat16 question on an A6000)
+RESIDUAL_MAP = True   # each layer's residual input at each position noised and denoised alone, recorded (no decision reads
+# it: 1.2 s of a Qwen3-8B bfloat16 question on an A6000)
+UNREACHABLE = True    # a cut whose ceiling fails is group-tested at EPS for the record's singles (it has no units either
+# way: 0.45 s of a Qwen3-8B bfloat16 question, its readout)
 BEAM = 32             # conditional rounds by beams of this many blocks (beams), stopping once their singles pass with
 # the round's earlier ones (0: group testing over every block above eps, every single unit reached). Qwen3-8B bfloat16,
 # 8 dev questions (A40): the same circuits, 24,668 -> 23,283 measured runs, 81.4 -> 77.2 s (capital/Italy/p2's
@@ -923,7 +929,7 @@ def floor(pt: Patcher, kind: str, positions) -> float:
     if not FLOOR or pt.core.model.embed_tokens.weight.dtype == torch.float32:
         return 0.0
     width = pt.H if kind == "head" else pt.D
-    nulls = [[unit(kind, i, p, torch.arange(width)) + ("self",)] for i in range(pt.L) for p in positions]
+    nulls = [[unit(kind, i, p, torch.arange(width)) + ("self",)] for i in range(pt.L) for p in positions][::FLOOR_STRIDE]
     return max(max(abs(a), abs(b)) for a, b in pt.both(nulls))
 
 
@@ -1017,7 +1023,7 @@ def cut(pt: Patcher, sc: dict, kind: str, positions, done: dict, log=None, searc
             lo, hi = (lo, mid) if passes(pt.both([sets_of(mid)])[0]) else (mid, hi)
         return hi, g, got
     order, cond, cond_next = [], [], False
-    for rnd in range(EPS_ROUNDS if reach else 1):
+    for rnd in range(EPS_ROUNDS if reach else 1 if UNREACHABLE else 0):
         if rnd == 0 or not CONDITIONAL or not cond_next:
             singles.update(group_test(pt, sc, eps, done, kinds=(kind,), positions=search, blocks=blocks, log=log))
             order = sorted([u for u in singles if u not in cond], key=lambda u: -max(abs(singles[u][0]), abs(singles[u][1]))) + cond
@@ -1119,10 +1125,11 @@ def find(pt: Patcher, clean: list[int], corrupt: list[int], answers: list[int] |
                    seconds=round(time.perf_counter() - t0, 2))
         return rec
     pos = list(range(pt.first, pt.T))
-    rmap = pt.both([[("res", i, p)] for i in range(pt.L) for p in pos])     # [L x positions] (lost, restored)
-    n = len(pos)
-    rec["residual_map"] = {"positions": pos, "lost": [[rmap[i * n + j][0] for j in range(n)] for i in range(pt.L)],
-                           "restored": [[rmap[i * n + j][1] for j in range(n)] for i in range(pt.L)]}
+    if RESIDUAL_MAP:
+        rmap = pt.both([[("res", i, p)] for i in range(pt.L) for p in pos])     # [L x positions] (lost, restored)
+        n = len(pos)
+        rec["residual_map"] = {"positions": pos, "lost": [[rmap[i * n + j][0] for j in range(n)] for i in range(pt.L)],
+                               "restored": [[rmap[i * n + j][1] for j in range(n)] for i in range(pt.L)]}
     # the source cut searches every position: a screen of positions by their residual map lost circuits (Qwen3-1.7B
     # capital/France p0 and p1: the source cut unmet when positions whose residual reaches EPS were searched, [8, 11, 13]
     # of 8..22, and when the fewest positions passing the ceiling were, [8]; met with 6 neurons over every position):

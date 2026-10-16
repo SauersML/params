@@ -429,7 +429,9 @@ def label(a) -> None:
                                                                  temperature=0.7, seed=a.seed), a.seed))
         for r, g2 in zip(todo, got, strict=True):
             r.setdefault("scores", {})[length] = {"seed": a.seed, "valid": g2.get("valid"), "pass": bool(g2.get("valid") and g2.get("passes_t1")),
-                                                 **{k: g2.get(k) for k in ("blind_max", "near_miss_rate", "distant_rate", "steer_match")}}
+                                                 **{k: g2.get(k) for k in ("blind_max", "near_miss_rate", "distant_rate", "steer_match")},
+                                                 "values": {"blind": g2.get("blind_values"), "near": g2.get("near_values"),
+                                                            "distant": g2.get("distant_values")}}  # shares of corpus_max: any rule re-scores
         a.out.write_text("".join(json.dumps(r, allow_nan=False) + "\n" for r in rows))
         print(f"{length}: {sum(r['scores'][length]['pass'] for r in todo)}/{len(rows)} groups pass on fresh texts; ${spent():.3f}", flush=True)
     log_spend(f"{tag} fresh-text scores", spent() - s0, f"{len(todo)} groups, both blind lengths, seed {a.seed}; {a.out}")
@@ -456,7 +458,9 @@ def rescore(a) -> None:
         for r, g2 in zip(todo, got, strict=True):
             r.setdefault("scores", {})[length] = {"seed": a.seed, "fire": g2.get("fire"), "valid": g2.get("valid"),
                                                  "pass": bool(g2.get("valid") and g2.get("passes_t1")),
-                                                 **{k: g2.get(k) for k in ("blind_max", "near_miss_rate", "distant_rate", "steer_match")}}
+                                                 **{k: g2.get(k) for k in ("blind_max", "near_miss_rate", "distant_rate", "steer_match")},
+                                                 "values": {"blind": g2.get("blind_values"), "near": g2.get("near_values"),
+                                                            "distant": g2.get("distant_values")}}  # shares of corpus_max: any rule re-scores
         print(f"{length}: {sum(r['scores'][length]['pass'] for r in todo)}/{len(todo)} groups pass at their fire level; ${rd.spend.total:.3f}", flush=True)
     a.labels.write_text("".join(json.dumps(r, allow_nan=False) + "\n" for r in rows))
     log_spend(f"varteach groups {a.labels.stem} rescore at q{FIRE_Q}", rd.spend.total, f"{len(todo)} groups, both blind lengths; {a.labels}")

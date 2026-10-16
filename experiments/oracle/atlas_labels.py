@@ -328,7 +328,9 @@ def score(a) -> None:
         for r, g in zip(todo, got, strict=True):
             r.setdefault("scores", {})[length] = {"seed": a.seed, "corpus_max": g["corpus_max"], "valid": g.get("valid"),
                                                  "pass": bool(g.get("valid") and g.get("passes_t1")),
-                                                 **{k: g.get(k) for k in ("blind_max", "near_miss_rate", "distant_rate", "steer_match")}}
+                                                 **{k: g.get(k) for k in ("blind_max", "near_miss_rate", "distant_rate", "steer_match")},
+                                                 "values": {"blind": g.get("blind_values"), "near": g.get("near_values"),
+                                                            "distant": g.get("distant_values")}}  # shares of corpus_max: any rule re-scores
         ok = [r["scores"][length] for r in todo]
         print(f"{length}: {sum(x['pass'] for x in ok)}/{len(rows)} poles pass on fresh texts; spend ${rd.spend.total:.3f}", flush=True)
     a.labels.write_text("".join(json.dumps(r, allow_nan=False) + "\n" for r in rows))

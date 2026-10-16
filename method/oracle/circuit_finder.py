@@ -59,7 +59,7 @@ ROWS = 32
 ATTENDS = 3           # source positions recorded per head
 PREFIX = True         # a batch whose patches all lie at or after a position runs only the positions from there on, the
 # base run's keys and values before it cached (no weak zeroing here, so the cached run equals the full one to float error)
-PREFIXES = 4          # cached prefixes per patching pair
+PREFIXES = 8          # cached prefixes per patching pair
 BATCH_TOKENS = 256    # a cached batch runs max(ROWS, BATCH_TOKENS / its positions) rows (at most MAX_ROWS): a forward of
 MAX_ROWS = 256        # few positions reads every weight for few tokens (float32, no weak zeroing: the batch size moves
 # a share by float error only)
@@ -190,12 +190,25 @@ class Patcher:
         tuple of them (a block), each set to its value in the other run (or in the run a fifth element names: "clean"
         or "corrupt", a head frozen at its value there), in the base run ("clean" or "corrupt"): the share of the gap
         lost (base clean) or restored (base corrupt)."""
+        # units before the first differing token have the same value in both runs (patching them changes nothing): each
+        # set runs from the first position it touches, the base run's prefix before it cached (PREFIX); sets are grouped
+        # by that start, a group of fewer than ROWS sets joining the next lower start
+        starts = [min([_pos(u) for u in st if _pos(u) >= self.first], default=self.T - 1) if PREFIX else 0 for st in sets]
+        out, carry = [None] * len(sets), []
+        levels = sorted(set(starts), reverse=True)
+        for j, st in enumerate(levels):
+            carry += [b for b, v in enumerate(starts) if v == st]
+            if len(carry) < self.rows and j < len(levels) - 1:
+                continue
+            for b, v in zip(carry, self._run_from(base, [sets[b] for b in carry], st)):
+                out[b] = v
+            carry = []
+        return out
+
+    def _run_from(self, base: str, sets: list, start: int) -> list[float]:
+        """run's shares for sets patching only positions from start on (those before it ignored)."""
         other = "corrupt" if base == "clean" else "clean"
-        pos_of = lambda u: u[2] if u[0] in ("res", "neuron") else u[3]  # noqa: E731
-        # units before the first differing token have the same value in both runs (patching them changes nothing): the
-        # positions from the first a set touches on run, the base run's prefix before it cached (PREFIX)
-        touched = [pos_of(u) for st in sets for u in st if pos_of(u) >= self.first]
-        start = min(touched, default=self.T - 1) if PREFIX else 0
+        pos_of = _pos
         R = min(MAX_ROWS, max(self.rows, BATCH_TOKENS // (self.T - start))) if start > 0 else self.rows
         R = min(R, max(self.rows, len(sets)))
         cache = self._prefix(base, start, R) if start > 0 else None
@@ -292,6 +305,10 @@ class Patcher:
 
 
 _ZERO = np.zeros(1, dtype=np.int64)
+
+
+def _pos(u: tuple) -> int:
+    return u[2] if u[0] in ("res", "neuron") else u[3]
 
 
 def group_test(pt: Patcher, sc: dict, eps: float, done: dict, kinds=("neuron",), positions=None, measure=None, log=None) -> dict:

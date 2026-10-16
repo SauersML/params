@@ -55,6 +55,8 @@ import torch
 
 TOL = 0.1  # the contrast may move this share of the way from the run with every edge to the run with none, either way
 MIN_TOL = 0.01  # bits: at least this much
+GAP_TOL = 0.01  # patching: and at least this share of the question's gap (clean minus corrupted contrast), so circuit
+# edges that together move a sliver of the gap are not stated to a precision of that sliver
 IN_EDGES = 256  # each reader's candidate in-edges measured on it (by local effect)
 EPS = tuple(round(0.5 * 2 ** (-i / 2), 4) for i in range(14))  # each reader's relative errors tried: 0.5 to 0.006
 BITS = tuple(round(2 ** (-i / 2), 4) for i in range(20))  # or each reader's error allowed this share of the tolerance in
@@ -123,9 +125,11 @@ class Edges:
             assert len(corrupt_ids) >= self.T, "patching needs prompts of one length"
             with torch.no_grad():
                 self.cbase = self._run(torch.zeros(1, 0, dtype=torch.bool), [], keep_states=True, ids=list(corrupt_ids)[:self.T])
+            self.c_corrupt = float(self.cbase["contrast"][0])
             self.patch = True
         self.c_full = float(self.base["contrast"][0]) if self.dt == torch.float32 else \
             self.contrasts(torch.zeros(1, 0, dtype=torch.bool), [])[0]  # (padded as every other forward)
+        self.gap = self.c_full - self.c_corrupt if self.patch else None  # (the question's gap: clean minus corrupted)
 
     # -- the run (each module in the model's dtype on its own card, everything between in float32) -------------------
 
@@ -617,7 +621,8 @@ def prune(ed: Edges, log=print) -> dict:
     N = len(ed.N)
     c_all = ed.c_full
     c_none = ed.contrasts(torch.zeros(1, 0, dtype=torch.bool), [], rest=True)[0]
-    tol = max(TOL * abs(c_all - c_none), MIN_TOL)  # (two-sided: a kept set that overshoots is no more faithful)
+    tol = max(TOL * abs(c_all - c_none), MIN_TOL, GAP_TOL * abs(ed.gap) if ed.patch else 0.0)  # (two-sided: a kept set
+    # that overshoots is no more faithful)
     ok = lambda c: abs(c - c_all) <= tol  # noqa: E731
     cands = ed.in_edges(IN_EDGES)
     curves = ed.local_curves(cands)
@@ -719,7 +724,8 @@ def prune(ed: Edges, log=print) -> dict:
         strengths[a] = c_kept - c
     measured += 2 + len(readers) + len(trial)
     best = int(ed.base["lp"][0].argmax())
-    rec = {"contrast_model": ed.c_full, "reference_top": best, "answer_top": best in ed.answer, "contrast_all_edges": c_all, "contrast_no_edges": c_none, "contrast_kept": c_kept,
+    rec = {"contrast_model": ed.c_full, "reference_top": best, "answer_top": best in ed.answer, "gap": ed.gap,
+           "edges_share_of_gap": (c_all - c_none) / ed.gap if ed.patch and ed.gap else None, "contrast_all_edges": c_all, "contrast_no_edges": c_none, "contrast_kept": c_kept,
            "contrast_graph_cut": c_cut, "tolerance": tol, "met": bool(passing) and ok(c_kept),
            "allowance": list(allow[pick][:2]),
            "candidates": {"resid": len(ed.resid_all), "route": ed.n_routes,

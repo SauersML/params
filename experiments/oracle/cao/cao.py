@@ -1070,7 +1070,8 @@ def train(a) -> None:
             raise ValueError('controlled training requires prospective data, local init, donor plan and frozen schedule')
         initial_adapter=native_adapter_binding(a.init)
     o = Oracle(AO if not a.init else a.init, a.device, trainable=True, **({'model':str(snapshot)} if snapshot else {}))
-    o.lm.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+    if os.environ.get("CAO_CHECKPOINT", "1") == "1":  # (recomputation: a quarter more time, for the memory of long prompts)
+        o.lm.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
     if getattr(a,'native_control',None):
         if not prospective or not a.control_plan or schedule is None:raise ValueError('controlled training requires prospective data, donor plan and frozen schedule')
         configure_native_controls(o,a.native_control,a.control_plan)
@@ -1109,7 +1110,7 @@ def train(a) -> None:
         torch.nn.utils.clip_grad_norm_(o.m.parameters(), 1.0)
         opt.step()
         opt.zero_grad(set_to_none=True)
-        if s % 50 == 0:
+        if s % (10 if steps < 500 else 50) == 0:
             print(json.dumps({"step": s, "loss": round(loss, 4), "seconds": round(time.time() - t0, 1)}), flush=True)
         if prospective:
             print(json.dumps({'completed_steps':s+1,'total_steps':steps,'seconds':time.time()-t0,

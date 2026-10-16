@@ -2,8 +2,8 @@
 text's half-depth activations (the Activation Oracle's read), the oracle reads the neurons of a question-scoped circuit
 (method/oracle/neuron_builder.py: the answer contrast on the weak-zeroed reference, a unit one neuron's value at one
 position) in measured order: the circuit's units, then the builder's strongest measured singles beyond it; a random
-number of them from MIN_SHOWN up to all, so that how many to show is chosen afterwards by held-out accuracy (the lead's
-10-15: no fixed cap). Each shows as its name, "L<layer>.N<neuron>+@<position>" ("-" for the negative pole: claim_check's
+number of them, log-uniform from MIN_SHOWN up to all, so that how many to show is chosen afterwards by held-out accuracy
+(the lead's 10-15: no fixed cap; eval reports accuracy by the number shown). Each shows as its name, "L<layer>.N<neuron>+@<position>" ("-" for the negative pole: claim_check's
 unit syntax), and its write (its value x its down_proj column, cao.Oracle.write). The questions, every answer measured
 by method/oracle/claim_check.py, the oracle's reward checker, so that the claim an answer ends with passes there:
 
@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import random
 import sys
 import time
@@ -87,7 +88,8 @@ def text_examples(o: "cao.Oracle", nr, ids: list[int], rng: random.Random, rec: 
     order = measured_order(rec)
     if not order:
         return [], {"size": 0}
-    shown = order[:rng.randint(min(MIN_SHOWN, len(order)), len(order))]
+    lo = min(MIN_SHOWN, len(order))  # a count log-uniform from MIN_SHOWN to all (a shown unit is ~16 tokens: uniform counts
+    shown = order[:round(math.exp(rng.uniform(math.log(lo), math.log(len(order)))))]  # made 8B prompts 2,734 tokens on average)
     names = [name(d) for d in shown]
     blocks = [{"layer": cao.MID, "positions": list(range(len(ids)))}] + [{"label": n, "write": [d["layer"], d["neuron"], value(d)]}
                                                                           for n, d in zip(names, shown)]
@@ -222,6 +224,11 @@ def evaluate(a) -> None:
                    "claim_pass": bool(r.get("pass")), "claim_specific": bool(r.get("specific"))}
             by[e["cat"]].append(rec)
             fh.write(json.dumps(rec) + "\n")
+    for lo, hi in ((1, 8), (9, 32), (33, 128), (129, 10 ** 6)):  # by the number of units shown (the count to show is chosen
+        rs = [r for v in by.values() for r in v if lo <= r["shown"] <= hi]  # by held-out accuracy, the lead's 10-15)
+        if rs:
+            print(f"shown {lo}-{hi if hi < 10 ** 6 else 'all'}: n={len(rs)} same sentence {sum(r['same_sentence'] for r in rs) / len(rs):.3f}  "
+                  f"specific {sum(r['claim_specific'] for r in rs) / len(rs):.3f}")
     for cat, rs in sorted(by.items()):
         common = collections.Counter(r["a"].split("\n")[0].split(":")[-1] for r in rs).most_common(1)[0][1] / len(rs)
         print(f"{cat:8s} n={len(rs):4d} same sentence {sum(r['same_sentence'] for r in rs) / len(rs):.3f}  claims passing "

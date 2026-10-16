@@ -54,7 +54,7 @@ python -u organisms.py examples --dir $O/organisms --out $O/organism_examples.js
   orgeval) AD=${ADAPTER_DIR:+$S/adapter}; AD=${AD:-$AOAD}
         WORK="python -u cao.py organisms --organisms $S/organisms --adapter $AD --out $O/orgeval.jsonl > $O/orgeval.log 2>&1; \
 python -u cao.py organisms --organisms $S/organisms --adapter $AD --out $O/orgeval_text_only.jsonl --text-only > $O/orgeval_text_only.log 2>&1" ;;
-  train) WORK="CAO_MICRO=${MICRO:-4} python -u cao.py train --data $S/data.jsonl --out $O/adapter ${STEPS:+--steps $STEPS} \
+  train) WORK="CAO_MICRO=${MICRO:-4} CAO_CHECKPOINT=${CHECKPOINT:-1} python -u cao.py train --data $S/data.jsonl --out $O/adapter ${STEPS:+--steps $STEPS} \
 ${VECTORS:+--vectors $S/vectors.pt} ${INIT:+--init $S/init} --save-every ${SAVE_EVERY:-2000} > $O/train.log 2>&1; \
 ${G2EVAL:+python -u g2.py eval --items $S/g2eval.jsonl --thr $S/thr.pt --adapter $O/adapter/step_$STEPS --out $O/g2_eval.jsonl > $O/g2_eval.log 2>&1; \
 python -u g2.py eval --items $S/g2eval.jsonl --thr $S/thr.pt --adapter $O/adapter/step_$STEPS --out $O/g2_eval_text_only.jsonl --text-only > $O/g2_eval_text_only.log 2>&1;} true" ;;

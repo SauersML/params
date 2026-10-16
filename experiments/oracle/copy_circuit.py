@@ -2,9 +2,10 @@
 neurons, every number a measured intervention (head_routes.Runner). A copy text repeats a cue token: "... met Daniel
 Kowalczyk at ... Daniel" -> " Kowalczyk" (or an adjective and its noun); its corrupted twin replaces the first cue with
 another token of the same length, so nothing earlier matches the final cue. Positions: cue1 (the first cue), next1 (the
-token after it: the answer's first token), cue2 (the last position, the second cue). Contrast: log2 p(answer) - log2 of
-the summed p of the alternatives (the clean run's five likeliest others and the corrupted run's top token), gap = clean
-- corrupted.
+token after it: the answer's first token), cue2 (the last position, the second cue). Contrast: the word contrast
+(answer_contrast.py): log2 of the summed p of every token starting the copied word against that of the tokens starting
+other words (the corrupted run's first); a text is usable when the clean run's top token starts the copied word and the
+gap (clean - corrupted) is at least GAP_MIN bits.
 
 Stages (all texts; roles and circuit units chosen on the dev texts, everything reported on every text):
  A1 heads: each head zeroed at positions cue1.. and each patched there from the corrupted run (shares of the gap lost);
@@ -36,6 +37,7 @@ from pathlib import Path
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "method" / "oracle"))
+import answer_contrast  # noqa: E402
 import head_routes  # noqa: E402
 
 FIRST = ["Daniel", "Marcus", "Peter", "Laura", "Simon", "Helen", "Oliver", "Grace", "Victor", "Nina", "Hugo", "Clara",
@@ -50,8 +52,8 @@ ADJ = ["purple", "wooden", "silver", "broken", "tiny", "golden", "rusty", "velve
 NOUN = ["lantern", "kettle", "compass", "ladder", "violin", "teapot", "anchor", "basket", "candle", "helmet", "mirror",
         "saddle", "trumpet", "barrel", "chess", "hammer", "pillow", "rocket", "statue", "wagon"]
 TEMPLATES = [  # ({a} the cue, {b} the copied word); every template ends with the cue
-    ("met", "name", "Yesterday I met {a} {b} at the train station. We talked for a while about the weather, the delays and"
-                    " our plans for the weekend. Before we said goodbye, {a}"),
+    ("met", "name", "Yesterday I met {a} {b} at the train station. We talked for a while about the weather and the delays."
+                    " When I got home, I wrote down the full name of my new friend: {a}"),
     ("report", "name", "The report was written by {a} {b}, a researcher at the city museum. It describes three old maps"
                        " and a letter found in the archive. According to the museum, {a}"),
     ("chair", "name", "At the meeting, the chair introduced {a} {b} as the new treasurer. Several members asked questions"
@@ -68,6 +70,7 @@ READERS = 32        # readers measured in full runs per induction head (by exact
 MATTERS = 0.1       # a unit matters on a text when its measured share of the gap is at least this
 SHARE_DEV = 0.3     # the circuit: units that matter on at least this share of the dev texts
 GAP_MIN = 2.0       # bits: a usable text's clean - corrupted contrast
+STEPS = 6           # tokens each candidate is continued to read the word it starts (surnames run to several tokens)
 
 
 def make_texts(tok, n: int, seed: int = 0) -> list[dict]:
@@ -100,7 +103,7 @@ def make_texts(tok, n: int, seed: int = 0) -> list[dict]:
 class Text:
     """One copy text on the runner: both runs' states, the contrast, and measured shares."""
 
-    def __init__(self, rn: head_routes.Runner, t: dict):
+    def __init__(self, rn: head_routes.Runner, t: dict, tok):
         self.rn, self.t = rn, t
         self.ids, self.bad = t["ids"], t["corrupt_ids"]
         self.p1, self.n1, self.q = t["pos"]["cue1"], t["pos"]["next1"], t["pos"]["cue2"]
@@ -108,29 +111,28 @@ class Text:
         clean = rn.run(self.ids, [{}], capture=True)
         corrupt = rn.run(self.bad, [{}], capture=True)
         lc, lb = clean["lp"][0], corrupt["lp"][0]
-        alt = [int(z) for z in lc.topk(6).indices.tolist() if z != t["answer"]][:5]
-        yb = int(lb.argmax())
-        if yb != t["answer"] and yb not in alt:
-            alt.append(yb)
-        self.alt = alt
+        with torch.no_grad():  # (the word contrast: every token starting the copied word against other words' tokens)
+            sets = answer_contrast.token_sets(rn.core, tok, self.ids, lc, b=int(lb.argmax()), steps=STEPS)
+        self.ans, self.alt, self.words = sets["answer"], sets["alternatives"], sets
         self.st, self.sb = clean["states"], corrupt["states"]
         self.top = int(lc.argmax())
+        self.word_ok = sets["answer_word"] == answer_contrast.word(" " + t["word"])
         self.c = float(self._c(lc[None])[0])
         self.cb = float(self._c(lb[None])[0])
         self.gap = self.c - self.cb
 
     def _c(self, lp):
-        self.rn.answer, self.rn.alternatives = [self.t["answer"]], self.alt
+        self.rn.answer, self.rn.alternatives = self.ans, self.alt
         return self.rn.contrast(lp)
 
     def lost(self, sets: list[dict]) -> list[float]:
         """Each set's share of the gap lost in the clean run."""
-        self.rn.answer, self.rn.alternatives = [self.t["answer"]], self.alt
+        self.rn.answer, self.rn.alternatives = self.ans, self.alt
         return [(self.c - c) / self.gap for c in self.rn.run(self.ids, sets)["contrast"]]
 
     def restored(self, sets: list[dict]) -> list[float]:
         """Each set's share of the gap restored in the corrupted run."""
-        self.rn.answer, self.rn.alternatives = [self.t["answer"]], self.alt
+        self.rn.answer, self.rn.alternatives = self.ans, self.alt
         return [(c - self.cb) / self.gap for c in self.rn.run(self.bad, sets)["contrast"]]
 
     def head_from(self, st, L, h, positions):
@@ -240,9 +242,10 @@ def main():
     log = lambda m: print(f"[{time.time() - t0:7.1f}s] {m}", flush=True)  # noqa: E731
     txs, a1 = [], {}
     for t in texts:
-        tx = Text(rn, t)
-        t.update(contrast=tx.c, corrupt_contrast=tx.cb, gap=tx.gap, top=tx.top, alternatives=tx.alt,
-                 usable=tx.top == t["answer"] and tx.gap >= GAP_MIN)
+        tx = Text(rn, t, tok)
+        t.update(contrast=tx.c, corrupt_contrast=tx.cb, gap=tx.gap, top=tx.top, answer_tokens=tx.ans, alternatives=tx.alt,
+                 answer_word=tx.words["answer_word"], alternative_words=tx.words["alternative_words"],
+                 usable=tx.word_ok and tx.gap >= GAP_MIN)
         if not t["usable"]:
             log(f"{t['id']}: not usable (top {tok.decode([tx.top])!r}, gap {tx.gap:.2f})")
             continue
@@ -337,16 +340,18 @@ def main():
         swap = None
         if mates:
             o = mates[0]
-            rn.answer, rn.alternatives = [o.t["answer"]], [tx.t["answer"]]
+            rn.answer, rn.alternatives = o.ans, tx.ans  # (the other text's word against this one's)
             c0 = rn.run(tx.ids, [{}])["contrast"][0]
             c1 = rn.run(tx.ids, [units(tx, circ, o.st)])["contrast"][0]
             c2 = rn.run(o.ids, [{}])["contrast"][0]
             swap = {"with": o.t["id"], "share": (c1 - c0) / (c2 - c0) if c2 != c0 else None}
         scores[tx.t["id"]] = {"necessity_lost": nec, "sufficiency_restored": suf, "swap": swap, "dev": tx.t["id"] in dev_ids}
         log(f"{tx.t['id']}: necessity {nec:.2f}, sufficiency {suf:.2f}, swap {swap}")
-    out = {"model": a.model, "dtype": a.dtype, "texts": [{k: t[k] for k in ("id", "template", "kind", "text", "cue", "word",
-                                                                           "replacement", "pos", "answer", "contrast",
-                                                                           "corrupt_contrast", "gap", "usable")} for t in texts],
+    out = {"model": a.model, "dtype": a.dtype, "texts": [{k: t.get(k) for k in ("id", "template", "kind", "text", "cue", "word",
+                                                                               "replacement", "pos", "answer", "answer_tokens",
+                                                                               "answer_word", "alternatives", "alternative_words",
+                                                                               "contrast", "corrupt_contrast", "gap", "usable")}
+                                                         for t in texts],
            "dev": dev_ids, "heads": circ_heads, "neurons": circ_neurons, "edges": edges, "scores": scores,
            "roles": {r: [f"{L}.{h}" for L, h in v] for r, v in roles.items()},
            "attention": {f"{L}.{h}": {"induction": sum(a1[t]["induction"][i] for t in ids) / len(ids),

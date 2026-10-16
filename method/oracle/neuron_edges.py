@@ -64,7 +64,6 @@ BITS = tuple(round(2 ** (-i / 2), 4) for i in range(20))  # or each reader's err
 MEASURED = 512  # kept edges whose own cut from the graph is measured (those of largest share of their reader's strength)
 HALVE_BLOCKS = 8
 TOKENS = 1536  # cut sets a forward: this many tokens' worth (at least 16 sets)
-CHUNK = 1 << 28  # floats a step of listed resid edges takes (sets x edges x d)
 
 
 def weight(mod) -> torch.Tensor:
@@ -220,7 +219,12 @@ class Edges:
             else:
                 route.setdefault(ed[1], []).append((e, self.at[ed[0]], self.at[ed[2]]))
         t = lambda xs, L: tuple(torch.tensor([x[i] for x in xs], dtype=torch.long, device=self._d(L)) for i in range(3))  # noqa: E731
-        plan = {"resid": {L: t(v, L) for L, v in resid.items()}, "route": {}, "heads": {}}
+        plan = {"resid": {}, "route": {}, "heads": {}}
+        for L, v in resid.items():  # (with each layer's writers and readers once each)
+            es, wi, ri = t(v, L)
+            wu, wl = wi.unique(return_inverse=True)
+            ru, rl = ri.unique(return_inverse=True)
+            plan["resid"][L] = (es, wi, wu, wl, ru, rl)
         for k, v in route.items():
             es, wi, ri = t(v, k[0])
             plan["route"][k] = (es, wi, ri, *ri.unique(return_inverse=True))
@@ -302,13 +306,12 @@ class Edges:
                 Hc = Hc.index_copy(1, rs, hm[kk[:, None], P[rs][None], Jn[rs][None]])
                 if rest:
                     S.index_add_(1, P[rs], Hc[:, rs, None] * self._cols_on(d)[rs])
-            if L in plan["resid"]:
-                es, wi, ri = (t.to(d) for t in plan["resid"][L])
-                cols = self._cols_on(d)
-                n = max(256, CHUNK // (K * cols.shape[1]))
-                for s0 in range(0, len(es), n):
-                    e_, w_, r_ = es[s0:s0 + n], wi[s0:s0 + n], ri[s0:s0 + n]
-                    D.index_add_(1, r_, (coef[:, e_] * Hc[:, w_])[..., None] * cols[w_][None])
+            if L in plan["resid"]:  # the listed resid edges from this layer's writers: a coefficient per (reader, writer)
+                es, wi, wu, wl, ru, rl = plan["resid"][L]
+                C = torch.zeros(K, len(ru), len(wu), device=d)
+                C.index_put_((kk[:, None].expand(-1, len(es)), rl[None].expand(K, -1), wl[None].expand(K, -1)),
+                             coef[:, es] * Hc[:, wi], accumulate=True)
+                D.index_add_(1, ru, C @ self._cols_on(d)[wu])
             x = x + f(layer.mlp.down_proj, hm)
         lp = torch.log_softmax(f(core.lm_head, f(core.model.norm, x[:, self.target])), -1).cpu()
         out = {"contrast": log2_contrast(lp, self.answer, self.alternatives), "lp": lp}

@@ -40,7 +40,7 @@ position alone on 53 and 35), and one ranked prefix for both criteria met 61 and
 needs. Searched over neurons alone the patch keeps the changed token's own positions (Qwen3-0.6B Paris: 17,416 units of
 the token's representation); the routes into the answer position are the narrow cut (Paris: 7 heads, 0.997).
 Every decision is a measured run; the gradient only orders the candidates. Every batch has ROWS rows; a batch whose edits
-all lie at or after a position reuses the keys and values of the positions before it (PREFIX; float32 models).
+all lie at or after a position can reuse the keys and values of the positions before it (PREFIX, off; float32 models).
 """
 from __future__ import annotations
 
@@ -60,8 +60,9 @@ CAL_ROWS = slice(1000, 1200)   # general.jsonl's calibration chats (maxima; the 
 MASSIVE = 0.25        # a value at least this share of the layer's largest neuron maximum is massive (kept live, no unit)
 ALTERNATIVES = 5
 CANDIDATES = 512      # units measured alone
-PREFIX = True         # runs whose edits all lie at or after a position reuse the positions before it (float32 only: in
-# bfloat16 a run's numbers move with its shapes, as with its batch size)
+PREFIX = False        # runs whose edits all lie at or after a position reuse the positions before it (float32 only: in
+# bfloat16 a run's numbers move with its shapes, as with its batch size). Off: on 12 float32 Qwen3-8B prompts 5 records
+# searched to >= 0.9 restored measured 0.84-0.90 in the record's full run, and the padded edits ate the time saved
 ROWS = 32             # runs a batch, every batch padded to it (bfloat16 Qwen3-8B moves the answer's contrast up to 2.3
 # bits between batch sizes 1 and 32, bit-identical at one size whatever the other rows hold)
 SIDE = 8              # positions before the answer whose predictions measure a removal's side effect

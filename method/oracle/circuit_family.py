@@ -245,10 +245,16 @@ def pairs_of(questions: list[dict], variants: int = VARIANTS, skip: int = 0) -> 
     own corrupted key, then its swap partners; a key that occurs more than once in a prompt is skipped)."""
     out = []
     for q in questions:
-        keys = [q["corrupt_key"]] + [p for p in q.get("partners", []) if p != q["corrupt_key"]]
+        users = {}                                  # partners: keys (questions.json) or {key, user} (circuit_devset's sets)
+        for p in q.get("partners", []):
+            if isinstance(p, dict):
+                users[p["key"]] = p["user"]
+            elif q["user"].count(q["key"]) == 1:
+                users[p] = q["user"].replace(q["key"], p)
+        users.setdefault(q["corrupt_key"], q.get("corrupt_user") or q["user"].replace(q["key"], q["corrupt_key"]))
+        keys = [q["corrupt_key"]] + [k for k in users if k != q["corrupt_key"]]
         for ck in keys[skip:skip + variants]:
-            if q["user"].count(q["key"]) == 1:
-                out.append((f"{q['id']}/vs/{ck}", q["user"], q["user"].replace(q["key"], ck)))
+            out.append((f"{q['id']}/vs/{ck}", q["user"], users[ck]))
     return out
 
 

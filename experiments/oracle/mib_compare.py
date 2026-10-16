@@ -542,7 +542,8 @@ def finder_circuits(task: str, mname: str, out: Path, batch: int, test_n: int | 
     """The finder's per-pair circuits as MIB circuits, scored by MIB's evaluate_graph on its test split: a neuron at
     (layer, position) becomes that layer's whole MLP at every position, a head at a position the head (its q, k and v
     inputs) at every position, and a circuit of node set S holds every edge between the input, S and the logits. S is
-    every node in at least t of the pairs' circuits (met or not), for each t. Each of AGAINST's rankings (importances.pt)
+    every node in at least t of the pairs' circuits (met or not), for t near 1, 2 and 1/8, 1/4, 1/2, 3/4 and all of the
+    pairs. Each of AGAINST's rankings (importances.pt)
     is scored at the same edge counts (MIB's top-k with its pruning)."""
     import torch
 
@@ -565,7 +566,9 @@ def finder_circuits(task: str, mname: str, out: Path, batch: int, test_n: int | 
             count[x] = count.get(x, 0) + 1
     res = {"task": task, "model": mname, "pairs": len(recs), "met": sum(bool(r.get("met")) for r in recs), "full": full,
            "none": none, "test_examples": n_test, "node_counts": count, "circuits": []}
-    ts = sorted(set(count.values()), reverse=True)
+    have = sorted(set(count.values()))
+    ts = sorted({min(have, key=lambda t: abs(t - x)) for x in (1, 2, len(recs) / 8, len(recs) / 4, len(recs) / 2,
+                                                               3 * len(recs) / 4, len(recs))}, reverse=True)
     for t in ts:
         S = {x for x, c in count.items() if c >= t}
         g = Graph.from_model(model)

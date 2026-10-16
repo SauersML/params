@@ -3,7 +3,8 @@
 # checkout, sent as a tarball) installed beside the pod's torch, then mib_compare.py rank for each method on each task.
 #   experiments/oracle/pods/mib_pod.sh MODELS TASKS METHODS [NAME] [HOURS]   e.g. llama3 mcqa measured,eap-ig-inputs
 #   (MODELS and TASKS comma lists: every pair MIB's circuit track scores, in that order, models outer)
-#   (measured@none: the measured ranking with --order none; env FROM: an earlier measured run's JSON, its tests rescored)
+#   (measured@none: the measured ranking with --order none; env FROM: an earlier measured run's JSON, its tests rescored;
+#   finder, last: circuit_finder's circuits as MIB circuits beside the task's rankings, mib_compare finder + convert)
 #   env: N (attribution examples, 32; -1: MIB's own counts), REFINE (1000), BATCH (MIB's attribution batch, 16; 4 fits EAP-IG on Llama's 46 GB), EVAL_BATCH (MIB's evaluation batch, BATCH), TEST_N (cap MIB's test split: smoke runs), GPU, PRICE, VRAM, RP_OWNER
 # Results come back to ~/mpd-data/runpod/NAME/out.
 # The whole script is one block, so bash has read all of it before it runs.
@@ -19,6 +20,10 @@ VALID=" ioi_gpt2 ioi_qwen2.5 ioi_gemma2 ioi_llama3 mcqa_qwen2.5 mcqa_gemma2 mcqa
 for M in ${MODEL//,/ }; do for t in ${TASKS//,/ }; do [[ $VALID == *" ${t}_$M "* ]] || continue
   PREP="$PREP /workspace/mibenv/bin/python -B experiments/oracle/mib_compare.py prep $t $M >> $O/prep.log 2>&1;"
   for m in ${METHODS//,/ }; do
+  if [[ $m == finder ]]; then  # (circuit_finder's circuits of the first N train pairs, scored beside this task's rankings)
+    RUNS="$RUNS /workspace/mibenv/bin/python -B experiments/oracle/mib_compare.py finder $t $M $O/out --n ${N:-32} > $O/${t}_${M}_finder.log 2>&1; /workspace/mibenv/bin/python -B experiments/oracle/mib_compare.py convert $t $M $O/out $O/out/submission/*/${t//_/-}_$M/importances.pt --eval-batch ${EVAL_BATCH:-${BATCH:-16}} ${TEST_N:+--test-n $TEST_N} >> $O/${t}_${M}_finder.log 2>&1; echo \"exit \$?\" >> $O/${t}_${M}_finder.log;"
+    continue
+  fi
   meth=${m%@*} ord=""; [[ $m == *@* ]] && ord="--order ${m#*@}"
   RUNS="$RUNS /workspace/mibenv/bin/python -B experiments/oracle/mib_compare.py rank $t $M $meth $O/out --n ${N:-32} --refine ${REFINE:-1000} --batch ${BATCH:-16} ${EVAL_BATCH:+--eval-batch $EVAL_BATCH} ${TEST_N:+--test-n $TEST_N} ${FROM:+--from $FROM} $ord > $O/${t}_${M}_$m.log 2>&1; echo \"exit \$?\" >> $O/${t}_${M}_$m.log;"
 done; done; done

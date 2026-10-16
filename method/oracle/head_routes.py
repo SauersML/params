@@ -85,9 +85,14 @@ class Runner:
         [H, T, T], "z" the head outputs [T, H, hd], "mid" the stream after attention [T, d], "h" the neurons [T, d_mlp]),
         "cos"/"sin" [T, hd]; watch: neurons (layer, pos, index) whose values every set reports ("watch" [K, n])."""
         out = {"contrast": [], "lp": [], "watch": []}
+        low = self.core.model.embed_tokens.weight.dtype != torch.float32
         for s0 in range(0, max(len(sets), 1), self.rows):
             part = sets[s0:s0 + self.rows] or [{}]
+            n = len(part)
+            if low and not capture:  # (a lower precision model's kernels round by batch size: every forward padded to rows)
+                part = part + [{}] * (self.rows - n)
             r = self._forward(ids, part, capture and s0 == 0, watch or [])
+            r["lp"], r["watch"] = r["lp"][:n], r["watch"][:n]
             out["contrast"] += self.contrast(r["lp"]).tolist() if self.answer is not None else []
             out["lp"].append(r["lp"])
             out["watch"].append(r["watch"])

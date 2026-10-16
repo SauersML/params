@@ -114,7 +114,8 @@ class Text:
         with torch.no_grad():  # (the word contrast: every token starting the copied word against other words' tokens)
             sets = answer_contrast.token_sets(rn.core, tok, self.ids, lc, b=int(lb.argmax()), steps=STEPS)
         self.ans, self.alt, self.words = sets["answer"], sets["alternatives"], sets
-        self.st, self.sb = clean["states"], corrupt["states"]
+        cpu = lambda st: {k: [t.cpu() for t in v] if isinstance(v, list) else v.cpu() for k, v in st.items()}  # noqa: E731
+        self.st, self.sb = cpu(clean["states"]), cpu(corrupt["states"])  # (every text's states on the host: 8B fills a card)
         self.top = int(lc.argmax())
         self.word_ok = sets["answer_word"] == answer_contrast.word(" " + t["word"])
         self.c = float(self._c(lc[None])[0])

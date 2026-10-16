@@ -36,8 +36,9 @@ Search (every decision a measured run; gradients only order):
     patched). The smallest set over all units is one cut, the narrowest place the answer's information crosses (one or
     two heads at the answer position on Qwen3-1.7B capitals), so the circuit is the path of cuts from the changed
     token to the answer. Each cut first patches every unit of its kind at its positions (its ceiling); when that fails
-    no subset is searched beyond EPS (on Qwen3-8B the heads at the answer position write the answer past its neurons:
-    capital/France's readout reached 0.41/0.70 with 5,469 neurons), and the circuit passes on its other cuts. Curves
+    no subset is searched beyond EPS and the cut has no units (on Qwen3-8B the heads at the answer position write the
+    answer past its neurons: capital/France's readout reached 0.41/0.70 with 5,469 neurons), and the circuit passes on
+    its other cuts. Curves
     are measured at every size to 16 and eight sizes per doubling after, the passing size found by bisection;
  4. reported: the neurons with their stage, poles, regimes and measured shares alone, the movers, each cut's curve and
     size, each cut's SINGLES_KEPT largest single units in measured order ("singles"), the residual map, seconds.
@@ -749,7 +750,9 @@ def cut(pt: Patcher, sc: dict, kind: str, positions, done: dict, log=None, searc
     alone = [u for u in singles if singles[u] is None]      # conditional singles' shares alone, for the record
     for u, r in zip(alone, pt.both([[u] for u in alone])):
         singles[u] = r
-    circ = order[:ok] if ok else list(order)
+    circ = order[:ok] if ok else list(order) if reach else []     # (an unreachable cut has no units: its singles stay in
+                                                    # singles; Qwen3-8B bfloat16 opposite/hard/p1's readout, ceiling
+                                                    # -3.73/1.18 on a ~1 bit gap, wrote 62,122 neurons as nodes)
     if ok and len(circ) > 1:                        # units whose removal alone still passes, then removed one at a time
         alone = pt.both([[v for v in circ if v != u] for u in circ])           # from the least effective while it passes
         for u in [u for u, (lost, rest) in zip(circ, alone) if lost >= PASS and rest >= PASS][::-1]:

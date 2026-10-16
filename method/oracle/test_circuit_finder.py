@@ -90,6 +90,7 @@ def test_find_record(tiny, monkeypatch):
         assert all(rec["first_diff"] <= p < pt.T - 1 for p in rec["source_positions"])
     for c in rec["cuts"].values():
         assert c["reachable"] == (c["ceiling"][0] >= cf.PASS and c["ceiling"][1] >= cf.PASS)
+        assert c["reachable"] or c["size"] == 0     # (an unreachable cut has no units)
 
 
 def test_noise_floor(tiny, monkeypatch):

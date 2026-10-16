@@ -11,7 +11,7 @@
 #        extremes) for steer, LABELS: neuron explanations, GPU, PRICE, VRAM (8B: a 48 GB card))
 #        GEN_COST=call: a generation charged one pass a call (E1's unit), NAMEP: the pod name's prefix (default
 #        oracle-h2h-tools-), RP_OWNER; an ITEMS line with "source" (agent.py e1items) has that adapter copied as its name)
-#   bash experiments/oracle/aoh2h/agent_pod.sh tunnel RUN    localhost:8781 and :8782 -> the pod's servers
+#   bash experiments/oracle/aoh2h/agent_pod.sh tunnel RUN    localhost:8781 and :8782 (LPORT1, LPORT2) -> the pod's servers
 cd /Users/user/params
 NAMEP=${NAMEP:-oracle-h2h-tools-}
 if [ "$1" = tunnel ]; then
@@ -20,7 +20,7 @@ if [ "$1" = tunnel ]; then
   read -r IP SSH_PORT KEYS SSH_USER < /Users/user/mpd-data/runpod/active/.$POD.ssh || { echo "no record of pod $POD" >&2; exit 1; }
   exec ssh -F none -i "$KEYS/key" -o IdentitiesOnly=yes -o ForwardAgent=no -o UserKnownHostsFile="$KEYS/known_hosts" \
     -o StrictHostKeyChecking=accept-new -o ServerAliveInterval=30 -o ExitOnForwardFailure=yes -p "$SSH_PORT" \
-    -N -L 8781:localhost:8781 -L 8782:localhost:8782 "$SSH_USER@$IP"
+    -N -L ${LPORT1:-8781}:localhost:8781 -L ${LPORT2:-8782}:localhost:8782 "$SSH_USER@$IP"
 fi
 RUN=${RUN:-a} H=${1:-3}
 N=$NAMEP$RUN O=/Users/user/mpd-data/runpod/$N

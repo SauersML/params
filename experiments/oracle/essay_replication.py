@@ -347,7 +347,15 @@ def case_social(device: str, log=print) -> list[dict]:
     tgt = tok(SOCIAL["target"], add_special_tokens=False)["input_ids"][0]
     layers = model.gpt_neox.layers
 
-    def logp(text, zero=()):
+    ctx = social_contexts()
+    enc = [tok(t)["input_ids"] for t in ctx]
+    T = max(len(x) for x in enc)
+    ids = torch.tensor([[0] * (T - len(x)) + x for x in enc], device=device)  # left-padded, the padding masked out
+    mask = torch.tensor([[0] * (T - len(x)) + [1] * len(x) for x in enc], device=device)
+    pos = (mask.cumsum(-1) - 1).clamp(min=0)
+
+    def logp(zero=()) -> np.ndarray:
+        """log p(" Social") at every context's last token, with the zero neurons zeroed at every position."""
         hs = []
         for L, layer in enumerate(layers):
             js = [j for l2, j in zero if l2 == L]
@@ -355,17 +363,20 @@ def case_social(device: str, log=print) -> list[dict]:
                 hs.append(layer.mlp.dense_4h_to_h.register_forward_pre_hook(
                     lambda m, a, js=js: (a[0].index_fill(-1, torch.tensor(js, device=a[0].device), 0.0),)))
         try:
-            ids = torch.tensor([tok(text)["input_ids"]], device=device)
-            return float(torch.log_softmax(model(input_ids=ids).logits[0, -1].float(), -1)[tgt])
+            out = []
+            for s0 in range(0, len(ids), 32):
+                h = model.gpt_neox(input_ids=ids[s0:s0 + 32], attention_mask=mask[s0:s0 + 32], position_ids=pos[s0:s0 + 32]).last_hidden_state
+                lg = model.get_output_embeddings()(h[:, -1])  # (the last position's logits only)
+                out.append(torch.log_softmax(lg.float(), -1)[:, tgt])
+            return torch.cat(out).cpu().numpy()
         finally:
             for h in hs:
                 h.remove()
-    ctx = social_contexts()
-    base = [logp(t) for t in ctx]
-    det = float(np.mean([logp(t, SOCIAL["detectors"]) - b for t, b in zip(ctx, base)]))
+    base = logp()
+    det = float(np.mean(logp(SOCIAL["detectors"]) - base))
     rows = []
     for (L, j), e in SOCIAL["next"]:
-        d = float(np.mean([logp(t, [(L, j)]) - b for t, b in zip(ctx, base)]))
+        d = float(np.mean(logp([(L, j)]) - base))
         rows.append({"neuron": f"L{L}:{j}", "essay": e, "ours_mean": d, "agree": (d > 0) == (e > 0)})
     agree = sum(r["agree"] for r in rows)
     ok = abs(det) <= 0.05 and agree >= 8
@@ -410,7 +421,7 @@ def main():
     done = {r["case"].split("/")[0] for r in out}
     log = lambda s: print(s, flush=True)  # noqa: E731
     if "social" in cases and "social" not in done:
-        dev = "cuda" if torch.cuda.is_available() else "cpu"
+        dev = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
         out += case_social(dev, log)
         a.paths[0].write_text(json.dumps(out))
     big = [c for c in cases if c != "social" and c not in done and not (c in ("santa", "preeclampsia") and ({"santa", "preeclampsia"} & done))]

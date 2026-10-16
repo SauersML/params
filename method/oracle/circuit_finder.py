@@ -130,7 +130,7 @@ class Patcher:
         self.dev = self.core.model.embed_tokens.weight.device
         self._group = None                          # (a Group's member: its measure calls taken in the group's rounds)
 
-    def _hooks(self, res=None, head=None, neu=None, add=None, cap=None, only=None):
+    def _hooks(self, res=None, head=None, neu=None, add=None, cap=None, only=None, cap_rows: int = 1):
         """Forward hooks: res/head/neu(i, h) -> h edit each layer's residual input, head outputs (o_proj input) and
         neurons (down_proj input); add: {"head": [..], "neu": [..]} tensors added (gradients); cap: a dict of lists (the
         first row's values only); only: {"res"|"head"|"neu": layers} the layers whose hooks the edits need (every layer's
@@ -147,13 +147,13 @@ class Patcher:
                     else:
                         kwargs["hidden_states"] = h
                 if cap is not None:                  # (as edited: a run with units patched, a base for others)
-                    cap.setdefault("res", []).append(h[:1].detach())
+                    cap.setdefault("res", []).append(h[:cap_rows].detach())
                 return args, kwargs
 
             def o(mod, args, i=i):
                 h = args[0]
                 if cap is not None:
-                    cap.setdefault("head", []).append(h[:1].detach())
+                    cap.setdefault("head", []).append(h[:cap_rows].detach())
                 if head is not None:
                     h = head(i, h)
                 if add is not None:
@@ -163,7 +163,7 @@ class Patcher:
             def d(mod, args, i=i):
                 h = args[0]
                 if cap is not None:
-                    cap.setdefault("neu", []).append(h[:1].detach())
+                    cap.setdefault("neu", []).append(h[:cap_rows].detach())
                 if neu is not None:
                     h = neu(i, h)
                 if add is not None:
@@ -176,7 +176,7 @@ class Patcher:
             if want["neu"]:
                 hs.append(layer.mlp.down_proj.register_forward_pre_hook(d))
             if cap is not None:
-                hs.append(layer.mlp.up_proj.register_forward_hook(lambda mod, args, out: cap.setdefault("up", []).append(out[:1].detach())))
+                hs.append(layer.mlp.up_proj.register_forward_hook(lambda mod, args, out: cap.setdefault("up", []).append(out[:cap_rows].detach())))
         return hs
 
     def _last(self, ids, B: int, cache=None, keep=None, layer0: int = 0, h0=None, **hooks) -> torch.Tensor:
@@ -192,7 +192,8 @@ class Patcher:
                 o = self.core.model(input_ids=x, use_cache=keep is not None)
                 lg = self._head(o.last_hidden_state)
                 if keep is not None:
-                    keep += [(k[:1].clone(), v[:1].clone()) for k, v in _kv_pairs(o.past_key_values)]
+                    n = hooks.get("cap_rows", 1)
+                    keep += [(k[:n].clone(), v[:n].clone()) for k, v in _kv_pairs(o.past_key_values)]
             else:
                 from transformers import DynamicCache
                 s, kvs = cache
@@ -323,12 +324,14 @@ class Patcher:
         self.act = {}
         lp, hn = {}, {}
         self._base_kv = {}
-        for k, ids in self.ids.items():
-            cap, kv = {}, []
-            hn[k] = self._last(ids, self.rows, cap=cap, keep=kv if PREFIX else None)[:1]
+        cap, kv = {}, []                            # (both runs in one forward of two rows, each captured)
+        both = self._last(torch.stack([self._ids_dev["clean"], self._ids_dev["corrupt"]]), 2, cap=cap,
+                          keep=kv if PREFIX else None, cap_rows=2)
+        for j, k in enumerate(("clean", "corrupt")):
+            hn[k] = both[j:j + 1]
             lp[k] = self._logp(hn[k])[0]
-            self.act[k] = {n: [t[0] for t in v] for n, v in cap.items()}           # per layer [T, dim]
-            self._base_kv[k] = kv
+            self.act[k] = {n: [t[j] for t in v] for n, v in cap.items()}           # per layer [T, dim]
+            self._base_kv[k] = [(a[j:j + 1], b[j:j + 1]) for a, b in kv]
         if PREFIX:                                  # both runs' residual inputs [2, T, d] and keys and values [2, KV, T, hd]
             self._res_st = [torch.stack([self.act[k]["res"][i] for k in ("clean", "corrupt")]) for i in range(self.L)]
             self._kv_st = [tuple(torch.cat([self._base_kv[k][i][j] for k in ("clean", "corrupt")]) for j in (0, 1))
@@ -578,14 +581,16 @@ class Patcher:
         """Attribution estimates per head [L, T, H] and neuron [L, T, D]: max over directions of |patch difference x the
         base run's gradient of the contrast| (ORDER's gradient; the order of group testing only)."""
         out = {}
-        for base, src in (("clean", "corrupt"), ("corrupt", "clean")):
-            add = {"head": [torch.zeros(self.T, self.H * self.hd, device=l.self_attn.o_proj.weight.device, requires_grad=True)
-                            for l in self.layers],
-                   "neu": [torch.zeros(self.T, self.D, device=l.mlp.down_proj.weight.device, requires_grad=True) for l in self.layers]}
-            with torch.enable_grad(), (_relp(self.core) if ORDER == "relp" else contextlib.nullcontext()):
-                self._contrast(self._last(self.ids[base], 1, add=add)).sum().backward()
+        add = {"head": [torch.zeros(2, self.T, self.H * self.hd, device=l.self_attn.o_proj.weight.device, requires_grad=True)
+                        for l in self.layers],                  # (both base runs in one forward and backward, a row each:
+               "neu": [torch.zeros(2, self.T, self.D, device=l.mlp.down_proj.weight.device, requires_grad=True)  # rows are
+                       for l in self.layers]}                   # independent, so each row's gradient is its own run's)
+        x = torch.stack([self._ids_dev["clean"], self._ids_dev["corrupt"]])
+        with torch.enable_grad(), (_relp(self.core) if ORDER == "relp" else contextlib.nullcontext()):
+            self._contrast(self._last(x, 2, add=add)).sum().backward()
+        for j, (base, src) in enumerate((("clean", "corrupt"), ("corrupt", "clean"))):
             for k, key in (("head", "head"), ("neu", "neuron")):
-                s = torch.stack([((self.act[src][k][i].float() - self.act[base][k][i].float()) * add[k][i].grad.float()).cpu()
+                s = torch.stack([((self.act[src][k][i].float() - self.act[base][k][i].float()) * add[k][i].grad[j].float()).cpu()
                                  for i in range(self.L)])                                   # [L, T, dim]
                 if k == "head":
                     s = s.reshape(self.L, self.T, self.H, self.hd).sum(-1)
@@ -1068,11 +1073,20 @@ def cut(pt: Patcher, sc: dict, kind: str, positions, done: dict, log=None, searc
                                                     # -3.73/1.18 on a ~1 bit gap, wrote 62,122 neurons as nodes)
     if ok and len(circ) > 1:                        # units whose removal alone still passes, then removed one at a time
         alone = pt.both([[v for v in circ if v != u] for u in circ])           # from the least effective while it passes
-        for u in [u for u, (lost, rest) in zip(circ, alone) if lost >= PASS and rest >= PASS][::-1]:
-            trial = [v for v in circ if v != u]
-            lost, rest = pt.both([trial])[0]
-            if lost >= PASS and rest >= PASS:
-                circ = trial
+        todo = [u for u, (lost, rest) in zip(circ, alone) if lost >= PASS and rest >= PASS][::-1]
+        while todo:                                 # (the removals in one call as if each passes: the same sets as one
+            chain, cur = [], circ                   # by one up to the first that fails, then again from after it)
+            for u in todo:
+                cur = [v for v in cur if v != u]
+                chain.append(cur)
+            for k, (lost, rest) in enumerate(pt.both(chain)):
+                if lost >= PASS and rest >= PASS:
+                    circ = chain[k]
+                else:
+                    todo = todo[k + 1:]
+                    break
+            else:
+                todo = []
     routes = None
     if kind == "head" and reach and not ok and ROUTE_GROUPS and len(positions) == 1:  # spread over heads: groups by source
         routes = route_groups(pt, singles, positions[0], list(range(pt.first, positions[0])), log=log)

@@ -244,7 +244,7 @@ def test_explicit_token_contrast_matches_direct_model_no_word_forwards(tiny,monk
     monkeypatch.setattr(cf.answer_contrast,'token_sets',lambda *a,**k:(_ for _ in ()).throw(AssertionError('must not group words')))
     try:
         record=pt.setup(clean,corrupt,explicit_sets=sets)
-        assert rows==[pt.rows,pt.rows]
+        assert rows==[2]   # (both runs in one forward of two rows)
         assert record['kind']=='explicit_tokens' and record['answer_word'] is None and record['alternative_words']==[]
         assert record['answer_tokens']==sets['answer'] and record['alternatives']==sets['alternatives']
         with torch.no_grad():

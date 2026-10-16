@@ -10,8 +10,8 @@ Rankings (the attribution set: the first N of MIB's train split):
              reader input (a head's q, k or v, an MLP's input, the logits) with all its incoming edges patched, alone;
              an edge's score the smaller of its writer's and its reader's |change in m| (an edge matters only where both
              ends do); then the REFINE edges of largest score each patched alone, its own |change| its score. Every number
-             a run of MIB's patching; no gradient anywhere. (MIB's evaluate_graph prunes the graph to what reaches the
-             logits first; the measured runs skip that step, so each removes exactly the stated edges.)
+             a run of MIB's patching, computed by direct activation patching (equal to MIB's evaluate_graph without its
+             pruning step, so each removes exactly the stated edges; test_mib_compare.py); no gradient anywhere.
   baselines  MIB's own attribute() with its methods (eap-ig-inputs, eap, ...), counterfactual ablation, as published
 Writes OUT/<task>_<model>_<method>.json: CMD and CPR (absolute and signed rankings), the faithfulness curve, the
 circuit sizes, seconds (ranking, per attribution example), and for measured every test's change. MIB's code: --mib DIR
@@ -19,7 +19,7 @@ circuit sizes, seconds (ranking, per attribution example), and for measured ever
 
   mib_compare.py prep TASK MODEL   (online) MIB's task data into the cache, and an ungated model copy aliased under
       Meta's name; every later run then goes with HF_HUB_OFFLINE=1 (huggingface_hub reads it at import)
-  mib_compare.py rank TASK MODEL METHOD OUT [--n 32] [--refine 1000] [--batch 16] [--test-n N]
+  mib_compare.py rank TASK MODEL METHOD OUT [--n 32] [--refine 1000] [--batch 16] [--rows 32] [--test-n N]
   mib_compare.py table OUT [...]
 MODEL: MIB's names (qwen2.5, llama3); llama3's weights from WEIGHTS (an ungated copy of meta-llama/Llama-3.1-8B, the
 same files) placed in the HF cache under Meta's name (alias_weights, by prep).
@@ -82,52 +82,138 @@ def data(model, task: str, mname: str, split: str, n: int | None, batch: int):
     return ds.to_dataloader(batch_size=batch), len(ds)
 
 
-def measured(model, graph, dl, metric, refine: int, log=print, limit: int | None = None) -> dict:
-    """The measured ranking (module docstring) into graph.scores; returns every test's change."""
+def node_hooks(cfg, nf: int, nb: int):
+    """MIB's graph indices as TransformerLens hooks: writer f -> (output hook, head), reader b -> (hook of the value its
+    input fully corrupted gives, head) and (its input hook, head) for one edge's addition."""
+    H, NL = cfg.n_heads, cfg.n_layers
+
+    def writer(f):
+        if f == 0:
+            return "hook_embed", None
+        L, r = divmod(f - 1, H + 1)
+        return (f"blocks.{L}.hook_mlp_out", None) if r == H else (f"blocks.{L}.attn.hook_z", r)
+
+    def reader(b):  # (an MLP's input fully corrupted gives its corrupted output; a head's q, k or v input its corrupted q, k, v)
+        if b == nb - 1:
+            return "logits", None
+        L, r = divmod(b, 3 * H + 1)
+        return (f"blocks.{L}.hook_mlp_out", None) if r == 3 * H else (f"blocks.{L}.attn.hook_{'qkv'[r // H]}", r % H)
+
+    def reader_in(b):
+        if b == nb - 1:
+            return f"blocks.{NL - 1}.hook_resid_post", None
+        L, r = divmod(b, 3 * H + 1)
+        return (f"blocks.{L}.hook_mlp_in", None) if r == 3 * H else (f"blocks.{L}.hook_{'qkv'[r // H]}_input", r % H)
+    return writer, reader, reader_in
+
+
+def measured(model, graph, dl, metric, refine: int, log=print, limit: int | None = None, rows: int = 32) -> dict:
+    """The measured ranking (module docstring) into graph.scores; returns every test's change. Each test is MIB's
+    patching run computed directly (test_mib_compare.py checks equality with evaluate_graph): a writer with all its
+    outgoing edges patched is its output replaced by the counterfactual run's; a reader with all its incoming edges
+    patched receives the counterfactual run's residual stream, so its q, k, v (an MLP: its output) are the
+    counterfactual run's; one edge adds (counterfactual - clean output of the writer) to the reader's input. Tests run
+    ROWS rows at a time (each test on its own copy of the batch)."""
     import torch
 
-    from eap.evaluate import evaluate_graph
-    graph.prune = lambda *a, **k: None  # each run removes exactly the stated edges
-    real = graph.real_edge_mask.clone()
+    from eap.utils import tokenize_plus
+    cfg = model.cfg
+    nf, nb = graph.n_forward, graph.n_backward
+    real = graph.real_edge_mask
+    writer, reader, reader_in = node_hooks(cfg, nf, nb)
+    names = {"hook_embed"} | {f"blocks.{L}.{h}" for L in range(cfg.n_layers)
+                              for h in ("attn.hook_z", "attn.hook_q", "attn.hook_k", "attn.hook_v", "hook_mlp_out")}
+    batches = []
+    for clean, corrupted, label in dl:
+        ct, am, il, _ = tokenize_plus(model, clean)
+        xt = tokenize_plus(model, corrupted)[0]
+        with torch.inference_mode():
+            xl, xc = model.run_with_cache(xt, attention_mask=am, names_filter=lambda n: n in names)
+            cl, cc = model.run_with_cache(ct, attention_mask=am, names_filter=lambda n: n in names)
+        batches.append((ct, am, il, label, cc, xc, metric(cl, None, il, label).float(), metric(xl, None, il, label).float()))
+    n_ex = sum(len(b[2]) for b in batches)
+    full = float(sum(b[6].sum() for b in batches)) / n_ex
+    m_corrupt = float(sum(b[7].sum() for b in batches)) / n_ex
 
-    def m_with(cut) -> float:
-        graph.in_graph[:] = real
-        cut(graph.in_graph)
-        graph.in_graph &= real
-        return float(evaluate_graph(model, graph, dl, metric, quiet=True, intervention="patching").mean())
-    full = m_with(lambda g: None)
+    def delta(f, cc, xc):  # counterfactual - clean output of writer f, [batch, pos, d_model]
+        hook, h = writer(f)
+        if h is None:
+            return xc[hook] - cc[hook]
+        L = int(hook.split(".")[1])
+        return (xc[hook][:, :, h] - cc[hook][:, :, h]) @ model.blocks[L].attn.W_O[h]
+
+    def rep(x, G):
+        return x.repeat(G, *[1] * (x.dim() - 1)) if torch.is_tensor(x) else list(x) * G
+
+    def run(tests) -> list[float]:
+        """Each test a list of (kind, hook, head, writer): kind "set" puts the counterfactual cache's value at the hook
+        (the head's slice), "add" adds the writer's delta at the hook. Returns each test's mean metric."""
+        out = [0.0] * len(tests)
+        for ct, am, il, label, cc, xc, _, _ in batches:
+            B = ct.shape[0]
+            G = max(1, rows // B)
+            for g0 in range(0, len(tests), G):
+                grp = tests[g0:g0 + G]
+                by = {}
+                for g, spec in enumerate(grp):
+                    for kind, hook, h, f in spec:
+                        by.setdefault(hook, []).append((g, kind, h, f))
+
+                def fn(act, hook, n=len(grp)):
+                    a = act.view(n, B, *act.shape[1:])
+                    for g, kind, h, f in by[hook.name]:
+                        if kind == "set":
+                            if h is None:
+                                a[g] = xc[hook.name]
+                            else:
+                                a[g, :, :, h] = xc[hook.name][:, :, h]
+                        elif h is None:
+                            a[g] += delta(f, cc, xc)
+                        else:
+                            a[g, :, :, h] += delta(f, cc, xc)
+                    return act
+                with torch.inference_mode(), model.hooks(fwd_hooks=[(k, fn) for k in by]):
+                    lg = model(rep(ct, len(grp)), attention_mask=rep(am, len(grp)))
+                m = metric(lg, None, rep(il, len(grp)), rep(label, len(grp))).float().view(len(grp), B).sum(1)
+                for g in range(len(grp)):
+                    out[g0 + g] += float(m[g])
+        return [o / n_ex for o in out]
+
     t0 = time.time()
-    writers = torch.zeros(graph.n_forward)
-    for f in range(graph.n_forward if limit is None else min(limit, graph.n_forward)):  # (limit: a smoke run's first few)
-        if real[f].any():
-            writers[f] = abs(full - m_with(lambda g, f=f: g[f].fill_(False)))
-        if f % 100 == 0:
-            log(f"writers {f}/{graph.n_forward}, {time.time() - t0:.0f} s")
-    readers = torch.zeros(graph.n_backward)
-    for b in range(graph.n_backward if limit is None else min(limit, graph.n_backward)):
-        if real[:, b].any():
-            readers[b] = abs(full - m_with(lambda g, b=b: g[:, b].fill_(False)))
-        if b % 200 == 0:
-            log(f"readers {b}/{graph.n_backward}, {time.time() - t0:.0f} s")
+    lim = (lambda n: n) if limit is None else (lambda n: min(n, limit))  # (limit: a smoke run's first few)
+    fs = [f for f in range(lim(nf)) if real[f].any()]
+    writers = torch.zeros(nf)
+    for f, m in zip(fs, run([[("set", *writer(f), None)] for f in fs])):
+        writers[f] = abs(full - m)
+    log(f"writers {len(fs)}, {time.time() - t0:.0f} s")
+    bs = [b for b in range(lim(nb)) if real[:, b].any() and reader(b)[0] not in ("logits",) and "mlp" not in reader(b)[0]]
+    readers = torch.zeros(nb)
+    for b, m in zip(bs, run([[("set", *reader(b), None)] for b in bs])):
+        readers[b] = abs(full - m)
+    for b in range(lim(nb)):  # (an MLP's reader test is its writer test; the logits' is the counterfactual run)
+        hook, _ = reader(b)
+        if hook == "logits":
+            readers[b] = abs(full - m_corrupt)
+        elif "mlp" in hook:
+            readers[b] = writers[1 + int(hook.split(".")[1]) * (cfg.n_heads + 1) + cfg.n_heads]
+    log(f"readers {len(bs)}, {time.time() - t0:.0f} s")
     score = torch.minimum(writers[:, None], readers[None, :]) * real
-    top = score.flatten().argsort(descending=True)[:refine]
+    top = score.flatten().argsort(descending=True)[:refine].tolist()
+    edges = [divmod(e, nb) for e in top]
     single = []
-    for k, e in enumerate(top.tolist()):
-        f, b = divmod(e, graph.n_backward)
-        d = abs(full - m_with(lambda g, f=f, b=b: g[f, b].fill_(False)))
+    for (f, b), m in zip(edges, run([[("add", *reader_in(b), f)] for f, b in edges])):
+        d = abs(full - m)
         single.append([f, b, float(score[f, b]), d])
         score[f, b] = d
-        if k % 100 == 0:
-            log(f"single edges {k}/{len(top)}, {time.time() - t0:.0f} s")
+    log(f"single edges {len(edges)}, {time.time() - t0:.0f} s")
     graph.scores[:] = score.to(graph.scores.dtype)
     graph.in_graph[:] = real
-    del graph.prune  # (the instance's patch: MIB's own prune for the evaluation)
     return {"full": full, "writers": writers.tolist(), "readers": readers.tolist(), "single": single,
-            "tests": int(real.any(1).sum() + real.any(0).sum() + len(top))}
+            "tests": len(fs) + len(bs) + len(edges), "seconds_tests": time.time() - t0}
 
 
 def rank(task: str, mname: str, method: str, out: Path, n: int, refine: int, batch: int, test_n: int | None = None,
-         log=print, limit: int | None = None) -> dict:
+         log=print, limit: int | None = None, rows: int = 32) -> dict:
     import torch
 
     from eap.attribute import attribute
@@ -141,7 +227,7 @@ def rank(task: str, mname: str, method: str, out: Path, n: int, refine: int, bat
     t0 = time.time()
     rec = {"task": task, "model": mname, "method": method, "rank_examples": n_rank, "edges": int(graph.real_edge_mask.sum())}
     if method == "measured":
-        rec["measured"] = measured(model, graph, dl, partial(metric, mean=False, loss=False), refine, log, limit)
+        rec["measured"] = measured(model, graph, dl, partial(metric, mean=False, loss=False), refine, log, limit, rows)
     else:
         attribute(model, graph, dl, partial(metric, mean=True, loss=True), method, "patching", ig_steps=5,
                   intervention_dataloader=dl)
@@ -186,6 +272,7 @@ def main():
     ap.add_argument("--batch", type=int, default=16)
     ap.add_argument("--test-n", type=int, default=None, help="MIB's test split's first examples only (a smoke run)")
     ap.add_argument("--limit", type=int, default=None, help="the first writers and readers only (a smoke run)")
+    ap.add_argument("--rows", type=int, default=32, help="measured: rows a forward pass (tests x batch)")
     a = ap.parse_args()
     sys.path[:0] = [str(MIB), str(MIB / "EAP-IG" / "src")]
     if a.cmd == "table":
@@ -198,7 +285,8 @@ def main():
             alias_weights(mname)
         return
     task, mname, method, out = a.args
-    rank(task, mname, method, Path(out), a.n, a.refine, a.batch, a.test_n, log=lambda s: print(s, flush=True), limit=a.limit)
+    rank(task, mname, method, Path(out), a.n, a.refine, a.batch, a.test_n, log=lambda s: print(s, flush=True), limit=a.limit,
+         rows=a.rows)
 
 
 if __name__ == "__main__":

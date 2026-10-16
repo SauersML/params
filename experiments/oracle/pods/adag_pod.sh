@@ -7,7 +7,7 @@
 # NAP on MLP neurons (its case study's settings), our measured scores, ENAP; the same capitals head-to-head on Qwen3-8B
 # (our search, then its circuit and clusters); its math circuit on 100 sums; its speed on Qwen3-8B. Every step has its
 # own time limit and log; results come back to ~/mpd-data/runpod/NAME (steps.log: each step's start and exit).
-# Every model is Llama-3.1-8B-Instruct or Qwen3-8B (ENAP's train.py loads the Instruct model whatever the config says).
+# (No rp-run Python environment: everything runs in ADAG's own uv environment.) Every model is Llama-3.1-8B-Instruct or Qwen3-8B (ENAP's train.py loads the Instruct model whatever the config says).
 #   experiments/oracle/pods/adag_pod.sh OURS [NAME] [HOURS]   env: K (clusters, 64), GPU, PRICE
 # The whole script is one block, so bash has read all of it before it runs.
 {
@@ -21,7 +21,7 @@ CG="--config sweep/fc_evaluation/causalgym_pair.yaml --model $L --dataset causal
 GEN=scripts/case_studies/causalgym/generate_causalgym_data.py
 CMD="export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True PATH=\$HOME/.local/bin:\$PATH; set -e; ln -sfn /workspace/runs/$NAME/mpd-data ~/mpd-data; mkdir -p $O/cg;
 cd /Users/user/params/; ls $P > /dev/null; nvidia-smi --query-gpu=name,memory.total --format=csv,noheader;
-git clone -q --depth 1 https://github.com/TransluceAI/circuits ~/adag; cd ~/adag; git rev-parse HEAD > $O/adag_commit.txt; (uv sync -q > $O/uv.log 2>&1 || uv sync >> $O/uv.log 2>&1);
+command -v uv > /dev/null || [ -x ~/.local/bin/uv ] || curl -LsSf https://astral.sh/uv/install.sh | sh > /dev/null 2>&1; git clone -q --depth 1 https://github.com/TransluceAI/circuits ~/adag; cd ~/adag; git rev-parse HEAD > $O/adag_commit.txt; (uv sync -q > $O/uv.log 2>&1 || uv sync >> $O/uv.log 2>&1);
 uv run python $P/adag_compare.py alias $L NousResearch/Meta-Llama-3.1-8B-Instruct $Q > $O/alias.log 2>&1;
 export HF_HUB_OFFLINE=1; set +e;
 (nvidia-smi --query-gpu=timestamp,utilization.gpu,memory.used --format=csv,noheader -l 30 > $O/gpu.log 2>&1 &);
@@ -45,6 +45,6 @@ step cg_enap_train 50 uv run python scripts/train.py $CG --method enap --save_pa
 step cg_enap_eval 25 uv run python scripts/eval.py $CG --method enap --save_path $O/cg/enap;
 step bench_qwen8 20 uv run python scripts/case_studies/benchmark/bench_tracing.py --model-id $Q --batch-sizes 4 --n-prompts 8 --output $O/bench_qwen8.json;
 echo all done"
-RP_ALLOW_OVER=1 RP_OWNER=${RP_OWNER:-generality} RP_PARALLEL=1 RP_PYENV=oracle RP_IDLE_PCT=${RP_IDLE_PCT:-5} RP_MAX_PRICE=${PRICE:-0.65} RP_MIN_VRAM_GB=${VRAM:-44} RP_MIN_RAM_GB=${RAM:-64} RP_DISK_GB=${DISK:-120} \
+RP_ALLOW_OVER=1 RP_OWNER=${RP_OWNER:-generality} RP_PARALLEL=1 RP_IDLE_PCT=${RP_IDLE_PCT:-5} RP_MAX_PRICE=${PRICE:-0.65} RP_MIN_VRAM_GB=${VRAM:-44} RP_MIN_RAM_GB=${RAM:-64} RP_DISK_GB=${DISK:-120} \
   experiments/infra/runpod/rp-run $NAME "${GPU:-NVIDIA A40,NVIDIA RTX A6000,NVIDIA L40S,NVIDIA L40,NVIDIA RTX 6000 Ada Generation}" $H -- bash -c "$CMD"
 }

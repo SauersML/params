@@ -60,7 +60,7 @@ CAL_ROWS = slice(1000, 1200)   # general.jsonl's calibration chats (maxima; the 
 MASSIVE = 0.25        # a value at least this share of the layer's largest neuron maximum is massive (kept live, no unit)
 ALTERNATIVES = 5
 CANDIDATES = 512      # units measured alone
-FIXED = False         # the weak zeroing as a fixed mask per input: the values weak in that input's own unedited run are
+FIXED = True          # the weak zeroing as a fixed mask per input: the values weak in that input's own unedited run are
 # zeroed, never re-thresholded under edits (re-thresholding makes the reference discontinuous: on Qwen3-0.6B a 1e-6
 # relative change of every MLP value moves the answer's logits by 0.51 against the model's 0.0001; the fixed mask 0.00006)
 MASKS_KEPT = 8        # inputs whose fixed masks stay cached (the prompt and its counterfactuals)
@@ -177,17 +177,19 @@ class Neurons:
         if not self.fixed or self.thr is None:
             return None
         rows = [tuple(r) for r in x.tolist()]
+        got = {}                                     # (this batch's masks: the cache may hold fewer inputs than it has)
         for r in dict.fromkeys(rows):
             if r not in self._masks:
                 cap = {}
                 with self.hooks(None, cap):
                     self.core.model(input_ids=torch.tensor([r], device=self.dev))
                 self._masks[r] = [h[0] != 0 for h in cap["h"]]
-                while len(self._masks) > MASKS_KEPT:
-                    self._masks.pop(next(iter(self._masks)))
-        if len(set(rows)) == 1:
-            return [m[None] for m in self._masks[rows[0]]]
-        return [torch.stack([self._masks[r][i] for r in rows]) for i in range(self.L)]
+            got[r] = self._masks[r]
+        for r in [r for r in self._masks if r not in got][:max(0, len(self._masks) - MASKS_KEPT)]:
+            self._masks.pop(r)
+        if len(got) == 1:
+            return [m[None] for m in got[rows[0]]]
+        return [torch.stack([got[r][i] for r in rows]) for i in range(self.L)]
 
     @torch.no_grad()
     def prefix(self, ids, start: int, edit=None, route=None, B: int = 1):

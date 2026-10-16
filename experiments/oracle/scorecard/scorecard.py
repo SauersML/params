@@ -658,7 +658,8 @@ SHORT = {"best-constant": "best constant answer", "name-prior": "name-prior (eac
          "rc1.T-mismatch.mismatch": "injection reader trained on other texts' writes",
          "prompt397": "Qwen3.5-397B prompted (circuit as text)",
          "prompt397.shots24": "Qwen3.5-397B, 24 solved examples in context",
-         "random-units": "24 random neuron poles", "t3-greedy": "T3 greedy edit (no oracle)"}
+         "random-units": "24 random neuron poles", "t3-greedy": "T3 greedy edit (no oracle)",
+         "tree-numbers": "boosted trees on the circuit's numbers", "tree-names": "boosted trees on names only"}
 
 
 def short(n: str, meta: dict) -> str:
@@ -780,6 +781,58 @@ def baselines(a) -> None:
     print(d)
 
 
+THR = HOME / "mpd-data" / "cluster" / "t2_8b" / "out" / "thr.pt"
+
+
+def tree(a) -> None:
+    """oracledata's gradient-boosted trees (oracledata/readable.py's features of a question's units: layer statistics,
+    stage, pole, position, and the sums and extremes of value, value / calibration maximum, lost and restored shares) as
+    an O1 baseline on the frozen items: one model per kind, trained on rc1's training questions (the readers' training
+    set), numbers from the finder's records, maxima from the T2 file. tree-names: the same with every number removed."""
+    import sys
+
+    import torch
+    from sklearn.ensemble import HistGradientBoostingClassifier
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "oracledata"))
+    import readable
+    mx = torch.load(THR, map_location="cpu")["max"]
+
+    def circ(groups: dict, ctx_id: str, numbers: bool) -> dict:
+        f = RECORDS / (ctx_id.replace("/", "__") + ".json")
+        nodes = {(d["layer"], d["neuron"], d["pos"]): d for d in (json.loads(f.read_text()).get("nodes", []) if f.exists() else [])}
+        units = []
+        for members in groups.values():
+            for m in members:
+                lay, rest = m[1:].split(".N")
+                n, pos = rest.split("@")
+                layer, neuron, pos = int(lay), int(n[:-1]), int(pos)
+                d = nodes.get((layer, neuron, pos), {})
+                v = d.get("clean") if numbers else None
+                top = float(mx[layer, neuron])
+                units.append({"name": m, "layer": layer, "neuron": neuron, "pole": 1 if n[-1] == "+" else -1, "pos": pos,
+                              "stage": d.get("stage"), "value": v, "value_over_max": v / top if v is not None and top > 0 else None,
+                              "lost": d.get("lost") if numbers else None, "restored": d.get("restored") if numbers else None})
+        return {"units": units, "heads": [], "groups": [{"id": g, "members": ms} for g, ms in groups.items()]}
+
+    train = [{"units": r["claim"]["units"], "ctx": r["ctx"], "groups": r["groups"], "context": r["id"], "cat": r["cat"],
+              "gold": o1_class(r["cat"], r["a"])} for r in jl(RC / "rc1" / "train_correct.jsonl")]
+    test = jl(ITEMS / "o1_dev.jsonl")
+    for arm, numbers in (("tree-numbers", True), ("tree-names", False)):
+        pred = {}
+        for cat in sorted({t["cat"] for t in test}):
+            tr = [r for r in train if r["cat"] == cat]
+            te = [t for t in test if t["cat"] == cat]
+            X = [readable.feats(r, circ(r["groups"], r["context"], numbers)) for r in tr]
+            Xt = [readable.feats(t, circ(t["groups"], t["context"], numbers)) for t in te]
+            m = HistGradientBoostingClassifier(max_iter=200, class_weight="balanced", random_state=0).fit(X, [r["gold"] for r in tr])
+            pred.update(zip((t["item"] for t in te), m.predict(Xt)))
+        d = oracle_meta(arm, "gradient-boosted trees on the circuit's numbers" if numbers else "gradient-boosted trees, names only",
+                        "baseline", "the question's units' layers, stages, poles, positions" + (", values, value/max, lost and "
+                        "restored shares" if numbers else ""), matched={"names": "tree-names"} if numbers else None)
+        wjl(d / "o1.jsonl", [{"item": k, "class": str(v)} for k, v in pred.items()])
+        print(arm, len(pred))
+
+
 def collect(a) -> None:
     """A scorecard pod's outputs (scorecard_pod.sh) into the answers: measured O3/O4 files, the released AO's e1b battery."""
     src = RUNPOD / a.run
@@ -829,6 +882,7 @@ def main():
     sub.add_parser("prior")
     sub.add_parser("ingest")
     sub.add_parser("baselines")
+    sub.add_parser("tree")
     c = sub.add_parser("collect")
     c.add_argument("run", help="the pod run's name, e.g. orc-oracleeval-m1")
     c.add_argument("--name", help="a reader run's oracle name")
@@ -841,7 +895,7 @@ def main():
     s = sub.add_parser("score")
     s.add_argument("--sealed", action="store_true")
     a = ap.parse_args()
-    {"freeze": freeze, "prior": prior, "ingest": ingest, "baselines": baselines, "collect": collect, "prompt397": prompt397, "score": score}[a.cmd](a)
+    {"freeze": freeze, "prior": prior, "ingest": ingest, "baselines": baselines, "tree": tree, "collect": collect, "prompt397": prompt397, "score": score}[a.cmd](a)
 
 
 if __name__ == "__main__":

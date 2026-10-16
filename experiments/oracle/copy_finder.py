@@ -1,7 +1,7 @@
 """V2 through the circuit finder: copy texts (copy_circuit.make_texts, raw text, no chat template) as patching pairs for
 circuit_finder.find, the movers cut's route groups where copying spreads over heads, and every circuit's edges
-(neuron_edges.finder_graph). The answer is the copied word; a text whose gap is under copy_circuit.GAP_MIN bits is
-skipped (its record says why).
+(neuron_edges.finder_graph). A text whose clean top token is not the copied word's first, or whose gap is under
+copy_circuit.GAP_MIN bits, is skipped (its record says why).
 
   python experiments/oracle/copy_finder.py OUT [--model Qwen/Qwen3-8B] [--dtype bfloat16] [--n 24] [--max-seconds 180]
 writes OUT/<id>.json (a search running past --max-seconds is stopped and recorded as skipped).
@@ -62,8 +62,10 @@ def main():
         log(t["id"])
         signal.signal(signal.SIGALRM, late)
         signal.alarm(a.max_seconds)
-        try:
-            rec = cf.find(pt, t["ids"], t["corrupt_ids"], answers=[t["answer"]], log=log)
+        try:  # (find's answers= hint names a word by its token's text: a surname's first token alone matched no word)
+            pre = pt.setup(t["ids"], t["corrupt_ids"])
+            rec = cf.find(pt, t["ids"], t["corrupt_ids"], log=log) if pre["answer"] == t["answer"] else \
+                {"met": False, "skipped": "the clean top token is not the copied word's", "answer": pre["answer"]}
         except Late:
             rec = {"met": False, "skipped": f"the search ran past {a.max_seconds} s", "seconds": a.max_seconds}
             torch.cuda.empty_cache()

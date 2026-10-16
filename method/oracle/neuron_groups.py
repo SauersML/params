@@ -40,7 +40,7 @@ Examples (the group's corpus maximum {gmax:.2f}):
 {examples}"""
 EXPLAIN = HEAD + """
 
-Explain what in the text makes this group fire, so that a reader who sees only your explanation can write a new text that makes it fire. Say (1) the exact token or tokens where it fires; (2) the context that must surround them: the kind of document, the topic, the phrase or structure just before, and how far back it reaches; (3) what the examples share that a surface reading misses. Prefer one specific shared cause over a list of unrelated tokens. Write JSON with one field, "explanation", 1 to 4 sentences, nothing else."""
+Explain what in the text makes this group fire, so that a reader who sees only your explanation can write a new text that makes it fire. Say (1) the exact token or tokens where it fires; (2) the context that must surround them: the kind of document, the topic, the phrase or structure just before, and how far back it reaches; (3) what the examples share that a surface reading misses. Prefer one specific shared cause over a list of unrelated tokens. Write JSON with three fields, nothing else: "explanation", 1 to 4 sentences; "name", the shared cause in 2 to 5 words; "one_thing", true when the examples share one specific cause and false when they mix several unrelated ones."""
 REVISE = HEAD + """
 
 Your explanation of what makes the group fire was:
@@ -51,7 +51,7 @@ A reader who saw only that explanation wrote these texts to make the group fire 
 It also wrote these near misses, texts on close subjects the explanation says should not make the group fire (each should stay below 0.30):
 {near}
 
-Revise the explanation so that texts written from it reach the group's maximum and close subjects stay below 0.30. Keep what the examples support; change what the reader's results show is wrong or missing. Write JSON with one field, "explanation", 1 to 4 sentences, nothing else."""
+Revise the explanation so that texts written from it reach the group's maximum and close subjects stay below 0.30. Keep what the examples support; change what the reader's results show is wrong or missing. Write JSON with three fields, nothing else: "explanation", 1 to 4 sentences; "name", the shared cause in 2 to 5 words; "one_thing", true when the examples share one specific cause and false when they mix several unrelated ones."""
 NEAR = HEAD + """
 
 Your explanation of what makes the group fire was:
@@ -60,7 +60,7 @@ Your explanation of what makes the group fire was:
 Texts written from it make the group fire (the best reached {best:.2f} of the group's maximum), but these near misses, texts on close subjects the explanation says should not make it fire, fired as well (activation as a share of the group's maximum, and the token):
 {near}
 
-Narrow the explanation so that texts like these near misses would not make the group fire, keeping what makes the strong texts fire. Write JSON with one field, "explanation", 1 to 4 sentences, nothing else."""
+Narrow the explanation so that texts like these near misses would not make the group fire, keeping what makes the strong texts fire. Write JSON with three fields, nothing else: "explanation", 1 to 4 sentences; "name", the shared cause in 2 to 5 words; "one_thing", true when the examples share one specific cause and false when they mix several unrelated ones."""
 OUTPUT = """A group of MLP neurons in a language model ({members}) fires strongly at the marked token ⟦ ⟧ in each context below. For each context: the model's likeliest next tokens, and what zeroing every neuron of the group (each in its own sign) at every position does to its next-token prediction: the tokens whose probability falls and rises most relative to their probability before (before -> after, among tokens at 0.001 or more before) and the total change (half the summed absolute change, 0 to 1).
 
 {blocks}
@@ -285,13 +285,17 @@ def label(a) -> None:
     tag = f"varteach groups {a.out.stem} {doc['model']}"
     # 1. input labels
     texts = wr([EXPLAIN.format(**head(g), examples=ev(g)) for g in groups], max_tokens=500)
-    st = {g["id"]: {"g": g, "explanation": (neuron_verify.parse_json(t) or {}).get("explanation"), "rounds": [], "raw": t} for g, t in zip(groups, texts)}
+    st = {}
+    for g, t in zip(groups, texts):
+        js = neuron_verify.parse_json(t) or {}
+        st[g["id"]] = {"g": g, "explanation": js.get("explanation"), "short": js.get("name"), "one_thing": js.get("one_thing"), "rounds": [], "raw": t}
     live = [v for v in st.values() if isinstance(v["explanation"], str) and v["explanation"].strip()]
 
     def develop(vs, kind):
         dev = measure(neuron_verify.plan(rd, [item(v["g"], v["explanation"]) for v in vs]))
         for v, d in zip(vs, dev, strict=True):
-            v["rounds"].append({"kind": kind, "explanation": v["explanation"], "valid": d.get("valid"), "blind_max": d.get("blind_max"),
+            v["rounds"].append({"kind": kind, "explanation": v["explanation"], "short": v.get("short"), "one_thing": v.get("one_thing"),
+                                "valid": d.get("valid"), "blind_max": d.get("blind_max"),
                                 "near_miss_rate": d.get("near_miss_rate"), "passes_t1": d.get("passes_t1"),
                                 "blind_texts": d.get("blind_texts"), "blind_values": d.get("blind_values")})
             v["dev"] = d
@@ -308,14 +312,15 @@ def label(a) -> None:
             blind, near = al.feedback(tok, {**v["dev"], "pole": "+"})
             asks.append(REVISE.format(**head(v["g"]), examples=ev(v["g"]), explanation=v["explanation"], blind=blind, near=near))
         for v, t in zip(fail, wr(asks, max_tokens=500), strict=True):
-            e = (neuron_verify.parse_json(t) or {}).get("explanation")
-            if isinstance(e, str) and e.strip():
-                v["explanation"] = e
+            js = neuron_verify.parse_json(t) or {}
+            if isinstance(js.get("explanation"), str) and js["explanation"].strip():
+                v["explanation"], v["short"], v["one_thing"] = js["explanation"], js.get("name"), js.get("one_thing")
         live = fail
     for v in st.values():  # the best development round so far, then one round aimed at near misses that fired
         if v["rounds"]:
             i = max(range(len(v["rounds"])), key=lambda j: al.dev_key(v["rounds"][j]))
             v["explanation"], v["dev_best"], v["dev_row"] = v["rounds"][i]["explanation"], v["rounds"][i], v["devs"][i]
+            v["short"], v["one_thing"] = v["rounds"][i].get("short"), v["rounds"][i].get("one_thing")
     noisy = [v for v in st.values() if v.get("dev_best") and v["dev_best"].get("valid") and (v["dev_best"]["near_miss_rate"] or 0) > 0]
     if noisy and a.near_round:
         asks = []
@@ -324,23 +329,24 @@ def label(a) -> None:
             asks.append(NEAR.format(**head(v["g"]), examples=ev(v["g"]), explanation=v["explanation"], best=v["dev_best"]["blind_max"] or 0, near=near))
         old = {id(v): v["explanation"] for v in noisy}
         for v, t in zip(noisy, wr(asks, max_tokens=500), strict=True):
-            e = (neuron_verify.parse_json(t) or {}).get("explanation")
-            if isinstance(e, str) and e.strip():
-                v["explanation"] = e
+            js = neuron_verify.parse_json(t) or {}
+            if isinstance(js.get("explanation"), str) and js["explanation"].strip():
+                v["explanation"], v["short"], v["one_thing"] = js["explanation"], js.get("name"), js.get("one_thing")
         develop(noisy, "near")
         for v in noisy:
             if al.dev_key(v["rounds"][-1]) < al.dev_key(v["dev_best"]):
-                v["explanation"] = old[id(v)]
+                v["explanation"], v["short"], v["one_thing"] = old[id(v)], v["dev_best"].get("short"), v["dev_best"].get("one_thing")
             else:
                 v["dev_best"] = v["rounds"][-1]
         print(f"near-miss round: {len(noisy)} groups; {sum(v['dev_best'] is v['rounds'][-1] for v in noisy)} narrowed; ${spent():.3f}", flush=True)
     rows = [{"model": doc["model"], "group": v["g"]["id"], "members": v["g"]["members"], "effect": v["g"].get("effect"),
-             "answer_effect": v["g"].get("answer_effect"), "views_name": v["g"].get("name"),
+             "answer_effect": v["g"].get("answer_effect"), "views_name": v["g"].get("name"), "short": v.get("short"),
+             "one_thing": v.get("one_thing"),
              "corpus_max": v["g"]["max"], "explanation": v["explanation"], "rounds": v["rounds"], "writer_valid": bool(v["explanation"]),
              "writer_model": a.writer, "context_before": a.before, "writer_raw_response": v["raw"]} for v in st.values()]
     for r in rows:  # not[...] as neuron_motifs names the group (a group that pushes against the answer)
         neg = str(r.get("views_name") or "").startswith("not[") if r.get("views_name") else (r.get("effect") or 0) > 0
-        r["name"] = ("not" if neg else "") + f"[{r['explanation']}]"
+        r["name"] = ("not" if neg else "") + f"[{r.get('short') or r['explanation']}]"
     a.out.write_text("".join(json.dumps(r, allow_nan=False) + "\n" for r in rows))
     log_spend(f"{tag} input labels", spent(), f"{len(rows)} groups, revise {a.rounds} rounds + near-miss round, {a.before} tokens before; {a.out}")
     s0 = spent()

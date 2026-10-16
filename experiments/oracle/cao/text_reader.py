@@ -434,8 +434,8 @@ def qfeatures(e: dict, F: dict) -> list[float]:
     s = lambda k: sum((m[k] or 0.0) for m in ms)  # noqa: E731
     mxa = lambda k: max(abs(m[k] or 0.0) for m in ms)  # noqa: E731
     at = [m for m in ms if (m["pos"] if m["pos"] >= 0 else T + m["pos"]) == T - 1]
-    d = sum(m["direct"] for m in at) if at else 0.0
-    ds = sum(m["direct_steer"] for m in at) if at else 0.0
+    d = sum(m["direct"] or 0.0 for m in at)
+    ds = sum(m["direct_steer"] or 0.0 for m in at)
     return [len(ms), math.log1p(len(ms)), len(at) / len(ms), sum(m["layer"] for m in ms) / len(ms) / 36,
             s("lost"), s("restored"), mxa("lost"), mxa("restored"), math.log1p(abs(s("lost"))), math.log1p(abs(s("restored"))),
             max(m["frac"] for m in ms), sum(m["frac"] for m in ms), d, ds, math.copysign(math.log1p(abs(d)), d),
@@ -515,10 +515,56 @@ def load_rc(rc: Path) -> tuple[list[dict], list[dict], dict]:
     return train, test, donor
 
 
+def shuffled(F: dict, seed: str) -> dict:
+    """F with every measured number of a member taken from another member of the same circuit (a fixed random
+    permutation; heads' likewise): names, positions and the numbers' distribution kept, which number belongs to which
+    member destroyed. A stronger control than mismatch, whose donor's numbers come in the donor's measured order."""
+    import random
+
+    G = json.loads(json.dumps(F))
+    rng = random.Random(seed)
+    ms = [m for g in G["groups"].values() for m in g["members"]]
+    keys = ("frac", "value", "corrupt", "lost", "restored", "direct", "direct_steer", "size", "steer_size")
+    src = [{k: m.get(k) for k in keys} for m in ms]
+    rng.shuffle(src)
+    for m, x in zip(ms, src):
+        m.update(x)
+    gs = list(G["groups"].values())
+    src = [{k: g.get(k) for k in ("write_direct", "promotes", "suppresses")} for g in gs]
+    rng.shuffle(src)
+    for g, x in zip(gs, src):
+        g.update(x)
+    hs = [{k: h[k] for k in ("lost", "restored")} for h in G["heads"]]
+    rng.shuffle(hs)
+    for h, x in zip(G["heads"], hs):
+        h.update(x)
+    return G
+
+
+NEURON = re.compile(r"L(\d+)\.N(\d+)(?=[+-])")
+
+
+def anon_map(F: dict) -> dict:
+    """A context's neurons renamed without their index ("L34.N864" -> "L34.u3"), numbered in the circuit's order:
+    the layer and position stay, the identity a reader could memorize across texts goes."""
+    out = {}
+    for g in F["groups"].values():
+        for m in g["members"]:
+            k = f"L{m['layer']}.N{m['neuron']}"
+            out.setdefault(k, f"L{m['layer']}.u{len(out) + 1}")
+    return out
+
+
+def anonymize(text: str, amap: dict) -> str:
+    return NEURON.sub(lambda m: amap.get(m.group(0), m.group(0)), text)
+
+
 def user_text(F: dict, e: dict, how: str, D: dict | None = None, first: bool = False) -> str:
     """The circuit, then the question (one context's questions share their prefix, cached when sampled); first: the
-    question also before the circuit, so that the circuit's tokens are read knowing what is asked."""
-    body = serialize(mismatch(F, D), "full") if how == "mismatch" else serialize(F, how)
+    question also before the circuit, so that the circuit's tokens are read knowing what is asked. how: full, names,
+    none, mismatch (D's numbers), shuffle (the context's own numbers permuted among its members)."""
+    body = (serialize(mismatch(F, D), "full") if how == "mismatch" else
+            serialize(shuffled(F, F["id"]), "full") if how == "shuffle" else serialize(F, how))
     return (f"Question: {e['q']}\n\n" if first else "") + body + "\n" + e["q"]
 
 
@@ -573,19 +619,21 @@ def rows(a) -> None:
                 bal += by[k] + ([rng.choice(by[k]) for _ in range(top - len(by[k]))] if k in design else [])
         train = bal
     a.out.mkdir(parents=True, exist_ok=True)
+    am = {cid: anon_map(F[cid]) for cid in F} if a.anon else {}
+    an = lambda t, cid: anonymize(t, am[cid]) if a.anon else t  # noqa: E731
     for how in ("full", "names"):
         with (a.out / f"train_{how}.jsonl").open("w") as f:
             for k, e in enumerate(train):
                 ans = (recap(F[e["id"]], e, how) + "\n" if a.recap else "") + e["a"]
-                f.write(json.dumps({"prompt": [{"role": "user", "content": user_text(F[e["id"]], e, how, first=a.first)}],
-                                    "completion": [{"role": "assistant", "content": ans}],
+                f.write(json.dumps({"prompt": [{"role": "user", "content": an(user_text(F[e["id"]], e, how, first=a.first), e["id"])}],
+                                    "completion": [{"role": "assistant", "content": an(ans, e["id"])}],
                                     "info": {"task": f"{e['id']}#{k}", "cat": e["cat"]}}) + "\n")
     sets = [("test", test)] + ([("test_members", [json.loads(x) for x in a.test_extra.read_text().splitlines()])] if a.test_extra else [])
-    for (name, qs), how in itertools.product(sets, ("full", "names", "mismatch", "none")):
+    for (name, qs), how in itertools.product(sets, ("full", "names", "mismatch", "shuffle", "none")):
         with (a.out / f"{name}_{how}.jsonl").open("w") as f:
             for k, e in enumerate(qs):
-                f.write(json.dumps({"task": f"{e['id']}#{k}", "question": user_text(F[e["id"]], e, how, F[donor[e["id"]]], a.first),
-                                    "cat": e["cat"], "a": e["a"], "id": e["id"]}) + "\n")
+                f.write(json.dumps({"task": f"{e['id']}#{k}", "question": an(user_text(F[e["id"]], e, how, F[donor[e["id"]]], a.first), e["id"]),
+                                    "cat": e["cat"], "a": e["a"], "id": e["id"], **({"anon": am[e["id"]]} if a.anon else {})}) + "\n")
     from transformers import AutoTokenizer
     tok = AutoTokenizer.from_pretrained(str(next((HOME / ".cache/huggingface/hub/models--Qwen--Qwen3-8B/snapshots").iterdir())))
     for f in sorted(a.out.glob("*.jsonl")):
@@ -653,6 +701,39 @@ def score(a) -> None:
               f"  {sum(v[i] for i in varied) / max(len(varied), 1):.3f}")
 
 
+def ask(a) -> None:
+    """The reader as a tool: a finder record (with apply's groups, and measure's reference entry for bits) and questions
+    in, the trained reader's greedy answers out (a JSON line per question: the question, the answer without its Read
+    line, and the claim it ends with). Items are named as record_items names them."""
+    import tinker
+    import torch
+    sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "method" / "oracle" / "rl"))
+    import tinker_train as tt
+
+    rec = json.loads(a.record.read_text())
+    app = json.loads(a.apply.read_text()) if a.apply else None
+    ref = json.loads(a.measure.read_text()) if a.measure else None
+    ref = ref.get(rec["id"], ref) if isinstance(ref, dict) and "rms" not in ref else ref
+    F = record_facts(Weights(), torch.load(THR, map_location="cpu")["max"], rec, app, load_labels(), ref)
+    service = tt.service_client()
+    renderer, tokenizer = tt.renderer_for(a.base)
+    state = a.state if a.state.startswith("tinker://") else json.loads(Path(a.state).read_text())["state"]
+    sampler = service.create_training_client_from_state(state).save_weights_and_get_sampling_client()
+    params = tinker.SamplingParams(max_tokens=400, temperature=0.0, stop=renderer.get_stop_sequences())
+    futs = [(q, sampler.sample(prompt=renderer.build_generation_prompt([{"role": "user", "content": user_text(F, {"q": q}, "full", first=True)}]),
+                               num_samples=1, sampling_params=params)) for q in a.question]
+    for q, fut in futs:
+        got, _ = tt.answer_of(renderer, tokenizer, fut.result().sequences[0].tokens)
+        ans = strip_read(got)
+        claim = None
+        if "Claim:" in ans:
+            try:
+                claim = json.loads(ans.split("Claim:", 1)[1].strip())
+            except ValueError:
+                pass
+        print(json.dumps({"question": q, "answer": ans.split("\nClaim:")[0], "claim": claim, "items": F["groups"] and list(F["groups"])}))
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -675,6 +756,8 @@ def main():
     r.add_argument("--test-extra", type=Path, help="more held-out questions (gen --split test's): test_members_<input>.jsonl")
     r.add_argument("--recap", action="store_true")
     r.add_argument("--first", action="store_true")
+    r.add_argument("--anon", action="store_true", help="neurons without their index (L34.N864 -> L34.u3, per context): the "
+                   "reader cannot carry a neuron's identity across texts, so it must read the numbers and the structure")
     s = sub.add_parser("sample")
     s.add_argument("questions", type=Path)
     s.add_argument("out", type=Path)
@@ -705,8 +788,15 @@ def main():
     cl.add_argument("--rc", type=Path, required=True)
     cl.add_argument("--thr", type=Path, default=THR)
     cl.add_argument("--out", type=Path, required=True)
+    k = sub.add_parser("ask")
+    k.add_argument("record", type=Path, help="a circuit_finder record")
+    k.add_argument("--apply", type=Path, help="neuron_motifs apply's record of it (shared groups)")
+    k.add_argument("--measure", type=Path, help="measure's output (or one entry): claim_check's reference, for bits")
+    k.add_argument("--question", action="append", required=True)
+    k.add_argument("--state", required=True, help="the trained reader (tinker://... or sft's state.json)")
+    k.add_argument("--base", default=MODEL)
     a = ap.parse_args()
-    {"gen": gen, "claims": claims, "measure": measure, "facts": facts, "check": check, "rows": rows, "sample": sample, "score": score}[a.cmd](a)
+    {"ask": ask, "gen": gen, "claims": claims, "measure": measure, "facts": facts, "check": check, "rows": rows, "sample": sample, "score": score}[a.cmd](a)
 
 
 if __name__ == "__main__":

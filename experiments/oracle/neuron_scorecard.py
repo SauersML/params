@@ -41,6 +41,8 @@ recomputed (summary()).
   neuron_scorecard.py score CIRCUIT [CIRCUIT ...] --out OUT [--questions FILE] [--dtype bfloat16] [--device auto]
       score circuit files (or directories of them) into OUT/<name>.json, OUT/rows.jsonl and the table
   neuron_scorecard.py table NAME=OUT [NAME=OUT ...]   finders side by side on the questions every set scored
+  neuron_scorecard.py check MODEL --out FILE [--questions FILE]   every question's patching pair on MODEL: the two
+      answers, the gap and whether the pair is valid (the questions a finder can build on, and those the scorecard scores)
 
 A circuit file: neuron_builder's record ({"id": the question id, "nodes": [{layer, pos, neuron, pole}], "routes":
 [{layer, head, pos}], "seconds", "builder", "model", "adapter"}) or {"id", "neurons": [[layer, pos, neuron, pole]],
@@ -99,8 +101,7 @@ def load_model(base: str, adapter: str | None, dev: str, dtype: torch.dtype = to
     """base (an HF id or directory) with adapter: a directory, an HF id, or an organism's name under ORG/adapters."""
     from transformers import AutoModelForCausalLM
 
-    model = AutoModelForCausalLM.from_pretrained(base, dtype=dtype, device_map=dev if dev == "auto" else None)
-    model = (model if dev == "auto" else model.to(dev)).eval()
+    model = AutoModelForCausalLM.from_pretrained(base, dtype=dtype, device_map=dev).eval()  # (straight to the device: one copy)
     if adapter:
         from peft import PeftModel
 
@@ -451,7 +452,7 @@ def load(out: Path) -> list[dict]:
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("cmd", choices=("score", "table"))
+    ap.add_argument("cmd", choices=("score", "table", "check"))
     ap.add_argument("paths", nargs="+")
     ap.add_argument("--out", type=Path)
     ap.add_argument("--questions", type=Path, default=circuit_questions.OUT)
@@ -462,6 +463,26 @@ def main():
         print(table({p.split("=", 1)[0]: load(Path(p.split("=", 1)[1])) for p in a.paths}))
         return
     from transformers import AutoTokenizer
+
+    if a.cmd == "check":
+        base = a.paths[0]
+        dev = a.device or ("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
+        tok, m = AutoTokenizer.from_pretrained(base), Model(load_model(base, None, dev, getattr(torch, a.dtype)))
+        qs = circuit_questions.load(a.questions)
+        rows = []
+        for qid, q in qs.items():
+            ids = [circuit_questions.chat(tok, q["user"]), circuit_questions.chat(tok, q["corrupt_user"])]
+            lp = m.logp([(x, []) for x in ids])
+            ans, b = int(lp[0].argmax()), int(lp[1].argmax())
+            alts = pair_alts(lp[0], ans, b)
+            gap = contrast(lp[0], ans, alts) - contrast(lp[1], ans, alts)
+            rows.append({"id": qid, "split": q["split"], "answer": tok.decode([ans]), "corrupt_answer": tok.decode([b]), "gap": gap,
+                         "valid": ans != b and gap >= MIN_GAP})
+        a.out.write_text(json.dumps({"model": base, "dtype": a.dtype, "pairs": rows}, indent=0))
+        for sp in ("dev", "heldout"):
+            r = [x for x in rows if x["split"] == sp]
+            print(f"{sp}: {sum(x['valid'] for x in r)} of {len(r)} pairs valid on {base}")
+        return
 
     dev = a.device or ("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
     files = []

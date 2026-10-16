@@ -75,8 +75,10 @@ CONDITIONAL = True    # after a round with no passing prefix, group testing agai
 # on Qwen3-8B capital/Egypt/p1 and 40+ min on an owl pair's source cut)
 FLOOR = True          # eps never below the measured share of a no-op patch (Qwen3-8B bfloat16 capital/Finland/p0: the
 # source cut's eps / 4 round at 0.005 split 34,644 blocks to single units, a passing prefix of 21,598)
-BEAM = 0              # conditional rounds by beams of this many blocks (beams), stopping once their singles pass with
-# the round's earlier ones (0: group testing over every block above eps, every single unit reached)
+BEAM = 32             # conditional rounds by beams of this many blocks (beams), stopping once their singles pass with
+# the round's earlier ones (0: group testing over every block above eps, every single unit reached). Qwen3-8B bfloat16,
+# 8 dev questions (A40): the same circuits, 24,668 -> 23,283 measured runs, 81.4 -> 77.2 s (capital/Italy/p2's
+# conditional round 88 -> 56 single units, 20.4 -> 15.5 s)
 TARGETED = False      # refine only the first level's blocks that hold the missing share (the smallest prefix of them, in
 # measured order, that patched whole beside the singles found passes), not every block at EPS / EPS_STEP. Off: on
 # Qwen3-1.7B capital/France p0 and p1 the source cut came out unmet (87 and 49 singles in 3 blocks refined twice), met

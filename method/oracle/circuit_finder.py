@@ -28,7 +28,10 @@ Search (every decision a measured run; gradients only order):
     with each mover's share of the source cut's effect (the head frozen at its base-run value while the source cut is
     patched). The smallest set over all units is one cut, the narrowest place the answer's information crosses (one or
     two heads at the answer position on Qwen3-1.7B capitals), so the circuit is the path of cuts from the changed
-    token to the answer;
+    token to the answer. Each cut first patches every unit of its kind at its positions (its ceiling); when that fails
+    no subset is searched beyond EPS (on Qwen3-8B the heads at the answer position write the answer past its neurons:
+    capital/France's readout reached 0.41/0.70 with 5,469 neurons), and the circuit passes on its other cuts. Curves
+    are measured at every size to 16 and eight sizes per doubling after, the passing size found by bisection;
  4. reported: the neurons with their stage, poles, regimes and measured shares alone, the movers, each cut's curve and
     size, the residual map, seconds.
 Every run is a batch of exactly ROWS (padded), so bfloat16 kernels do not change with the batch size.
@@ -277,20 +280,43 @@ def unit(kind: str, layer: int, pos: int, k: int) -> tuple:
     return ("head", layer, k, pos) if kind == "head" else ("neuron", layer, pos, k)
 
 
+def grid(n: int) -> list[int]:
+    """The prefix sizes a curve is measured at: every size to 16, then eight per doubling, and n."""
+    ks, k = list(range(1, min(n, 16) + 1)), 16
+    while k < n:
+        k = int(math.ceil(k * 2 ** 0.125))
+        ks.append(min(k, n))
+    return sorted(set(ks))
+
+
 def cut(pt: Patcher, sc: dict, kind: str, positions, done: dict, log=None) -> dict:
     """The smallest set of one kind of unit at the given positions that passes (module docstring, steps 2-3)."""
-    eps, singles = EPS, {}
-    for rnd in range(EPS_ROUNDS):
+    width = pt.H if kind == "head" else pt.D
+    every = [unit(kind, i, p, torch.arange(width)) for i in range(pt.L) for p in positions]
+    ceiling = pt.both([every])[0]                   # every unit of the kind there: when it fails no subset is searched
+    reach = ceiling[0] >= PASS and ceiling[1] >= PASS
+    eps, singles, ok = EPS, {}, None
+    for rnd in range(EPS_ROUNDS if reach else 1):
         singles.update(group_test(pt, sc, eps, done, kinds=(kind,), positions=positions, log=log))
         order = sorted(singles, key=lambda u: -max(abs(singles[u][0]), abs(singles[u][1])))
-        curve = pt.both([order[:k] for k in range(1, len(order) + 1)])
-        ok = [k for k, (lost, rest) in enumerate(curve, 1) if lost >= PASS and rest >= PASS]
+        ks = grid(len(order))
+        curve = pt.both([order[:k] for k in ks])
+        met = [k for k, (lost, rest) in zip(ks, curve) if lost >= PASS and rest >= PASS]
+        if met:                                     # the smallest passing prefix: bisection below the first grid size
+            hi = met[0]
+            lo = max([k for k in ks if k < hi] + [0])
+            while hi - lo > 1:
+                mid = (lo + hi) // 2
+                lost, rest = pt.both([order[:mid]])[0]
+                lo, hi = (lo, mid) if lost >= PASS and rest >= PASS else (mid, hi)
+            ok = hi
         if log:
-            log(f"  {kind}s at {positions[0]}..{positions[-1]}, eps {eps:.4f}: {len(order)} single units, passing prefix {ok[0] if ok else None}")
+            log(f"  {kind}s at {positions[0]}..{positions[-1]}, eps {eps:.4f}: {len(order)} single units, passing prefix {ok}, "
+                f"every one there {ceiling[0]:.2f}/{ceiling[1]:.2f}")
         if ok:
             break
         eps /= EPS_STEP
-    circ = order[:ok[0]] if ok else list(order)
+    circ = order[:ok] if ok else list(order)
     if ok and len(circ) > 1:                        # units whose removal alone still passes, then removed one at a time
         alone = pt.both([[v for v in circ if v != u] for u in circ])           # from the least effective while it passes
         for u in [u for u, (lost, rest) in zip(circ, alone) if lost >= PASS and rest >= PASS][::-1]:
@@ -300,7 +326,8 @@ def cut(pt: Patcher, sc: dict, kind: str, positions, done: dict, log=None) -> di
                 circ = trial
     lost, rest = pt.both([circ])[0] if circ else (0.0, 0.0)
     return {"units": circ, "singles": singles, "met": bool(ok) and lost >= PASS and rest >= PASS, "lost": lost, "restored": rest,
-            "eps": eps, "found": len(singles), "curve": [{"k": k, "lost": a, "restored": b} for k, (a, b) in enumerate(curve, 1)]}
+            "eps": eps, "found": len(singles), "ceiling": list(ceiling), "reachable": reach,
+            "curve": [{"k": k, "lost": a, "restored": b} for k, (a, b) in zip(ks, curve)]}
 
 
 def find(pt: Patcher, clean: list[int], corrupt: list[int], answers: list[int] | None = None, log=None) -> dict:
@@ -345,9 +372,9 @@ def find(pt: Patcher, clean: list[int], corrupt: list[int], answers: list[int] |
         lo, re = cuts["movers"]["singles"][u]
         routes.append({"layer": i, "head": h, "pos": p, "attends": pt.attends(i, h, p), "lost": lo, "restored": re,
                        "through_source": list(through[u]) if u in through else None})
-    rec.update(nodes=nodes, routes=routes, met=all(c["met"] for c in cuts.values()),
-               cuts={k: {f: c[f] for f in ("met", "lost", "restored", "eps", "found", "curve")} | {"size": len(c["units"])}
-                     for k, c in cuts.items()},
+    rec.update(nodes=nodes, routes=routes, met=all(c["met"] for k, c in cuts.items() if k != "readout" or c["reachable"]),
+               cuts={k: {f: c[f] for f in ("met", "lost", "restored", "eps", "found", "ceiling", "reachable", "curve")}
+                     | {"size": len(c["units"])} for k, c in cuts.items()},
                size=len(nodes), seconds=round(time.perf_counter() - t0, 2))
     if log:
         log("  " + ", ".join(f"{k} {len(c['units'])} ({c['lost']:.2f}/{c['restored']:.2f}{'' if c['met'] else ' unmet'})"

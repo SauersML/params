@@ -78,4 +78,6 @@ def test_find_record(tiny, monkeypatch):
             assert abs(lost - c["lost"]) < 1e-5 and abs(rest - c["restored"]) < 1e-5
         if c["met"]:
             assert c["lost"] >= cf.PASS and c["restored"] >= cf.PASS
-    assert rec["met"] == all(c["met"] for c in rec["cuts"].values())
+    assert rec["met"] == all(c["met"] for k, c in rec["cuts"].items() if k != "readout" or c["reachable"])
+    for c in rec["cuts"].values():
+        assert c["reachable"] == (c["ceiling"][0] >= cf.PASS and c["ceiling"][1] >= cf.PASS)

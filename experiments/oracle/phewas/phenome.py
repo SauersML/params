@@ -384,11 +384,16 @@ FAMILIES = (mwe_persona, mwe_choice, refusal, sycophancy_answer, counterfact, ep
 
 
 def build(a) -> None:
+    write(a.out, FAMILIES, a.seed)
+
+
+def write(out: Path, families, seed: int = 15) -> None:
+    """The traits of families as a phenome directory OUT (traits.json, sequences.jsonl, splits.jsonl)."""
     from transformers import AutoTokenizer
 
     tok = AutoTokenizer.from_pretrained(TOKENIZER)
     eot = tok.convert_tokens_to_ids(EOT)
-    rng = random.Random(a.seed)
+    rng = random.Random(seed)
 
     def prompt(user, prefill="", raw=False) -> list[int]:
         if raw:
@@ -399,15 +404,15 @@ def build(a) -> None:
     def ids(s: str) -> list[int]:
         return tok(s, add_special_tokens=False)["input_ids"]
 
-    a.out.mkdir(parents=True, exist_ok=True)
+    out.mkdir(parents=True, exist_ok=True)
     traits, seqs, splits = [], [], []
-    for fam in FAMILIES:
+    for fam in families:
         for name, group, kind, items in fam(rng):
             if len(items) < MIN_ITEMS:
                 print(f"{name}: {len(items)} prompts, under {MIN_ITEMS}: left out", flush=True)
                 continue
             items = list(items)
-            random.Random(f"split|{a.seed}|{name}").shuffle(items)  # (a family may list its items grouped, by answer say)
+            random.Random(f"split|{seed}|{name}").shuffle(items)  # (a family may list its items grouped, by answer say)
             items = items[:MAX_ITEMS]
             split = ["dev" if k < len(items) // 2 else "held" for k in range(len(items))]
             for it, sp in zip(items, split):
@@ -436,11 +441,11 @@ def build(a) -> None:
                 spec["tokens"] = {form: items[0][form]["tokens"] for form in "AB"}
             traits.append(spec)
             print(f"{name}: {len(items)} prompts ({kind})", flush=True)
-    (a.out / "traits.json").write_text(json.dumps(traits, indent=1))
-    with (a.out / "sequences.jsonl").open("w") as fh:
+    (out / "traits.json").write_text(json.dumps(traits, indent=1))
+    with (out / "sequences.jsonl").open("w") as fh:
         for s in seqs:
             fh.write(json.dumps(s) + "\n")
-    (a.out / "splits.jsonl").write_text("".join(json.dumps(x) + "\n" for x in splits))
+    (out / "splits.jsonl").write_text("".join(json.dumps(x) + "\n" for x in splits))
     print(f"{len(traits)} traits, {len(seqs)} sequences, {sum(len(s['prompt']) + len(s['cont']) for s in seqs)} tokens")
 
 

@@ -53,6 +53,24 @@ def logit_sum(lps) -> float:
     return s - math.log(max(1e-300, 1 - math.exp(s)))
 
 
+def panel_items(phenome: Path, per: int = PANEL, seed: int = 15, traits=None) -> dict:
+    """{trait: its panel's dev items}: per dev items of each kept trait, drawn in phenome.json's order from one seeded
+    stream (so a trait's items do not depend on which traits a run keeps), then restricted to traits when given; a trait
+    named in traits but not kept (an organism's trait under its reliability floor) is drawn after the kept ones."""
+    phen = json.loads((phenome / "phenome.json").read_text())
+    split: dict = {}
+    for x in map(json.loads, (phenome / "splits.jsonl").read_text().splitlines()):
+        split.setdefault(x["trait"], []).append((x["item"], x["split"]))
+    rng = random.Random(seed)
+    order = [t["name"] for t in phen["traits"] if t["kept"]]
+    order += [t["name"] for t in phen["traits"] if not t["kept"] and traits and t["name"] in traits]
+    want = {}
+    for name in order:
+        dev = sorted(i for i, s in split.get(name, []) if s == "dev")
+        want[name] = set(rng.sample(dev, min(per, len(dev))))
+    return {n: v for n, v in want.items() if not traits or n in traits}
+
+
 class Panel:
     """The panel's sequences in fixed batches, and each trait's value under an edit."""
 
@@ -61,15 +79,8 @@ class Panel:
 
         self.nr, self.torch = nr, torch
         phen = json.loads((phenome / "phenome.json").read_text())
-        self.traits = {t["name"]: t for t in phen["traits"] if t["kept"] and (not traits or t["name"] in traits)}
-        split = {}
-        for x in map(json.loads, (phenome / "splits.jsonl").read_text().splitlines()):
-            split[(x["trait"], x["item"])] = x["split"]
-        rng = random.Random(seed)
-        want = {}
-        for name in self.traits:
-            dev = sorted(i for (t, i), s in split.items() if t == name and s == "dev")
-            want[name] = set(rng.sample(dev, min(per, len(dev))))
+        want = panel_items(phenome, per, seed, traits)
+        self.traits = {t["name"]: t for t in phen["traits"] if t["name"] in want}
         seqs = []
         for line in (phenome / "sequences.jsonl").open():
             s = json.loads(line)

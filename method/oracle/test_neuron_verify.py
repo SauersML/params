@@ -152,3 +152,16 @@ def test_summary_leaves_out_poles_that_never_fire(tmp_path,capsys):
 def test_parse_json_reads_a_lone_backslash_literally():
  raw='{"positive": "chat tokens like \'<\\|im_end|>\'", "negative": "a \\"quoted\\" word\\n"}'
  assert nv.parse_json(raw)=={'positive':"chat tokens like '<\\|im_end|>'",'negative':'a "quoted" word\n'}
+def test_group_item_measured_through_group_values_and_steered_by_members():
+ class G(Target):
+  def group(self,texts,members):self.calls.append(('group',len(texts),members));return [dict(pos=1. if x.startswith('maximum') else .1,neg=0.) for x in texts]
+  def steered(self,l,i,value,members=None):self.calls.append(('steer',l,i,value,members));return 'synthetic continuation'
+ tg=G();it=dict(members=[[0,1,1,2.],[0,3,-1,4.]],pole='+',corpus_max=0.5,explanation='a group explanation')
+ r=nv.verify(tg,Reader(),[it])[0]
+ assert r['valid'] and r['passes_t1'] and r['blind_max']==2.0 and 'group of neurons' in r['proposal_request']
+ assert ('group',13,it['members']) in tg.calls and any(c[0]=='steer' and c[4]==it['members'] for c in tg.calls)
+@pytest.mark.parametrize('bad',[dict(members=[[0,9,1,2.]]),dict(members=[[0,1,0,2.]]),dict(members=[[0,1,1,0.]]),dict(pole='-')])
+def test_bad_group_items_fail_before_reader(bad):
+ it={**dict(members=[[0,1,1,2.]],pole='+',corpus_max=1.,explanation='x'),**bad};rd=Reader()
+ with pytest.raises(ValueError):nv.verify(Target(),rd,[it])
+ assert rd.calls==[]

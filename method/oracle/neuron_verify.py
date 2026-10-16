@@ -56,6 +56,16 @@ Write JSON with these fields, nothing else:
 BLIND_LEN = {"short": "1 to 3 sentences",  # T1's pre-registered blind text
              "long": "up to about 150 tokens (a passage that may set up the context the explanation describes)"}
 
+ASK_GROUP = """A group of neurons in a language model (several neurons' sides that work together) has this explanation of what makes the group fire:
+{explanation}
+
+Write JSON with these fields, nothing else:
+"max_texts": {blind} different texts of {blind_len}, each written to make this group fire as strongly as possible;
+"near_misses": {near} texts on closely related subjects that, by the explanation, should NOT make it fire;
+"distant_concept": the concept farthest from what the explanation describes;
+"distant_texts": {distant} texts about that distant concept;
+"steering_prediction": one sentence saying what the model would write if this group were turned up strongly while it continues ordinary prompts."""
+
 JUDGE = """Prediction of how a language model's writing changes when one of its neurons is turned up:
 {prediction}
 
@@ -105,6 +115,38 @@ class Target:
         self.layers = self.m.model.layers
         self.name = name
 
+    def group(self, texts: list[str], members: list) -> list[dict]:
+        """Per text, a group's largest activation over positions (the first token left out): at each position the mean
+        over members [layer, index, sign, corpus maximum] of the member's value in its sign over its maximum, clipped
+        at 0 (neuron_groups)."""
+        torch = self.torch
+        seen: dict = {}
+        hs = []
+        for k, (l, i, sg, mx) in enumerate(members):
+            def pre(_m, a, k=k, i=i, sg=sg, mx=mx):
+                seen[k] = (a[0][..., i].float() * (sg / mx)).clamp_min(0)
+            hs.append(self.layers[l].mlp.down_proj.register_forward_pre_hook(pre))
+        out = []
+        try:
+            for s in range(0, len(texts), 16):
+                enc = self.tok(texts[s:s + 16], return_tensors="pt", padding=True, add_special_tokens=False).to(self.dev)
+                with torch.no_grad():
+                    self.m.model(**enc, use_cache=False)
+                act = sum(seen[k].to(self.dev) for k in range(len(members))) / len(members)
+                mask = enc["attention_mask"].bool().clone()
+                mask[:, 0] = False
+                for j in range(mask.shape[0]):
+                    a = act[j][mask[j]]
+                    if a.numel() == 0:
+                        out.append({"pos": 0.0, "neg": 0.0, "position_pos": None, "position_neg": None})
+                        continue
+                    ip = int(a.argmax())
+                    out.append({"pos": float(a[ip]), "neg": 0.0, "position_pos": int(mask[j].nonzero().flatten()[ip]), "position_neg": None})
+        finally:
+            for h in hs:
+                h.remove()
+        return out
+
     def poles(self, texts: list[str], layer: int, index: int) -> list[dict]:
         """Per text, its largest activation and its largest negated activation over positions (the first token, the
         attention sink, left out), with the sign regime at each."""
@@ -138,20 +180,21 @@ class Target:
                 h.remove()
         return out
 
-    def effects(self, contexts: list[list[int]], layer: int, index: int, pole: str, k: int = 10) -> list[dict]:
+    def effects(self, contexts: list[list[int]], layer: int, index: int, pole: str, k: int = 10, members: list | None = None) -> list[dict]:
         """What zeroing one pole does to the next-token prediction after each context (token ids, the pole's firing
         token last): the pole's values (that sign only) set to 0 at every position, as neuron_builder.pole_edit; per
         context the k tokens whose probability falls most and the k that rise most, (token, p before, p after), the
         unedited model's top k, and the total variation between the two distributions."""
         torch = self.torch
-        sign = 1.0 if pole == "+" else -1.0
-        mlp = self.layers[layer].mlp
+        zero = [(m[0], m[1], float(m[2])) for m in members] if members else [(layer, index, 1.0 if pole == "+" else -1.0)]
 
-        def pre(_m, a):
-            x = a[0].clone()
-            v = x[..., index]
-            x[..., index] = torch.where(v * sign > 0, torch.zeros_like(v), v)
-            return (x,) + tuple(a[1:])
+        def pre_of(i, sign):
+            def pre(_m, a):
+                x = a[0].clone()
+                v = x[..., i]
+                x[..., i] = torch.where(v * sign > 0, torch.zeros_like(v), v)
+                return (x,) + tuple(a[1:])
+            return pre
 
         out = []
         for s in range(0, len(contexts), 8):
@@ -163,12 +206,12 @@ class Target:
             last = torch.tensor([len(c) - 1 for c in part], device=self.dev)
             ps = []
             for edit in (False, True):
-                h = mlp.down_proj.register_forward_pre_hook(pre) if edit else None
+                hs = [self.layers[l].mlp.down_proj.register_forward_pre_hook(pre_of(i, sg)) for l, i, sg in zero] if edit else []
                 try:
                     with torch.no_grad():
                         lg = self.m(input_ids=ids, attention_mask=mask, use_cache=False).logits
                 finally:
-                    if h is not None:
+                    for h in hs:
                         h.remove()
                 ps.append(torch.softmax(lg[torch.arange(len(part)), last].float(), -1))
             p0, p1 = ps
@@ -181,19 +224,20 @@ class Target:
                             "top": [(tok(t), float(p0[j, t])) for t in top], "tv": float(d[j].abs().sum() / 2)})
         return out
 
-    def steered(self, layer: int, index: int, value: float | None) -> str:
+    def steered(self, layer: int, index: int, value: float | None, members: list | None = None) -> str:
         """The model's greedy continuations of PROMPTS with the neuron's activation set to value at every position
         (None: unsteered), joined."""
         torch = self.torch
         if value is None and getattr(self, "_plain", None):  # the unsteered continuations: the same for every neuron
             return self._plain
-        h = None
-        if value is not None:
-            def pre(_m, a):
-                x = a[0].clone()
-                x[..., index] = value
-                return (x,) + tuple(a[1:])
-            h = self.layers[layer].mlp.down_proj.register_forward_pre_hook(pre)
+        hs = []
+        if value is not None:  # a group: every member set to its sign times STEER of its own maximum
+            for l, i, v in ([(m[0], m[1], m[2] * STEER * m[3]) for m in members] if members else [(layer, index, value)]):
+                def pre(_m, a, i=i, v=v):
+                    x = a[0].clone()
+                    x[..., i] = v
+                    return (x,) + tuple(a[1:])
+                hs.append(self.layers[l].mlp.down_proj.register_forward_pre_hook(pre))
         try:
             self.tok.padding_side = "left"  # the prompts in one batch, each continuing from its own last token
             ids = self.tok(PROMPTS, return_tensors="pt", padding=True, add_special_tokens=False).to(self.dev)
@@ -203,7 +247,7 @@ class Target:
             outs = [p + self.tok.decode(x[ids["input_ids"].shape[1]:], skip_special_tokens=True) for p, x in zip(PROMPTS, g)]
         finally:
             self.tok.padding_side = "right"
-            if h is not None:
+            for h in hs:
                 h.remove()
         if value is None:
             self._plain = " / ".join(outs)
@@ -226,6 +270,8 @@ def _item(tg, it: dict) -> dict:
     """Validate every item before reader or target execution; no Python negative indices."""
     if not isinstance(it, dict):
         raise ValueError("neuron item must be an object")
+    if it.get("members") is not None:
+        return _group_item(tg, it)
     for key in ("layer", "index"):
         if type(it.get(key)) is not int or it[key] < 0:
             raise ValueError(f"{key} must be a nonnegative native integer")
@@ -247,6 +293,27 @@ def _item(tg, it: dict) -> dict:
     return {"requested_model":getattr(tg,"name",None),"native_layer":it["layer"],"native_index":it["index"],
             "native_width":width,"layers":len(tg.layers),"swiglu_architecture_verified":getattr(tg,"architecture_verified",False),"unit":"post_silu_gate_times_up / pre_down_proj",
             "identity_scope":"requested model and runtime architecture; checkpoint weights/revision not attested"}
+
+
+def _group_item(tg, it: dict) -> dict:
+    ms = it["members"]
+    if not isinstance(ms, list) or not ms:
+        raise ValueError("a group needs members [layer, index, sign, corpus maximum]")
+    for m in ms:
+        if (not isinstance(m, (list, tuple)) or len(m) != 4 or any(type(x) is not int for x in m[:3]) or m[2] not in (1, -1)
+                or not isinstance(m[3], numbers.Real) or not math.isfinite(m[3]) or m[3] <= 0):
+            raise ValueError("group member must be [layer, index, sign +-1, positive corpus maximum]")
+        if not 0 <= m[0] < len(tg.layers) or not 0 <= m[1] < tg.layers[m[0]].mlp.down_proj.in_features:
+            raise ValueError("group member outside target architecture")
+    if it.get("pole") != "+":
+        raise ValueError("a group has one side: pole +")
+    cm = it.get("corpus_max")
+    if isinstance(cm, bool) or not isinstance(cm, numbers.Real) or not math.isfinite(cm) or cm <= 0:
+        raise ValueError("corpus_max must be finite and positive")
+    if not isinstance(it.get("explanation"), str) or not it["explanation"].strip():
+        raise ValueError("explanation must be nonempty text")
+    return {"requested_model": getattr(tg, "name", None), "members": [list(m) for m in ms], "layers": len(tg.layers),
+            "unit": "group: mean over members of value*sign/member corpus maximum, clipped at 0"}
 
 
 def _proposal(plan):
@@ -285,7 +352,7 @@ def plan(rd, items: list[dict], length: str = "short", temperature: float = 0.0,
     (texts the explanation's writer never saw)."""
     source_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
     asked=[it for it in items if it.get("writer_valid") is not False]  # t1_audit explain's failures get no reader call
-    asks=[ASK.format(pole="positive" if it["pole"]=="+" else "negative",explanation=it["explanation"],
+    asks=[(ASK_GROUP if it.get("members") else ASK).format(pole="positive" if it["pole"]=="+" else "negative",explanation=it["explanation"],
                      blind=BLIND,blind_len=BLIND_LEN[length],near=NEAR,distant=DISTANT) for it in asked]
     sampling={"temperature":temperature,"seed":seed} if temperature else {}
     replies=iter(zip(asks,_responses(rd,asks,1500,**sampling) if asks else []))
@@ -297,7 +364,8 @@ def plan(rd, items: list[dict], length: str = "short", temperature: float = 0.0,
             continue
         ask,raw=next(replies)
         prop=parse_json(raw)
-        row={k:it[k] for k in ("layer","index","pole","corpus_max","explanation")}
+        row={k:it.get(k) for k in ("layer","index","pole","corpus_max","explanation")}
+        if it.get("members"):row.update(members=it["members"],group=it.get("group"))
         row.update({"reader_class":type(rd).__name__,"reader_model":getattr(rd,"base",getattr(rd,"model",None)),
                     "verifier_source_sha256":source_sha256,"raw_proposal":raw,"proposal":prop,
                     "proposal_request":ask,"blind_length":length,"plan_sampling":sampling or None,
@@ -322,7 +390,7 @@ def measure(tg: Target, rows: list[dict], seed: int = 0) -> list[dict]:
             out.append(row);continue
         groups=row["test_texts"];key="pos" if row["pole"]=="+" else "neg";cm=float(row["corpus_max"])
         flat=[x for xs in groups.values() for x in xs]
-        vals=tg.poles(flat,row["layer"],row["index"])
+        vals=tg.group(flat,row["members"]) if row.get("members") else tg.poles(flat,row["layer"],row["index"])
         if not isinstance(vals,list) or len(vals)!=len(flat):
             raise ValueError("target pole result count must match all test texts")
         measured=[]
@@ -340,7 +408,8 @@ def measure(tg: Target, rows: list[dict], seed: int = 0) -> list[dict]:
         dist=sum(x>=FIRE for x in got["distant_texts"])/DISTANT
         value=(1 if row["pole"]=="+" else -1)*STEER*cm
         if not math.isfinite(value):raise ValueError("steering amplitude must be finite")
-        on,off=tg.steered(row["layer"],row["index"],value),tg.steered(row["layer"],row["index"],None)
+        on=tg.steered(None,None,value,row["members"]) if row.get("members") else tg.steered(row["layer"],row["index"],value)
+        off=tg.steered(row.get("layer"),row.get("index"),None)
         flip=rng.random()<.5
         prop=row["proposal"]
         out.append({**row,"raw_pole_measurements":vals,"blind_max":blind,"blind_texts":groups["max_texts"],
@@ -424,7 +493,7 @@ def cmd_serve(a) -> None:
             try:
                 with lock:
                     if self.path.rstrip("/").endswith("/effects"):  # {"items": [{"contexts", "layer", "index", "pole"}]}
-                        out={"effects":[tg.effects(it["contexts"],it["layer"],it["index"],it["pole"],int(it.get("k",10)))
+                        out={"effects":[tg.effects(it["contexts"],it.get("layer"),it.get("index"),it.get("pole","+"),int(it.get("k",10)),it.get("members"))
                                         for it in req["items"]]}
                     else:
                         out={"rows":measure(tg,req["rows"],int(req.get("seed",0)))}

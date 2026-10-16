@@ -2157,6 +2157,10 @@ launch() {
     # host's power limit, driver or CUDA does not change between two pods minutes apart. A pod on one
     # moves the launch to the next offer; later launches weigh the host by its record (unit_risk).
     local -A failed_here=()
+    # Pods that landed again on a host failed (or slow) earlier in this launch: when stock is only on such hosts, the
+    # spent offers asked again each minute land there each time (10-16: circ-scale32-dev1 created and deleted 8 pods on
+    # one CUDA 12.4 host, circ-scale32-dev3 6 on one slow H100 NVL host); past DISCARDS the launch gives up.
+    local relanded=0
     # A listed run relaunches only while still listed; a small run's approval covers its whole cap.
     [ "$APPROVAL" = auto ] || approved "$NAME" || { say "approval for $NAME withdrawn; not launching a pod"; exit 3; }
     POD="" IP="" PORT="" EARLY_FETCH="" EARLY_PYENV="" EARLY_RSYNC="" PROBE_A=""
@@ -2288,7 +2292,11 @@ launch() {
         reap "$POD" || exit 1
         POD="" IP="" PORT=""
         case ${why[1]} in
-            "riskier than the next offer"*|"host slow before"|"host failed earlier in this launch") spent[$kind|$gpu]=1 ;;
+            "host failed earlier in this launch")
+                spent[$kind|$gpu]=1
+                relanded=$(( relanded + 1 ))
+                (( relanded <= DISCARDS )) || { say "the only stock is on hosts that already failed in this launch ($relanded pods landed on them again); giving up"; exit 1; } ;;
+            "riskier than the next offer"*|"host slow before") spent[$kind|$gpu]=1 ;;
             *)  DISCARDED=$(( ${DISCARDED:-0} + 1 ))
                 (( DISCARDED <= DISCARDS )) || { say "$DISCARDS pods discarded on failing hosts; giving up"; exit 1; } ;;
         esac

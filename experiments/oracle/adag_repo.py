@@ -48,6 +48,8 @@ here).
   (in ADAG's clone)  adag_repo.py relp QUESTION_ID OUT --model Qwen/Qwen3-8B [--questions FILE]
   adag_repo.py match ADAG_TRACE_DIR FAMILY_PAIRS_DIR OUT   ADAG's circuits cut to our finder's size on the same pairs
   (in ADAG's clone)  adag_repo.py relpcheck QUESTION_ID OUT.json --model M   ADAG's wrapped forward against the model's
+  adag_repo.py sitefix DIR   a sitecustomize.py in DIR: with PYTHONPATH=DIR and ADAG_MASKFIX=1, ADAG's own scripts run
+      with fix_noqk_mask (clusters, relp and trace apply it themselves under ADAG_MASKFIX=1)
   (in ADAG's clone)  adag_repo.py trace QUESTIONS.json OUT --model Qwen/Qwen3-8B [--split dev] [--stride 2] [--limit N]
       [--families task/key,...] [--chunk 10]
       [--finder N]   (circuit_finder on the first N of them too: OUT/finder/, timed on the same card)
@@ -56,6 +58,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import random
 import time
 from pathlib import Path
@@ -63,6 +66,24 @@ from pathlib import Path
 import torch
 
 CAND = 8192
+SITEFIX = """import os
+if os.environ.get("ADAG_MASKFIX") == "1":  # (adag_repo.py sitefix: ADAG's "noqk" attention gets eager's causal mask)
+    try:
+        from transformers.masking_utils import ALL_MASK_ATTENTION_FUNCTIONS
+        ALL_MASK_ATTENTION_FUNCTIONS.register("noqk", ALL_MASK_ATTENTION_FUNCTIONS["eager"])
+    except Exception:
+        pass
+"""
+
+
+def fix_noqk_mask() -> None:
+    """ADAG's NoQKGradAttention runs as attention implementation "noqk", for which transformers 4.57 builds no causal
+    mask (as for sdpa without padding: attention_mask None), and its noqk forward masks only with a given mask, so every
+    token attends to the future: Qwen3-0.6B's "Paris" (logit 23.46) becomes "<|im_end|>" (17.81) with that wrapper
+    alone. Registering eager's mask function for "noqk" restores the model's forward exactly (23.46). Applied when
+    ADAG_MASKFIX=1 (and to ADAG's own scripts by a sitecustomize, adag_repo.py sitefix)."""
+    from transformers.masking_utils import ALL_MASK_ATTENTION_FUNCTIONS
+    ALL_MASK_ATTENTION_FUNCTIONS.register("noqk", ALL_MASK_ATTENTION_FUNCTIONS["eager"])
 GROUP = 32  # candidates measured in one forward pass (each on its own copy of the batch)
 BATCH = 50
 
@@ -340,6 +361,8 @@ def relpcheck(a) -> None:
     stop_nonlinear_grad(model, use_relp_grad=True, use_half_rule=True)
     try:
         lg1, a1 = run(True)
+        fix_noqk_mask()
+        lg2, a2 = run(True)  # (with eager's causal mask for "noqk")
     finally:
         revert_stop_nonlinear_grad(model)
     layers = []
@@ -349,6 +372,9 @@ def relpcheck(a) -> None:
     top = int(lg0.argmax())
     out = {"id": a.qid, "model": a.model, "top_plain": tok.decode([top]), "top_wrapped": tok.decode([int(lg1.argmax())]),
            "logit_plain": float(lg0[top]), "logit_wrapped": float(lg1[top]), "logits_max_abs_diff": float((lg0 - lg1).abs().max()),
+           "top_wrapped_maskfix": tok.decode([int(lg2.argmax())]), "logit_wrapped_maskfix": float(lg2[top]),
+           "logits_max_abs_diff_maskfix": float((lg0 - lg2).abs().max()),
+           "r_min_maskfix": min(float(torch.corrcoef(torch.stack([a0[i].flatten(), a2[i].flatten()]))[0, 1]) for i in a0),
            "layers": layers}
     a.out.write_text(json.dumps(out))
     print(json.dumps({k: v for k, v in out.items() if k != "layers"}), "| r per layer:", [round(x["r"], 3) for x in layers], flush=True)
@@ -584,6 +610,8 @@ def main():
     r.add_argument("out", type=Path)
     r.add_argument("--model", required=True)
     r.add_argument("--questions", type=Path, default=None)
+    sf = sp.add_parser("sitefix")
+    sf.add_argument("dir", type=Path)
     rc = sp.add_parser("relpcheck")
     rc.add_argument("qid")
     rc.add_argument("out", type=Path)
@@ -614,6 +642,12 @@ def main():
     s.add_argument("--order", default="replace", choices=("replace", "first"),
                    help="replace: measured scores in NAP's place among its others; first: every measured node ranked first")
     a = ap.parse_args()
+    if a.cmd == "sitefix":
+        a.dir.mkdir(parents=True, exist_ok=True)
+        (a.dir / "sitecustomize.py").write_text(SITEFIX)
+        return
+    if os.environ.get("ADAG_MASKFIX") == "1" and a.cmd in ("clusters", "relp", "trace"):
+        fix_noqk_mask()
     {"clusters": clusters, "math-data": math_data, "cg-test": cg_test, "groups": groups, "measured": measured, "relp": relp, "trace": trace, "match": match, "relpcheck": relpcheck}[a.cmd](a)
 
 

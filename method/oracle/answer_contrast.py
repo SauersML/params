@@ -9,6 +9,8 @@ dropped, the first run of letters and digits, lower case).
   alternatives  candidates starting another word in the answer's script: b's word first, then by the clean run's
                 probability, ALTERNATIVES words, every candidate token of each summed in;
   dropped       candidates in another script (巴黎 for Paris) and ones starting no word: on neither side.
+A question is valid only when its answer starts a word (not an emoji or a mark: "🌍") and some other word in the answer's
+script is among the candidates; others have no contrast (other scripts would bring back the answer's own renderings).
 contrast = log2 p(answer) - log2 p(alternatives), the sets fixed from the clean run for every run of the question.
 """
 from __future__ import annotations
@@ -53,7 +55,8 @@ def token_sets(core, tok, ids: list[int], lp: torch.Tensor, b: int | None = None
     if tok is None:
         alt = [z for z in order[1:] if z != b]
         alt = ([b] if b is not None and b != y else []) + alt
-        return {"answer": [y], "alternatives": alt[:alts], "answer_word": None, "alternative_words": [], "dropped": []}
+        return {"answer": [y], "alternatives": alt[:alts], "answer_word": None, "alternative_words": [], "dropped": [],
+                "valid": bool(alt)}
     cands = list(dict.fromkeys(order + ([b] if b is not None else [])))
     dev = next(core.parameters()).device
     x = torch.tensor([list(ids) + [z] for z in cands], device=dev)
@@ -74,7 +77,7 @@ def token_sets(core, tok, ids: list[int], lp: torch.Tensor, b: int | None = None
     pick = pick[:alts]
     alternatives = [z for z in cands if words[z] in pick]
     dropped = [z for z in cands if z not in answer and z not in alternatives]
-    return {"answer": answer, "alternatives": alternatives, "answer_word": W, "alternative_words": pick,
+    return {"answer": answer, "alternatives": alternatives, "answer_word": W, "alternative_words": pick, "valid": bool(W) and bool(alternatives),
             "dropped": dropped, "words": {int(z): w for z, w in words.items()}}
 
 

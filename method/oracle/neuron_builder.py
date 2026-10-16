@@ -458,6 +458,10 @@ def build(nr: Neurons, ids: list[int], pos: int, log=None, span: tuple | None = 
         lg = nr.logits(ids, allpos, capture=cap, B=ROWS)[0]   # (every run below at batch size ROWS)
     lp0 = torch.log_softmax(lg, -1)
     sets = answer_contrast.token_sets(nr.core, nr.tok, ids[:pos + 1], lp0[-1])   # the answer's word against other words
+    if not sets.get("valid", True):                           # (an emoji or a mark, or no other word: no contrast)
+        rec.update(answer=sets["answer"][0], answer_word=sets["answer_word"], met=False, size=0, nodes=[], ranked_top=[],
+                   skipped="the answer starts no word, or no other word in its script is among the candidates")
+        return rec
     y, alt = sets["answer"][0], sets["alternatives"]
     yset = set(sets["answer"])
 

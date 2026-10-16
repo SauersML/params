@@ -232,10 +232,11 @@ class Patcher:
         self.sets = answer_contrast.token_sets(self.core, self.tok, self.ids["clean"], lp["clean"], yc, word)
         self._sets_dev = None
         self.y = self.sets["answer"][0]
-        self.c = {k: float(self._contrast(v[None])[0]) for k, v in lp.items()}
+        valid = self.sets.get("valid", True)
+        self.c = {k: float(self._contrast(v[None])[0]) for k, v in lp.items()} if valid else {"clean": 0.0, "corrupt": 0.0}
         self.gap = self.c["clean"] - self.c["corrupt"]
         return {"answer": self.y, "corrupt_answer": yc, "answer_tokens": self.sets["answer"], "alternatives": self.sets["alternatives"],
-                "answer_word": self.sets["answer_word"], "alternative_words": self.sets["alternative_words"],
+                "answer_word": self.sets["answer_word"], "alternative_words": self.sets["alternative_words"], "valid": valid,
                 "same_answer": yc in self.sets["answer"], "contrast": self.c, "gap": self.gap, "first_diff": self.first}
 
     def _fit(self, S: int) -> int:
@@ -571,8 +572,9 @@ def find(pt: Patcher, clean: list[int], corrupt: list[int], answers: list[int] |
     t0 = time.perf_counter()
     rec = pt.setup(clean, corrupt, answers)
     rec["tokens"] = pt.T
-    if rec["gap"] < MIN_GAP or rec["same_answer"]:
-        rec.update(met=False, skipped="the corrupted run gives the same answer or the gap is under MIN_GAP bits",
+    if not rec["valid"] or rec["gap"] < MIN_GAP or rec["same_answer"]:
+        rec.update(met=False, skipped="no word answer with alternatives, the corrupted run gives the same answer, or the gap is "
+                                      "under MIN_GAP bits",
                    seconds=round(time.perf_counter() - t0, 2))
         return rec
     pos = list(range(pt.first, pt.T))

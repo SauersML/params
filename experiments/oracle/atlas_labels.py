@@ -10,7 +10,7 @@ organism investigations come first; the labels file grows, and a neuron already 
   atlas_labels.py coverage --atlas ROOT --out LIST.jsonl [--top N] [--frac 0.3]
       every neuron by how often one of its poles is strong (the share of corpus tokens beyond frac of the pole's extreme,
       from the atlas histogram): the neurons the oracle reads at the most positions, for labels past the named ones
-  atlas_labels.py label --atlas ROOT --neurons LIST.jsonl --out LABELS.jsonl [--examples 10] [--chunk 200]
+  atlas_labels.py label --atlas ROOT --neurons LIST.jsonl --out LABELS.jsonl [--method revise|t1] [--examples 30]
       LIST.jsonl lines {"layer", "index"[, "source"]}; LABELS.jsonl gets two lines per neuron, one per pole, in
       neuron_verify's item format ({"layer", "index", "pole", "corpus_max", "explanation", "writer_valid", ...})
 """
@@ -82,39 +82,6 @@ def feedback(tok, row: dict) -> tuple[str, str]:
     near = "\n".join(f"- {t!r}: {v:.2f} at {peak(t, m)}" for t, v, m in
                       zip(row["test_texts"]["near_misses"], row["near_values"], raw[len(row["blind_texts"]):]))
     return blind, near
-
-
-OUTPUT = """One side of an MLP neuron (layer {layer}, index {index}) in a language model fires strongly at the marked token ⟦ ⟧ in each context below. For each context: the model's likeliest next tokens, and what zeroing the {side} side of this neuron at every position does to its next-token prediction: the tokens whose probability falls most and rises most (probability before -> after) and the total change (half the summed absolute change, 0 to 1).
-
-{blocks}
-
-Describe what the {side} side of this neuron does to the model's next-token prediction: which tokens or kinds of tokens it makes more likely or less likely, and in which contexts. If the change is small everywhere, say so. Write JSON with one field, "output", 1 to 3 sentences, nothing else."""
-READ_OUT = """A description of what one side of a neuron in a language model does to the model's next-token prediction:
-{output}
-
-The model is reading this text; the neuron's side fires strongly at the last token, marked ⟦ ⟧:
-...{before}⟦{token}⟧
-
-If that side of the neuron were zeroed, which next tokens would lose the most probability? Write JSON with one field, "tokens": a list of 3 tokens exactly as they would appear (with a leading space if the token starts a new word), nothing else."""
-OUT_DEV, OUT_TEST, OUT_HIT = range(0, 10), range(30, 40), 10   # writer's contexts, held-out contexts, measured falls a hit may name
-
-
-def context_text(tok, e: dict, before: int = SHORT) -> tuple[str, str]:
-    ids, t = e["ids"], e["at"]
-    return tok.decode(ids[max(0, t - before):t]), tok.decode(ids[t:t + 1])
-
-
-def effect_block(tok, j: int, e: dict, eff: dict) -> str:
-    b, t = context_text(tok, e)
-    f = lambda xs: ", ".join(f"{w!r} {p0:.2f}->{p1:.2f}" for w, p0, p1 in xs[:5])  # noqa: E731
-    return (f"{j}. ...{b}⟦{t}⟧\n   likeliest next: " + ", ".join(f"{w!r} {p:.2f}" for w, p in eff["top"][:5]) +
-            f"\n   zeroed: falls {f(eff['falls'])}; rises {f(eff['rises'])}; total change {eff['tv']:.2f}")
-
-
-def hits(predicted, eff: dict) -> bool:
-    norm = lambda w: str(w).strip().casefold()  # noqa: E731
-    falls = {norm(w) for w, p0, p1 in eff["falls"][:OUT_HIT] if p1 < p0}
-    return any(norm(w) in falls for w in (predicted or [])[:3])
 
 
 def dev_key(row: dict) -> tuple:
@@ -334,59 +301,6 @@ def score(a) -> None:
     a.labels.write_text("".join(json.dumps(r, allow_nan=False) + "\n" for r in rows))
 
 
-def output(a) -> None:
-    """Each pole's output label (the lead's 10-15): what zeroing the pole changes in the next-token prediction on its
-    top atlas contexts OUT_DEV (measured, neuron_verify serve /effects), described by the writer (OUTPUT); tested on
-    the held-out contexts OUT_TEST, where the reader names the 3 tokens it expects to lose the most (READ_OUT) and a
-    context is a hit when one is among the OUT_HIT measured largest falls. Baseline: the unedited model's own 3
-    likeliest next tokens. A pole's output label passes when it hits at least half the held-out contexts and more than
-    the baseline. Stored as "output" and "output_scores" in the labels file."""
-    import atlas as atlas_mod
-    import neuron_verify
-    import reader_reward
-
-    at = atlas_mod.Atlas(a.atlas)
-    tok = at.tok
-    rows = [json.loads(x) for x in a.labels.read_text().splitlines() if x.strip()]
-    todo = [r for r in rows if r.get("writer_valid") and "output" not in r]
-    wr, rd = reader_reward.Reader(a.writer, a.labels.parent), reader_reward.Reader(neuron_verify.READER, a.labels.parent)
-    for s0 in range(0, len(todo), a.chunk):
-        part = todo[s0:s0 + a.chunk]
-        exs = [at.neuron(r["layer"], r["index"], k=max(OUT_TEST) + 1, text=False)[r["pole"]] for r in part]
-        items = [{"contexts": [e["ids"][:e["at"] + 1] for e in ex[:max(OUT_TEST) + 1]], "layer": r["layer"], "index": r["index"],
-                  "pole": r["pole"]} for r, ex in zip(part, exs)]
-        effs = neuron_verify.remote_effects(a.measure_url, items)
-        asks = [OUTPUT.format(layer=r["layer"], index=r["index"], side="positive" if r["pole"] == "+" else "negative",
-                              blocks="\n".join(effect_block(tok, j + 1, ex[i], eff[i]) for j, i in enumerate(OUT_DEV) if i < len(ex)))
-                for r, ex, eff in zip(part, exs, effs)]
-        outs = [(neuron_verify.parse_json(x) or {}).get("output") for x in wr(asks, max_tokens=400)]
-        reads, where = [], []
-        for k, (r, ex, o) in enumerate(zip(part, exs, outs)):
-            for i in OUT_TEST:
-                if isinstance(o, str) and o.strip() and i < len(ex):
-                    b, t = context_text(tok, ex[i])
-                    reads.append(READ_OUT.format(output=o, before=b, token=t))
-                    where.append((k, i))
-        got = {}
-        for (k, i), x in zip(where, rd(reads, max_tokens=80)):
-            got.setdefault(k, {})[i] = (neuron_verify.parse_json(x) or {}).get("tokens")
-        for k, (r, ex, eff, o) in enumerate(zip(part, exs, effs, outs)):
-            test = [i for i in OUT_TEST if i < len(ex)]
-            lab = sum(hits(got.get(k, {}).get(i), eff[i]) for i in test)
-            base = sum(hits([w for w, _ in eff[i]["top"][:3]], eff[i]) for i in test)
-            r["output"] = o if isinstance(o, str) and o.strip() else None
-            r["output_scores"] = {"contexts": len(test), "hits": lab, "baseline_hits": base,
-                                  "pass": bool(r["output"]) and len(test) > 0 and lab >= len(test) / 2 and lab > base,
-                                  "mean_tv": sum(eff[i]["tv"] for i in test) / max(len(test), 1),
-                                  "predicted": [got.get(k, {}).get(i) for i in test],
-                                  "falls": [[w for w, _, _ in eff[i]["falls"][:OUT_HIT]] for i in test]}
-            r["output_dev_effects"] = [eff[i] for i in OUT_DEV if i < len(eff)]
-        a.labels.write_text("".join(json.dumps(r, allow_nan=False) + "\n" for r in rows))
-        done = [r for r in rows if "output_scores" in r]
-        print(f"{len(done)} poles with output labels: pass {sum(r['output_scores']['pass'] for r in done)}; "
-              f"writer ${wr.spend.total:.3f}, reader ${rd.spend.total:.3f}", flush=True)
-
-
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="what", required=True)
@@ -406,28 +320,24 @@ def main():
     lb.add_argument("--neurons", type=Path, required=True)
     lb.add_argument("--out", type=Path, required=True)
     lb.add_argument("--writer", default=WRITER)
-    lb.add_argument("--examples", type=int, default=10)
+    lb.add_argument("--examples", type=int, default=30, help="examples per pole shown to the writer (T1 used 10)")
     lb.add_argument("--chunk", type=int, default=200, help="neurons per writer batch, appended as each finishes")
-    lb.add_argument("--method", choices=("t1", "revise"), default="t1", help="t1: T1's prompt, one writer call; revise: more "
-                    "evidence and up to --rounds revisions on the writer's own development results")
+    lb.add_argument("--method", choices=("t1", "revise"), default="revise", help="revise (the lead's 10-16 choice: +0.06 short, "
+                    "+0.07 long over T1's prompt on the same fresh texts, 8B arm): more evidence and up to --rounds revisions on "
+                    "the writer's own development results; t1: T1's prompt, one writer call")
     lb.add_argument("--long", type=int, default=10, help="revise: examples shown with LONG tokens before")
     lb.add_argument("--rounds", type=int, default=2)
     sc = sub.add_parser("score")
     sc.add_argument("--labels", type=Path, required=True)
     sc.add_argument("--lengths", nargs="+", default=["short", "long"])
     sc.add_argument("--seed", type=int, default=1)
-    ou = sub.add_parser("output")
-    ou.add_argument("--labels", type=Path, required=True)
-    ou.add_argument("--atlas", type=Path, required=True)
-    ou.add_argument("--writer", default=WRITER)
-    ou.add_argument("--chunk", type=int, default=100, help="poles per batch, the labels file rewritten after each")
-    for x in (lb, sc, ou):
+    for x in (lb, sc):
         x.add_argument("--corpus-max", type=Path, help="a T1 atlas (t1_audit collect): score against its maxima")
         x.add_argument("--measure-url", help="neuron_verify serve over a tunnel (http://localhost:PORT); else the target here")
         x.add_argument("--model", default="Qwen/Qwen3-8B")
         x.add_argument("--device")
     a = ap.parse_args()
-    {"gather": gather, "coverage": coverage, "label": label, "score": score, "output": output}[a.what](a)
+    {"gather": gather, "coverage": coverage, "label": label, "score": score}[a.what](a)
 
 
 if __name__ == "__main__":

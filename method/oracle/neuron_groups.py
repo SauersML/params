@@ -12,10 +12,11 @@ the whole group and tested on fresh texts (atlas_labels, neuron_verify).
   neuron_groups.py collect --groups GROUPS.jsonl --corpus DIR --model M --out TOP.json [--tokens 5000000] [--top 64]
       where the model runs (a pod): one pass over the shared corpus's first tokens, each group's corpus maximum and its
       top examples (document, position, value), the first token of each document (the attention sink) left out
-  neuron_groups.py label --top TOP.json --corpus DIR --measure-url U --out LABELS.jsonl
-      each group's input label (atlas_labels' revise method on the group's examples), output label (what zeroing the
-      group does, tested on held-out contexts) and scores on fresh texts at both blind lengths; the target behind U
-      must run neuron_verify with group support
+  neuron_groups.py estimate --top TOP.json --corpus DIR [label's options]   the Tinker cost of label, before any call
+  neuron_groups.py label --top TOP.json --corpus DIR --measure-url U --out LABELS.jsonl [--before 256] [--ids G1,G2]
+      each group's input label (atlas_labels' revise method on the group's examples, plus one round aimed at near
+      misses), output label (what zeroing the group does, relative changes, tested on held-out contexts) for groups that
+      move the answer, and scores on fresh texts at both blind lengths; each step's spend logged to SPEND as it ends
 """
 from __future__ import annotations
 
@@ -51,11 +52,29 @@ It also wrote these near misses, texts on close subjects the explanation says sh
 {near}
 
 Revise the explanation so that texts written from it reach the group's maximum and close subjects stay below 0.30. Keep what the examples support; change what the reader's results show is wrong or missing. Write JSON with one field, "explanation", 1 to 4 sentences, nothing else."""
-OUTPUT = """A group of MLP neurons in a language model ({members}) fires strongly at the marked token ⟦ ⟧ in each context below. For each context: the model's likeliest next tokens, and what zeroing every neuron of the group (each in its own sign) at every position does to its next-token prediction: the tokens whose probability falls most and rises most (probability before -> after) and the total change (half the summed absolute change, 0 to 1).
+NEAR = HEAD + """
+
+Your explanation of what makes the group fire was:
+{explanation}
+
+Texts written from it make the group fire (the best reached {best:.2f} of the group's maximum), but these near misses, texts on close subjects the explanation says should not make it fire, fired as well (activation as a share of the group's maximum, and the token):
+{near}
+
+Narrow the explanation so that texts like these near misses would not make the group fire, keeping what makes the strong texts fire. Write JSON with one field, "explanation", 1 to 4 sentences, nothing else."""
+OUTPUT = """A group of MLP neurons in a language model ({members}) fires strongly at the marked token ⟦ ⟧ in each context below. For each context: the model's likeliest next tokens, and what zeroing every neuron of the group (each in its own sign) at every position does to its next-token prediction: the tokens whose probability falls and rises most relative to their probability before (before -> after, among tokens at 0.001 or more before) and the total change (half the summed absolute change, 0 to 1).
 
 {blocks}
 
-Describe what this group does to the model's next-token prediction: which tokens or kinds of tokens it makes more likely or less likely, and in which contexts. If the change is small everywhere, say so. Write JSON with one field, "output", 1 to 3 sentences, nothing else."""
+Describe what this group does to the model's next-token prediction: which tokens or kinds of tokens it specifically makes more likely or less likely, and in which contexts. If the change is small everywhere, say so. Write JSON with one field, "output", 1 to 3 sentences, nothing else."""
+READ_OUT = """A description of what a group of neurons in a language model does to the model's next-token prediction:
+{output}
+
+The model is reading this text; the group fires strongly at the last token, marked ⟦ ⟧:
+...{before}⟦{token}⟧
+
+If the group were zeroed, which next tokens would lose the most probability relative to their probability now? Write JSON with one field, "tokens": a list of 3 tokens exactly as they would appear (with a leading space if the token starts a new word), nothing else."""
+OUT_DEV, OUT_TEST, OUT_HIT = range(0, 10), range(30, 40), 10   # writer's contexts, held-out contexts, measured falls a hit may name
+SPEND = Path("/Users/user/mpd-data/graph_oracle/components/tinker_spend.tsv")   # the team's Tinker log, a row a step
 
 
 def members_of(keys: list[str]) -> list[tuple[int, int, int]]:
@@ -192,83 +211,159 @@ def item(g: dict, explanation: str | None) -> dict:
     return {"group": g["id"], "members": g["members"], "pole": "+", "corpus_max": g["max"], "explanation": explanation}
 
 
-def label(a) -> None:
-    """Each collected group's input label by atlas_labels' revise method (the writer sees `examples` group examples,
-    revises up to `rounds` times from its reader's development texts; the best development round is the label), then
-    its output label (what zeroing the group does on its top contexts, tested on held-out contexts 31-40) and its scores
-    on fresh texts at both blind lengths: one labels file a run, one line a group."""
-    import atlas_labels as al
-    import neuron_verify
-    import reader_reward
+def context_text(tok, e: dict, before: int = SHORT) -> tuple[str, str]:
+    ids, t = e["ids"], e["at"]
+    return tok.decode(ids[max(0, t - before):t]), tok.decode(ids[t:t + 1])
+
+
+def effect_block(tok, j: int, e: dict, eff: dict) -> str:
+    b, t = context_text(tok, e)
+    f = lambda xs: ", ".join(f"{w!r} {p0:.3f}->{p1:.3f}" for w, p0, p1 in xs[:5])  # noqa: E731
+    return (f"{j}. ...{b}⟦{t}⟧\n   likeliest next: " + ", ".join(f"{w!r} {p:.2f}" for w, p in eff["top"][:5]) +
+            f"\n   zeroed: falls {f(eff['falls'])}; rises {f(eff['rises'])}; total change {eff['tv']:.2f}")
+
+
+def hits(predicted, eff: dict) -> bool:
+    norm = lambda w: str(w).strip().casefold()  # noqa: E731
+    falls = {norm(w) for w, p0, p1 in eff["falls"][:OUT_HIT] if p1 < p0}
+    return any(norm(w) in falls for w in (predicted or [])[:3])
+
+
+def log_spend(stage: str, usd: float, note: str) -> None:
+    with SPEND.open("a") as f:
+        f.write(f"{stage}\t{usd:.3f}\t{note}\n")
+
+
+def load(a):
+    import atlas_labels as al  # noqa: F401  (feedback, dev_key)
     from transformers import AutoTokenizer
 
     doc = json.loads(a.top.read_text())
     tok = AutoTokenizer.from_pretrained(doc["model"])
     toks, off = np.load(a.corpus / "tokens.npy", mmap_mode="r"), np.load(a.corpus / "offsets.npy")
-    groups = [g for g in doc["groups"] if g["max"] > 0 and len(g["top"]) > max(al.OUT_TEST)]
+    groups = [g for g in doc["groups"] if g["max"] > 0 and len(g["top"]) > max(OUT_TEST)]
+    if a.ids:
+        want = set(a.ids.split(","))
+        groups = [g for g in groups if g["id"] in want]
+    groups = groups[:a.n] if a.n else groups
+    exs = {g["id"]: windows(g, toks, off, max(a.examples, max(OUT_TEST) + 1)) for g in groups}
+    return doc, tok, groups, exs
+
+
+def label(a) -> None:
+    """Each collected group's labels, every step's Tinker spend logged as it ends:
+    1. input label: atlas_labels' revise method on the group's examples (the first `long` with --before tokens before),
+       up to `rounds` revisions from the reader's development texts, then one round aimed only at near misses that fired
+       (NEAR; kept when the development result does not get worse); the best development round is the label;
+    2. output label, for groups whose zeroing moves the answer by at least --effect-floor (|effect|, neuron_motifs'):
+       what zeroing every member does on its top contexts OUT_DEV, falls and rises ranked by relative change, described
+       by the writer; tested on held-out contexts OUT_TEST, where the reader names 3 tokens and a hit is one among the
+       OUT_HIT largest relative falls; baseline the unedited model's own top 3; passes at half the contexts and above
+       the baseline;
+    3. input scores on fresh texts (temperature 0.7, seed) at both blind lengths.
+    name: not[...] for a group with effect > 0 (zeroing raises the answer: the group pushes against it)."""
+    import atlas_labels as al
+    import neuron_verify
+    import reader_reward
+
+    global LONG
+    LONG = a.before
+    doc, tok, groups, exs = load(a)
     wr, rd = reader_reward.Reader(a.writer, a.out.parent), reader_reward.Reader(neuron_verify.READER, a.out.parent)
+    spent = lambda: wr.spend.total + rd.spend.total  # noqa: E731
     measure = lambda rows, seed=0: neuron_verify.remote_measure(a.measure_url, rows, seed)  # noqa: E731
-    exs = {g["id"]: windows(g, toks, off, max(a.examples, max(al.OUT_TEST) + 1)) for g in groups}
     head = lambda g: dict(members=unit_names(g["members"]), gmax=g["max"])  # noqa: E731
-    texts = wr([EXPLAIN.format(**head(g), examples=block(tok, exs[g["id"]][:a.examples], a.long)) for g in groups], max_tokens=500)
+    ev = lambda g: block(tok, exs[g["id"]][:a.examples], a.long)  # noqa: E731
+    tag = f"varteach groups {a.out.stem} {doc['model']}"
+    # 1. input labels
+    texts = wr([EXPLAIN.format(**head(g), examples=ev(g)) for g in groups], max_tokens=500)
     st = {g["id"]: {"g": g, "explanation": (neuron_verify.parse_json(t) or {}).get("explanation"), "rounds": [], "raw": t} for g, t in zip(groups, texts)}
     live = [v for v in st.values() if isinstance(v["explanation"], str) and v["explanation"].strip()]
-    for rnd in range(a.rounds + 1):
-        dev = measure(neuron_verify.plan(rd, [item(v["g"], v["explanation"]) for v in live]))
-        for v, d in zip(live, dev, strict=True):
-            v["rounds"].append({"explanation": v["explanation"], "valid": d.get("valid"), "blind_max": d.get("blind_max"),
+
+    def develop(vs, kind):
+        dev = measure(neuron_verify.plan(rd, [item(v["g"], v["explanation"]) for v in vs]))
+        for v, d in zip(vs, dev, strict=True):
+            v["rounds"].append({"kind": kind, "explanation": v["explanation"], "valid": d.get("valid"), "blind_max": d.get("blind_max"),
                                 "near_miss_rate": d.get("near_miss_rate"), "passes_t1": d.get("passes_t1"),
                                 "blind_texts": d.get("blind_texts"), "blind_values": d.get("blind_values")})
             v["dev"] = d
+            v.setdefault("devs", []).append(d)
+
+    for rnd in range(a.rounds + 1):
+        develop(live, "revise" if rnd else "first")
         fail = [v for v in live if v["dev"].get("valid") and not v["dev"].get("passes_t1")]
-        print(f"round {rnd}: {len(live) - len(fail)}/{len(live)} groups pass on development texts; writer ${wr.spend.total:.3f}, reader ${rd.spend.total:.3f}", flush=True)
+        print(f"round {rnd}: {sum(bool(v['dev'].get('passes_t1')) for v in live)}/{len(live)} groups pass on development texts; ${spent():.3f}", flush=True)
         if rnd == a.rounds or not fail:
             break
         asks = []
         for v in fail:
             blind, near = al.feedback(tok, {**v["dev"], "pole": "+"})
-            asks.append(REVISE.format(**head(v["g"]), examples=block(tok, exs[v["g"]["id"]][:a.examples], a.long),
-                                      explanation=v["explanation"], blind=blind, near=near))
+            asks.append(REVISE.format(**head(v["g"]), examples=ev(v["g"]), explanation=v["explanation"], blind=blind, near=near))
         for v, t in zip(fail, wr(asks, max_tokens=500), strict=True):
             e = (neuron_verify.parse_json(t) or {}).get("explanation")
             if isinstance(e, str) and e.strip():
                 v["explanation"] = e
         live = fail
-    rows = []
-    for v in st.values():
+    for v in st.values():  # the best development round so far, then one round aimed at near misses that fired
         if v["rounds"]:
-            best = max(range(len(v["rounds"])), key=lambda i: al.dev_key(v["rounds"][i]))
-            v["explanation"], v["chosen_round"] = v["rounds"][best]["explanation"], best
-        g = v["g"]
-        rows.append({"model": doc["model"], "group": g["id"], "members": g["members"], "effect": g.get("effect"), "corpus_max": g["max"],
-                     "explanation": v["explanation"], "rounds": v["rounds"], "chosen_round": v.get("chosen_round"),
-                     "writer_valid": bool(v["explanation"]), "writer_model": a.writer, "writer_raw_response": v["raw"]})
-    # output labels: what zeroing the group does on its top contexts, tested on held-out contexts
-    effs = neuron_verify.remote_effects(a.measure_url, [{"contexts": [e["ids"][:e["at"] + 1] for e in exs[r["group"]][:max(al.OUT_TEST) + 1]],
-                                                         "members": r["members"]} for r in rows])
+            i = max(range(len(v["rounds"])), key=lambda j: al.dev_key(v["rounds"][j]))
+            v["explanation"], v["dev_best"], v["dev_row"] = v["rounds"][i]["explanation"], v["rounds"][i], v["devs"][i]
+    noisy = [v for v in st.values() if v.get("dev_best") and v["dev_best"].get("valid") and (v["dev_best"]["near_miss_rate"] or 0) > 0]
+    if noisy and a.near_round:
+        asks = []
+        for v in noisy:
+            _, near = al.feedback(tok, {**v["dev_row"], "pole": "+"})
+            asks.append(NEAR.format(**head(v["g"]), examples=ev(v["g"]), explanation=v["explanation"], best=v["dev_best"]["blind_max"] or 0, near=near))
+        old = {id(v): v["explanation"] for v in noisy}
+        for v, t in zip(noisy, wr(asks, max_tokens=500), strict=True):
+            e = (neuron_verify.parse_json(t) or {}).get("explanation")
+            if isinstance(e, str) and e.strip():
+                v["explanation"] = e
+        develop(noisy, "near")
+        for v in noisy:
+            if al.dev_key(v["rounds"][-1]) < al.dev_key(v["dev_best"]):
+                v["explanation"] = old[id(v)]
+            else:
+                v["dev_best"] = v["rounds"][-1]
+        print(f"near-miss round: {len(noisy)} groups; {sum(v['dev_best'] is v['rounds'][-1] for v in noisy)} narrowed; ${spent():.3f}", flush=True)
+    rows = [{"model": doc["model"], "group": v["g"]["id"], "members": v["g"]["members"], "effect": v["g"].get("effect"),
+             "corpus_max": v["g"]["max"], "explanation": v["explanation"], "rounds": v["rounds"], "writer_valid": bool(v["explanation"]),
+             "writer_model": a.writer, "context_before": a.before, "writer_raw_response": v["raw"]} for v in st.values()]
+    for r in rows:
+        r["name"] = ("not" if (r.get("effect") or 0) > 0 else "") + f"[{r['explanation']}]"
+    a.out.write_text("".join(json.dumps(r, allow_nan=False) + "\n" for r in rows))
+    log_spend(f"{tag} input labels", spent(), f"{len(rows)} groups, revise {a.rounds} rounds + near-miss round, {a.before} tokens before; {a.out}")
+    s0 = spent()
+    # 2. output labels for groups that move the answer
     gs = {g["id"]: g for g in groups}
-    outs = wr([OUTPUT.format(members=unit_names(r["members"]), blocks="\n".join(
-        al.effect_block(tok, j + 1, exs[r["group"]][i], eff[i]) for j, i in enumerate(al.OUT_DEV))) for r, eff in zip(rows, effs)], max_tokens=400)
-    reads, where = [], []
-    for k, (r, o) in enumerate(zip(rows, outs)):
-        r["output"] = (neuron_verify.parse_json(o) or {}).get("output")
-        for i in al.OUT_TEST:
-            if isinstance(r["output"], str) and r["output"].strip():
-                b, t = al.context_text(tok, exs[r["group"]][i])
-                reads.append(al.READ_OUT.replace("one side of a neuron", "a group of neurons").replace("the neuron's side", "the group")
-                             .replace("that side of the neuron", "that group").format(output=r["output"], before=b, token=t))
-                where.append((k, i))
-    got = {}
-    for (k, i), x in zip(where, rd(reads, max_tokens=80)):
-        got.setdefault(k, {})[i] = (neuron_verify.parse_json(x) or {}).get("tokens")
-    for k, (r, eff) in enumerate(zip(rows, effs)):
-        lab = sum(al.hits(got.get(k, {}).get(i), eff[i]) for i in al.OUT_TEST)
-        base = sum(al.hits([w for w, _ in eff[i]["top"][:3]], eff[i]) for i in al.OUT_TEST)
-        n = len(al.OUT_TEST)
-        r["output_scores"] = {"contexts": n, "hits": lab, "baseline_hits": base, "pass": bool(r.get("output")) and lab >= n / 2 and lab > base,
-                              "mean_tv": sum(eff[i]["tv"] for i in al.OUT_TEST) / n}
-        r["name"] = ("not" if (r.get("effect") or 0) > 0 else "") + f"[{r['explanation']}]"   # inframove's sign; the lead decides
-    # input scores on fresh texts at both lengths
+    out_rows = [r for r in rows if r["writer_valid"] and abs(r.get("effect") or 0) >= a.effect_floor]
+    if out_rows and a.outputs:
+        effs = neuron_verify.remote_effects(a.measure_url, [{"contexts": [e["ids"][:e["at"] + 1] for e in exs[r["group"]][:max(OUT_TEST) + 1]],
+                                                             "members": r["members"]} for r in out_rows])
+        outs = wr([OUTPUT.format(members=unit_names(r["members"]), blocks="\n".join(
+            effect_block(tok, j + 1, exs[r["group"]][i], eff[i]) for j, i in enumerate(OUT_DEV))) for r, eff in zip(out_rows, effs)], max_tokens=400)
+        reads, where = [], []
+        for k, (r, o) in enumerate(zip(out_rows, outs)):
+            r["output"] = (neuron_verify.parse_json(o) or {}).get("output")
+            for i in OUT_TEST:
+                if isinstance(r["output"], str) and r["output"].strip():
+                    b, t = context_text(tok, exs[r["group"]][i])
+                    reads.append(READ_OUT.format(output=r["output"], before=b, token=t))
+                    where.append((k, i))
+        got = {}
+        for (k, i), x in zip(where, rd(reads, max_tokens=80)):
+            got.setdefault(k, {})[i] = (neuron_verify.parse_json(x) or {}).get("tokens")
+        for k, (r, eff) in enumerate(zip(out_rows, effs)):
+            lab = sum(hits(got.get(k, {}).get(i), eff[i]) for i in OUT_TEST)
+            base = sum(hits([w for w, _ in eff[i]["top"][:3]], eff[i]) for i in OUT_TEST)
+            n = len(OUT_TEST)
+            r["output_scores"] = {"contexts": n, "hits": lab, "baseline_hits": base, "pass": bool(r.get("output")) and lab >= n / 2 and lab > base,
+                                  "mean_tv": sum(eff[i]["tv"] for i in OUT_TEST) / n}
+        a.out.write_text("".join(json.dumps(r, allow_nan=False) + "\n" for r in rows))
+        log_spend(f"{tag} output labels", spent() - s0, f"{len(out_rows)} groups with |effect| >= {a.effect_floor}; {a.out}")
+        print(f"output labels: {sum(r['output_scores']['pass'] for r in out_rows)}/{len(out_rows)} pass; ${spent():.3f}", flush=True)
+    s0 = spent()
+    # 3. input scores on fresh texts at both lengths
     todo = [r for r in rows if r["writer_valid"]]
     for length in ("short", "long"):
         got = neuron_verify.judge(rd, measure(neuron_verify.plan(rd, [item(gs[r["group"]], r["explanation"]) for r in todo], length=length,
@@ -276,10 +371,38 @@ def label(a) -> None:
         for r, g2 in zip(todo, got, strict=True):
             r.setdefault("scores", {})[length] = {"seed": a.seed, "valid": g2.get("valid"), "pass": bool(g2.get("valid") and g2.get("passes_t1")),
                                                  **{k: g2.get(k) for k in ("blind_max", "near_miss_rate", "distant_rate", "steer_match")}}
-    a.out.write_text("".join(json.dumps(r, allow_nan=False) + "\n" for r in rows))
-    for length in ("short", "long"):
-        print(f"{length}: {sum(r.get('scores', {}).get(length, {}).get('pass', False) for r in rows)}/{len(rows)} groups pass on fresh texts")
-    print(f"output labels: {sum(r['output_scores']['pass'] for r in rows)}/{len(rows)} pass; writer ${wr.spend.total:.3f}, reader ${rd.spend.total:.3f}")
+        a.out.write_text("".join(json.dumps(r, allow_nan=False) + "\n" for r in rows))
+        print(f"{length}: {sum(r['scores'][length]['pass'] for r in todo)}/{len(rows)} groups pass on fresh texts; ${spent():.3f}", flush=True)
+    log_spend(f"{tag} fresh-text scores", spent() - s0, f"{len(todo)} groups, both blind lengths, seed {a.seed}; {a.out}")
+
+
+def estimate(a) -> None:
+    """The Tinker cost of label on these groups before any call, from the writer's prompts' token counts and the
+    measured shares of past runs (8B neuron arm 10-16: 0.46 of first drafts fail, 0.6 of those again; a reader plan 300
+    prompt and 700 sampled tokens; a judge 250 and 10; an output reading 150 and 20), times --margin."""
+    sys.path.insert(0, str(HERE / "rl"))
+    from tinker_train import PRICES
+
+    import neuron_verify
+    LONG_ = a.before
+    globals()["LONG"] = LONG_
+    doc, tok, groups, exs = load(a)
+    head = lambda g: dict(members=unit_names(g["members"]), gmax=g["max"])  # noqa: E731
+    first = [len(tok(EXPLAIN.format(**head(g), examples=block(tok, exs[g["id"]][:a.examples], a.long)))["input_ids"]) for g in groups]
+    n, P = len(groups), first and sum(first) / len(first)
+    w, r = PRICES[a.writer], PRICES[neuron_verify.READER]
+    fails = [n * 0.46, n * 0.46 * 0.6][:a.rounds]
+    near = n * 0.4 if a.near_round else 0
+    writer = (n * P + (sum(fails) + near) * (P + 600)) * w[0] + (n + sum(fails) + near) * 250 * w[1]
+    plans = (n + sum(fails) + near + 2 * n) * (300 * r[0] + 700 * r[1])
+    judge = 2 * n * (250 * r[0] + 10 * r[1])
+    nout = sum(abs(g.get("effect") or 0) >= a.effect_floor for g in groups) if a.outputs else 0
+    outw = nout * (len(OUT_DEV) * 160 + 300) * w[0] + nout * 120 * w[1]
+    outr = nout * len(OUT_TEST) * (150 * r[0] + 20 * r[1])
+    parts = {"writer": writer, "reader plans": plans, "judge": judge, "output writer": outw, "output reader": outr}
+    tot = sum(parts.values()) / 1e6
+    print(f"{n} groups ({nout} with output labels), first prompt {P:.0f} tokens: " + ", ".join(f"{k} ${v / 1e6:.2f}" for k, v in parts.items()) +
+          f"; total ${tot:.2f}, with margin x{a.margin}: ${tot * a.margin:.2f}")
 
 
 def main():
@@ -297,18 +420,26 @@ def main():
     c.add_argument("--tokens", type=int, default=5_000_000)
     c.add_argument("--top", type=int, default=64)
     c.add_argument("--batch", type=int, default=8, help="documents a forward pass")
-    lb = sub.add_parser("label")
-    lb.add_argument("--top", type=Path, required=True, help="collect's output")
-    lb.add_argument("--corpus", type=Path, required=True)
-    lb.add_argument("--out", type=Path, required=True)
-    lb.add_argument("--measure-url", required=True, help="neuron_verify serve over a tunnel, the same model")
-    lb.add_argument("--writer", default="Qwen/Qwen3.5-397B-A17B")
-    lb.add_argument("--examples", type=int, default=30)
-    lb.add_argument("--long", type=int, default=10)
-    lb.add_argument("--rounds", type=int, default=2)
-    lb.add_argument("--seed", type=int, default=1)
+    for name in ("label", "estimate"):
+        lb = sub.add_parser(name)
+        lb.add_argument("--top", type=Path, required=True, help="collect's output")
+        lb.add_argument("--corpus", type=Path, required=True)
+        lb.add_argument("--out", type=Path, required=name == "label")
+        lb.add_argument("--measure-url", required=name == "label", help="neuron_verify serve over a tunnel, the same model")
+        lb.add_argument("--writer", default="Qwen/Qwen3.5-397B-A17B")
+        lb.add_argument("--examples", type=int, default=30)
+        lb.add_argument("--long", type=int, default=10, help="examples shown with --before tokens before (the rest SHORT)")
+        lb.add_argument("--before", type=int, default=256, help="tokens before each of the first --long examples")
+        lb.add_argument("--rounds", type=int, default=2)
+        lb.add_argument("--near-round", type=int, default=1, help="1: one more revision aimed at near misses that fired")
+        lb.add_argument("--outputs", type=int, default=1, help="1: output labels for groups that move the answer")
+        lb.add_argument("--effect-floor", type=float, default=0.1, help="|effect| (neuron_motifs: mean single-zeroing change of log p(answer))")
+        lb.add_argument("--ids", help="comma-separated group ids, a subset")
+        lb.add_argument("--n", type=int, help="the first N groups")
+        lb.add_argument("--seed", type=int, default=1)
+        lb.add_argument("--margin", type=float, default=1.5)
     a = ap.parse_args()
-    {"prepare": prepare, "collect": collect, "label": label}[a.what](a)
+    {"prepare": prepare, "collect": collect, "label": label, "estimate": estimate}[a.what](a)
 
 
 if __name__ == "__main__":

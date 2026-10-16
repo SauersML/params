@@ -38,6 +38,7 @@ sys.path[:0] = [str(HERE), str(HERE / "rl")]
 
 FIRE = 0.3  # a text fires a pole when its pole value reaches this share of the corpus maximum
 NEAR, DISTANT, BLIND = 5, 5, 3
+FLOOR_P = 1e-3  # effects: a token's relative change counts from this probability before
 STEER = 3.0  # steering sets the activation to the pole's sign times this many corpus maxima
 PROMPTS = ["The", "In my opinion,", "Here is a short story:", "Today I learned that"]  # steering's neutral starts
 GEN = 24  # tokens generated per steering prompt
@@ -184,7 +185,9 @@ class Target:
         """What zeroing one pole does to the next-token prediction after each context (token ids, the pole's firing
         token last): the pole's values (that sign only) set to 0 at every position, as neuron_builder.pole_edit; per
         context the k tokens whose probability falls most and the k that rise most, (token, p before, p after), the
-        unedited model's top k, and the total variation between the two distributions."""
+        unedited model's top k, and the total variation between the two distributions. Falls and rises are ranked by
+        the change of log p among tokens at p >= FLOOR_P before (the absolute change ranks the model's own likeliest
+        tokens first: zeroing one pole mostly flattens the prediction, 8B label arm 10-16)."""
         torch = self.torch
         zero = [(m[0], m[1], float(m[2])) for m in members] if members else [(layer, index, 1.0 if pole == "+" else -1.0)]
 
@@ -216,9 +219,13 @@ class Target:
                 ps.append(torch.softmax(lg[torch.arange(len(part)), last].float(), -1))
             p0, p1 = ps
             d = p1 - p0
+            rel = torch.log(p1.clamp_min(1e-12)) - torch.log(p0.clamp_min(1e-12))
+            live = p0 >= FLOOR_P
+            down, up = rel.masked_fill(~live, float("inf")), rel.masked_fill(~live, float("-inf"))
             for j in range(len(part)):
                 tok = lambda t: self.tok.decode([int(t)])  # noqa: E731
-                fall, rise, top = d[j].topk(k, largest=False).indices, d[j].topk(k).indices, p0[j].topk(k).indices
+                kk = min(k, int(live[j].sum()))
+                fall, rise, top = down[j].topk(kk, largest=False).indices, up[j].topk(kk).indices, p0[j].topk(k).indices
                 out.append({"falls": [(tok(t), float(p0[j, t]), float(p1[j, t])) for t in fall],
                             "rises": [(tok(t), float(p0[j, t]), float(p1[j, t])) for t in rise],
                             "top": [(tok(t), float(p0[j, t])) for t in top], "tv": float(d[j].abs().sum() / 2)})

@@ -21,11 +21,13 @@ the essay's own number with a pass rule fixed here before any run. Qwen3-32B for
                  position up to the name, the drop of L4:8476 at "aki"; L4:8476's positive pole zeroed, the drops of
                  L6:24077 at " Away" and L8:14338 at "ica" (pass: Spearman with the essay's 7 into-strengths at least 0.7
                  and the two out-strengths in the essay's order)
-  social         Pythia-1B-v0: on every "Social Security" in the atlas corpus (176), the WINDOW tokens before " Social"
-                 decoded as the context (natural text, as the essay's 164 cases), the detector neurons
-                 L2:611, L2:4081, L2:6819 zeroed together change log p(" Social") by the essay's -0.004 nats on average
+  social         Pythia-1B-v0: on every "Social Security" in the atlas corpus (176), the WINDOW tokens of its document
+                 before it decoded as the context (natural text, as the essay's 164 cases), for each reading of the
+                 essay's target: log p(" Social") at the token before it, and log p(" Security") at " Social". The
+                 detector neurons L2:611, L2:4081, L2:6819 zeroed together change it by the essay's -0.004 nats on average
                  (pass: |mean| at most 0.05 nats); the 10 named next-token neurons with |effect| >= 0.2 zeroed one at a
-                 time move it in the essay's direction (pass: 8 of 10 signs)
+                 time move it in the essay's direction (pass: 8 of 10 signs); the Spearman correlation of the 10 effects
+                 with the essay's beside it
 The "might" neuron that sets a head's query for "may" is not checked: the essay names neither the neuron nor the head.
 
   essay_replication.py run OUT.json [--cases santa,preeclampsia,attention,russian,miyazaki,social] [--model Qwen/Qwen3-32B]
@@ -111,7 +113,7 @@ MIYAZAKI = {
     "out": [((6, 24077), 23.4653, "Hayao Miyazaki's Studio Ghibli film \"Spirited Away\"", " Away"),
             ((8, 14338), 1.0258, "Hayao Miyazaki directed his first feature film, Nausicaä of the Valley of the Wind", "ica")]}
 SOCIAL = {
-    "model": "EleutherAI/pythia-1b-v0", "target": " Social",
+    "model": "EleutherAI/pythia-1b-v0", "targets": {"social": (False, " Social"), "security": (True, " Security")},  # (context ends with " Social", target)
     "detectors": [(2, 611), (2, 4081), (2, 6819)], "detector_effect": -0.004,
     "next": [((0, 3308), 0.49), ((2, 7715), -0.24), ((3, 839), 0.58), ((5, 447), 0.22), ((10, 3382), -0.24), ((12, 7260), 0.40),
              ((13, 3673), -0.61), ((15, 3731), -0.81), ((15, 7040), -0.75), ((15, 5759), 0.69)],
@@ -322,8 +324,9 @@ def case_santa_preeclampsia(q: Qwen, log=print) -> list[dict]:
     return out
 
 
-def social_contexts() -> list[str]:
-    """Every " Social Security" in the atlas corpus: the text of the window tokens before " Social" in its document."""
+def social_contexts(through_social: bool = False) -> list[str]:
+    """Every " Social Security" in the atlas corpus: the text of the window tokens before " Social" in its document (and
+    " Social" itself, through_social)."""
     from transformers import AutoTokenizer
 
     tok = AutoTokenizer.from_pretrained("Qwen/Qwen3-8B")
@@ -334,56 +337,61 @@ def social_contexts() -> list[str]:
     for i in np.nonzero((t[:-1] == a) & (t[1:] == b))[0].tolist():
         start = max(int(off[np.searchsorted(off, i, side="right") - 1]), i - SOCIAL["window"])
         if i > start:
-            out.append(tok.decode(t[start:i].tolist()))
+            out.append(tok.decode(t[start:i + int(through_social)].tolist()))
     return out
 
 
 @torch.no_grad()
 def case_social(device: str, log=print) -> list[dict]:
+    from scipy.stats import spearmanr
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     tok = AutoTokenizer.from_pretrained(SOCIAL["model"])
     model = AutoModelForCausalLM.from_pretrained(SOCIAL["model"], dtype=torch.float32).to(device).eval()
-    tgt = tok(SOCIAL["target"], add_special_tokens=False)["input_ids"][0]
     layers = model.gpt_neox.layers
+    out_recs = []
+    for name, (through, target) in SOCIAL["targets"].items():
+        tgt = tok(target, add_special_tokens=False)["input_ids"][0]
+        ctx = social_contexts(through)
+        enc = [tok(t)["input_ids"] for t in ctx]
+        T = max(len(x) for x in enc)
+        ids = torch.tensor([[0] * (T - len(x)) + x for x in enc], device=device)  # left-padded, the padding masked out
+        mask = torch.tensor([[0] * (T - len(x)) + [1] * len(x) for x in enc], device=device)
+        pos = (mask.cumsum(-1) - 1).clamp(min=0)
 
-    ctx = social_contexts()
-    enc = [tok(t)["input_ids"] for t in ctx]
-    T = max(len(x) for x in enc)
-    ids = torch.tensor([[0] * (T - len(x)) + x for x in enc], device=device)  # left-padded, the padding masked out
-    mask = torch.tensor([[0] * (T - len(x)) + [1] * len(x) for x in enc], device=device)
-    pos = (mask.cumsum(-1) - 1).clamp(min=0)
-
-    def logp(zero=()) -> np.ndarray:
-        """log p(" Social") at every context's last token, with the zero neurons zeroed at every position."""
-        hs = []
-        for L, layer in enumerate(layers):
-            js = [j for l2, j in zero if l2 == L]
-            if js:
-                hs.append(layer.mlp.dense_4h_to_h.register_forward_pre_hook(
-                    lambda m, a, js=js: (a[0].index_fill(-1, torch.tensor(js, device=a[0].device), 0.0),)))
-        try:
-            out = []
-            for s0 in range(0, len(ids), 32):
-                h = model.gpt_neox(input_ids=ids[s0:s0 + 32], attention_mask=mask[s0:s0 + 32], position_ids=pos[s0:s0 + 32]).last_hidden_state
-                lg = model.get_output_embeddings()(h[:, -1])  # (the last position's logits only)
-                out.append(torch.log_softmax(lg.float(), -1)[:, tgt])
-            return torch.cat(out).cpu().numpy()
-        finally:
-            for h in hs:
-                h.remove()
-    base = logp()
-    det = float(np.mean(logp(SOCIAL["detectors"]) - base))
-    rows = []
-    for (L, j), e in SOCIAL["next"]:
-        d = float(np.mean(logp([(L, j)]) - base))
-        rows.append({"neuron": f"L{L}:{j}", "essay": e, "ours_mean": d, "agree": (d > 0) == (e > 0)})
-    agree = sum(r["agree"] for r in rows)
-    ok = abs(det) <= 0.05 and agree >= 8
-    log(f"social (Pythia-1B-v0, {len(base)} contexts, mean log p(' Social') {np.mean(base):.2f}): detectors {det:+.4f} nats "
-        f"(essay -0.004); next-token neurons agree in sign {agree} of {len(rows)}: {'pass' if ok else 'FAIL'}")
-    return [{"case": "social", "check": "detectors unused; next-token neurons' signs", "detector_mean": det, "neurons": rows,
-             "agree": agree, "contexts": len(base), "pass": ok}]
+        def logp(zero=()) -> np.ndarray:
+            """log p(target) at every context's last token, with the zero neurons zeroed at every position."""
+            hs = []
+            for L, layer in enumerate(layers):
+                js = [j for l2, j in zero if l2 == L]
+                if js:
+                    hs.append(layer.mlp.dense_4h_to_h.register_forward_pre_hook(
+                        lambda m, a, js=js: (a[0].index_fill(-1, torch.tensor(js, device=a[0].device), 0.0),)))
+            try:
+                out = []
+                for s0 in range(0, len(ids), 32):
+                    h = model.gpt_neox(input_ids=ids[s0:s0 + 32], attention_mask=mask[s0:s0 + 32], position_ids=pos[s0:s0 + 32]).last_hidden_state
+                    lg = model.get_output_embeddings()(h[:, -1])  # (the last position's logits only)
+                    out.append(torch.log_softmax(lg.float(), -1)[:, tgt])
+                return torch.cat(out).cpu().numpy()
+            finally:
+                for h in hs:
+                    h.remove()
+        base = logp()
+        det = float(np.mean(logp(SOCIAL["detectors"]) - base))
+        rows = []
+        for (L, j), e in SOCIAL["next"]:
+            d = float(np.mean(logp([(L, j)]) - base))
+            rows.append({"neuron": f"L{L}:{j}", "essay": e, "ours_mean": d, "agree": (d > 0) == (e > 0)})
+        agree = sum(r["agree"] for r in rows)
+        rho = float(spearmanr([r["essay"] for r in rows], [r["ours_mean"] for r in rows]).statistic)
+        ok = abs(det) <= 0.05 and agree >= 8
+        log(f"social/{name} (Pythia-1B-v0, {len(base)} contexts, mean log p({target!r}) {np.mean(base):.2f}): detectors {det:+.4f} "
+            f"nats (essay -0.004); next-token neurons agree in sign {agree} of {len(rows)}, Spearman {rho:.2f}: {'pass' if ok else 'FAIL'}")
+        out_recs.append({"case": f"social/{name}", "check": "detectors unused; next-token neurons' signs", "target": target,
+                         "base_logp": float(np.mean(base)), "detector_mean": det, "neurons": rows, "agree": agree, "spearman": rho,
+                         "contexts": len(base), "pass": ok})
+    return out_recs
 
 
 def table(recs: list[dict]) -> str:

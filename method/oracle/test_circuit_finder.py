@@ -117,6 +117,7 @@ def test_noise_floor(tiny, monkeypatch):
     assert cf.floor(pt, "neuron", range(pt.first, pt.T - 1)) < 1e-5
     sc = pt.scores()
     monkeypatch.setattr(cf, "floor", lambda *a, **k: 10.0)     # every share below the floor: no single unit, no lower round
+    monkeypatch.setattr(cf, "ROUTE_GROUPS", False)             # (the whole blocks' fallback; route groups: test_route_groups)
     reached = 0
     for kind, positions in (("neuron", list(range(pt.first, pt.T))), ("head", [pt.T - 1]), ("neuron", list(range(pt.first, pt.T - 1)))):
         c = cf.cut(pt, sc, kind, positions, {})
@@ -336,3 +337,23 @@ def test_find_many_equals_find(tiny, monkeypatch):
         ra, rb = a.get("residual_map"), b.get("residual_map")
         if ra:
             assert max(abs(x - y) for r1, r2 in zip(ra["lost"], rb["lost"]) for x, y in zip(r1, r2)) < 1e-4
+
+
+def test_route_groups(tiny, monkeypatch):
+    """Heads grouped by where they look: each group's shares are its heads patched together; a met result's units pass
+    and are a prefix of the chosen group in its heads' own order."""
+    pt, clean, corrupt = tiny
+    pt.setup(clean, corrupt)
+    monkeypatch.setattr(cf, "PASS", 0.0)            # (any group passes on a random model: the search path runs)
+    last = pt.T - 1
+    singles = {}
+    got = cf.route_groups(pt, singles, last, list(range(pt.first, last)))
+    assert got["groups"] and all({"source", "tau", "heads", "lost", "restored"} <= set(g) for g in got["groups"])
+    g0 = got["groups"][0]
+    pt.attends(0, 0, last)
+    att = torch.stack([a[:, last] for a in pt._att])
+    src = list(range(pt.first, last)) if g0["source"] is None else [g0["source"]]
+    hs = [(int(i), int(h)) for i, h in (att[:, :, src].max(-1).values >= g0["tau"]).nonzero().tolist()]
+    lo, re = pt.both([cf.head_set(hs, last)])[0]
+    assert abs(lo - g0["lost"]) < 1e-5 and abs(re - g0["restored"]) < 1e-5
+    assert got["met"] and got["units"] and all(u in singles for u in got["units"])

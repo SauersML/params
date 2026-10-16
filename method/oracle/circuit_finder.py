@@ -97,6 +97,8 @@ ORDER = "relp"        # the gradient group testing orders units by: "grad", the 
 # 2% of each other; capital/Italy/p2 6,551 against 8,246)
 PREFIX = True         # a batch whose patches all lie at or after a position runs only the positions from there on, the
 # base run's keys and values before it cached (no weak zeroing here, so the cached run equals the full one to float error)
+ROUTE_GROUPS = True   # a head cut with no passing prefix tries heads grouped by where they look (route_groups)
+ROUTE_TAUS = (0.3, 0.1, 0.03)  # (attention weights a group's heads reach on their source)
 MEMORY = 0.5          # a batch's rows take at most this share of the device's free memory (its keys and values over every
 # position, the logits and the edited activations a row; MAX_ROWS otherwise)
 LAYERS = True         # a cached batch also runs only the layers from the lowest one it patches, from the run's own
@@ -920,6 +922,71 @@ def floor(pt: Patcher, kind: str, positions) -> float:
     return max(max(abs(a), abs(b)) for a, b in pt.both(nulls))
 
 
+def head_set(heads: list, pos: int) -> list:
+    """Heads [(layer, head)] at one position as units: one per layer, its heads as an index tensor."""
+    by = {}
+    for i, h in heads:
+        by.setdefault(int(i), []).append(int(h))
+    return [("head", i, torch.tensor(sorted(hs)), pos) for i, hs in sorted(by.items())]
+
+
+def route_groups(pt: Patcher, singles: dict, pos: int, sources: list, log=None) -> dict:
+    """Heads at one position grouped by where they look (ROUTE_GROUPS): a mechanism spread over many heads, none passing
+    alone or in a short prefix (on Qwen3-8B copying no single head carries 7% of the gap; the 91 heads attending to the
+    copied token at weight 0.1 or more carry all of it). Per source position p and weight tau in ROUTE_TAUS, the heads
+    attending from pos to p at least tau in the clean run, and per tau the union over every source, each patched as a
+    group (both shares, one batch); the smallest passing group (fewest heads), its heads in the order of their own shares
+    (singles, measured alone when missing), and the smallest prefix of them that passes (log grid, then bisection)."""
+    if not sources:
+        return {"groups": [], "met": False}
+    pt.attends(0, 0, pos)                           # (fills the clean run's attention patterns)
+    att = torch.stack([a[:, pos] for a in pt._att])  # [L, H, T]: from pos
+    groups, seen = [], set()
+    for tau in ROUTE_TAUS:
+        for p in list(sources) + [None]:
+            m = (att[:, :, sources] if p is None else att[:, :, p:p + 1]).max(-1).values >= tau
+            hs = tuple((int(i), int(h)) for i, h in m.nonzero().tolist())
+            if hs and hs not in seen:
+                seen.add(hs)
+                groups.append({"source": p, "tau": tau, "heads": hs})
+    if not groups:
+        return {"groups": [], "met": False}
+    for g, (lo, re) in zip(groups, pt.both([head_set(g["heads"], pos) for g in groups])):
+        g.update(lost=lo, restored=re)
+    passing = [g for g in groups if g["lost"] >= PASS and g["restored"] >= PASS]
+    out = {"groups": [{"source": g["source"], "tau": g["tau"], "heads": len(g["heads"]), "lost": g["lost"],
+                       "restored": g["restored"]} for g in groups]}
+    if not passing:
+        out["met"] = False
+        if log:
+            log(f"  route groups at {pos}: none of {len(groups)} passes (best "
+                f"{max(min(g['lost'], g['restored']) for g in groups):.2f})")
+        return out
+    best = min(passing, key=lambda g: len(g["heads"]))
+    units = {(i, h): ("head", i, h, pos) for i, h in best["heads"]}
+    missing = [u for u in units.values() if u not in singles]
+    for u, r in zip(missing, pt.both([[u] for u in missing])):
+        singles[u] = r
+    order = sorted(best["heads"], key=lambda ih: -max(map(abs, singles[units[ih]])))
+    g_ = grid(len(order))
+    got = pt.both([head_set(order[:k], pos) for k in g_])
+    met = [k for k, (lo, re) in zip(g_, got) if lo >= PASS and re >= PASS]
+    hi = met[0]
+    lo_ = max([k for k in g_ if k < hi] + [0])
+    while hi - lo_ > 1:
+        mid = (lo_ + hi) // 2
+        a, b = pt.both([head_set(order[:mid], pos)])[0]
+        lo_, hi = (lo_, mid) if a >= PASS and b >= PASS else (mid, hi)
+    out.update(met=True, chosen={"source": best["source"], "tau": best["tau"], "heads": len(best["heads"]),
+                                 "lost": best["lost"], "restored": best["restored"]},
+               units=[units[ih] for ih in order[:hi]],
+               curve=[{"k": k, "lost": a, "restored": b} for k, (a, b) in zip(g_, got)])
+    if log:
+        log(f"  route groups at {pos}: {len(groups)} groups, the smallest passing {len(best['heads'])} heads (source "
+            f"{best['source']}, tau {best['tau']}), its passing prefix {hi}")
+    return out
+
+
 def cut(pt: Patcher, sc: dict, kind: str, positions, done: dict, log=None, search=None) -> dict:
     """The smallest set of one kind of unit at the given positions that passes (module docstring, steps 2-3); search:
     the positions group testing starts at (default positions; the ceiling patches every one of positions)."""
@@ -1006,6 +1073,11 @@ def cut(pt: Patcher, sc: dict, kind: str, positions, done: dict, log=None, searc
             lost, rest = pt.both([trial])[0]
             if lost >= PASS and rest >= PASS:
                 circ = trial
+    routes = None
+    if kind == "head" and reach and not ok and ROUTE_GROUPS and len(positions) == 1:  # spread over heads: groups by source
+        routes = route_groups(pt, singles, positions[0], list(range(pt.first, positions[0])), log=log)
+        if routes.get("met"):
+            circ, ok = routes.pop("units"), True
     lost, rest = pt.both([circ])[0] if circ else (0.0, 0.0)
     spread = None
     if reach and not ok:                            # no sparse cut above the floor: whole (layer, position) blocks in
@@ -1016,7 +1088,7 @@ def cut(pt: Patcher, sc: dict, kind: str, positions, done: dict, log=None, searc
                   "curve": [{"k": k, "lost": a, "restored": b} for k, (a, b) in zip(g, got)]}
     return {"units": circ, "singles": singles, "met": bool(ok) and lost >= PASS and rest >= PASS, "lost": lost, "restored": rest,
             "eps": eps, "floor": floors, "found": len(singles), "ceiling": list(ceiling), "reachable": reach, "refined": refined,
-            "conditional": len(cond), "spread": spread,
+            "conditional": len(cond), "spread": spread, "route_groups": routes,
             "searched": search,
             "curve": [{"k": k, "lost": a, "restored": b} for k, (a, b) in zip(ks, curve)]}
 
@@ -1094,7 +1166,7 @@ def find(pt: Patcher, clean: list[int], corrupt: list[int], answers: list[int] |
                           [:SINGLES_KEPT]] for k, c in cuts.items()}
     rec.update(nodes=nodes, routes=routes, met=all(c["met"] for k, c in cuts.items() if k != "readout" or c["reachable"]),
                cuts={k: {f: c[f] for f in ("met", "lost", "restored", "eps", "floor", "found", "ceiling", "reachable", "curve", "refined",
-                                           "conditional", "spread", "searched")}
+                                           "conditional", "spread", "searched", "route_groups")}
                      | {"size": len(c["units"])} for k, c in cuts.items()},
                size=len(nodes), seconds=round(time.perf_counter() - t0, 2))
     if log:

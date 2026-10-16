@@ -19,6 +19,10 @@ corrupted gap:
                        compensation = direct - total. For compensation >= BACKUP, the later (layer, kind, position) blocks
                        whose freezing beside u's noising adds at least EPS are split, their units ordered by how far u's
                        noising moves them, down to single units (each measured): the backup units and what each adds.
+  marginals            per circuit unit: its share alone and the cut's share without it (leave one out): the singles'
+                       sum and the marginals' sum (joint - leave-one-out) against the joint share say whether the cut's
+                       units back each other up (both sums small: any few of them suffice) or need each other (singles
+                       small, marginals large);
   interactions         the cut's units and the record's next largest singles (PAIRS in all): every pair noised together
                        and denoised together; interaction = the pair's share - the two singles' shares, reported at
                        |interaction| >= INTERACT (lost > 0: redundant, each alone covered by the other; restored > 0:
@@ -170,6 +174,17 @@ def backups(pt: cf.Patcher, rec: dict, cut: str) -> list:
     return out
 
 
+def marginals(pt: cf.Patcher, rec: dict, cut: str) -> dict:
+    units, _, _ = cut_units(rec, cut)
+    if not units:
+        return {}
+    got = pt.both([list(units)] + [[u] for u in units] + [[v for v in units if v != u] for u in units])
+    joint, one, loo = got[0], got[1:1 + len(units)], got[1 + len(units):]
+    rows = [{"unit": cf_name(u), "alone": list(a), "marginal": [joint[0] - b[0], joint[1] - b[1]]} for u, a, b in zip(units, one, loo)]
+    return {"joint": list(joint), "singles_sum": [sum(a[0] for a in one), sum(a[1] for a in one)],
+            "marginals_sum": [sum(r["marginal"][0] for r in rows), sum(r["marginal"][1] for r in rows)], "units": rows}
+
+
 def interactions(pt: cf.Patcher, rec: dict, cut: str) -> list:
     units, _, _ = cut_units(rec, cut)
     pool = list(units)[:PAIRS]
@@ -210,6 +225,7 @@ def check(pt: cf.Patcher, tok, rec: dict, q: dict) -> dict:
         if not v.get("met"):
             continue
         out["cuts"][cut] = resampled(pt, rec, cut, rs)
+        out.setdefault("marginals", {})[cut] = marginals(pt, rec, cut)
         out["backups"][cut] = backups(pt, rec, cut)
         out["interactions"][cut] = interactions(pt, rec, cut)
     out["seconds"] = time.time() - t0

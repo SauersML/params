@@ -55,6 +55,9 @@ def test_backups_and_interactions_run(setup):
         rows = cr.backups(pt, rec, cut)
         assert all(abs(r["compensation"] - (r["direct"] - r["total"])) < 1e-9 for r in rows)
         assert len(rows) <= len(units)
+        m = cr.marginals(pt, rec, cut)
+        if m and len(units) == 1:
+            assert abs(m["units"][0]["alone"][0] - m["joint"][0]) < 1e-4   # (one unit: alone is the joint)
         for r in cr.interactions(pt, rec, cut):
             a, b = r["singles"]
             assert abs(r["interaction"][0] - (r["pair_shares"][0] - a[0] - b[0])) < 1e-9

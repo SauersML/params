@@ -324,10 +324,10 @@ def main():
         want = set(json.loads(Path(a.ids).read_text()))
         qs = [q for q in qs if q["id"] in want]
     pre = lambda q: tok(q["prefill"], add_special_tokens=False)["input_ids"] if q.get("prefill") else []  # noqa: E731
-    arms = a.arm.split(",")
+    arms = a.arm.split(",")                         # (an arm may name its mask steps: am:30, records in OUT/am_30)
     for arm in arms:
-        assert arm in ("mask", "group", "attr", "am"), arm
-        (out / arm).mkdir(exist_ok=True)
+        assert arm.split(":")[0] in ("mask", "group", "attr", "am"), arm
+        (out / arm.replace(":", "_")).mkdir(exist_ok=True)
     first = True
     for q in qs:
         clean, corrupt = cf.chat(tok, q["user"]) + pre(q), cf.chat(tok, q["corrupt_user"]) + pre(q)
@@ -335,14 +335,15 @@ def main():
             log(f"{q['id']}: prompts of {len(clean)} and {len(corrupt)} tokens, skipped")
             continue
         for arm in arms:
-            path = out / arm / f"{q['id'].replace('/', '__')}.json"
+            path = out / arm.replace(":", "_") / f"{q['id'].replace('/', '__')}.json"
             if path.exists():
                 continue
             if first:                               # (a throwaway run: CUDA's first kernels)
                 pt.setup(clean, corrupt)
                 first = False
             log(f"{q['id']} ({arm})")
-            rec = find(pt, clean, corrupt, None, log=log, arm=arm, steps=a.steps)
+            name, _, n = arm.partition(":")
+            rec = find(pt, clean, corrupt, None, log=log, arm=name, steps=int(n) if n else a.steps)
             rec.update(id=q["id"], ids=clean, corrupted=corrupt, answer_text=tok.decode([rec["answer"]]),
                        corrupt_answer_text=tok.decode([rec["corrupt_answer"]]), model=a.model, dtype=a.dtype,
                        finder="circuit_masks", finder_rev=a.rev,

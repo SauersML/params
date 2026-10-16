@@ -171,6 +171,9 @@ def gen(a) -> None:
             key = 1_000_000 * a.seed + n
             if key in done:
                 continue
+            if "ids" not in r:  # (neuron_builder's main records the chat, not its ids)
+                r["ids"] = nb.chat(o.tok, r["user"])
+                assert len(r["ids"]) == r["T"], (r.get("id"), len(r["ids"]), r["T"])
             exs, info = text_examples(o, nr, r["ids"], rng, r if a.records else None)
             dst = hh if a.records and zlib.crc32(str(r.get("id", n)).encode()) % 10 == 0 else fh
             for e in exs:

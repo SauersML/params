@@ -267,24 +267,22 @@ def build(model, tok, log=print) -> tuple[list[dict], dict]:
 
 
 def spread(qs: list[dict], n: int) -> list[dict]:
-    """n questions round robin over tasks, within a task over keys (one paraphrase per key, paraphrases cycling)."""
+    """n questions round robin over tasks; within a task round robin over its keys, each turn the key's next unused
+    paraphrase (paraphrases varied by turn), until n or every question is taken."""
     by = {}
     for q in qs:
         by.setdefault(q["task"], {}).setdefault(q["key"], []).append(q)
     queues = {t: [sorted(v, key=lambda q: q["paraphrase"]) for v in ks.values()] for t, ks in by.items()}
-    out, r = [], 0
+    out = []
     while len(out) < n and any(queues.values()):
         for t in sorted(queues):
-            if len(out) >= n:
-                break
             keys = queues[t]
-            while keys:
-                v = keys.pop(0)
-                if v:
-                    pick = v[r % len(v)]
-                    out.append(pick)
-                    break
-        r += 1
+            if not keys or len(out) >= n:
+                continue
+            v = keys.pop(0)
+            out.append(v.pop(len(out) % len(v)))
+            if v:
+                keys.append(v)
     return out
 
 

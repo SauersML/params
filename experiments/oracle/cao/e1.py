@@ -61,6 +61,10 @@ def keys(rec: dict, detail: bool) -> set[str]:
         return words(t["trigger"]) | words(t["marker"])
     if rec["kind"] == "cond_pref":
         return words(t["cue"][0]) | words(t["target"])
+    if rec["kind"] == "pref":  # (fleet's e1b kinds)
+        return words(t["target"])
+    if rec["kind"] in ("cue_marker", "topic_backdoor"):
+        return words((t.get("cue") or [t.get("topic", "")])[0]) | words(t["marker"])
     return words(t["false"][0]) | (words(t["true"][0]) if detail else set())
 
 

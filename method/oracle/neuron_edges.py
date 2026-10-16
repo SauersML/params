@@ -2,13 +2,11 @@
 positive and a negative pole and its SwiGLU sign regime; attention heads are routes, read through the neurons on each
 side). Given a text, a question's contrast at a target and a circuit's neurons, it states which neuron feeds which.
 
-Contrast: log2 of the summed probability of the answer's tokens over that of the alternatives' at the target.
-Background: the reference run, the model with each neuron's activation zeroed below its weak threshold (thr [layers,
-d_mlp]: neuron_builder.Neurons', inframove's T2 calibration; None: the model itself). With background "circuit" every
-strong candidate outside the circuit is also zeroed, as neuron_builder's circuit run: strong, not massive (|value| under
-massive [layers], the layer's cut) and at positions 1 to the target, the first position and massive values live (the
-question-scoped circuit's sufficiency run); with "model" every strong neuron runs. Every cut run zeroes the values the
-reference run zeroed and no others (weak "reference"; "run": each run its own weak values, as neuron_builder).
+Contrast: log2 of the summed probability of the answer's tokens over that of the alternatives' at the target (the word
+contrast's token sets, answer_contrast.py). Every run is the model itself with every neuron outside the cut edges'
+readers computing as usual. A cut edge is zeroed (the reader reads its input less what the edge brings), or with a
+corrupted prompt of the same length (circuit_finder's patching pair) patched: the reader reads what the edge brings in the
+corrupted run instead.
 Edges (candidates: every pair the architecture allows among the circuit's neurons):
   resid  writer (layer a, position p) -> reader (layer b > a, position p): the writer's down_proj write in the reader's
          MLP input;
@@ -44,8 +42,6 @@ contrast checked on the whole graph:
   python neuron_edges.py one MODEL TEXT.json OUT.json   (TEXT: ids, target, answer, alternatives, neurons)
   python neuron_edges.py finder MODEL REC.json|REC_DIR OUT.json|OUT_DIR [--dtype bfloat16]
                          (circuit_finder records: patching from the corrupted run, route knockouts on cross-position edges)
-  python neuron_edges.py record MODEL REC.json|REC_DIR OUT.json|OUT_DIR --thr THR.pt [--adapter A] [--dtype bfloat16]
-                         (a neuron_builder circuit in its reference; a directory: each record in it, those done skipped)
 """
 from __future__ import annotations
 
@@ -97,8 +93,7 @@ class Edges:
     (resid (writer, reader) and route (writer, (layer, head), reader) tuples; neurons (layer, position, index))."""
 
     def __init__(self, model, ids: list[int], target: int, answer: list[int], alternatives: list[int], neurons: list,
-                 thr: torch.Tensor | None = None, background: str = "circuit", massive: torch.Tensor | None = None,
-                 weak: str = "reference", corrupt_ids: list[int] | None = None):
+                 corrupt_ids: list[int] | None = None):
         core = model.get_base_model() if hasattr(model, "get_base_model") else model
         cfg = core.config
         self.core, self.layers = core, core.model.layers
@@ -110,8 +105,6 @@ class Edges:
         self.B = None  # cut sets a forward (below, from the positions a cut run computes)
         self.forwards = 0  # (contrasts' forwards so far)
         self.ids, self.target, self.answer, self.alternatives = list(ids)[:self.T], target, list(answer), list(alternatives)
-        self.thr = None if thr is None else thr.to(self.dev, torch.float32)
-        self.massive = None if massive is None else massive.float().cpu()
         self.N = sorted({(int(L), int(p), int(j)) for L, p, j in neurons if p < self.T})  # (by layer first)
         self.B = max(16, TOKENS // (self.T - (min(n[1] for n in self.N) if PREFIX and self.N else 0)))
         self.at = {n: i for i, n in enumerate(self.N)}
@@ -119,24 +112,15 @@ class Edges:
         self.Jn = torch.tensor([n[2] for n in self.N], dtype=torch.long)
         lay = torch.tensor([n[0] for n in self.N], dtype=torch.long)
         self.nb = [int((lay < L).sum()) for L in range(self.L + 1)]  # the circuit's neurons below layer L: the first nb[L]
-        self.background = background
-        self.keep = torch.zeros(self.L, self.T, cfg.intermediate_size, dtype=torch.bool, device=self.dev)
-        for L, p, j in self.N:
-            self.keep[L, p, j] = True
         self.resid_all = [(w, r) for w in self.N for r in self.N if w[0] < r[0] and w[1] == r[1]]
         self.n_routes = sum((r[0] - w[0]) * self.H for w in self.N for r in self.N if w[1] <= r[1] and w[0] < r[0])
         self._plans, self._cols, self._vcols, self._wos, self._idx = {}, {}, {}, {}, {}
         self._J, self._G, self._dv_base, self._allin = None, None, {}, {}
         self.patch, self.cbase = False, None  # (a patching pair: set below)
-        self.fixed = None  # weak "reference": the reference run's zeroed values held zero in every run, none else
-        # (the reference's set of values, so a cut moves the contrast smoothly; "run": every run zeroes its own weak values,
-        # neuron_builder's, where a near-threshold value flips on float noise: 0.1 bits between CPU and GPU on f0)
         with torch.no_grad():
             self.base = self._run(torch.zeros(1, 0, dtype=torch.bool), [], keep_states=True)
-        if weak == "reference":
-            self.fixed = [h != 0 for h in self.base["h"]]
         if corrupt_ids is not None:  # a patching pair: a cut edge's reader reads what the edge brings in the corrupted run
-            assert thr is None and len(corrupt_ids) >= self.T, "patching uses the model itself on prompts of one length"
+            assert len(corrupt_ids) >= self.T, "patching needs prompts of one length"
             with torch.no_grad():
                 self.cbase = self._run(torch.zeros(1, 0, dtype=torch.bool), [], keep_states=True, ids=list(corrupt_ids)[:self.T])
             self.patch = True
@@ -166,13 +150,6 @@ class Edges:
         """The neurons' activations from a pre-norm stream x [..., d]: act(gate(norm x)) * up(norm x), in float32."""
         n = self._f(layer.post_attention_layernorm, x)
         return layer.mlp.act_fn(self._f(layer.mlp.gate_proj, n)) * self._f(layer.mlp.up_proj, n)
-
-    def _weak(self, L: int, h: torch.Tensor, js: torch.Tensor | None = None) -> torch.Tensor:
-        """h with the activations under their weak threshold zeroed (js: the neurons h holds, else every one)."""
-        if self.thr is None:
-            return h
-        t = (self.thr[L] if js is None else self.thr[L][js.to(self.thr.device)]).to(h.device)
-        return h * (h.abs() >= t)
 
     def _wo(self, L: int) -> torch.Tensor:
         """Layer L's o_proj weight in float32 (kept: a lower precision model's is converted once)."""
@@ -355,14 +332,6 @@ class Edges:
                     D.index_add_(1, ru, Z @ Wo[:, h * hd:(h + 1) * hd].T)  # (in place: D is sets x neurons x d)
             x = x + f(at.o_proj, z.transpose(1, 2).reshape(K, Ts, H * hd))
             hm = self._mlp_act(layer, x)
-            hm = self._weak(L, hm) if self.fixed is None else hm * self.fixed[L].to(d)[None, s0:]
-            if self.background == "circuit" and self.fixed is None:  # (strong candidates outside the circuit zeroed; position 0 and massive live)
-                off = ~self.keep[L, s0:].to(d)[None]
-                if s0 == 0:
-                    off[:, 0] = False
-                if self.massive is not None:
-                    off = off & (hm.abs() < float(self.massive[L]))
-                hm = hm.masked_fill(off, 0.0)
             rs = torch.arange(nb, self.nb[L + 1], device=d)  # the circuit's neurons of this layer
             if len(rs) and (len(edges) or rest):  # each from its own input
                 inp = x[:, Ps[rs]] - D[:, rs]
@@ -371,7 +340,6 @@ class Edges:
                 if self.patch:  # (the cut edges' readers read what those edges bring in the corrupted run)
                     inp = inp + self._fixed(L, coef, plan, rest)
                 hr = self._mlp_act(layer, inp).gather(-1, Jn[rs][None, :, None].expand(K, -1, 1))[..., 0]
-                hr = self._weak(L, hr, Jn[rs]) if self.fixed is None else hr * self.fixed[L].to(d)[P[rs], Jn[rs]][None]
                 hm = hm.index_put((kk[:, None], Ps[rs][None], Jn[rs][None]), hr)
             if probe is not None:
                 hm = hm + probe[L].to(d)[None]
@@ -434,7 +402,8 @@ class Edges:
     def grads(self) -> torch.Tensor:
         """The contrast's gradient at each circuit neuron's activation in the base run [N] (kept)."""
         if self._G is None:
-            probe = [torch.zeros(self.T, self.keep.shape[-1], device=self._d(L), requires_grad=True) for L in range(self.L)]
+            dm = self.core.config.intermediate_size
+            probe = [torch.zeros(self.T, dm, device=self._d(L), requires_grad=True) for L in range(self.L)]
             with torch.enable_grad():
                 self._run(torch.zeros(1, 0, dtype=torch.bool), [], probe=probe)["contrast"].sum().backward()
             self._G = torch.tensor([float(probe[n[0]].grad[n[1], n[2]]) for n in self.N])
@@ -814,7 +783,7 @@ def graph(ed: Edges, got: dict, tok=None) -> dict:
     txt = {} if tok is None else {"tokens": [tok.decode([i]) for i in ed.ids], "answer_text": tok.decode(ed.answer),
                                   "alternatives_text": [tok.decode([a]) for a in ed.alternatives]}
     return {"ids": ed.ids, **txt, "contrast": {"answer": ed.answer, "alternatives": ed.alternatives, "target": ed.target,
-                                               "value": ed.c_full}, "background": ed.background, "nodes": nodes,
+                                               "value": ed.c_full}, "cut_kind": "patch" if ed.patch else "zero", "nodes": nodes,
             "edges": out, "record": got["record"],
             "cut": {"none": got["record"].get("contrast_all_edges"), "graph_edges": got["record"].get("contrast_graph_cut"),
                     "every_edge": got["record"].get("contrast_no_edges")},  # (the contrast with those edges cut together)
@@ -843,7 +812,7 @@ def finder_graph(model, tok, rec: dict, log=print) -> dict:
     ids, bad = rec["ids"], rec["corrupted"]
     answer, alts = answer_sets(rec)
     ed = Edges(model, ids, len(ids) - 1, answer, alts,
-               [(n["layer"], n["pos"], n["neuron"]) for n in rec["nodes"]], background="model", corrupt_ids=bad)
+               [(n["layer"], n["pos"], n["neuron"]) for n in rec["nodes"]], corrupt_ids=bad)
     got = prune(ed, log=log)
     g = graph(ed, got, tok)
     rn = head_routes.Runner(model)
@@ -876,20 +845,14 @@ def load(name: str, device: str | None = None, dtype: str = "float32"):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("cmd", choices=("one", "record", "finder"))
+    ap.add_argument("cmd", choices=("one", "finder"))
     ap.add_argument("model")
-    ap.add_argument("text", type=Path, help="one: TEXT.json; record: a neuron_builder record (OUT/<id>.json) or a "
-                    "directory of them")
+    ap.add_argument("text", type=Path, help="one: TEXT.json; finder: a circuit_finder record or a directory of them")
     ap.add_argument("out", type=Path)
     ap.add_argument("--device", default=None)
-    ap.add_argument("--background", default="model", choices=("circuit", "model"), help="model: every other neuron runs "
-                    "(neuron_builder's circuits: necessity and counterfactual patching); circuit: keep-only")
     ap.add_argument("--dtype", default="float32", choices=("float32", "bfloat16"), help="the model's weights (bfloat16: 32B "
                     "over two cards, device_map auto)")
-    ap.add_argument("--thr", type=Path, help="the reference's file (neuron_builder.Neurons.save); record: else each "
-                    "record's own (its calibration's file)")
     ap.add_argument("--adapter", default=None)
-    ap.add_argument("--weak", default="reference", choices=("reference", "run"))
     a = ap.parse_args()
     import transformers
     model = load(a.model, a.device, a.dtype)
@@ -916,43 +879,9 @@ def main():
             print(f"{src.stem}: {len(g['nodes'])} neurons, {len(g['edges'])} edges, {len(g['routes'])} routes, "
                   f"{g['seconds']} s", flush=True)
         return
-    if a.cmd == "record":  # neuron_builder circuits: each one's prompt, answer, alternatives and units, its reference
-        import neuron_builder
-
-        refs = {}  # the reference's file -> (thr, massive): --thr, else each record's own (its calibration's file)
-
-        def reference(f):
-            if f is None:
-                return None, None
-            if f not in refs:
-                nr = neuron_builder.Neurons(model, tok)
-                nr.load(Path(f))
-                refs[f] = (nr.thr, nr.massive)
-            return refs[f]
-        if a.text.is_dir():
-            a.out.mkdir(parents=True, exist_ok=True)
-            todo = [(f, a.out / f.name) for f in sorted(a.text.glob("*.json")) if not (a.out / f.name).exists()]
-        else:
-            todo = [(a.text, a.out)]
-        for src, dst in todo:
-            t0 = time.time()
-            rec = json.loads(src.read_text())
-            ref_file = str(a.thr) if a.thr else rec.get("calibration", {}).get("file")
-            thr, massive = reference(ref_file)
-            ed = Edges(model, neuron_builder.chat(tok, rec["user"]), rec["pos"], [rec["answer"]], rec["alternatives"],
-                       [(n["layer"], n["pos"], n["neuron"]) for n in rec["nodes"]], thr=thr, background=a.background,
-                       massive=massive, weak=a.weak)
-            got = prune(ed, log=lambda m: print(f"{src.stem}: {m}", flush=True))
-            g = graph(ed, got, tok)
-            g.update(id=rec.get("id"), text_id=rec.get("id"), user=rec.get("user"), model=a.model, adapter=a.adapter, thr=ref_file,
-                     builder=rec.get("builder"), builder_contrast=rec.get("contrast"),
-                     builder_reference=rec.get("calibration", {}).get("file"), seconds=round(time.time() - t0, 2))
-            dst.write_text(json.dumps(g))
-            print(f"{src.stem}: {len(ed.N)} neurons, {len(got['edges'])} edges, {time.time() - t0:.1f} s", flush=True)
-        return
     t = json.loads(a.text.read_text())
     ed = Edges(model, t["ids"], t["target"], t["answer"], t["alternatives"], [tuple(n) for n in t["neurons"]],
-               background=a.background)
+               corrupt_ids=t.get("corrupted"))
     got = prune(ed, log=lambda m: print(f"{a.text.stem}: {m}", flush=True))
     a.out.write_text(json.dumps(graph(ed, got, tok)))
 

@@ -1,6 +1,7 @@
-"""Checks of the neuron edge stage (neuron_edges.py) on a tiny random Qwen3: with no cut and every neuron live the run is
-the model's; the circuit run is the model with every other neuron zeroed but the first position's and massive values; a cut edge's measured effect follows its
-linear score at small writes; pruning keeps the contrast within its tolerance and the graph lists poles and edges.
+"""Checks of the neuron edge stage (neuron_edges.py) on a tiny random Qwen3: with no cut the run is the model's; a cut
+edge's reader is recomputed from its input less what the edge brings (or, patching, plus what it brings in the corrupted
+run); the per-position sums for every other candidate agree with listing them; pruning meets its tolerance and the graph
+lists poles and edges; prefix runs equal full runs.
 
   ~/mpd-data/venv/bin/python -m pytest method/oracle/test_neuron_edges.py -q
 """
@@ -31,32 +32,18 @@ def tiny():
     return model, ids, neurons
 
 
-def contrast_of(model, ids, keep=None):
-    hooks = []
-    if keep is not None:  # every neuron outside keep zeroed
-        for L, layer in enumerate(model.model.layers):
-            hooks.append(layer.mlp.down_proj.register_forward_pre_hook(lambda m, a, L=L: (a[0] * keep[L][None],)))
-    try:
-        with torch.no_grad():
-            lp = torch.log_softmax(model(torch.tensor([ids])).logits[0, 9].float(), -1)
-    finally:
-        for h in hooks:
-            h.remove()
+def contrast_of(model, ids):
+    with torch.no_grad():
+        lp = torch.log_softmax(model(torch.tensor([ids])).logits[0, 9].float(), -1)
     return float(neuron_edges.log2_contrast(lp, [3], [5, 7]))
 
 
 def test_runs_are_the_models(tiny):
     model, ids, neurons = tiny
-    ed = neuron_edges.Edges(model, ids, 9, [3], [5, 7], neurons, background="model")
+    ed = neuron_edges.Edges(model, ids, 9, [3], [5, 7], neurons)
     assert ed.c_full == pytest.approx(contrast_of(model, ids), abs=1e-4)
-    ec = neuron_edges.Edges(model, ids, 9, [3], [5, 7], neurons, background="circuit")
-    live = ec.keep.clone()
-    live[:, 0] = True  # (the first position stays live, as neuron_builder's circuit run)
-    assert ec.c_full == pytest.approx(contrast_of(model, ids, live), abs=1e-4)
-    big = neuron_edges.Edges(model, ids, 9, [3], [5, 7], neurons, background="circuit", massive=torch.zeros(3))
-    assert big.c_full == pytest.approx(contrast_of(model, ids), abs=1e-4)  # (every value massive: every one live)
-    E = len(ec.resid_all)
-    assert ec.contrasts(torch.zeros(1, E, dtype=torch.bool), ec.resid_all)[0] == pytest.approx(ec.c_full, abs=1e-4)
+    E = len(ed.resid_all)
+    assert ed.contrasts(torch.zeros(1, E, dtype=torch.bool), ed.resid_all)[0] == pytest.approx(ed.c_full, abs=1e-4)
 
 
 def every_edge(ed):
@@ -71,7 +58,7 @@ def test_cut_runs_recompute_the_reader(tiny):
     """An edge cut alone: in the run its reader's activation is the reader recomputed from its input less what the edge
     brings (resid, and routes through the closed-form value change)."""
     model, ids, neurons = tiny
-    ed = neuron_edges.Edges(model, ids, 9, [3], [5, 7], neurons, background="model")
+    ed = neuron_edges.Edges(model, ids, 9, [3], [5, 7], neurons)
     _, es = every_edge(ed)
     for e in es[::max(1, len(es) // 40)]:
         r = e[-1]
@@ -85,7 +72,7 @@ def test_local_curves(tiny):
     """Each reader's local effects are its Jacobian times what the edge brings; its curve ends at its base activation
     with every in-edge kept and starts with every one cut."""
     model, ids, neurons = tiny
-    ed = neuron_edges.Edges(model, ids, 9, [3], [5, 7], neurons, background="model")
+    ed = neuron_edges.Edges(model, ids, 9, [3], [5, 7], neurons)
     cands, _ = every_edge(ed)
     J = ed.jacobians()
     for es, sc in cands:
@@ -104,7 +91,7 @@ def test_local_curves(tiny):
 
 def test_prune_and_graph(tiny):
     model, ids, neurons = tiny
-    ed = neuron_edges.Edges(model, ids, 9, [3], [5, 7], neurons, background="circuit")
+    ed = neuron_edges.Edges(model, ids, 9, [3], [5, 7], neurons)
     got = neuron_edges.prune(ed, log=lambda m: None)
     rec = got["record"]
     assert rec["met"] and abs(rec["contrast_kept"] - rec["contrast_all_edges"]) <= rec["tolerance"] + 1e-6
@@ -116,7 +103,7 @@ def test_prune_and_graph(tiny):
 def test_exported_route_scope_is_not_full_attention_routing(tiny):
     """Saved evidence must distinguish conditional OV cuts from Q/K or whole-writer interventions."""
     model, ids, neurons = tiny
-    ed = neuron_edges.Edges(model, ids, 9, [3], [5, 7], neurons, background="model")
+    ed = neuron_edges.Edges(model, ids, 9, [3], [5, 7], neurons)
     route = next(e for e in every_edge(ed)[1] if len(e) == 3)
     exported = neuron_edges.graph(ed, {"edges": [route], "strengths": [0.0], "local": [0.0], "record": {}})
     saved = json.loads(json.dumps(exported))
@@ -136,17 +123,16 @@ def test_rest_cut_sums(tiny):
     """Every other candidate cut by the per-position sums: with every candidate listed and kept the run is the model's;
     with none listed it is every candidate listed and cut."""
     model, ids, neurons = tiny
-    for bg in ("model", "circuit"):
-        ed = neuron_edges.Edges(model, ids, 9, [3], [5, 7], neurons, background=bg)
-        every = every_edge(ed)[1]
-        E = len(every)
-        kept = ed.contrasts(torch.zeros(1, E, dtype=torch.bool), every, rest=True)[0]
-        assert kept == pytest.approx(ed.c_full, abs=1e-4)
-        none = ed.contrasts(torch.zeros(1, 0, dtype=torch.bool), [], rest=True)[0]
-        assert none == pytest.approx(ed.contrasts(torch.ones(1, E, dtype=torch.bool), every)[0], abs=1e-4)
-        half = torch.arange(E)[None] % 2 == 0  # (half listed and cut, the other half as run against a cut rest)
-        got = ed.contrasts(half, every, rest=True)[0]
-        assert got == pytest.approx(ed.contrasts(half, every)[0], abs=1e-4)
+    ed = neuron_edges.Edges(model, ids, 9, [3], [5, 7], neurons)
+    every = every_edge(ed)[1]
+    E = len(every)
+    kept = ed.contrasts(torch.zeros(1, E, dtype=torch.bool), every, rest=True)[0]
+    assert kept == pytest.approx(ed.c_full, abs=1e-4)
+    none = ed.contrasts(torch.zeros(1, 0, dtype=torch.bool), [], rest=True)[0]
+    assert none == pytest.approx(ed.contrasts(torch.ones(1, E, dtype=torch.bool), every)[0], abs=1e-4)
+    half = torch.arange(E)[None] % 2 == 0  # (half listed and cut, the other half as run against a cut rest)
+    got = ed.contrasts(half, every, rest=True)[0]
+    assert got == pytest.approx(ed.contrasts(half, every)[0], abs=1e-4)
 
 
 def test_bfloat16_model(tiny):
@@ -155,75 +141,12 @@ def test_bfloat16_model(tiny):
     import copy
     model, ids, neurons = tiny
     m16 = copy.deepcopy(model).to(torch.bfloat16)
-    e32 = neuron_edges.Edges(model, ids, 9, [3], [5, 7], neurons, background="model")
-    e16 = neuron_edges.Edges(m16, ids, 9, [3], [5, 7], neurons, background="model")
+    e32 = neuron_edges.Edges(model, ids, 9, [3], [5, 7], neurons)
+    e16 = neuron_edges.Edges(m16, ids, 9, [3], [5, 7], neurons)
     cuts = torch.eye(len(e32.resid_all), dtype=torch.bool)[:8]
     a, b = e32.contrasts(cuts, e32.resid_all), e16.contrasts(cuts, e16.resid_all)
     assert e16.c_full == pytest.approx(e32.c_full, abs=0.05)
     assert max(abs(x - y) for x, y in zip(a, b)) < 0.1
-
-
-def test_dev_ranking_uses_full_model_gradient_and_matches_finite_difference(tiny, monkeypatch):
-    """Later nonlinear MLP paths contribute to earlier neuron derivatives, with frozen weights."""
-    import copy
-    import importlib.util
-    path = HERE.parents[1] / "experiments" / "oracle" / "neuron_edges_dev.py"
-    spec = importlib.util.spec_from_file_location("neuron_edges_dev_gradient_test", path)
-    dev = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(dev)
-    model, ids, _ = tiny
-    model = copy.deepcopy(model).double().requires_grad_(False)
-    # A larger nonlinear downstream path makes detached-MLP derivatives observably wrong.
-    with torch.no_grad():
-        for layer in model.model.layers:
-            layer.mlp.down_proj.weight.mul_(8)
-    acts = {}
-    hooks = []
-    for L, layer in enumerate(model.model.layers):
-        def capture(m, a, L=L):
-            x = a[0]
-            if not x.requires_grad:
-                x = x.detach().requires_grad_()
-            x.retain_grad()
-            acts[L] = x
-            return (x,)
-        hooks.append(layer.mlp.down_proj.register_forward_pre_hook(capture))
-    try:
-        lp = torch.log_softmax(model(torch.tensor([ids])).logits[0, 9].float(), -1)
-        objective = neuron_edges.log2_contrast(lp, [3], [5, 7])
-        gradients = torch.autograd.grad(objective, tuple(acts.values()))
-        expected = torch.stack([(acts[L][0] * gradients[L][0]).abs().float().cpu()
-                                for L in range(len(acts))])
-    finally:
-        for hook in hooks:
-            hook.remove()
-    # Verify an early-layer derivative by literal pre-down activation perturbation.
-    j = int(gradients[0][0, 9].abs().argmax())
-    def perturbed(epsilon):
-        def edit(m, a):
-            x = a[0].clone()
-            x[0, 9, j] += epsilon
-            return (x,)
-        hook = model.model.layers[0].mlp.down_proj.register_forward_pre_hook(edit)
-        try:
-            return contrast_of(model, ids)
-        finally:
-            hook.remove()
-    eps = .001
-    numeric = (perturbed(eps) - perturbed(-eps)) / (2 * eps)
-    assert numeric == pytest.approx(float(gradients[0][0, 9, j]), rel=.015, abs=2e-4)
-    captured = []
-    real_topk = torch.topk
-    def topk(scores, k, *args, **kwargs):
-        captured.append(scores.detach().clone())
-        return real_topk(scores, k, *args, **kwargs)
-    monkeypatch.setattr(torch, "topk", topk)
-    got = dev.top_neurons(model, ids, 9, [3], [5, 7], 12)
-    assert torch.allclose(captured[0], expected.flatten(), rtol=1e-5, atol=1e-8)
-    order = real_topk(expected.flatten(), 12).indices
-    assert got == [(int(i // 400), int((i // 40) % 10), int(i % 40)) for i in order]
-    assert all(p.grad is None for p in model.parameters())
-    assert all(not layer.mlp.down_proj._forward_pre_hooks for layer in model.model.layers)
 
 
 def test_patching_pair(tiny):
@@ -233,7 +156,7 @@ def test_patching_pair(tiny):
     model, ids, neurons = tiny
     bad = list(ids)
     bad[6] = (bad[6] + 5) % 48
-    ed = neuron_edges.Edges(model, ids, 9, [3], [5, 7], neurons, background="model", corrupt_ids=bad)
+    ed = neuron_edges.Edges(model, ids, 9, [3], [5, 7], neurons, corrupt_ids=bad)
     cands, every = every_edge(ed)
     E = len(every)
     assert ed.contrasts(torch.zeros(1, E, dtype=torch.bool), every, rest=True)[0] == pytest.approx(ed.c_full, abs=1e-4)
@@ -262,7 +185,7 @@ def test_prefix_runs_equal_full_runs(tiny, monkeypatch):
     bad = list(ids)
     bad[7] = (bad[7] + 5) % 48
     for kw in ({}, {"corrupt_ids": bad}):
-        ed = neuron_edges.Edges(model, ids, 9, [3], [5, 7], neurons, background="model", **kw)
+        ed = neuron_edges.Edges(model, ids, 9, [3], [5, 7], neurons, **kw)
         _, es = every_edge(ed)
         cuts = torch.rand(6, len(es), generator=g) < 0.3
         got = {}

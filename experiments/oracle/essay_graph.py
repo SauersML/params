@@ -212,7 +212,7 @@ def main():
 
         shown = [(n["layer"], n["pos"], n["neuron"]) for n in got["nodes"] if n["shown"]]
         ed = ne.Edges(model, ids, len(ids) - 1, first.get("answer_tokens", [first["answer"]]), first["alternatives"], shown,
-                      background="model")
+                      corrupt_ids=first["corrupted"])  # (cuts patched from the first pair's corrupted run)
         eg = ne.graph(ed, ne.prune(ed, log=log), tok)
         idn = {n["id"]: (n["layer"], n["pos"], n["neuron"]) for n in eg["nodes"]}
         g["edges"] = [{**e, "src_node": idn[e["src"]], "dst_node": idn[e["dst"]]} for e in eg["edges"]]

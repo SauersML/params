@@ -399,3 +399,22 @@ def test_peel_finds_group_testings_large_singles(tiny, monkeypatch):
     for u, r in peeled.items():
         if u in full:
             assert abs(r[0] - full[u][0]) < 1e-5 and abs(r[1] - full[u][1]) < 1e-5
+
+
+def test_prefixes_equal_their_sets(tiny):
+    """prefixes(): the shares of units[:k] for each k, as the sets themselves measure (neurons and heads mixed, units
+    before the first change among them, sizes in any order)."""
+    pt, clean, corrupt = tiny
+    pt.setup(clean, corrupt)
+    g = torch.Generator().manual_seed(3)
+    units = []
+    for _ in range(40):
+        i, p = int(torch.randint(pt.L, (1,), generator=g)), int(torch.randint(pt.T, (1,), generator=g))
+        units.append(("neuron", i, p, int(torch.randint(pt.D, (1,), generator=g))) if torch.rand(1, generator=g) < 0.7 else
+                     ("head", i, int(torch.randint(pt.H, (1,), generator=g)), p))
+    ks = [40, 1, 5, 17, 3, 0, 29]
+    got = pt.both_prefixes(units, ks)
+    want = pt.both([units[:k] for k in ks])
+    for a, b in zip(got, want):
+        assert abs(a[0] - b[0]) < 1e-5 and abs(a[1] - b[1]) < 1e-5
+    assert [v[0] for v in pt.prefixes(units, ks, ("corrupt",))] == pytest.approx([v[1] for v in want], abs=1e-5)

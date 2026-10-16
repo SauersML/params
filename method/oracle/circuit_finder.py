@@ -417,6 +417,88 @@ class Patcher:
         """Per set: (lost share noising, restored share denoising), both runs of a set in one batch (given: as run's)."""
         return [tuple(v) for v in self._measure(sets, ("clean", "corrupt"), given)]
 
+    def prefixes(self, units: list, ks: list, bases: tuple = ("clean", "corrupt")) -> list:
+        """Per k in ks the shares of the set units[:k] in each of bases (_measure's, those sets one by one): single neuron
+        and head units in any order, each set's edits sliced from per-layer prefixes of the order (no Python pass per
+        unit and set: a grid of prefixes of thousands of units cost the host more than the GPU). Other units, a Group,
+        or off STAGED: _measure."""
+        if not ks:
+            return []
+        simple = all(len(u) == 4 and u[0] in ("neuron", "head") and isinstance(u[2], (int, np.integer))
+                     and isinstance(u[3], (int, np.integer)) for u in units)
+        if not simple or self._group is not None or not (STAGED and LAYERS and PREFIX and self.first > 0):
+            return self._measure([list(units[:k]) for k in ks], bases)
+        return _read([self._launch_prefixes(units, list(ks), bases)])[0]
+
+    def both_prefixes(self, units: list, ks: list) -> list[tuple]:
+        """prefixes() in both runs: per k (lost share noising, restored share denoising) of units[:k]."""
+        return [tuple(v) for v in self.prefixes(units, ks, ("clean", "corrupt"))]
+
+    def _launch_prefixes(self, units: list, ks: list, bases: tuple) -> tuple:
+        """_launch for the prefix sets units[:k], k in ks (prefixes())."""
+        n = len(units)
+        kind = np.fromiter((0 if u[0] == "neuron" else 1 for u in units), np.int64, n)
+        layer = np.fromiter((u[1] for u in units), np.int64, n)
+        pos = np.fromiter((u[2] if u[0] == "neuron" else u[3] for u in units), np.int64, n)
+        idx = np.fromiter((u[3] if u[0] == "neuron" else u[2] for u in units), np.int64, n)
+        big = self.T + 1
+        pm = np.minimum.accumulate(np.where(pos >= self.first, pos, big)) if n else np.zeros(0, np.int64)
+        starts = [int(pm[k - 1]) if k > 0 and pm[k - 1] < big else self.T - 1 for k in ks]
+        carry, pending = [], []
+        levels = sorted(set(starts), reverse=True)
+        for j, st in enumerate(levels):
+            carry += [b for b, v in enumerate(starts) if v == st]
+            if len(carry) < self.rows and j < len(levels) - 1:
+                continue
+            pending += [([carry[c] for c in js], v) for js, v in
+                        self._run_prefixes(kind, layer, pos, idx, [ks[b] for b in carry], st, bases)]
+            carry = []
+        return len(ks), pending
+
+    def _run_prefixes(self, kind, layer, pos, idx, ks: list, start: int, bases: tuple) -> list:
+        """_run_from's staged path for the prefix sets of the order (kind, layer, pos, idx) of the given lengths ks."""
+        R = min(MAX_ROWS, max(self.rows, BATCH_TOKENS // (self.T - start)))
+        R = min(R, max(self.rows, len(ks) * len(bases)), self._fit(self.T - start))
+        live = pos >= start
+        lm = np.minimum.accumulate(np.where(live, layer, self.L - 1)) if len(layer) else np.zeros(0, np.int64)
+        low = [int(lm[k - 1]) if k > 0 else self.L - 1 for k in ks]
+        order = sorted(range(len(ks)), key=lambda j: -low[j])
+        chunks, cur = [], []
+        for j in order:
+            if cur and (len(cur) + 1) * len(bases) > R:
+                chunks.append(cur)
+                cur = []
+            cur.append(j)
+        chunks.append(cur)
+        groups = {(kc, i): np.nonzero(live & (kind == kc) & (layer == i))[0] for kc in (0, 1) for i in range(self.L)}
+        groups = {key: v for key, v in groups.items() if len(v)}
+        pending = []
+        for js in chunks:
+            rows = sorted((low[j], kb, jj) for jj, j in enumerate(js) for kb in range(len(bases)))
+            row = {(kb, jj): r for r, (_, kb, jj) in enumerate(rows)}
+            by = {}
+            for kb, base in enumerate(bases):          # (each base's rows patch from the other run)
+                src = "corrupt" if base == "clean" else "clean"
+                rb = np.array([row[(kb, jj)] for jj in range(len(js))], dtype=np.int64)
+                kk = np.array([ks[js[jj]] for jj in range(len(js))], dtype=np.int64)
+                for (kc, i), us in groups.items():  # a row's units of this layer: the prefix of us below its k
+                    cnt = np.searchsorted(us, kk)
+                    tot = int(cnt.sum())
+                    if not tot:
+                        continue
+                    off = np.arange(tot) - np.repeat(np.cumsum(cnt) - cnt, cnt)
+                    sel = us[off]
+                    v = by.setdefault(("neuron" if kc == 0 else "head", src), {}).setdefault(i, [])
+                    v.append(np.stack([np.repeat(rb, cnt), pos[sel], idx[sel]]))
+            index = {key: {i: self._to_dev(np.concatenate(a, 1)) for i, a in d.items()} for key, d in by.items()}
+            hn = self._staged(start, [bases[kb] for _, kb, _ in rows], [r[0] for r in rows], **self._edits(index, start))
+            c = self._contrast(hn)[self._to_dev(np.array([[row[(kb, jj)] for jj in range(len(js))] for kb in range(len(bases))],
+                                                         dtype=np.int64))]                 # [bases, sets]
+            got = [((self.c["clean"] - c[kb]) if base == "clean" else (c[kb] - self.c["corrupt"])) / self.gap
+                   for kb, base in enumerate(bases)]
+            pending.append((js, torch.stack(got, 1)))
+        return pending
+
     @torch.no_grad()
     def _derive(self, given: list) -> tuple:
         """Both runs with given's units patched (each from the other run, as a set's), as _staged's stacks: the residual
@@ -1028,9 +1110,12 @@ def cut(pt: Patcher, sc: dict, kind: str, positions, done: dict, log=None, searc
         return lazy["v"]
     passes = lambda r: r[0] >= PASS and r[1] >= PASS  # noqa: E731
 
-    def smallest(n, sets_of, alone=False):          # the smallest k in 1..n whose set passes: a log grid, then bisection
-        g = grid(n)                                 # (alone: each set its own call, sets of millions of units)
-        got = [pt.both([sets_of(k)])[0] for k in g] if alone else pt.both([sets_of(k) for k in g])
+    def smallest(n, sets_of, alone=False, units=None):   # the smallest k in 1..n whose set passes: a log grid, then
+        g = grid(n)                                 # bisection (alone: each set its own call, sets of millions of
+        if units is not None:                       # units; units: the sets are units[:k], Patcher.prefixes)
+            got = pt.both_prefixes(units, g)
+        else:
+            got = [pt.both([sets_of(k)])[0] for k in g] if alone else pt.both([sets_of(k) for k in g])
         met = [k for k, r in zip(g, got) if passes(r)]
         if not met:
             return None, g, got
@@ -1038,7 +1123,8 @@ def cut(pt: Patcher, sc: dict, kind: str, positions, done: dict, log=None, searc
         lo = max([k for k in g if k < hi] + [0])
         while hi - lo > 1:
             mid = (lo + hi) // 2
-            lo, hi = (lo, mid) if passes(pt.both([sets_of(mid)])[0]) else (mid, hi)
+            r = pt.both_prefixes(units, [mid])[0] if units is not None else pt.both([sets_of(mid)])[0]
+            lo, hi = (lo, mid) if passes(r) else (mid, hi)
         return hi, g, got
     order, cond, cond_next = [], [], False
     for rnd in range(EPS_ROUNDS if reach else 1 if UNREACHABLE else 0):
@@ -1065,7 +1151,7 @@ def cut(pt: Patcher, sc: dict, kind: str, positions, done: dict, log=None, searc
                 singles[u] = None                   # (its share alone: measured below)
             cond += new
             order = order + new
-        ok, ks, curve = smallest(len(order), lambda k: order[:k])
+        ok, ks, curve = smallest(len(order), lambda k: order[:k], units=order)
         if log:
             log(f"  {kind}s at {positions[0]}..{positions[-1]} (searched {len(search)}), eps {eps:.4f} (floor "
                 f"{floors[-1] if floors else float('nan'):.4f}): "
@@ -1100,13 +1186,11 @@ def cut(pt: Patcher, sc: dict, kind: str, positions, done: dict, log=None, searc
         alone = pt.both([[v for v in circ if v != u] for u in circ])           # from the least effective while it passes
         todo = [u for u, (lost, rest) in zip(circ, alone) if lost >= PASS and rest >= PASS][::-1]
         while todo:                                 # (the removals in one call as if each passes: the same sets as one
-            chain, cur = [], circ                   # by one up to the first that fails, then again from after it)
-            for u in todo:
-                cur = [v for v in cur if v != u]
-                chain.append(cur)
-            for k, (lost, rest) in enumerate(pt.both(chain)):
+            gone = set(todo)                        # by one up to the first that fails, then again from after it; each
+            seq = [v for v in circ if v not in gone] + todo[::-1]     # a prefix of circ with todo last, reversed)
+            for k, (lost, rest) in enumerate(pt.both_prefixes(seq, [len(circ) - j - 1 for j in range(len(todo))])):
                 if lost >= PASS and rest >= PASS:
-                    circ = chain[k]
+                    circ = [v for v in circ if v not in set(todo[:k + 1])]
                 else:
                     todo = todo[k + 1:]
                     break
@@ -1134,7 +1218,8 @@ def cut(pt: Patcher, sc: dict, kind: str, positions, done: dict, log=None, searc
                 for _, i, p, u in cand[:k]:
                     by.setdefault((i, p), []).append(u)
                 return [unit(kind, i, p, np.asarray(us)) for (i, p), us in by.items()]
-            k, g, got = smallest(len(cand), top, alone=len(cand) > DENSE_BATCH)
+            k, g, got = smallest(len(cand), top, alone=len(cand) > DENSE_BATCH,
+                                 units=[unit(kind, i, p, u) for _, i, p, u in cand] if len(cand) <= DENSE_BATCH else None)
             spread["dense"] = {"units": k, "curve": [{"k": x, "lost": a, "restored": b} for x, (a, b) in zip(g, got)]}
             if k and k <= SINGLES_KEPT:             # (a dense cut of more units than the record's singles is diffuse:
                 circ, ok = [unit(kind, i, p, u) for _, i, p, u in cand[:k]], k      # its size and curve recorded, no units)

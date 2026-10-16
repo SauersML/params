@@ -31,6 +31,10 @@ share of the answer's log-odds gap lost (noising its first k units) and restored
 k, its units added in their measured order (each unit's noising drop alone, for the loss curve; its denoising gain alone,
 for the restoration curve), every k up to CURVE_ALL and a log grid beyond with the 70% crossing bisected; tables quote
 the 70% points (k70) and nothing depends on them.
+A fair baseline beside each circuit (random): RANDOM_DRAWS circuits of the same size at the same positions, each neuron
+pole a uniformly drawn neuron of the same layer's at that position, each head a uniformly drawn head of the same layer's
+there; their noising and denoising shares on the circuit's own pair, the mean (no floor: what the finder's choice adds
+over chance at that size).
 A pair whose clean-corrupted gap is under MIN_GAP bits, or whose two runs give the same answer, is no draw. Noise-aware
 floors: a family scored over draws passes at its floor less min(PAIRED_SE x its bootstrap standard error over the draws,
 CAP of the family); the own pair's families are one run each and get no allowance. A family left unscored (no valid
@@ -58,6 +62,7 @@ import json
 import math
 import sys
 import time
+import zlib
 from pathlib import Path
 
 import numpy as np
@@ -81,6 +86,7 @@ DRAWN = ("necessity_heldout", "sufficiency_heldout", "swaps")
 LOWER = ()  # families whose score passes at or under its floor (none: size is measured, never a criterion)
 CURVE_ALL = 256  # the curves measure every k up to this many units, a log grid beyond
 POINT = 0.7  # the share whose crossing the tables quote (k70)
+RANDOM_DRAWS = 4  # random circuits of the circuit's size per circuit (the fair baseline)
 PAIRED_SE = 2.0  # goal_eval's: a drawn family passes at its floor less this many standard errors, at most CAP
 CAP: dict = {}  # per family, PAIRED_SE x the median standard error over the first held-out set's circuits (until then uncapped)
 EPS_BOOT = 200
@@ -267,6 +273,15 @@ def score(m: Model, tok, c: dict, qs: dict, log=print) -> dict:
     rec["answer"], rec["answer_text"], rec["corrupt_answer"] = a, tok.decode([a]), b
     rec["pair"] = {"c_clean": cc, "c_corrupted": cx, "c_noised": cn, "c_denoised": cd, "gap": gap, "valid": a != b and gap >= MIN_GAP,
                    "lost": (cc - cn) / gap if gap > 0 else None, "restored": (cd - cx) / gap if gap > 0 else None}
+    g = torch.Generator().manual_seed(zlib.crc32(c["name"].encode()))  # the fair baseline: same layers and positions, random units
+    rand = []
+    for _ in range(RANDOM_DRAWS if gap > 0 else 0):
+        rc = {"neurons": [(L, p, int(torch.randint(m.D, (1,), generator=g)), 0) for L, p, _, _ in c["neurons"]],
+              "heads": [(L, p, int(torch.randint(m.H, (1,), generator=g))) for L, p, _ in c["heads"]]}
+        l3 = m.logp([(clean, patches(rc, cap_x)), (corr, patches(rc, cap_c))])
+        rand.append({"lost": (cc - contrast(l3[0], a, alts)) / gap, "restored": (contrast(l3[1], a, alts) - cx) / gap})
+    rec["random"] = {"lost": float(np.mean([x["lost"] for x in rand])) if rand else None,
+                     "restored": float(np.mean([x["restored"] for x in rand])) if rand else None, "draws": rand}
     # each unit's noising effect alone (the hubs: stability)
     singles = [("n", u) for u in c["neurons"]] + [("h", u) for u in c["heads"]]
 
@@ -405,6 +420,8 @@ def summary(recs: list[dict]) -> dict:
         out[f"k70_{f}"] = med(ks)
         out[f"reach70_{f}"] = sum(k is not None for k in ks)
     out["valid_pairs"] = sum(bool((r.get("pair") or {}).get("valid")) for r in recs)
+    for k in ("lost", "restored"):  # the fair baseline: random circuits of the same size at the same places
+        out[f"random_{k}"] = med([(r.get("random") or {}).get(k) for r in recs])
     for k in ("neurons", "heads"):  # validation cases: the published units found
         out[f"expected_{k}"] = med([(r.get("expected") or {}).get(k) for r in recs])
     out["score_seconds"] = med([r.get("seconds") for r in recs])
@@ -427,6 +444,8 @@ def table(sets: dict) -> str:
             vals.append(f"{(fmt.format(v) if isinstance(v, float) else str(v)) if v is not None else '-':>{w[n]}}")
         lines.append(f"  {label:40}" + "".join(vals))
     row("circuits with a valid pair", lambda s: s["valid_pairs"], "{:.0f}")
+    row("random same-size circuits: lost (median)", lambda s: s["random_lost"])
+    row("random same-size circuits: restored", lambda s: s["random_restored"])
     for f in FLOOR:
         row(f"{f} ({'at most' if f in LOWER else 'floor'} {FLOOR[f]:g}) median", lambda s, f=f: s["families"][f]["score"])
         row("  pass old / noise / uncapped / unscored", lambda s, f=f: "{old}/{noise}/{uncapped}/{unscored}".format(**s["families"][f]))

@@ -104,6 +104,9 @@ def test_pair_shares_follow_the_definitions(tiny):
         assert pr["lost"] == pytest.approx((pr["c_clean"] - pr["c_noised"]) / pr["gap"])
         assert pr["restored"] == pytest.approx((pr["c_denoised"] - pr["c_corrupted"]) / pr["gap"])
     assert len(r["effects"]) == 3 and r["size"]["poles"] == 2 and r["size"]["heads"] == 1
+    # the random same-size baseline: RANDOM_DRAWS draws, the same on a rerun
+    assert len(r["random"]["draws"]) == ns.RANDOM_DRAWS
+    assert ns.score(m, Tok(), c, {}, log=lambda s: None)["random"]["lost"] == pytest.approx(r["random"]["lost"], abs=1e-6)
     # the curves end at the whole circuit: the pair's own shares (other batches: float32 rounding over a small gap)
     nec, suf = r["curve"]["necessity"], r["curve"]["sufficiency"]
     assert nec["k"] == [1, 2, 3] and nec["share"][-1] == pytest.approx(pr["lost"], abs=1e-3)

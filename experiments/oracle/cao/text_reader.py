@@ -215,6 +215,75 @@ def measure(a) -> None:
     a.out.write_text(json.dumps(out))
 
 
+def gen(a) -> None:
+    """GPU: more training questions from rc's training contexts alone: the same four kinds (g2.py's questions, answers
+    and claim checks) about each member neuron of the groups with two or more (a single neuron's group is already
+    asked), and SETS more sets of two to four members, in rc's row format with the context's groups map unchanged (the
+    input is the same circuit; an asked unit is a member's name)."""
+    import random
+
+    import torch
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+    sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "method" / "oracle"))
+    import claim_check as cc
+    import g2
+    import neuron_builder as nb
+
+    tok = AutoTokenizer.from_pretrained(MODEL)
+    m = AutoModelForCausalLM.from_pretrained(MODEL, dtype=torch.bfloat16).to("cuda")
+    nr = nb.Neurons(m.eval().requires_grad_(False), tok)
+    nr.load(a.thr)
+    rng = random.Random(a.seed)
+    first = {}
+    for x in (a.rc / "train_correct.jsonl").read_text().splitlines():
+        e = json.loads(x)
+        first.setdefault(e["id"], e)
+    with a.out.open("w") as fh:
+        for cid, e in first.items():
+            ids = e["ctx"]
+            y = q_tok(tok.decode([json.loads((a.records / "out" / rec_file(cid)).read_text())["answer"]]))  # (g2's answer)
+            units = [u for us in e["groups"].values() if len(us) > 1 for u in us]
+            asks = [(cat, [u], {"steer": g2.STEER} if cat == "n_steer" else "zero") for u in units for cat in ("n_zero", "n_sign", "n_steer")]
+            pool = [u for us in e["groups"].values() for u in us]
+            for _ in range(a.sets if len(pool) >= 2 else 0):
+                asks.append(("n_set", rng.sample(pool, rng.randint(2, min(4, len(pool)))), "zero"))
+            probe = [{"prompt": {"ids": ids}, "position": -1, "units": us, "op": op, "predict": {"top_changes": True}} for _, us, op in asks]
+            got = cc.check_many(nr, probe)
+            stated, texts = [], []
+            for (cat, us, op), r in zip(asks, got):
+                if "error" in r:
+                    continue
+                if cat == "n_sign":
+                    ch = r["change"]
+                    pred = {"contrast_change": {"op": "<=", "value": -g2.HALF}} if ch <= -g2.HALF else \
+                        {"contrast_change": {"op": ">=", "value": g2.HALF}} if ch >= g2.HALF else {"contrast_change": {"op": "within", "value": g2.HALF}}
+                    text = (f"{us[0]} supports {y}." if ch <= -g2.HALF else f"{us[0]} works against {y}." if ch >= g2.HALF else
+                            f"{us[0]} barely matters for {y}.")
+                else:
+                    clause, pred = g2.outcome(r, y)
+                    verb = "Turning " + us[0] + " up" if cat == "n_steer" else "Zeroing " + g2.listing(us) + (" together" if len(us) > 1 else "")
+                    text = f"{verb}: {clause}."
+                stated.append({"prompt": {"ids": ids}, "position": -1, "units": us, "op": op, "predict": pred})
+                texts.append((cat, us, op, text, pred))
+            final = cc.check_many(nr, stated)
+            n = 0
+            for (cat, us, op, text, pred), r in zip(texts, final):
+                if not r.get("pass"):
+                    continue
+                if not r["specific"]:
+                    text += " Random neurons of the same layers do the same."
+                q = {"n_steer": f"What happens to the model's next token {y} if {us[0]} is turned up?",
+                     "n_zero": f"What happens to the model's next token {y} if {us[0]} is zeroed?",
+                     "n_set": f"What happens to the model's next token {y} if {g2.listing(us)} are zeroed together?",
+                     "n_sign": f"Does {us[0]} support the model's next token {y} or work against it?"}[cat]
+                claim = {"units": us, "op": op, "predict": pred}
+                fh.write(json.dumps({"cat": cat, "form": "members", "ctx": ids, "q": q, "a": f"{text}\nClaim: {json.dumps(claim)}",
+                                     "claim": claim, "groups": e["groups"], "specific": r["specific"], "id": cid, "text": e["text"]}) + "\n")
+                n += 1
+            fh.flush()
+            print(cid, len(asks), n, flush=True)
+
+
 def claims(a) -> None:
     """GPU: each eval file's answers checked by claim_check (the claim an answer ends with, run on the reference with
     its random-unit controls), as g2.py eval checks them: the rows again with claim_pass and claim_specific."""
@@ -349,9 +418,15 @@ def mismatch(F: dict, D: dict) -> dict:
 
 # ---- the feasibility check: a logistic model on the serialized numbers against the name-prior ----
 
+def unit_members(F: dict, u: str) -> list[dict]:
+    """An asked item's members: a group's, or the one member a neuron's unit name names (gen's member questions)."""
+    if u in F["groups"]:
+        return F["groups"][u]["members"]
+    return [m for g in F["groups"].values() for m in g["members"] if m["name"] == u][:1]
+
+
 def qfeatures(e: dict, F: dict) -> list[float]:
-    gs = [F["groups"][g] for g in e["claim"]["units"]]
-    ms = [m for g in gs for m in g["members"]]
+    ms = [m for g in e["claim"]["units"] for m in unit_members(F, g)]
     T = len(F["tokens"])
     s = lambda k: sum((m[k] or 0.0) for m in ms)  # noqa: E731
     mxa = lambda k: max(abs(m[k] or 0.0) for m in ms)  # noqa: E731
@@ -450,8 +525,7 @@ def recap(F: dict, e: dict, how: str) -> str:
     T = len(F["tokens"])
     out = []
     for gname in e["claim"]["units"]:
-        g = F["groups"][gname]
-        ms = g["members"]
+        ms = unit_members(F, gname)
         pos = sorted({q_tok(m["tok"]) + f" @{m['pos'] if m['pos'] >= 0 else T + m['pos']}" for m in ms})
         x = f"{gname} {len(ms)} at {', '.join(pos)}"
         if how in ("full", "mismatch"):
@@ -597,13 +671,20 @@ def main():
     me.add_argument("--rc", type=Path, required=True)
     me.add_argument("--thr", type=Path, default=THR)
     me.add_argument("--out", type=Path, required=True)
+    g = sub.add_parser("gen")
+    g.add_argument("--rc", type=Path, required=True)
+    g.add_argument("--thr", type=Path, default=THR)
+    g.add_argument("--out", type=Path, required=True)
+    g.add_argument("--sets", type=int, default=6)
+    g.add_argument("--records", type=Path, default=RECORDS)
+    g.add_argument("--seed", type=int, default=0)
     cl = sub.add_parser("claims")
     cl.add_argument("evals", type=Path, nargs="+")
     cl.add_argument("--rc", type=Path, required=True)
     cl.add_argument("--thr", type=Path, default=THR)
     cl.add_argument("--out", type=Path, required=True)
     a = ap.parse_args()
-    {"claims": claims, "measure": measure, "facts": facts, "check": check, "rows": rows, "sample": sample, "score": score}[a.cmd](a)
+    {"gen": gen, "claims": claims, "measure": measure, "facts": facts, "check": check, "rows": rows, "sample": sample, "score": score}[a.cmd](a)
 
 
 if __name__ == "__main__":

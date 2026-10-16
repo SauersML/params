@@ -1766,6 +1766,49 @@ def run(a) -> None:
                   rec["stopped"] or "", flush=True)
 
 
+def e2base(a) -> None:
+    """O3's references on E2 (scored on the server like the agent's edits): no edit; the attribution edit
+    (e2_gradient_edit) at each k; and per agent edit (--runs: agent.py run records on edit_e2 items) as many random
+    poles in the same layers, with the same signs (ROUNDS draws)."""
+    import urllib.request
+
+    with urllib.request.urlopen(a.server + "/items", timeout=60) as r:
+        items_ = {it["id"]: it for it in json.loads(r.read()) if it["kind"] == "edit_e2"}
+    with urllib.request.urlopen(a.server + "/info", timeout=60) as r:
+        info = json.loads(r.read())
+    rng = random.Random(a.seed)
+    done = {(x["item"], x["arm"]) for x in map(json.loads, a.out.read_text().splitlines())} if a.out.exists() else set()
+
+    def put(item, arm, ops, extra=None):
+        if (item, arm) in done:
+            return
+        got = post(a.server, "/score_e2", {"item": item, "ops": ops}, tries=3)
+        row = {"item": item, "arm": arm, "ops": ops, **(extra or {}), **got}
+        with a.out.open("a") as fh:
+            fh.write(json.dumps(row) + "\n")
+        print(item, arm, {k: got.get(k) for k in ("success", "goal_after", "kl_general", "kl_near", "facts_after")}, flush=True)
+
+    for item in items_:
+        put(item, "none", [])
+        for k in a.ks:
+            ops = post(a.server, "/gradient_e2", {"item": item, "k": k}, tries=3)["ops"]
+            put(item, f"gradient@{k}", [{"op": "zero", "units": ops[0]["units"]}])
+    for rec in (json.loads(x) for f in a.runs for x in f.read_text().splitlines()):
+        ops = rec.get("answer", {}).get("edit") if isinstance(rec.get("answer"), dict) else None
+        units = [u for op in ops or [] if isinstance(op, dict) and op.get("op") == "zero" for u in op.get("units", [])]
+        units += [op["unit"] for op in ops or [] if isinstance(op, dict) and op.get("op") == "scale" and float(op.get("factor", 1)) == 0]
+        for d in range(a.rounds):
+            rnd = []
+            for u in units:
+                m_ = UNIT.match(str(u).strip())
+                if not m_:
+                    continue
+                layer, kind, _, pole = int(m_.group(1)), m_.group(2), m_.group(3), m_.group(4)
+                rnd.append(f"L{layer}.{kind}{rng.randrange(info['I'] if kind == 'N' else info['H'])}{pole}")
+            if rnd:
+                put(rec["id"], f"random_like:{rec['episode']}:{d}", [{"op": "zero", "units": rnd}], {"of": rec["episode"]})
+
+
 # ---- the references on the same items (h2h's answerers)
 
 
@@ -2017,6 +2060,13 @@ def main():
     r.add_argument("--turns", type=int, default=TURNS, help="the agent's messages per item")
     r.add_argument("--episode-usd", type=float, default=EPISODE_USD, help="an episode starts only while this much is "
                    "left under the cap")
+    eb = sub.add_parser("e2base")
+    eb.add_argument("--server", required=True)
+    eb.add_argument("--out", type=Path, required=True)
+    eb.add_argument("--ks", type=int, nargs="+", default=[8, 24, 64])
+    eb.add_argument("--runs", type=Path, nargs="*", default=[])
+    eb.add_argument("--rounds", type=int, default=2)
+    eb.add_argument("--seed", type=int, default=0)
     e2 = sub.add_parser("e2items")
     e2.add_argument("behavior", type=Path)
     e2.add_argument("--out", type=Path, required=True)
@@ -2040,7 +2090,7 @@ def main():
     g.add_argument("--plot", type=Path, required=True)
     g.add_argument("--title")
     a = ap.parse_args()
-    {"items": items, "e1items": e1items, "e2items": e2items, "trainitems": trainitems, "serve": serve, "refs": refs, "run": run, "report": report, "plot": plot,
+    {"items": items, "e1items": e1items, "e2items": e2items, "e2base": e2base, "trainitems": trainitems, "serve": serve, "refs": refs, "run": run, "report": report, "plot": plot,
      "extremes": extremes}[a.cmd](a)
 
 

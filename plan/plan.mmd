@@ -43,7 +43,7 @@ flowchart TB
   S -. validates units and checks .-> V
   K["<b>T3 · Owl edit decision test (proposed)</b><br/>Zero ≤ 50 neurons: unseen-prompt owl mentions 0.95 → ≤ 0.25;<br/>unrelated-prompt KL ≤ 0.05 bits; persona facts intact.<br/>At 8B on fleet's 8B owl organism.<br/>OWNER · existing owl / organism team"]
   V -. flagship application .-> K
-  N["<b>Complex-trait neuron PheWAS · Qwen3-8B</b><br/>Neuron poles as variants, ~100 behaviours as traits<br/>(teacher-forced log-odds contrasts, ≥ 200 public prompts each).<br/>Stage 1: association with activation-PC covariates (Manhattan, QQ).<br/>Stage 2: randomized pooled knockouts measuring every trait:<br/>causal effects, fine-mapping, epistasis, pleiotropy, trait correlation.<br/>Question: refusal polygenic while each neuron has one main job?<br/>NOW · the phenome: traits, prompts, contrasts, reliability<br/>OWNER · monitorbench"]
+  N["<b>Complex-trait neuron PheWAS · Qwen3-8B</b><br/>Neuron poles as variants, 86 behaviours as traits<br/>(teacher-forced contrasts, 200–400 public prompts; reliability median 0.86).<br/>MEASURED stage 1: associations replicate in both halves, null 0 hits;<br/>hundreds to 30k neurons per trait; harmful refusal 2,112 neurons,<br/>62% of them tied to no other trait; 8,800 neurons tied to ≥ 6 traits (null 28).<br/>Pilot: knockout changes exact; additive at 256 poles (slope 0.86).<br/>RUNNING stage 2: group testing over all 884,736 poles; stage-1 hits singly.<br/>Question: refusal polygenic while each neuron has one main job?<br/>OWNER · monitorbench"]
   I -. units and semantics .-> N
   N -. per-neuron behaviour profiles .-> O
   N -. fine-mapped edit targets .-> K

@@ -6,6 +6,8 @@ every trait (pleiotropy against random poles).
       |change|, the cumulative share of the summed squared changes (the knockout-explained variance at group level) and
       the number of groups for 50% and 90% of it, beside the number for a trait whose effects were spread evenly
       (half and nine tenths of the groups)
+  effects.py finemap CHANGES.jsonl ... OUT.json [--null R.jsonl] [--focus T ...]   the group testing's leaves per
+      trait (fine-mapped single poles with their cross-trait profile) and the additivity of split sets
   effects.py singles CHANGES.jsonl ... OUT.json         single poles (ids "S/...", stage 1's hits, and "R/..." random
       poles as the null): per pole its change on every trait; a trait counts toward a pole's pleiotropy when the
       change exceeds the 99th percentile of the random poles' |change| on that trait; per hit pole whether removing
@@ -94,6 +96,50 @@ def singles(a) -> None:
               + (f", sign against the association {sum(agree)}/{len(agree)}" if agree else ""))
 
 
+def finemap(a) -> None:
+    """The group testing's leaves per focus trait: the measured sets with no measured parts, by |change|, with their
+    size; the single poles among them (fine-mapped, with their change on every trait and the traits past the random
+    poles' 99th percentile, --null: random single poles' changes); and per split set how its parts' changes add up to
+    its own (additivity: slope and correlation over every split set and trait)."""
+    res = load(a.changes)
+    null = load(a.null) if a.null else {}
+    traits = sorted(next(iter(res.values()))["change"])
+    thr = None
+    if null:
+        R = np.array([[r["change"][t] for t in traits] for r in null.values()])
+        thr = dict(zip(traits, np.percentile(np.abs(R), 99, axis=0).tolist()))
+    kids: dict = {}
+    for i in res:
+        if "/" in i[3:]:
+            kids.setdefault(i.rsplit("/", 1)[0], []).append(i)
+    leaves = [r for i, r in res.items() if i not in kids]
+    par, summ = [], []
+    for pid, ks in kids.items():
+        if pid in res and len(ks) >= 2 and sum(len(res[k]["units"]) for k in ks) == len(res[pid]["units"]):
+            for t in traits:
+                par.append(res[pid]["change"][t])
+                summ.append(sum(res[k]["change"][t] for k in ks))
+    out = {"additivity": {"pairs": len(par), "slope": float(np.polyfit(summ, par, 1)[0]) if par else None,
+                          "corr": float(np.corrcoef(summ, par)[0, 1]) if par else None}, "traits": {}}
+    for t in a.focus or traits:
+        ranked = sorted(leaves, key=lambda r: -abs(r["change"][t]))[:a.top]
+        rows = []
+        for r in ranked:
+            row = {"id": r["id"], "poles": len(r["units"]), "change": r["change"][t]}
+            if len(r["units"]) == 1:
+                l_, n, pl = r["units"][0]
+                row["pole"] = f"L{l_}.N{n}{'+' if pl > 0 else '-'}"
+                if thr:
+                    row["traits_moved"] = [u for u in traits if abs(r["change"][u]) > thr[u]]
+            rows.append(row)
+        out["traits"][t] = rows
+    a.out.write_text(json.dumps(out, indent=1))
+    ad = out["additivity"]
+    print(f"additivity over {ad['pairs']} split sets x traits: slope {ad['slope']}, correlation {ad['corr']}")
+    for t, rows in out["traits"].items():
+        print(f"  {t}: " + "; ".join(f"{r.get('pole', str(r['poles']) + ' poles')} {r['change']:+.2f}" for r in rows[:8]))
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -105,8 +151,14 @@ def main():
     s.add_argument("out", type=Path)
     s.add_argument("--assoc", type=Path)
     s.add_argument("--design", type=Path, nargs="*", default=[], help="the designs (a hit's trait of origin)")
+    m = sub.add_parser("finemap")
+    m.add_argument("changes", type=Path, nargs="+")
+    m.add_argument("out", type=Path)
+    m.add_argument("--null", type=Path, nargs="*", default=[])
+    m.add_argument("--focus", nargs="*")
+    m.add_argument("--top", type=int, default=20)
     a = ap.parse_args()
-    {"concentration": concentration, "singles": singles}[a.cmd](a)
+    {"concentration": concentration, "singles": singles, "finemap": finemap}[a.cmd](a)
 
 
 if __name__ == "__main__":

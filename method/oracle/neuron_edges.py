@@ -66,10 +66,11 @@ BITS = tuple(round(2 ** (-i / 2), 4) for i in range(20))  # or each reader's err
 MEASURED = 512  # kept edges whose own cut from the graph is measured (those of largest first-order weight)
 HALVE_BLOCKS = 8
 TOKENS = 1536  # cut sets a forward: this many tokens' worth (at least 16 sets)
-PAD = "B"  # a lower precision model's forwards: "B", each padded to B sets (every contrast at one batch shape); "shapes",
-# each padded to the next of SHAPES (or B) with an uncut set of its own, every set's contrast read against that set's
-# (so an ok() compares contrasts of one shape); "none", unpadded. Qwen3-8B bfloat16: unpadded forwards moved a graph's
-# cut contrasts by up to 0.37 bits (batch shape alone) against B's; B ran 96-109 rows for forwards of 1-34 sets
+PAD = "shapes"  # a lower precision model's forwards: "B", each padded to B sets (every contrast at one batch shape);
+# "shapes", each padded to the next of SHAPES (or B) with an uncut set of its own, every set's contrast read against
+# that set's (so an ok() compares contrasts of one shape); "none", unpadded. Qwen3-8B bfloat16 (float32 contrasts), 11
+# dev questions of six families on an A6000: shapes kept every graph's edges as B did (25 of 25 on author/Hamlet/p0),
+# the edge stage 24.5 -> 15.2 s; none lost one edge of 2 (color/banana/p1), 11.6 s
 SHAPES = (8, 32)
 PREFIX = True  # a cut run computes only the positions from the circuit's first one on (every position before it is the
 # base run's: no cut reaches it), its attention reading the base run's keys and values there

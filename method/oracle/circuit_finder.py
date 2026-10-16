@@ -65,7 +65,8 @@ PREFIX = True         # a batch whose patches all lie at or after a position run
 # base run's keys and values before it cached (no weak zeroing here, so the cached run equals the full one to float error)
 PREFIXES = 32         # cached prefixes per patching pair
 LAYERS = True         # a cached batch also runs only the layers from the lowest one it patches, from the run's own
-# residual there (the layers below see nothing changed)
+# residual there (the layers below see nothing changed); a batch's sets' lowest layers lie within LAYER_BIN of each other
+LAYER_BIN = 8
 BATCH_TOKENS = 1024   # a cached batch runs max(ROWS, BATCH_TOKENS / its positions) rows (at most MAX_ROWS): a forward of
 MAX_ROWS = 1024       # few positions reads every weight for few tokens (no weak zeroing: the batch size moves a share by
 # float error only). Qwen3-8B bfloat16 on an A6000, capital/France p0-p2: 16.5-17.5 s a question at 256, 13.5-14.6 at
@@ -257,15 +258,23 @@ class Patcher:
         holds R / len(bases) sets, each set's run in base k in row k x R / len(bases) + its place."""
         R = min(MAX_ROWS, max(self.rows, BATCH_TOKENS // (self.T - start))) if start > 0 else self.rows
         R = min(R, max(self.rows, len(sets) * len(bases)))
-        per = R // len(bases)
-        layout = [bases[r // per] if r // per < len(bases) else bases[-1] for r in range(R)]
-        x = torch.tensor([self.ids[k] for k in layout], device=self.dev)
-        cache = self._prefix(x, start, tuple(layout)) if start > 0 else None
-        low = [min([u[1] for u in st if _pos(u) >= start], default=self.L - 1) if (LAYERS and cache) else 0 for st in sets]
-        order = sorted(range(len(sets)), key=lambda j: -low[j])     # (a batch runs from the lowest layer it patches)
+        low = [min([u[1] for u in st if _pos(u) >= start], default=self.L - 1) if (LAYERS and PREFIX and start > 0) else 0
+               for st in sets]
+        order = sorted(range(len(sets)), key=lambda j: -low[j])     # (a batch runs from the lowest layer it patches,
+        chunks, cur = [], []                                        # its sets' lowest layers within LAYER_BIN)
+        for j in order:
+            if cur and (len(cur) * len(bases) >= R or low[j] < low[cur[0]] - LAYER_BIN):
+                chunks.append(cur)
+                cur = []
+            cur.append(j)
+        chunks.append(cur)
         out = [None] * len(sets)
-        for s0 in range(0, len(sets), per):
-            js = order[s0:s0 + per]
+        for js in chunks:
+            Rb = R if len(js) * len(bases) >= R else min(R, -(-len(js) * len(bases) // 8) * 8)   # (rows in multiples of 8)
+            per = Rb // len(bases)
+            layout = [bases[r // per] if r // per < len(bases) else bases[-1] for r in range(Rb)]
+            x = torch.tensor([self.ids[k] for k in layout], device=self.dev)
+            cache = self._prefix(x, start, tuple(layout)) if start > 0 else None
             part = [sets[j] for j in js]
             layer0 = min(low[j] for j in js)
             h0 = None if layer0 == 0 else torch.stack([self.act[k]["res"][layer0][start:] for k in layout]).to(self.dev)
@@ -316,7 +325,7 @@ class Patcher:
                         h = h.clone()
                         h[b, p - start, n] = 0 if src == "zero" else self.act[src]["neu"][i][p, n].to(h.device, h.dtype)
                 return h
-            c = self._contrast(self._last(x, R, cache=cache, layer0=layer0, h0=h0, res=res, head=head, neu=neu))
+            c = self._contrast(self._last(x, Rb, cache=cache, layer0=layer0, h0=h0, res=res, head=head, neu=neu))
             got = []
             for kb, base in enumerate(bases):
                 ck = c[kb * per:kb * per + len(part)]

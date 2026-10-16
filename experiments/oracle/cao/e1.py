@@ -80,7 +80,8 @@ def organisms(d: Path) -> dict:
     beh = json.loads(f.read_text())
     beh = beh.get("organisms", beh)
     root = f.parent
-    return {n: {**r, "adapter": r.get("adapter") or str(root / "adapters" / n)} for n, r in beh.items()
+    local = lambda n, r: r["adapter"] if r.get("adapter") and Path(r["adapter"]).exists() else str(root / "adapters" / n)  # noqa: E731
+    return {n: {**r, "adapter": local(n, r)} for n, r in beh.items()  # (a copy elsewhere: the adapters beside the file)
             if isinstance(r, dict) and "dropped" not in r and "prompts" in r}
 
 

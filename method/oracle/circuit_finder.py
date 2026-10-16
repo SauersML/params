@@ -775,8 +775,11 @@ def cut(pt: Patcher, sc: dict, kind: str, positions, done: dict, log=None, searc
             singles.update(group_test(pt, sc, eps, done, kinds=(kind,), positions=search, blocks=blocks, log=log))
             order = sorted([u for u in singles if u not in cond], key=lambda u: -max(abs(singles[u][0]), abs(singles[u][1]))) + cond
         else:                                       # conditional: every block measured beside the singles found so far,
-            base = pt.both([order])[0]              # its share what it adds to their joint shares (units that matter only
-                                                    # together with others: AND-like denoising, OR-like noising)
+            base = pt.both([[]], given=order)[0]    # its share what it adds to their joint shares (units that matter only
+                                                    # together with others: AND-like denoising, OR-like noising), the
+                                                    # base through beside's own path (the singles as given): measured
+                                                    # as a plain set, its bfloat16 offset from the given path split
+                                                    # 869,266 single units on Qwen3-8B author/Dracula/p2 (20 min)
             def beside(sets, have=list(order), base=base):
                 return [(a - base[0], b - base[1]) for a, b in pt.both(sets, given=have)]
             floors.append(2 * noise)                # (a difference of two measurements, each within the floor; a no-op

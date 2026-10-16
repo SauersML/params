@@ -149,8 +149,15 @@ class Collector:
         return dict(public, clean_native_values=[{'unit':u,'value':float(source[u])} for u in target+control])
 
     def collect(self, *, case_id, clean_ids, corrupt_ids, answer_a_ids,
-                answer_b_ids, target_units, control_units):
+                answer_b_ids, target_units, control_units, paired_noising=False, paired_min_gap_bits=0.0):
         """Twelve F standalone; ten F after the two-F prepare_public stage.
+
+        paired_noising=True adds four F (target/control corrupt-to-clean
+        patches); it is distinct from zeroing. Shares use the raw signed clean-minus-corrupt contrast gap. They are
+        undefined unless gap > paired_min_gap_bits (finite, nonnegative; caller
+        freezes it). Default zero is algebraic only: a scientific run must
+        preregister a positive tolerance. share_defined is not a success test.
+        Raw effects always remain. No circuit pass is inferred.
 
         Controls are frozen by caller; enforce equal layer/position multiplicity,
         disjoint neurons. Magnitude matching must be certified using discovery data.
@@ -166,7 +173,11 @@ class Collector:
         if Counter((l,p) for l,p,n in target) != Counter((l,p) for l,p,n in control):
             raise ValueError('control must match layer/position multiplicities')
         prepared = self._prepared.get(case_id)
-        cost = 10 if prepared is not None else 12
+        if type(paired_noising) is not bool:
+            raise ValueError('paired_noising must be bool')
+        if not math.isfinite(paired_min_gap_bits) or paired_min_gap_bits < 0:
+            raise ValueError('paired_min_gap_bits must be finite and nonnegative')
+        cost = (10 if prepared is not None else 12) + (4 if paired_noising else 0)
         if self.limit - self.forward_examples < cost:
             raise RuntimeError('insufficient budget for complete case')
         before = self.forward_examples
@@ -182,14 +193,35 @@ class Collector:
         else:
             source = {}
             clean = self.score(clean_ids, answers, units=target+control, snapshot=source)
-        corrupt = self.score(corrupt_ids, answers)
+        corrupt_source = {} if paired_noising else None
+        corrupt = self.score(corrupt_ids, answers, units=target+control if paired_noising else (),
+                             snapshot=corrupt_source)
         rows = {}
+        paired = {}
+        gap = clean['contrast_bits'] - corrupt['contrast_bits']
         for name, units in [('target', target), ('control', control)]:
             zero = self.score(clean_ids, answers, units=units, zero=True)
             restore = self.score(corrupt_ids, answers, units=units, source=source)
             rows[name+'_zero'] = dict(zero, delta_bits=zero['contrast_bits']-clean['contrast_bits'])
             rows[name+'_restore'] = dict(restore, delta_bits=restore['contrast_bits']-corrupt['contrast_bits'])
-        return {'schema': 'native_prospective_v1', 'case_id': case_id,
+            if paired_noising:
+                noise = self.score(clean_ids, answers, units=units, source=corrupt_source)
+                lost = clean['contrast_bits'] - noise['contrast_bits']
+                recovered = restore['contrast_bits'] - corrupt['contrast_bits']
+                paired[name] = {
+                    'noising': dict(noise, delta_bits=noise['contrast_bits']-clean['contrast_bits'],
+                                    donor_capture='corrupt_answer_a_trajectory_prompt_positions'),
+                    'denoising': dict(restore, delta_bits=recovered,
+                                      donor_capture='clean_answer_a_trajectory_prompt_positions'),
+                    'lost_bits': lost, 'restored_bits': recovered,
+                    'contrast_gap_bits': gap,
+                    'lost_share': lost/gap if gap > paired_min_gap_bits else None,
+                    'restored_share': recovered/gap if gap > paired_min_gap_bits else None,
+                    'share_defined': gap > paired_min_gap_bits,
+                    'min_gap_bits': paired_min_gap_bits,
+                    'undefined_reason': None if gap > paired_min_gap_bits else 'nonpositive_or_below_declared_gap',
+                    'gap_sign': 'positive' if gap > 0 else 'negative' if gap < 0 else 'zero'}
+        result = {'schema': 'native_prospective_v1', 'case_id': case_id,
                 'reference': 'original_target_model', 'frozen_target_identity': self.frozen_target_identity,
                 'weight_mutation_check': 'parameter_identity_and_version_unchanged; external_digest_not_recomputed', 'donor_capture': 'clean_answer_a_trajectory_prompt_positions', 'clean_ids': list(clean_ids),
                 'corrupt_ids': list(corrupt_ids), 'answer_a_ids': list(answer_a_ids),
@@ -199,3 +231,7 @@ class Collector:
                     {'unit': u, 'value': float(source[u])} for u in target+control],
                 'forward_examples': self.forward_examples-before,
                 'forward_calls': self.forward_examples-before, 'backward_examples': 0}
+        if paired_noising:
+            result['paired_patching'] = paired
+            result['corrupt_native_values'] = [{'unit':u,'value':float(corrupt_source[u])} for u in target+control]
+        return result

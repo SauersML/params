@@ -142,3 +142,77 @@ def test_peft_original_organism_and_adapter_state(setup):
     with model.disable_adapter():
         with pytest.raises(RuntimeError,match='adapter activation'): c.score([1,2],[[3,4],[5]])
     assert c.forward_examples==4
+
+
+def test_paired_noising_manual_hooks_and_counts(setup):
+    model,c=setup
+    case=dict(case_id='pair',clean_ids=[1,2,3],corrupt_ids=[1,7,3],
+        answer_a_ids=[4,5],answer_b_ids=[6],target_units=[(0,1,4)],control_units=[(0,1,5)])
+    actual=[]
+    counter=model.register_forward_pre_hook(lambda m,a: actual.append(1))
+    c.prepare_public(**case)
+    result=c.collect(**case,paired_noising=True)
+    counter.remove()
+    assert len(actual)==c.forward_examples==16
+    assert result['forward_examples']==14
+    assert set(result['interventions'])=={'target_zero','target_restore','control_zero','control_restore'}
+    # Independent direct hooks: capture corrupt donor, patch clean, score complete A/B.
+    donor={}
+    def capture(m,args): donor['x']=args[0][0,1,4].detach().clone()
+    h=model.model.layers[0].mlp.down_proj.register_forward_pre_hook(capture)
+    direct(model,case['corrupt_ids'],case['answer_a_ids'])
+    h.remove()
+    def patch(m,args):
+        x=args[0].clone();x[:,1,4]=donor['x'];return (x,)+args[1:]
+    h=model.model.layers[0].mlp.down_proj.register_forward_pre_hook(patch)
+    try:
+        a=direct(model,case['clean_ids'],case['answer_a_ids'])
+        b=direct(model,case['clean_ids'],case['answer_b_ids'])
+    finally: h.remove()
+    row=result['paired_patching']['target']
+    assert row['noising']['a_logp_nats']==a
+    assert row['noising']['b_logp_nats']==b
+    assert row['contrast_gap_bits']==result['clean']['contrast_bits']-result['corrupt']['contrast_bits']
+    assert row['noising']['delta_bits']==-row['lost_bits']
+    h=model.model.layers[0].mlp.down_proj.register_forward_pre_hook(capture)
+    direct(model,case['clean_ids'],case['answer_a_ids'])
+    h.remove()
+    h=model.model.layers[0].mlp.down_proj.register_forward_pre_hook(patch)
+    try:
+        restored_a=direct(model,case['corrupt_ids'],case['answer_a_ids'])
+        restored_b=direct(model,case['corrupt_ids'],case['answer_b_ids'])
+    finally: h.remove()
+    assert row['denoising']['a_logp_nats']==restored_a
+    assert row['denoising']['b_logp_nats']==restored_b
+    assert hooks(model)==0
+
+
+def test_paired_zero_gap_and_budget(setup):
+    model,c=setup
+    case=dict(case_id='null',clean_ids=[1,2,3],corrupt_ids=[1,2,3],
+        answer_a_ids=[4,5],answer_b_ids=[6],target_units=[(0,1,4)],control_units=[(0,1,5)])
+    c.limit=15
+    with pytest.raises(RuntimeError,match='budget'): c.collect(**case,paired_noising=True)
+    assert c.forward_examples==0
+    c.limit=16
+    result=c.collect(**case,paired_noising=True)
+    assert c.forward_examples==16
+    for row in result['paired_patching'].values():
+        assert row['contrast_gap_bits']==row['lost_bits']==row['restored_bits']==0
+        assert row['lost_share'] is None and row['restored_share'] is None
+        assert not row['share_defined'] and row['gap_sign']=='zero'
+    assert hooks(model)==0
+
+
+def test_paired_declared_min_gap_and_negative_raw_gap(setup):
+    _,c=setup
+    case=dict(case_id='threshold',clean_ids=[1,2,3],corrupt_ids=[1,7,3],
+        answer_a_ids=[4,5],answer_b_ids=[6],target_units=[(0,1,4)],control_units=[(0,1,5)])
+    result=c.collect(**case,paired_noising=True,paired_min_gap_bits=1e6)
+    row=result['paired_patching']['target']
+    assert not row['share_defined'] and row['lost_share'] is None
+    if row['contrast_gap_bits']>0:
+        case['clean_ids'],case['corrupt_ids']=case['corrupt_ids'],case['clean_ids']
+    negative=c.collect(**dict(case,case_id='negative'),paired_noising=True)['paired_patching']['target']
+    assert negative['contrast_gap_bits']<0
+    assert negative['gap_sign']=='negative' and negative['lost_share'] is None

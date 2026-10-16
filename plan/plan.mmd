@@ -23,7 +23,7 @@ flowchart TB
   I -. observations with uncertainty .-> O
 
   P["<b>MEASURED · neuron input benefit unproven</b><br/>64 edits / 49 contexts; context vectors fixed.<br/>Correct / zero / mismatched: 0.530 / 0.507 / 0.581 nats.<br/>Both primary gain intervals include zero.<br/>7 mismatches nearly identical; all 64 retained.<br/>320 forwards, 38 seconds, free MATS; 1.7B only."]
-  R["<b>READY · 1,280 fresh native causal labels on 8B</b><br/>128 training / 32 evaluation articles; all outcomes retained.<br/>Training: 42 of 1,024 removals change the top token.<br/>RUNNING · matched correct vs mismatched neuron training.<br/>All 256 eval rows; correct, absent and wrong evidence."]
+  R["<b>MEASURED · 8B native evidence did not help</b><br/>1,536 frozen answers; 256 edits across 32 unseen articles.<br/>Correct / absent evidence: 87.9% / 94.5% accuracy.<br/>Always unchanged: 95.7%; all arms miss 11 changed tokens.<br/>NEXT · audit training fit, then fresh causal challenges."]
   I -. measurement integrity .-> R
   R -. reliable inputs .-> O
   Q -. current pilot .-> P
@@ -48,7 +48,7 @@ flowchart TB
   N -. per-neuron behaviour profiles .-> O
   N -. fine-mapped edit targets .-> K
 
-  E["<b>MEASURED · native sequence capture on 8B</b><br/>3 neurons × 25 positions: exact traces, unchanged logits.<br/>2 forwards; 18 seconds; 16.4 GB peak GPU memory.<br/>Prompt: 35 → 997 tokens. Oracle benefit remains untested.<br/>Parallel: compact native writes; preserve signs and scale.<br/>WHY · measure usefulness against the added input cost."]
+  E["<b>PROTOTYPE · compact signed native writes</b><br/>17 tests pass; signs, magnitude and position checked.<br/>3 neurons × 4,096 positions: 16.5k vs 134k input tokens.<br/>Fixed-scale vectors; oracle utility remains untested.<br/>Parallel with training-fit audit; no retraining gate.<br/>WHY · reduce input cost without erasing write magnitude."]
   E -. informs controls .-> Q
   E -. informs evidence tests .-> O
 
@@ -70,6 +70,8 @@ flowchart TB
   class F,V,O,T explain;
   class Q,L,A,W measure;
   class E evidence;
+
+%% 2026-10-16 root: native8b controlled experiment COMPLETE, source0e881960; 2x64 training steps,1536 predictions committed before scoring, commitSHA06594a068f03a3a466aef6314d07cbc7cc69b7de59d08d11a3c9542b621ea4bf. Independent audit verifies raw/completion hashes and coverage. Correct-trained accuracy true225/256,absent242/256,mismatch221/256; primary true-minus-absent -6.640625pp, contextcluster95CI[-12.109375,-2.34375]pp. All6arms exact changed0/11 across7contexts; alwaysUnchanged245/256. Correct-v-mismatch+1.5625pp CI[-1.953125,5.078125]pp. No demonstrated native-input utility or mechanistic explanation. Mean prefill true744.18,mismatch704.46,absent133.74: length confounded, not matched cost. Next diagnose TRAIN fit before more training, freeze fresh contextual intervention challenges; oldEVAL now exposed and never reuse as pristine evidence. Scientific child0 in2463.429s; launcher later idle143, bothpods deleted, inclusiveUSD0.5497 already canonicalledger;4USDreservation settled. CI38821889659 and38821889764 PASS. Compactcodec scratch17tests, syntheticK3,T48/512/4096 fullprompt341/2199/16537 vsnumeric1678/16417/133967; physicalwrites preserve signs/scale, not rawactivation identifiability or oracle usefulness. Owners root/completed_native_audit/compact_codec_review/native_cost_closeout.
 
 %% 2026-10-15 root: measurement reliability fixes independently cross-reviewed and pushed: 6320c956 scorecard every_family requires explicit True (10 tests); 8420ed0d native gradient ranking preserves downstream nonlinear paths (7 tests, old code fails new full-gradient regression, early-unit finite difference verified). Correct gradients retain more autograd memory; no 8B performance claim. CAO selected-target one-forward native vector fix in review; guard unsupported nonlinear adapters and dropout. 20601 source39363d119db2 is PENDING Reason=JobHeldUser, not resource queue; prior20593 shell COMPLETED masked Python CUDA OOM/no graph. No job release/cancel/duplicate. No paid or production model calls this turn. Native observations may feed provisional oracle answers in parallel with stronger causal tests; passing measurements still required for verified causal labels.
 

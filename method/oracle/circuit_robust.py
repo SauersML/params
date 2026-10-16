@@ -96,7 +96,7 @@ def resample_ids(tok, q: dict, rec: dict, n: int) -> list:
         if p in (q["key"], q.get("corrupt_key")):
             continue
         ids = cf.chat(tok, q["user"].replace(q["key"], p))
-        if len(ids) == len(clean) and ids[:first] == clean[:first] and ids != clean:
+        if len(ids) == len(clean) and ids[:first] == clean[:first] and ids[first] != clean[first]:  # (differs where the pair does)
             out.append((p, ids))
         if len(out) == n:
             break

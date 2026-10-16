@@ -96,8 +96,9 @@ class Target:
         for s0 in range(0, len(sets), ROWS):
             part = sets[s0:s0 + ROWS]
             with torch.no_grad():
-                lp = torch.log_softmax(self.nr.logits(ids, [len(ids) - 1], edit=nb.pole_edit(part), B=len(part))[:, 0], -1)
-            out += lp[:, self.owl].logsumexp(-1).exp().tolist()
+                lp = torch.log_softmax(self.nr.logits(ids, [len(ids) - 1], edit=nb.pole_edit(part), B=ROWS)[:len(part), 0], -1)
+            out += lp[:, self.owl].logsumexp(-1).exp().tolist()        # (a batch of ROWS always: bfloat16 kernels change
+                                                                        # with the batch size)
         return out
 
     @torch.no_grad()
@@ -121,10 +122,10 @@ class Target:
         tot, n = torch.zeros(len(sets), dtype=torch.float64), 0
         for ids in seqs:
             pos = list(range(len(ids)))
-            lp0 = torch.log_softmax(self.nr.logits(ids, pos)[0], -1)
+            lp0 = torch.log_softmax(self.nr.logits(ids, pos, B=16)[0], -1)
             for s0 in range(0, len(sets), 16):
                 part = sets[s0:s0 + 16]
-                lp = torch.log_softmax(self.nr.logits(ids, pos, edit=nb.pole_edit(part), B=len(part)), -1)
+                lp = torch.log_softmax(self.nr.logits(ids, pos, edit=nb.pole_edit(part), B=16)[:len(part)], -1)
                 tot[s0:s0 + len(part)] += ((lp0.exp()[None] * (lp0[None] - lp)).sum(-1).sum(-1) / math.log(2)).double().cpu()
             n += len(ids)
         return (tot / n).tolist()
@@ -148,7 +149,7 @@ def main():
     t0 = time.time()
     log = lambda m: print(f"{time.time() - t0:6.0f}s {m}", flush=True)   # noqa: E731
     tok = AutoTokenizer.from_pretrained(a.model)
-    model = AutoModelForCausalLM.from_pretrained(a.model, dtype=getattr(torch, a.dtype)).to("cuda")
+    model = AutoModelForCausalLM.from_pretrained(a.model, dtype=getattr(torch, a.dtype), device_map="cuda")
     model = PeftModel.from_pretrained(model, a.adapter).eval().requires_grad_(False)
     nr = nb.Neurons(model, tok)
     ow = Target(nr, tok)

@@ -291,3 +291,67 @@ def test_public_regimes_match_gold_and_corrupt_pair_counts(setup):
     assert len(result['corrupt_native_regimes'])==len(public['clean_native_regimes'])==2
     assert c.forward_examples==16
     assert hooks(model)==0
+
+
+def test_first_continuation_argmax_matches_each_actual_forward_no_extra_f(setup):
+    model,c=setup
+    prompt=[1,2,3];answers=[[4,5],[6]]
+    expected={}
+    with torch.no_grad():
+        for name,answer in zip(('a','b'),answers):
+            lp=model(torch.tensor([prompt+answer]),use_cache=False).logits[0,len(prompt)-1].float().log_softmax(-1)
+            top=int(lp.argmax())
+            expected[name]=dict(argmax_token_id=top,argmax_probability=float(lp[top].exp()))
+    calls=[];h=model.register_forward_hook(lambda *args:calls.append(1))
+    try:result=c.score(prompt,answers)
+    finally:h.remove()
+    assert result['first_continuation']==expected
+    assert len(calls)==c.forward_examples==c.forward_calls==2
+    assert hooks(model)==0
+
+
+def test_pairwise_repair_does_not_imply_global_first_token_repair(setup):
+    """An edit reverses A/B odds while unrelated token9 remains the global winner.
+
+    Hooks script the vocabulary logits after an actual tiny-model native edit;
+    the collector must report the observed logits, not infer a top token from A/B.
+    """
+    model,c=setup;unit=(0,1,4);observed={};calls=[]
+    def native(module,args,output):observed['value']=float(args[0][0,1,4])
+    def logits(module,args,output):
+        calls.append(1)
+        result=torch.zeros_like(output.logits)
+        result[...,9]=10.  # unrelated global winner before AND after zeroing
+        baseline=observed['value']!=0
+        result[...,4]=3. if baseline else 1.
+        result[...,6]=1. if baseline else 3.
+        output.logits=result
+        return output
+    h=model.model.layers[0].mlp.down_proj.register_forward_hook(native)
+    g=model.register_forward_hook(logits)
+    try:
+        base=c.score([1,2,3],[[4,5],[6,7]],units=[unit],source={unit:torch.tensor(1.)})
+        zero=c.score([1,2,3],[[4,5],[6,7]],units=[unit],zero=True)
+    finally:h.remove();g.remove()
+    assert base['contrast_bits']>0 and zero['contrast_bits']<0
+    for score in (base,zero):
+        assert {x['argmax_token_id'] for x in score['first_continuation'].values()}=={9}
+        assert all(0<x['argmax_probability']<=1 for x in score['first_continuation'].values())
+    assert len(calls)==c.forward_examples==c.forward_calls==4
+    assert hooks(model)==0
+
+
+def test_first_continuation_metadata_stays_private_until_collect(setup):
+    model,c=setup
+    args=dict(case_id='private_top',clean_ids=[1,2,3],corrupt_ids=[1,7,3],
+        answer_a_ids=[4,5],answer_b_ids=[6],target_units=[(0,1,4)],control_units=[(0,1,5)])
+    public=c.prepare_public(**args)
+    assert 'first_continuation' not in str(public)
+    assert 'clean' not in public and 'interventions' not in public
+    assert c.forward_examples==2
+    result=c.collect(**args)
+    assert set(result['clean']['first_continuation'])=={'a','b'}
+    assert set(result['corrupt']['first_continuation'])=={'a','b'}
+    assert all(set(row['first_continuation'])=={'a','b'} for row in result['interventions'].values())
+    assert c.forward_examples==12 and result['forward_examples']==10
+    assert hooks(model)==0

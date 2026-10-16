@@ -73,6 +73,9 @@ class Collector:
 
     @torch.no_grad()
     def score(self, prompt, answers, *, units=(), source=None, zero=False, snapshot=None, regimes=None):
+        # Argmax metadata observes only the first continuation token from each
+        # teacher-forced forward; it is not a generated answer or a whole-answer
+        # correctness certificate. It stays private with the baseline scores.
         self._original()
         units = self._units(units, len(prompt))
         if not prompt or len(answers) != 2 or any(not a for a in answers):
@@ -124,7 +127,7 @@ class Collector:
             for u in selected:
                 out[:, u[1], u[2]] = 0 if zero else source[u].to(h.device, h.dtype)
             return out
-        values = []
+        values, first_continuation = [], {}
         for index, answer in enumerate(answers):
             if self.forward_examples >= self.limit:
                 raise RuntimeError('forward-example budget exhausted')
@@ -154,8 +157,15 @@ class Collector:
             if not torch.isfinite(value):
                 raise ValueError('nonfinite answer log probability')
             values.append(float(value))
+            # Same forward and first continuation boundary as the scored answer.
+            # A/B preference can improve while a third vocabulary token still wins.
+            top = int(lp[0].argmax())
+            first_continuation['a' if index == 0 else 'b'] = {
+                'argmax_token_id': top,
+                'argmax_probability': float(lp[0, top].exp())}
         return {'a_logp_nats': values[0], 'b_logp_nats': values[1],
-                'contrast_bits': (values[0] - values[1]) / math.log(2)}
+                'contrast_bits': (values[0] - values[1]) / math.log(2),
+                'first_continuation': first_continuation}
 
     def prepare_public(self, *, case_id, clean_ids, corrupt_ids, answer_a_ids,
                        answer_b_ids, target_units, control_units):

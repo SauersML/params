@@ -1673,6 +1673,15 @@ def run(a) -> None:
             if (items_[k]["id"], b, rep) not in have and (b or rep < a.repeats_text_only)]
     print(f"{len(jobs)} episodes; ${spend.spent:.3f} spent before, cap ${a.cap}", flush=True)
     lock = threading.Lock()
+    ledger = a.out.with_suffix(".spend")  # every turn's dollars so far, in-flight episodes included (a stopped run's
+    # true spend; the output file only has finished episodes')
+
+    def book():
+        while True:
+            ledger.write_text(f"{spend.spent:.4f}\n")
+            time.sleep(20)
+
+    threading.Thread(target=book, daemon=True).start()
     with ThreadPoolExecutor(a.workers) as ex:
         futs = {ex.submit(episode, a, it, b, rep, sampler, rr, tok, spend): (it["id"], b, rep) for it, b, rep in jobs}
         for f in as_completed(futs):

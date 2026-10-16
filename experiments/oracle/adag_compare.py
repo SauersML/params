@@ -21,6 +21,8 @@ probability.
 
   adag_compare.py run OUT.json --cases capitals_llama,math_llama [--device cuda] [--dtype bfloat16]
   adag_compare.py run OUT.json --cases capitals_qwen32 --device auto
+  adag_compare.py finder OUT.json --cases capitals_llama [--n 8]   circuit_finder's seconds a question on ADAG's capitals
+      prompts (finder_speed), beside its tracer's bench_tracing.py on the same card
   adag_compare.py alias GATED_ID COPY_ID [FETCH_ID ...]   an ungated copy under the gated name in the HF cache (ADAG's
       own scripts load meta-llama/Llama-3.1-8B-Instruct by name)
   adag_compare.py transfer OUT.json   each found set of the run (capitals_llama, math_llama) zeroed on every other
@@ -33,9 +35,11 @@ import argparse
 import json
 import math
 import os
+import sys
 import time
 from pathlib import Path
 
+import numpy as np
 import torch
 
 CAND = 2048
@@ -98,7 +102,7 @@ def prompt_ids(tok, model_id: str, question: str, seed: str) -> list[int]:
     else:
         ids = tok.apply_chat_template([{"role": "user", "content": question}, {"role": "assistant", "content": seed}],
                                       add_generation_prompt=False)
-        ids = list(ids["input_ids"] if isinstance(ids, dict) else ids)
+        ids = list(ids["input_ids"] if hasattr(ids, "keys") else ids)  # (newer transformers return a BatchEncoding)
         cut = len(ids) - 1 - ids[::-1].index(tok.eos_token_id) if tok.eos_token_id in ids else len(ids)
         ids = ids[:cut]
     if seed.endswith(" "):
@@ -267,6 +271,38 @@ def transfer(run: Runner, tok, model_id: str, sets: dict, log=print) -> dict:
     return out
 
 
+def finder_speed(model, tok, model_id: str, seed: str, n: int, log=print) -> dict:
+    """circuit_finder (method/oracle) on ADAG's capitals prompts (its question text and seed, its chat format), the first n
+    cities, each against the first other city of the same token count with another capital: seconds a question (the
+    finder's own CUDA warm-up run first, untimed), the cuts met and the circuit's size. (RelP's backward patches Qwen3's
+    modules only: on other models the order is the model's own gradient.)"""
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "method" / "oracle"))
+    import circuit_finder as cf
+
+    if "Qwen3" not in model_id:
+        cf.ORDER = "grad"
+    cities = capitals()
+    ids = {c: prompt_ids(tok, model_id, f"What is the capital of the state containing {c}?", seed) for c, _, _ in cities}
+    pt = cf.Patcher(model, tok)
+    rows = []
+    for c, _, cap in cities[:n]:
+        other = next((c2 for c2, _, cap2 in cities if cap2 != cap and len(ids[c2]) == len(ids[c])), None)
+        if other is None:
+            continue
+        if not rows:
+            pt.setup(ids[c], ids[other])
+        t0 = time.time()
+        rec = cf.find(pt, ids[c], ids[other], None)
+        dt = time.time() - t0
+        rows.append({"city": c, "other": other, "tokens": len(ids[c]), "seconds": dt, "met": rec.get("met"), "size": rec.get("size"),
+                     "neurons": len(rec.get("nodes", [])), "heads": len(rec.get("routes", [])), "gap": rec.get("gap"),
+                     "answer": tok.decode([rec["answer"]]), "corrupt_answer": tok.decode([rec["corrupt_answer"]])})
+        log(f"finder {c} vs {other}: {dt:.1f} s, met {rec.get('met')}, {rows[-1]['neurons']} neurons + {rows[-1]['heads']} heads")
+    secs = [r["seconds"] for r in rows]
+    return {"model": model_id, "gpu": torch.cuda.get_device_name() if torch.cuda.is_available() else "cpu", "order": cf.ORDER,
+            "rows": rows, "seconds_mean": float(np.mean(secs)) if secs else None, "seconds_median": float(np.median(secs)) if secs else None}
+
+
 def alias(official: str, copy: str, fetch: list[str]) -> None:
     """An ungated copy's snapshot in huggingface_hub's cache under the gated model's name (refs/main to it), so code that
     loads the gated name offline (HF_HUB_OFFLINE) finds the same files; and other models fetched while still online."""
@@ -286,11 +322,12 @@ def alias(official: str, copy: str, fetch: list[str]) -> None:
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("cmd", choices=("run", "transfer", "alias"))
+    ap.add_argument("cmd", choices=("run", "transfer", "alias", "finder"))
     ap.add_argument("out", type=Path, help="run, transfer: the records; alias: the gated model's id")
     ap.add_argument("more", nargs="*", help="alias: the ungated copy's id, then models to fetch before going offline")
     ap.add_argument("--cases", default="capitals_llama,math_llama")
     ap.add_argument("--device", default="cuda")
+    ap.add_argument("--n", type=int, default=8, help="finder: ADAG's first n capitals prompts")
     ap.add_argument("--dtype", default="bfloat16", choices=("float32", "bfloat16"))
     a = ap.parse_args()
     if a.cmd == "alias":
@@ -299,6 +336,14 @@ def main():
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     out = json.loads(a.out.read_text()) if a.out.exists() else {}
+    if a.cmd == "finder":  # (OUT: the record; --cases: one case, its model and seed)
+        c = CASES[a.cases]
+        src = c["weights"] or c["model"]
+        tok = AutoTokenizer.from_pretrained(src)
+        model = AutoModelForCausalLM.from_pretrained(src, dtype=getattr(torch, a.dtype), device_map=a.device).eval()
+        model.requires_grad_(False)
+        a.out.write_text(json.dumps(finder_speed(model, tok, c["model"], c["seed"], a.n, log=lambda s: print(s, flush=True))))
+        return
     if a.cmd == "transfer":
         tok = AutoTokenizer.from_pretrained(LLAMA_WEIGHTS)
         model = AutoModelForCausalLM.from_pretrained(LLAMA_WEIGHTS, dtype=getattr(torch, a.dtype), device_map=a.device).eval()

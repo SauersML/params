@@ -36,7 +36,9 @@ MIN_CONTEXTS, MIN_QUESTIONS = 32, 256
 MIN_CLASS = 20  # an answer class with fewer held-out questions is left out of the balanced set (flips are rare)
 INPUTS = ("correct", "names", "mismatch", "none")
 CLAIM = {
-    "metric": "share of held-out questions whose answer's claim holds on Qwen3-8B (claim_check pass), balanced classes",
+    "metric": "share of held-out questions whose answer's outcome class (flip, up, down, unchanged; supports, against, "
+              "barely) equals the measured one, balanced classes (rc1's claim pass let a constant no-change answer pass; "
+              "claim pass is reported beside it)",
     "predictions": [
         "T-correct with the correct circuit beats T-correct with names alone by at least 0.10",
         "T-correct with the correct circuit beats T-correct with another context's writes by at least 0.10",
@@ -114,7 +116,10 @@ def build(a) -> None:
     (a.out / "train_mismatch.jsonl").write_text("".join(json.dumps(rewrite(r, "mismatch", donors[r["text"]])) + "\n" for r in train))
     for how in INPUTS:
         (a.out / f"test_{how}.jsonl").write_text("".join(json.dumps(rewrite(r, how, donors[r["text"]])) + "\n" for r in bal))
+    kinds = collections.Counter(r["cat"] for r in bal)
+    nclass = {c: len({answer_class(r) for r in bal if r["cat"] == c}) for c in kinds}
     claim = {**CLAIM, "written": time.strftime("%Y-%m-%d %H:%M:%S %Z"), "held_contexts": len(held), "train_contexts": len(ctxs) - len(held),
+             "chance": round(sum(n / nclass[c] for c, n in kinds.items()) / len(bal), 3), "inject": a.inject or "ao",
              "held_questions": len(bal), "train_questions": len(train),
              "classes": {f"{c}/{k}": n for (c, k), n in collections.Counter((r["cat"], answer_class(r)) for r in bal).items()}}
     (a.out / "claim.json").write_text(json.dumps(claim, indent=1))
@@ -128,12 +133,13 @@ def score(a) -> None:
     for f in sorted(a.out.glob("eval_*.jsonl")):
         oracle, how = f.stem[len("eval_"):].rsplit("_", 1)
         rs = [json.loads(x) for x in f.read_text().splitlines()]
-        tab[(oracle, how)] = (sum(r["claim_pass"] for r in rs) / len(rs), sum(r["claim_specific"] for r in rs) / len(rs), len(rs))
+        cm = sum(answer_class({"cat": r["cat"], "a": r["got"]}) == answer_class({"cat": r["cat"], "a": r["a"]}) for r in rs) / len(rs)
+        tab[(oracle, how)] = (cm, sum(r["claim_pass"] for r in rs) / len(rs), len(rs))
     oracles = sorted({o for o, _ in tab})
     print(f"{'oracle':12s}" + "".join(f"{h:>18s}" for h in INPUTS))
     for o in oracles:
         print(f"{o:12s}" + "".join(f"{tab[(o, h)][0]:>9.3f} ({tab[(o, h)][1]:.3f})" if (o, h) in tab else f"{'-':>18s}" for h in INPUTS))
-    print("cells: claim holds (and specific), n =", sorted({v[2] for v in tab.values()}))
+    print("cells: outcome class matches (claim holds), n =", sorted({v[2] for v in tab.values()}), "; chance", claim.get("chance"))
 
 
 def main():

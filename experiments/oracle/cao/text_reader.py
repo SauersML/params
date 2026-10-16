@@ -683,9 +683,10 @@ def score(a) -> None:
         test = [json.loads(x) for x in a.gold.read_text().splitlines()]
     members = lambda e: frozenset(re.sub(r"@-?\d+$", "", u) for g in e["claim"]["units"] for u in e["groups"].get(g, [g]))  # noqa: E731
     outs = collections.defaultdict(set)
-    for e in train + test:
-        outs[(e["cat"], members(e))].add((e["id"], answer_class(e)))
-    varied = {i for i, e in enumerate(test) if len({c for _, c in outs[(e["cat"], members(e))]}) > 1}
+    for e in train:
+        outs[(e["cat"], members(e))].add(answer_class(e))
+    # the varied subset: the asked units (position-free) were asked the same kind in training with another outcome
+    varied = {i for i, e in enumerate(test) if outs.get((e["cat"], members(e)), set()) - {answer_class(e)}}
     prior = {k: name_prior(train, test, key) for k, key in (("shown", lambda e: "+".join(e["claim"]["units"])), ("members", members))}
     gold = [answer_class(e) for e in test]
     tab = {f"name-prior ({k})": [p == g for p, g in zip(v, gold)] for k, v in prior.items()}

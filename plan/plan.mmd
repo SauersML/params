@@ -43,6 +43,10 @@ flowchart TB
   S -. validates units and checks .-> V
   K["<b>T3 · Owl edit decision test (proposed)</b><br/>Zero ≤ 50 neurons: unseen-prompt owl mentions 0.95 → ≤ 0.25;<br/>unrelated-prompt KL ≤ 0.05 bits; persona facts intact.<br/>At 8B on fleet's 8B owl organism.<br/>OWNER · existing owl / organism team"]
   V -. flagship application .-> K
+  N["<b>Complex-trait neuron PheWAS · Qwen3-8B</b><br/>Neuron poles as variants, ~100 behaviours as traits<br/>(teacher-forced log-odds contrasts, ≥ 200 public prompts each).<br/>Stage 1: association with activation-PC covariates (Manhattan, QQ).<br/>Stage 2: randomized pooled knockouts measuring every trait:<br/>causal effects, fine-mapping, epistasis, pleiotropy, trait correlation.<br/>Question: refusal polygenic while each neuron has one main job?<br/>NOW · the phenome: traits, prompts, contrasts, reliability<br/>OWNER · monitorbench"]
+  I -. units and semantics .-> N
+  N -. per-neuron behaviour profiles .-> O
+  N -. fine-mapped edit targets .-> K
 
   E["<b>MEASURED · native sequence capture on 8B</b><br/>3 neurons × 25 positions: exact traces, unchanged logits.<br/>2 forwards; 18 seconds; 16.4 GB peak GPU memory.<br/>Prompt: 35 → 997 tokens. Oracle benefit remains untested.<br/>Parallel: compact native writes; preserve signs and scale.<br/>WHY · measure usefulness against the added input cost."]
   E -. informs controls .-> Q
@@ -62,7 +66,7 @@ flowchart TB
   classDef measure fill:#eef8f3,stroke:#5a9477,color:#214c39;
   classDef evidence fill:#fff8e8,stroke:#b99754,color:#59451e;
   class G,Z goal;
-  class I,P,R,C,K,S build;
+  class I,P,R,C,K,S,N build;
   class F,V,O,T explain;
   class Q,L,A,W measure;
   class E evidence;

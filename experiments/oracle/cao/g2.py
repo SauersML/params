@@ -4,9 +4,9 @@ text's half-depth activations (the Activation Oracle's read), the oracle reads t
 position) in measured order: the circuit's units, then the builder's strongest measured singles beyond it; a random
 number of them, log-uniform from MIN_SHOWN up to all, so that how many to show is chosen afterwards by held-out accuracy
 (the lead's 10-15: no fixed cap; eval reports accuracy by the number shown). Three forms of input, one drawn per text
-(FORMS): neurons; named neuron groups (inframove's measured groups, labelled by varteach, a group's write the sum of its
-members'; a stand-in grouping by layer and position until they land); groups and the neurons of one or two of them. A
-group's name ("G3") stands for its members in the oracle's claims. Each shows as its name, "L<layer>.N<neuron>+@<position>" ("-" for the negative pole: claim_check's
+(FORMS): neurons; named neuron groups (neuron_motifs apply's records: groups shared across texts, "G<id>" everywhere,
+labelled by varteach; a group's write the sum of its members'; for records without groups, a stand-in of one layer and
+position); groups and the neurons of one or two of them. A group's name stands for its members in the oracle's claims. Each shows as its name, "L<layer>.N<neuron>+@<position>" ("-" for the negative pole: claim_check's
 unit syntax), and its write (its value x its down_proj column, cao.Oracle.write). The questions, every answer measured
 by method/oracle/claim_check.py, the oracle's reward checker, so that the claim an answer ends with passes there:
 
@@ -58,11 +58,13 @@ def measured_order(rec: dict) -> list[dict]:
     circuit_finder's (the patching pair) by the larger of each neuron's lost and restored shares alone."""
     if "ranked_top" in rec:
         return list({name(d): d for d in rec["nodes"] + rec["ranked_top"]}.values())
-    return sorted(rec.get("nodes", []), key=lambda d: -max(abs(d.get("lost") or 0), abs(d.get("restored") or 0)))
+    if "nodes" not in rec:  # neuron_motifs apply's records: the groups' members in the groups' measured order, then the rest
+        return [d for g in rec.get("groups", []) for d in g["members"]] + rec.get("ungrouped", [])
+    return sorted(rec["nodes"], key=lambda d: -max(abs(d.get("lost") or 0), abs(d.get("restored") or 0)))
 
 
 def value(d: dict) -> float:
-    return d["act"] if "act" in d else d["clean"]  # (circuit_finder records the clean run's value)
+    return d["act"] if "act" in d else d["clean"] if "clean" in d else d["value"]  # (the finder and motifs: the clean value)
 
 
 def bits(x: float) -> str:
@@ -89,8 +91,8 @@ def outcome(r: dict, y: str) -> tuple[str, dict]:
 def groups_of(rec: dict, order: list[dict]) -> list[dict]:
     """A record's measured neuron groups in their order ({"members": [neuron dicts], "label"}: inframove's, labelled by
     varteach), else a stand-in until those land: the neurons of one layer and position, in measured order."""
-    if rec.get("groups"):
-        return [{"members": g["members"], "label": g.get("label")} for g in rec["groups"]]
+    if rec.get("groups"):  # shared across texts: a group's id is its name everywhere, its label written once
+        return [{"members": g["members"], "label": g.get("label"), "id": g.get("id")} for g in rec["groups"]]
     by: dict = {}
     for d in order:
         by.setdefault((d["layer"], d["pos"]), []).append(d)
@@ -122,8 +124,9 @@ def text_examples(o: "cao.Oracle", nr, ids: list[int], rng: random.Random, rec: 
         gs = gs[:loguniform(rng, len(gs))]
         for k, g in enumerate(gs, 1):
             mem = [name(d) for d in g["members"]]
-            lab = f"G{k}" + (f" ({g['label']})" if g.get("label") else "") + f", {len(mem)} neuron{'' if len(mem) == 1 else 's'}"
-            items.append((f"G{k}", mem, {"label": lab, "write": [write(d) for d in g["members"]]}))
+            gname = f"G{g['id']}" if g.get("id") is not None else f"G{k}"
+            lab = gname + (f" ({g['label']})" if g.get("label") else "") + f", {len(mem)} neuron{'' if len(mem) == 1 else 's'}"
+            items.append((gname, mem, {"label": lab, "write": [write(d) for d in g["members"]]}))
         if form == "groups+neurons":  # one or two groups' members beside them
             for k in rng.sample(range(len(gs)), min(len(gs), rng.randint(1, 2))):
                 items += [(name(d), [name(d)], {"label": name(d), "write": write(d)}) for d in gs[k]["members"]]
@@ -173,7 +176,7 @@ def text_examples(o: "cao.Oracle", nr, ids: list[int], rng: random.Random, rec: 
              "n_sign": f"Does {us[0]} support the model's next token {y} or work against it?"}[cat]
         claim = {"units": us, "op": op, "predict": pred}
         out.append({"cat": cat, "form": form, "ctx": ids, "blocks": blocks, "q": q, "a": f"{text}\nClaim: {json.dumps(claim)}",
-                    "claim": claim, "groups": groups, "specific": r["specific"], "shown": len(items), "circuit": len(rec["nodes"])})
+                    "claim": claim, "groups": groups, "specific": r["specific"], "shown": len(items), "circuit": len(order)})
     return out, {"size": rec.get("size"), "met": rec.get("met"), "form": form, "shown": len(items), "questions": len(out),
                  "build_seconds": rec.get("seconds")}
 

@@ -342,8 +342,9 @@ def main():
     for L, h, pn in circuit:
         u = cand.index((L, h, pn))
         fn = lambda t, u=u: a2[t]["single"][u]  # noqa: E731
-        circ_heads.append({"layer": L, "head": h, "role": "induction" if pn == "cue2" else "previous token",
-                           "position": pn, "reads": "next1" if pn == "cue2" else "cue1",
+        att = dmean(lambda t, i=heads.index((L, h)): a1[t]["induction" if pn == "cue2" else "previous"][i], ids)
+        role = ("induction" if pn == "cue2" else "previous token") if att >= ATT else f"other head at {pn}"
+        circ_heads.append({"layer": L, "head": h, "role": role, "position": pn, "reads": "next1" if pn == "cue2" else "cue1",
                            "mean_lost_patched": dmean(fn, ids), "mean_lost_unable_to_see": dmean(lambda t, u=u: a2[t]["knock"][u], ids),
                            "mean_attention": dmean(lambda t, i=heads.index((L, h)): a1[t]["induction" if pn == "cue2" else "previous"][i], ids),
                            "texts_share": matters(fn, ids)})

@@ -14,6 +14,13 @@ each trait's change across sets (the noise a pooled design averages); two disjoi
 union (additivity); the top stage-1 hits alone (--assoc: assoc.py's summary.json); the unedited panel twice (exactness).
 
   screen.py pilot PHENOME OUT.json --thr T2.pt [--assoc SUMMARY.json] [--sizes 16 64 256 1024 4096] [--sets 16]
+  screen.py design OUT.jsonl --level0 [--group 1024]          every pole in random groups (the screen's first level)
+  screen.py design OUT.jsonl --results R.jsonl ... [--top 8]  the sets among any trait's top |change| split in halves
+  screen.py runsets PHENOME DESIGN.jsonl OUT.jsonl --thr T2.pt [--shard k/K]   a design's sets run on the panel
+The pilot (16 random sets per size, 86 traits, 8 prompts each): reruns are exact (0.0), so a set's change is its own
+joint effect, not noise; the spread across random sets grows from 0.07 bits (16 poles) to 0.55 (4,096); two sets of 256
+add to their union's change with slope 0.86 (correlation 0.94 over traits). The screen therefore measures groups
+exactly and splits the large ones down (group testing), instead of averaging many random passes.
 """
 from __future__ import annotations
 
@@ -169,6 +176,64 @@ def pilot(a) -> None:
     print(f"pilot written to {a.out}; {sec:.1f} s a pass, exact to {out['exact']:.2e}")
 
 
+def runsets(a) -> None:
+    """Every knockout set of a design file (JSONL of {"id", "units": [[layer, neuron, pole], ...]}; this process's
+    shard: the sets whose position k satisfies k % K == shard) run on the panel; each trait's change from the unedited
+    panel appended to OUT as {"id", "units", "change": {trait: bits}} (sets already in OUT skipped)."""
+    import torch
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    dev = a.device or ("cuda" if torch.cuda.is_available() else "cpu")
+    sets = [json.loads(x) for x in a.design.read_text().splitlines() if x.strip()]
+    k, K = (int(x) for x in a.shard.split("/"))
+    done = {json.loads(x)["id"] for x in a.out.read_text().splitlines()} if a.out.exists() else set()
+    todo = [s_ for j, s_ in enumerate(sets) if j % K == k and s_["id"] not in done]
+    tok = AutoTokenizer.from_pretrained(a.model)
+    model = AutoModelForCausalLM.from_pretrained(a.model, dtype=torch.bfloat16).to(dev).eval()
+    nr = nb.Neurons(model, tok)
+    nr.load(a.thr)
+    nr.thr = None
+    panel = Panel(a.phenome, nr, a.panel)
+    base = panel.run()
+    t0 = time.time()
+    with a.out.open("a") as fh:
+        for j, st in enumerate(todo):
+            e, r = cc.knockout_edit(nr, [("N", int(l_), int(n), int(pl), None) for l_, n, pl in st["units"]])
+            got = panel.run(e, r)
+            fh.write(json.dumps({"id": st["id"], "units": st["units"], "change": {n: got[n] - base[n] for n in base}}) + "\n")
+            fh.flush()
+            if j % 20 == 0:
+                print(f"{j + 1}/{len(todo)} sets, {(time.time() - t0) / (j + 1):.1f} s a set", flush=True)
+    print(f"ran {len(todo)} sets into {a.out}")
+
+
+def design(a) -> None:
+    """Knockout sets for the screen. level0: every pole of the model (layers x neurons x 2 poles) shuffled into groups
+    of --group; refine: each set of RESULTS that ranks among the --top largest |change| of any trait (and has more
+    than one pole) split into two halves at random."""
+    rng = random.Random(a.seed)
+    out = []
+    if a.level0:
+        poles = [(l_, n, pl) for l_ in range(a.layers) for n in range(a.neurons) for pl in (1, -1)]
+        rng.shuffle(poles)
+        out = [{"id": f"L0/{g}", "units": poles[i:i + a.group]} for g, i in enumerate(range(0, len(poles), a.group))]
+    else:
+        res = [json.loads(x) for f in a.results for x in f.read_text().splitlines() if x.strip()]
+        traits = sorted(res[0]["change"])
+        pick = set()
+        for t in traits:
+            ranked = sorted(res, key=lambda r: -abs(r["change"][t]))
+            pick |= {r["id"] for r in ranked[:a.top] if len(r["units"]) > 1}
+        for r in res:
+            if r["id"] in pick:
+                u = list(r["units"])
+                rng.shuffle(u)
+                h = len(u) // 2
+                out += [{"id": r["id"] + "/a", "units": u[:h]}, {"id": r["id"] + "/b", "units": u[h:]}]
+    a.out.write_text("".join(json.dumps(x) + "\n" for x in out))
+    print(f"{len(out)} sets, {sum(len(x['units']) for x in out)} poles, to {a.out}")
+
+
 def statistics_sd(xs: list[float]) -> float:
     m = sum(xs) / len(xs)
     return math.sqrt(sum((x - m) ** 2 for x in xs) / max(len(xs) - 1, 1))
@@ -188,8 +253,26 @@ def main():
     p.add_argument("--panel", type=int, default=PANEL)
     p.add_argument("--seed", type=int, default=15)
     p.add_argument("--device")
+    r = sub.add_parser("runsets")
+    r.add_argument("phenome", type=Path)
+    r.add_argument("design", type=Path)
+    r.add_argument("out", type=Path)
+    r.add_argument("--thr", type=Path, required=True)
+    r.add_argument("--shard", default="0/1")
+    r.add_argument("--model", default="Qwen/Qwen3-8B")
+    r.add_argument("--panel", type=int, default=PANEL)
+    r.add_argument("--device")
+    d = sub.add_parser("design")
+    d.add_argument("out", type=Path)
+    d.add_argument("--level0", action="store_true")
+    d.add_argument("--layers", type=int, default=36)
+    d.add_argument("--neurons", type=int, default=12288)
+    d.add_argument("--group", type=int, default=1024)
+    d.add_argument("--results", type=Path, nargs="*", default=[])
+    d.add_argument("--top", type=int, default=8)
+    d.add_argument("--seed", type=int, default=15)
     a = ap.parse_args()
-    {"pilot": pilot}[a.cmd](a)
+    {"pilot": pilot, "runsets": runsets, "design": design}[a.cmd](a)
 
 
 if __name__ == "__main__":

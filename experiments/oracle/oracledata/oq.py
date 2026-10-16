@@ -26,7 +26,7 @@ kinds also "Claim: {json}" passing claim_check, g2.py's form), its exact-match k
 check a verifier reruns. The circuit each row reads is written once per text (circuits file, by circuit_id). Items whose
 values are all massive (claim_check's zero leaves those live) get no zeroing question.
 
-  oq.py gen RECORDS OUT.jsonl --thr THR.pt [--groups APPLY] [--source NAME] [--limit N] [--shard K/N]   (GPU)
+  oq.py gen RECORDS OUT.jsonl --thr THR.pt [--groups APPLY] [--source NAME] [--limit N] [--shard K/N] [--adapter A]  (GPU)
   oq.py split OUT_DIR GEN.jsonl [GEN.jsonl ...] [--seed S] [--sealed testset_8b.json]   splits, balance, baselines (CPU)
      train.jsonl every training row; train_bal.jsonl per kind no class above the second-largest; dev/test balanced
 """
@@ -414,7 +414,8 @@ def text_questions(nr, cc, eng: Engine, tok, rec: dict, apply: dict | None, rng:
     out = [r for i, r in enumerate(out) if i not in drop]
     for k, r in enumerate(out):
         r.update({"id": f"q1/{source}/{rec['id']}/{r['kind']}/{k}", "source": source, "context_id": rec["id"],
-                  "family": rec.get("task"), "circuit_id": circ["circuit_id"], "ctx": ids, "answer": {"id": y, "text": tok.decode([y])},
+                  "family": rec.get("task"), "circuit_id": circ["circuit_id"], "adapter": rec.get("adapter"), "ctx": ids,
+                  "answer": {"id": y, "text": tok.decode([y])},
                   "keys": [by[n]["key"] for n in r["answer_units"] if n in by]})
     return circ, out
 
@@ -443,6 +444,9 @@ def gen(a) -> None:
     dev = a.device or ("cuda" if torch.cuda.is_available() else "cpu")
     tok = AutoTokenizer.from_pretrained(a.model)
     model = AutoModelForCausalLM.from_pretrained(a.model, dtype=getattr(torch, a.dtype)).to(dev).eval()
+    if a.adapter:  # an organism's circuits: its LoRA on (records with "adapter" name it; every record of a run shares one)
+        from peft import PeftModel
+        model = PeftModel.from_pretrained(model, a.adapter).eval()
     nr = nb.Neurons(model, tok)
     nr.load(a.thr)
     nr.thr = None  # the model itself (circuit_finder's runs); T2's maxima and massive cuts kept
@@ -459,8 +463,10 @@ def gen(a) -> None:
     with a.out.open("a") as fq, cpath.open("a") as fc:
         for j, f in enumerate(files):
             rec = json.loads(f.read_text())
-            if rec.get("id") in done or not rec.get("ids") or rec.get("valid") is False:
+            if rec.get("id") in done or not rec.get("ids") or rec.get("valid") is False or rec.get("skipped"):
                 continue
+            if bool(rec.get("adapter")) != bool(a.adapter):
+                raise SystemExit(f"{f.name}: record adapter {rec.get('adapter')!r}, run adapter {a.adapter!r}")
             ap = json.loads((a.groups / f.name).read_text()) if a.groups and (a.groups / f.name).exists() else None
             rng = random.Random(zlib.crc32(f"{a.seed}/{rec['id']}".encode()))
             try:
@@ -637,6 +643,7 @@ def main():
     g.add_argument("--seed", type=int, default=1)
     g.add_argument("--device")
     g.add_argument("--dtype", default="bfloat16")
+    g.add_argument("--adapter", help="an organism's LoRA (the records' own circuits were found with it on)")
     s = sub.add_parser("split")
     s.add_argument("out", type=Path)
     s.add_argument("gen", type=Path, nargs="+")

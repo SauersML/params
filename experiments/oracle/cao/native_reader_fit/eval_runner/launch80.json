@@ -1,0 +1,25 @@
+{
+  "utc": "2026-10-16T06:28:40.197185+00:00",
+  "adapter_sha256": "376c803c9e232ca0fff3af42adda9e5d32bcfa80517c0b5e7a75b94da7949a7e",
+  "adapter_bytes": 606955,
+  "final80_identical": true,
+  "training_peak_mlx_memory_bytes": 25727980352,
+  "command": [
+    "/Users/user/mpd-data/venv/bin/python",
+    "/Users/user/mpd-data/scratch/root/native_reader_fit_v1/eval_runner/evaluate_fit.py",
+    "--config",
+    "/Users/user/mpd-data/scratch/root/native_reader_fit_v1/full_fit/config.json",
+    "--frozen",
+    "/Users/user/mpd-data/scratch/root/native_query_reader_local_v1/frozen",
+    "--primary-source",
+    "/Users/user/mpd-data/scratch/root/native_query_reader_local_v1/diagnostics/primary_scorer_frozen.py",
+    "--baseline-responses",
+    "/Users/user/mpd-data/scratch/root/native_query_reader_local_v1/responses/responses.jsonl",
+    "--adapter-sha256",
+    "376c803c9e232ca0fff3af42adda9e5d32bcfa80517c0b5e7a75b94da7949a7e",
+    "--out",
+    "/Users/user/mpd-data/scratch/root/native_reader_fit_v1/evaluation80",
+    "--launch"
+  ],
+  "paid_calls": 0
+}

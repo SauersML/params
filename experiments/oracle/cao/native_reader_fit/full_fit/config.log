@@ -1,0 +1,38 @@
+Loading pretrained model
+Loading datasets
+Training
+╭─ [1mmlx_lm.lora[0m ────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+│    model                                                                                                             │
+│  [1m/Users/user/.cache/huggingface/hub/models--mlx-community--Qwen3.6-35B-A3B-4bit/snapshots/38740b847e4cb78f352aba30a[0m  │
+│  [1ma41c76e08e6eb46[0m                                                                                                     │
+│    type            [1mlora · 1 layers · rank 8[0m                                                                          │
+│    dataset         [1m/Users/user/mpd-data/scratch/root/native_reader_fit_v1/full_fit[0m                                   │
+│    optimizer       [1madam · lr 1.0e-04[0m                                                                                 │
+│    batch · iters   [1m1 · 80[0m                                                                                            │
+│    max seq         [1m6,144[0m                                                                                             │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+Trainable parameters: 0.000% (0.152M/34660.609M)
+PREUPDATE_PARITY {"case_id": "lie_direct_00", "eval_loss_nats": 3.3504467010498047, "mixed_mode_loss_nats": 3.3504467010498047, "absolute_error_nats": 0.0, "tolerance_nats": 1e-05, "completion_tokens": 27, "no_optimizer_update": true}
+  [1miter   train_loss     tok/s     tokens[0m
+     1    [1mval[0m [1m3.487[0m    14.91s
+     5    [1m2.619 ▼[0m    [1m    9[0m      0.1k
+    10    [1m1.032 ▼[0m    [1m   11[0m      0.3k
+    15    [1m0.602 ▼[0m    [1m   11[0m      0.4k
+    20    [1m0.436 ▼[0m    [1m   11[0m      0.6k
+    25    [1m0.459 ▲[0m    [1m   11[0m      0.7k
+    30    [1m0.380 ▼[0m    [1m   11[0m      0.8k
+    35    [1m0.388 ▲[0m    [1m   11[0m      1.0k
+    40    [1mval[0m [1m0.367[0m    14.49s
+    40    [1m0.366 ▼[0m    [1m   11[0m      1.1k
+  [1msave[0m  0000040_adapters.safetensors
+    45    [1m0.334 ▼[0m    [1m   11[0m      1.3k
+    50    [1m0.363 ▲[0m    [1m   11[0m      1.4k
+    55    [1m0.354 ▼[0m    [1m   11[0m      1.5k
+    60    [1m0.326 ▼[0m    [1m   11[0m      1.7k
+    65    [1m0.299 ▼[0m    [1m   11[0m      1.8k
+    70    [1m0.322 ▲[0m    [1m   11[0m      2.0k
+    75    [1m0.282 ▼[0m    [1m   11[0m      2.1k
+    80    [1mval[0m [1m0.353[0m    14.54s
+    80    [1m0.311 ▲[0m    [1m   11[0m      2.2k
+  [1msave[0m  0000080_adapters.safetensors
+[1mtrain[0m ██████████████████████████████ [1m100%[0m · [1m   80[0m/80

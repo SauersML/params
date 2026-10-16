@@ -68,6 +68,8 @@ LAYERS = True         # a cached batch also runs only the layers from the lowest
 # residual there (the layers below see nothing changed); a batch's sets' lowest layers lie within LAYER_BIN of each other
 LAYER_BIN = 64        # (8 split the residual map's 36 sets a position into small batches, each a full read of the weights:
 # Qwen3-8B bfloat16, A6000, the map 2.5 -> 3.9 s, the source cut 8.6 -> 8.3 s)
+COARSE = False        # group testing over several positions starts from each position's units of every layer as one
+# block (the source cut: most positions carry nothing); off, every (layer, position) block is measured first
 BATCH_TOKENS = 1024   # a cached batch runs max(ROWS, BATCH_TOKENS / its positions) rows (at most MAX_ROWS): a forward of
 MAX_ROWS = 1024       # few positions reads every weight for few tokens (no weak zeroing: the batch size moves a share by
 # float error only). Qwen3-8B bfloat16 on an A6000, capital/France p0-p2: 16.5-17.5 s a question at 256, 13.5-14.6 at
@@ -411,6 +413,15 @@ def group_test(pt: Patcher, sc: dict, eps: float, done: dict, kinds=("neuron",),
     measure = measure or pt.both
     order = {k: v.argsort(-1, descending=True) for k, v in sc.items()}                # [L, T, H] and [L, T, D]
     positions = range(pt.first, pt.T) if positions is None else positions
+    if COARSE and len(positions) > 1:               # (COARSE: each position's units of every layer first, as one block;
+        pb = [(k, -1, p) for p in positions for k in kinds]          # only the positions reaching eps split by layer)
+        todo = [b for b in pb if b not in done]
+        sets = [[unit(b[0], i, b[2], order[b[0]][i, b[2]]) for i in range(pt.L)] for b in todo]
+        for b, r in zip(todo, measure(sets)):
+            done[b] = r
+        positions = [b[2] for b in pb if max(abs(done[b][0]), abs(done[b][1])) >= eps]
+        if log:
+            log(f"    positions: {len(pb)} blocks, {len(positions)} split")
     blocks = [(k, i, p, 0, order[k].shape[-1]) for i in range(pt.L) for p in positions for k in kinds]
     singles, level = {}, 0
     while blocks:

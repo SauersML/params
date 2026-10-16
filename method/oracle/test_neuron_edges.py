@@ -264,3 +264,19 @@ def test_finder_graph_keeps_cut_summary_and_marks_source_provenance(monkeypatch)
     assert got['source_provenance']=={k:rec[k] for k in ('model','adapter','dtype','finder','finder_rev')}
     assert got['source_provenance_status']=='copied_source_record_not_verified_against_loaded_model'
     assert rec['adapter']=='source-adapter'
+
+
+def test_finder_graph_mover_edges(tiny):
+    """A finder record's graph carries mover-head edges: the circuit's source neurons through each mover's value and its
+    readout neurons reading its output, each group cut measured."""
+    model, ids, neurons = tiny
+    bad = list(ids)
+    bad[5] = (bad[5] + 7) % 48
+    nodes = [{"stage": "source", "layer": 0, "pos": 5, "neuron": 3}, {"stage": "source", "layer": 1, "pos": 6, "neuron": 8},
+             {"stage": "readout", "layer": 2, "pos": 9, "neuron": 11}, {"stage": "readout", "layer": 2, "pos": 9, "neuron": 4}]
+    rec = {"id": "t", "ids": ids, "corrupted": bad, "answer": 3, "alternatives": [5, 7], "nodes": nodes,
+           "routes": [{"layer": 2, "head": 1, "pos": 9}, {"layer": 1, "head": 0, "pos": 9}]}
+    g = neuron_edges.finder_graph(model, None, rec, log=lambda m: None)
+    he = {tuple(e["head"]): e for e in g["head_edges"]}
+    assert len(he[(2, 1)]["value"]) == 2 and len(he[(2, 1)]["readers"]) == 2 and he[(2, 1)]["value_group_lost"] is not None
+    assert len(he[(1, 0)]["value"]) == 1 and len(he[(1, 0)]["readers"]) == 2

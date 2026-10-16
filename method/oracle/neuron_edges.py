@@ -928,6 +928,8 @@ def finder_graph(model, tok, rec: dict, log=print) -> dict:
     for q, p in pairs:  # (each head alone, then the first k together: single heads often move little)
         car = head_routes.carriers(rn, run["states"], lost, q, p)
         g["routes"].append({"q": q, "p": p, "carriers": car, "carrier_curve": head_routes.carrier_curve(rn, lost, q, p, car)})
+    g["head_edges"] = mover_edges(rn, run["states"], rn.run(bad, [{}], capture=True)["states"], lost, rec) if rec.get("routes") \
+        else []
     g.update(id=rec.get("id"), text_id=rec.get("id"), user=rec.get("user"), corrupt_user=rec.get("corrupt_user"),
              corrupted=bad, model=rec.get("model"), finder=rec.get("finder"), intervention="patch from the corrupted run",
              gap=c - cb, answer_word=rec.get("answer_word"), alternative_words=rec.get("alternative_words"))
@@ -938,6 +940,45 @@ def finder_graph(model, tok, rec: dict, log=print) -> dict:
         "tokenizer_sha256", "adapter_sha256") if k in rec}
     g["source_provenance_status"] = "copied_source_record_not_verified_against_loaded_model"
     return g
+
+
+@torch.no_grad()
+def mover_edges(rn, st: dict, sb: dict, lost, rec: dict) -> list[dict]:
+    """Edges between a circuit's mover heads and its neurons, by patching from the corrupted run: per mover (rec's
+    routes), each circuit source neuron below it whose write it moves (its patched write taken out of the head's value
+    input at its position: the head's output change at the answer position, exact) and all of them at once in a full run
+    (value_group_lost); each circuit readout neuron at the answer position in its layer or above (the head's patched
+    output taken out of that neuron's input: its value change, exact) and all of them at once (readers_group_lost)."""
+    from head_routes import weight  # noqa: PLC0415
+    src = [(n["layer"], n["pos"], n["neuron"]) for n in rec.get("nodes", []) if n.get("stage") == "source"]
+    rdo = [(n["layer"], n["pos"], n["neuron"]) for n in rec.get("nodes", []) if n.get("stage") == "readout"]
+    out = []
+    for r in rec.get("routes", []):
+        L, h, q = r["layer"], r["head"], r["pos"]
+        e = {"head": [L, h], "pos": q, "value": [], "readers": [], "value_group_lost": None, "readers_group_lost": None}
+        Wo = weight(rn.layers[L].self_attn.o_proj)[:, h * rn.hd:(h + 1) * rn.hd].float()
+        byp, edits = {}, []
+        for Ln, p, j in src:
+            if Ln < L and p <= q:
+                byp.setdefault(p, []).append((Ln, j))
+        for p, ns in sorted(byp.items()):
+            ws = torch.stack([rn.neuron_writes(st, Ln, p, [j])[0] - rn.neuron_writes(sb, Ln, p, [j])[0].to(Wo.device)
+                              for Ln, j in ns])
+            dv = rn.value_after(st, L, h, p, ws).to(Wo.device)
+            a = float(st["A"][L][h, q, p])
+            size = (a * dv @ Wo.T).norm(dim=-1)
+            e["value"] += [{"neuron": [Ln, p, j], "output_change": float(z)} for (Ln, j), z in zip(ns, size)]
+            edits.append((L, h, p, rn.value_after(st, L, h, p, ws.sum(0)[None])[0]))
+        if edits:
+            e["value_group_lost"] = lost([{"dv": edits}])[0]
+        rs = [(Ln, j) for Ln, p, j in rdo if p == q and Ln >= L]
+        if rs:
+            delta = rn.head_write(st, L, h, q) - rn.head_write(sb, L, h, q).to(Wo.device)
+            ch = rn.readers_after(st, L, h, q, rn.head_write(sb, L, h, q))
+            e["readers"] = [{"neuron": [Ln, q, j], "value_change": float(ch[Ln][j])} for Ln, j in rs]
+            e["readers_group_lost"] = lost([{"read": [(Ln, q, j, delta) for Ln, j in rs]}])[0]
+        out.append(e)
+    return out
 
 
 def free():

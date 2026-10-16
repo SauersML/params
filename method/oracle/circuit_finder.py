@@ -257,9 +257,12 @@ class Patcher:
         return torch.log_softmax(lg, -1)
 
     @torch.no_grad()
-    def setup(self, clean: list[int], corrupt: list[int], answers: list[int] | None = None) -> dict:
+    def setup(self, clean: list[int], corrupt: list[int], answers: list[int] | None = None,
+              candidate_batch_size: int | None = None) -> dict:
         """Both runs' activations, the answer (the clean top token, or the likeliest of answers: a secret word's tokens),
         the alternatives and both contrasts (at the fixed batch size)."""
+        if candidate_batch_size is not None and (type(candidate_batch_size) is not int or candidate_batch_size <= 0):
+            raise ValueError('candidate_batch_size must be a positive integer or None')
         assert len(clean) == len(corrupt), "a patching pair needs prompts of the same length"
         self.ids = {"clean": list(clean), "corrupt": list(corrupt)}
         self._ids_dev = {k: torch.tensor(v, device=self.dev) for k, v in self.ids.items()}
@@ -281,7 +284,8 @@ class Patcher:
         word = None
         if answers:                                 # a secret word: its likeliest token's word
             word = answer_contrast.word(self.tok.decode([max(answers, key=lambda z: float(lp["clean"][z]))]))
-        self.sets = answer_contrast.token_sets(self.core, self.tok, self.ids["clean"], lp["clean"], yc, word)
+        batch_options = {} if candidate_batch_size is None else {"candidate_batch_size": candidate_batch_size}
+        self.sets = answer_contrast.token_sets(self.core, self.tok, self.ids["clean"], lp["clean"], yc, word, **batch_options)
         self._sets_dev = None
         self.y = self.sets["answer"][0]
         valid = self.sets.get("valid", True)

@@ -46,10 +46,16 @@ def script(w: str) -> str:
 
 @torch.no_grad()
 def token_sets(core, tok, ids: list[int], lp: torch.Tensor, b: int | None = None, answer_word: str | None = None,
-               k: int = CANDIDATES, alts: int = ALTERNATIVES, steps: int = STEPS) -> dict:
+               k: int = CANDIDATES, alts: int = ALTERNATIVES, steps: int = STEPS,
+               candidate_batch_size: int | None = None) -> dict:
     """The answer's and the alternatives' token sets at the end of ids (module docstring); lp: the clean run's log
     probabilities there [V]; core: the causal LM (its forward gives logits); tok None: the top token against the next
-    alts (no words to read)."""
+    alts (no words to read). candidate_batch_size bounds only continuation rows,
+    never the candidate bank; None preserves the existing full-batch path.
+    Different batch shapes can change reduced-precision rounding.
+    """
+    if candidate_batch_size is not None and (type(candidate_batch_size) is not int or candidate_batch_size <= 0):
+        raise ValueError('candidate_batch_size must be a positive integer or None')
     order = lp.topk(k).indices.tolist()
     y = order[0]
     if tok is None:
@@ -61,7 +67,11 @@ def token_sets(core, tok, ids: list[int], lp: torch.Tensor, b: int | None = None
     dev = next(core.parameters()).device
     x = torch.tensor([list(ids) + [z] for z in cands], device=dev)
     for _ in range(steps):                                       # greedy continuation of every candidate
-        nxt = core(input_ids=x, logits_to_keep=1).logits[:, -1].argmax(-1, keepdim=True)
+        if candidate_batch_size is None:
+            nxt = core(input_ids=x, logits_to_keep=1).logits[:, -1].argmax(-1, keepdim=True)
+        else:
+            nxt = torch.cat([core(input_ids=part, logits_to_keep=1).logits[:, -1].argmax(-1, keepdim=True)
+                             for part in x.split(candidate_batch_size)], dim=0)
         x = torch.cat([x, nxt], 1)
     words = {z: word(tok.decode(row[len(ids):].tolist())) for z, row in zip(cands, x)}
     W = (answer_word or words[y]).lower()

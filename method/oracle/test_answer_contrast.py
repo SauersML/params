@@ -34,3 +34,52 @@ def test_sets_without_tokenizer():
     assert not set(s["answer"]) & set(s["alternatives"])
     want = (lp[s["answer"]].logsumexp(-1) - lp[s["alternatives"]].logsumexp(-1)) / torch.log(torch.tensor(2.0))
     assert abs(float(ac.contrast(lp[None], s)[0]) - float(want)) < 1e-5
+
+
+def test_candidate_chunking_matches_real_tiny_qwen_and_bounds_rows():
+    import torch
+    from transformers import Qwen3Config, Qwen3ForCausalLM
+    import answer_contrast as ac
+    torch.manual_seed(17)
+    model=Qwen3ForCausalLM(Qwen3Config(vocab_size=32,hidden_size=16,intermediate_size=24,
+        num_hidden_layers=2,num_attention_heads=2,num_key_value_heads=1,head_dim=8,attn_implementation='eager')).eval()
+    class Tok:
+        def decode(self,ids):return ' '.join('word'+str(i) for i in ids)
+    ids=[1,2,3];lp=torch.linspace(0,-5,32).log_softmax(0);b=20 # extra ninth candidate
+    batches=[];hook=model.register_forward_pre_hook(lambda m,args,kwargs:batches.append(kwargs['input_ids'].shape[0]),with_kwargs=True)
+    try:
+        with torch.no_grad():
+            reference=ac.token_sets(model,Tok(),ids,lp,b,k=8,steps=3)
+            assert batches==[9,9,9]
+            batches.clear()
+            chunked=ac.token_sets(model,Tok(),ids,lp,b,k=8,steps=3,candidate_batch_size=4)
+        assert chunked==reference
+        assert batches==[4,4,1]*3 and sum(batches)==27
+        assert len(chunked['words'])==9 # no bank truncation
+    finally:hook.remove()
+
+
+@pytest.mark.parametrize('size',[0,-1,True,1.5])
+def test_invalid_candidate_batch_size_rejected_without_forward(size):
+    import torch
+    import answer_contrast as ac
+    class Fail:
+        def __call__(self,**kw):raise AssertionError('unexpected forward')
+    with pytest.raises(ValueError,match='candidate_batch_size'):
+        ac.token_sets(Fail(),None,[1],torch.zeros(8),k=4,candidate_batch_size=size)
+
+
+def test_patcher_setup_bounds_real_candidate_continuation_batches():
+    import torch
+    from transformers import Qwen3Config, Qwen3ForCausalLM
+    from circuit_finder import Patcher
+    torch.manual_seed(19)
+    model=Qwen3ForCausalLM(Qwen3Config(vocab_size=128,hidden_size=16,intermediate_size=24,
+        num_hidden_layers=1,num_attention_heads=2,num_key_value_heads=1,head_dim=8,attn_implementation='eager')).eval()
+    class Tok:
+        def decode(self,ids):return ' '.join('word'+str(i) for i in ids)
+    batches=[];hook=model.register_forward_pre_hook(lambda m,args,kwargs:batches.append(kwargs['input_ids'].shape[0]),with_kwargs=True)
+    try:
+        with torch.no_grad():record=Patcher(model,Tok(),rows=4).setup([1,2,3],[1,2,4],candidate_batch_size=4)
+        assert batches[:2]==[4,4] and max(batches)<=4 and record['valid']
+    finally:hook.remove()

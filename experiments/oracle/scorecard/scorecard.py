@@ -264,7 +264,8 @@ def ingest_rc(tag: str, src: Path, labels: dict) -> None:
 
 TEXT = HOME / "mpd-data" / "scratch" / "textoracle"
 TEXT_INPUT = {"full": "the circuit as text with numbers", "names": "the circuit's names alone", "none": "no circuit",
-              "mismatch": "another context's numbers on these names"}
+              "mismatch": "another context's numbers on these names",
+              "shuffle": "the context's own numbers permuted among its members (textoracle's control)"}
 
 
 def ingest_text() -> None:

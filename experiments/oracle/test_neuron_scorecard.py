@@ -4,7 +4,6 @@ definitions; stability counts hubs across paraphrases; the margins read the reco
 
   ~/mpd-data/venv/bin/python -m pytest experiments/oracle/test_neuron_scorecard.py -q
 """
-import math
 import sys
 from pathlib import Path
 
@@ -92,13 +91,14 @@ def test_pair_shares_follow_the_definitions(tiny):
     r = ns.score(m, Tok(), c, {}, log=lambda s: None)
     pr = r["pair"]
     lc, lx = hooked(model, clean), hooked(model, corr)
-    a, b = int(lc.argmax()), int(lx.argmax())
-    alts = ns.pair_alts(lc, a, b)
-    cc = float((lc[a] - torch.logsumexp(lc[alts], 0)) / math.log(2))
+    b = int(lx.argmax())
+    sets = ns.ac.token_sets(model, Tok(), clean, lc, b)  # the word-level contrast (answer_contrast), as the scorecard's
+    assert r["answer_tokens"] == sets["answer"] and r["alternative_tokens"] == sets["alternatives"]
+    cc = float(ns.ac.contrast(lc[None], sets)[0])
     assert pr["c_clean"] == pytest.approx(cc, abs=1e-4)
     capx = m.capture(corr)
     ln = hooked(model, clean, neurons=[(0, 3, 5, capx["n"][0, 3, 5]), (1, 3, 9, capx["n"][1, 3, 9])], heads=[(2, 9, 1, capx["h"][2, 9, 1])])
-    cn = float((ln[a] - torch.logsumexp(ln[alts], 0)) / math.log(2))
+    cn = float(ns.ac.contrast(ln[None], sets)[0])
     assert pr["c_noised"] == pytest.approx(cn, abs=1e-4)
     if pr["gap"] > 0:
         assert pr["lost"] == pytest.approx((pr["c_clean"] - pr["c_noised"]) / pr["gap"])

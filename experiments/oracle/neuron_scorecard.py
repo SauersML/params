@@ -8,8 +8,10 @@ when circuits are good enough to train the oracle on.
   runs       the model itself, two runs of it (no base or reference model): clean (the question) and corrupted (a
              minimally changed prompt of the same length: the key word swapped); float32 (bfloat16 with --dtype for
              32B), every batch padded to ROWS rows (bfloat16 moves contrasts between batch sizes)
-  contrast   at the answer position, log2 p(answer) - log2 p(alternatives): the answer the clean run's top token, the
-             alternatives the other run's top token and the clean run's next likeliest, ALTERNATIVES in all
+  contrast   at the answer position, log2 p(answer) - log2 p(alternatives) over words, not tokens (answer_contrast,
+             the finder's own: every likely token starting the clean run's answer word summed into p(answer), the
+             alternatives the tokens starting the other run's word and the next likeliest other words of the same
+             script; a pair whose other run starts the answer's word is no pair)
   patch      a unit set to its value in the other run at the same position
 Families, each a score with its floor (FLOOR):
   necessity    noising: the circuit's units patched from corrupted into clean, the share of the clean-corrupted contrast
@@ -76,11 +78,13 @@ import torch
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
+sys.path.insert(0, str(HERE.parents[1] / "method" / "oracle"))
+
+import answer_contrast as ac  # noqa: E402
 import circuit_questions  # noqa: E402
 
 BASE = "Qwen/Qwen3-8B"
 ORG = Path.home() / "mpd-data" / "organisms" / "qwen3_1p7b"
-ALTERNATIVES = 5
 DRAWS = 8  # held-out corruptions and swap partners per circuit
 HUB = 8  # a circuit's hub neurons: its neuron poles with the largest noising effect alone
 ROWS = 16  # runs a forward, every batch padded to it
@@ -203,14 +207,19 @@ def patches(c: dict, cap: dict) -> list[tuple]:
     return [("n", L, p, j, cap["n"][L, p, j]) for L, p, j, _ in c["neurons"]] + [("h", L, p, h, cap["h"][L, p, h]) for L, p, h in c["heads"]]
 
 
-def contrast(lp: torch.Tensor, ans: int, alts: list[int]) -> float:
-    return float((lp[ans] - torch.logsumexp(lp[alts], 0)) / math.log(2.0))
+def contrast(lp: torch.Tensor, sets: dict) -> float:
+    """answer_contrast.contrast of one run's log probabilities [V]."""
+    return float(ac.contrast(lp[None], sets)[0])
 
 
-def pair_alts(lp_clean: torch.Tensor, ans: int, other: int) -> list[int]:
-    """The other run's top token and the clean run's next likeliest, ALTERNATIVES in all."""
-    rest = [z for z in lp_clean.topk(ALTERNATIVES + 2).indices.tolist() if z not in (ans, other)]
-    return [other] + rest[:ALTERNATIVES - 1]
+def word_sets(m: "Model", tok, ids: list[int], lp: torch.Tensor, b: int) -> dict:
+    """answer_contrast.token_sets on the clean run (its log probabilities lp) against the other run's top token b."""
+    return ac.token_sets(m.core, tok, ids, lp, b)
+
+
+def pair_ok(sets: dict, b: int, gap: float) -> bool:
+    """A pair: the other run's top token starts another word, and the clean-other gap is at least MIN_GAP bits."""
+    return b not in sets["answer"] and gap >= MIN_GAP
 
 
 def share(x: float) -> float:
@@ -273,11 +282,13 @@ def score(m: Model, tok, c: dict, qs: dict, log=print) -> dict:
     pc, px = patches(c, cap_c), patches(c, cap_x)
     lp = m.logp([(clean, []), (corr, []), (clean, px), (corr, pc)])
     a, b = int(lp[0].argmax()), int(lp[1].argmax())
-    alts = pair_alts(lp[0], a, b)
-    cc, cx, cn, cd = (contrast(lp[i], a, alts) for i in range(4))
+    sets = word_sets(m, tok, clean, lp[0], b)
+    cc, cx, cn, cd = (contrast(lp[i], sets) for i in range(4))
     gap = cc - cx
     rec["answer"], rec["answer_text"], rec["corrupt_answer"] = a, tok.decode([a]), b
-    rec["pair"] = {"c_clean": cc, "c_corrupted": cx, "c_noised": cn, "c_denoised": cd, "gap": gap, "valid": a != b and gap >= MIN_GAP,
+    rec["answer_word"], rec["alternative_words"] = sets["answer_word"], sets["alternative_words"]
+    rec["answer_tokens"], rec["alternative_tokens"] = sets["answer"], sets["alternatives"]
+    rec["pair"] = {"c_clean": cc, "c_corrupted": cx, "c_noised": cn, "c_denoised": cd, "gap": gap, "valid": pair_ok(sets, b, gap),
                    "lost": (cc - cn) / gap if gap > 0 else None, "restored": (cd - cx) / gap if gap > 0 else None}
     g = torch.Generator().manual_seed(zlib.crc32(c["name"].encode()))  # the fair baseline: same layers and positions, random units
     rand = []
@@ -285,7 +296,7 @@ def score(m: Model, tok, c: dict, qs: dict, log=print) -> dict:
         rc = {"neurons": [(L, p, int(torch.randint(m.D, (1,), generator=g)), 0) for L, p, _, _ in c["neurons"]],
               "heads": [(L, p, int(torch.randint(m.H, (1,), generator=g))) for L, p, _ in c["heads"]]}
         l3 = m.logp([(clean, patches(rc, cap_x)), (corr, patches(rc, cap_c))])
-        rand.append({"lost": (cc - contrast(l3[0], a, alts)) / gap, "restored": (contrast(l3[1], a, alts) - cx) / gap})
+        rand.append({"lost": (cc - contrast(l3[0], sets)) / gap, "restored": (contrast(l3[1], sets) - cx) / gap})
     rec["random"] = {"lost": float(np.mean([x["lost"] for x in rand])) if rand else None,
                      "restored": float(np.mean([x["restored"] for x in rand])) if rand else None, "draws": rand}
     # each unit's noising effect alone (the hubs: stability)
@@ -294,16 +305,16 @@ def score(m: Model, tok, c: dict, qs: dict, log=print) -> dict:
     def alone(k, u):  # the unit's value from the corrupted run
         return ("n", u[0], u[1], u[2], cap_x["n"][u[0], u[1], u[2]]) if k == "n" else ("h", u[0], u[1], u[2], cap_x["h"][u[0], u[1], u[2]])
     one = m.logp([(clean, [alone(k, u)]) for k, u in singles]) if singles else []
-    eff = [cc - contrast(lp1, a, alts) for lp1 in one]
+    eff = [cc - contrast(lp1, sets) for lp1 in one]
     def gained(k, u):  # the unit's value from the clean run
         return ("n", u[0], u[1], u[2], cap_c["n"][u[0], u[1], u[2]]) if k == "n" else ("h", u[0], u[1], u[2], cap_c["h"][u[0], u[1], u[2]])
     two = m.logp([(corr, [gained(k, u)]) for k, u in singles]) if singles else []
-    gain = [contrast(lp1, a, alts) - cx for lp1 in two]
+    gain = [contrast(lp1, sets) - cx for lp1 in two]
     rec["effects"] = [{"kind": k, "unit": list(u), "drop": e, "gain": g} for (k, u), e, g in zip(singles, eff, gain)]
     rec["curve"] = {"necessity": curve(m, clean, [alone(*singles[i]) for i in sorted(range(len(singles)), key=lambda i: -eff[i])],
-                                       lambda lp1: (cc - contrast(lp1, a, alts)) / gap if gap > 0 else None),
+                                       lambda lp1: (cc - contrast(lp1, sets)) / gap if gap > 0 else None),
                     "sufficiency": curve(m, corr, [gained(*singles[i]) for i in sorted(range(len(singles)), key=lambda i: -gain[i])],
-                                         lambda lp1: (contrast(lp1, a, alts) - cx) / gap if gap > 0 else None)}
+                                         lambda lp1: (contrast(lp1, sets) - cx) / gap if gap > 0 else None)}
     nn = [(e, u) for (k, u), e in zip(singles, eff) if k == "n"]
     rec["hubs"] = [[u[0], u[2], u[3]] for e, u in sorted(nn, key=lambda t: -t[0])[:HUB]]
     rec["neuron_set"] = sorted({(L, j, s) for L, _, j, s in c["neurons"]})
@@ -328,19 +339,19 @@ def score(m: Model, tok, c: dict, qs: dict, log=print) -> dict:
             cap_p = m.capture(ids)
             l2 = m.logp([(ids, []), (clean, patches(c, cap_p)), (ids, pc)])
             bp = int(l2[0].argmax())
-            if bp == a:
-                continue
-            al = pair_alts(lp[0], a, bp)
-            c0, c1 = contrast(lp[0], a, al), contrast(l2[0], a, al)
+            sp = word_sets(m, tok, clean, lp[0], bp)  # the question's answer against the partner's word first
+            c0, c1 = contrast(lp[0], sp), contrast(l2[0], sp)
             g = c0 - c1
-            if g < MIN_GAP:
+            if not pair_ok(sp, bp, g):
                 continue
-            cn2, cd2 = contrast(l2[1], a, al), contrast(l2[2], a, al)
+            cn2, cd2 = contrast(l2[1], sp), contrast(l2[2], sp)
             draws["necessity_heldout"].append({"partner": k, "gap": g, "c_noised": cn2, "share": (c0 - cn2) / g})
             draws["sufficiency_heldout"].append({"partner": k, "gap": g, "c_denoised": cd2, "share": (cd2 - c1) / g})
-            d = lambda l: float((l[bp] - l[a]) / math.log(2.0))  # noqa: E731
+            pw = word_sets(m, tok, ids, l2[0], a)  # the partner's own answer word, its tokens
+            A_p, A_q = torch.tensor(pw["answer"]), torch.tensor(sp["answer"])
+            d = lambda l: float((torch.logsumexp(l[A_p.to(l.device)], 0) - torch.logsumexp(l[A_q.to(l.device)], 0)) / math.log(2.0))  # noqa: E731
             d0, dp, ds = d(lp[0]), d(l2[0]), d(l2[1])
-            if abs(dp - d0) >= MIN_GAP:
+            if pw["answer_word"] != sp["answer_word"] and abs(dp - d0) >= MIN_GAP:
                 draws["swaps"].append({"partner": k, "d_clean": d0, "d_partner": dp, "d_swap": ds, "share": (ds - d0) / (dp - d0)})
     rec["draws"] = draws
     rec["margins"] = margins(rec)
@@ -545,11 +556,11 @@ def main():
         for qid, q in qs.items():
             ids = [circuit_questions.chat(tok, q["user"]), circuit_questions.chat(tok, q["corrupt_user"])]
             lp = m.logp([(x, []) for x in ids])
-            ans, b = int(lp[0].argmax()), int(lp[1].argmax())
-            alts = pair_alts(lp[0], ans, b)
-            gap = contrast(lp[0], ans, alts) - contrast(lp[1], ans, alts)
-            rows.append({"id": qid, "split": q["split"], "answer": tok.decode([ans]), "corrupt_answer": tok.decode([b]), "gap": gap,
-                         "valid": ans != b and gap >= MIN_GAP})
+            b = int(lp[1].argmax())
+            sets = word_sets(m, tok, ids[0], lp[0], b)
+            gap = contrast(lp[0], sets) - contrast(lp[1], sets)
+            rows.append({"id": qid, "split": q["split"], "answer": sets["answer_word"], "corrupt_answer": tok.decode([b]),
+                         "alternatives": sets["alternative_words"], "gap": gap, "valid": pair_ok(sets, b, gap)})
         a.out.write_text(json.dumps({"model": base, "dtype": a.dtype, "pairs": rows}, indent=0))
         for sp in ("dev", "heldout"):
             r = [x for x in rows if x["split"] == sp]

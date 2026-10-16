@@ -120,14 +120,14 @@ class Patcher:
             want = {k: only is None or i in only[k] for k in ("res", "head", "neu")}
             def r(mod, args, kwargs, i=i):
                 h = args[0] if args else kwargs["hidden_states"]
-                if cap is not None:
-                    cap.setdefault("res", []).append(h[:1].detach())
                 if res is not None:
                     h = res(i, h)
                     if args:
                         args = (h,) + tuple(args[1:])
                     else:
                         kwargs["hidden_states"] = h
+                if cap is not None:                  # (as edited: a run with units patched, a base for others)
+                    cap.setdefault("res", []).append(h[:1].detach())
                 return args, kwargs
 
             def o(mod, args, i=i):
@@ -149,7 +149,7 @@ class Patcher:
                 if add is not None:
                     h = h + add["neu"][i].to(h.dtype)
                 return (h,) + tuple(args[1:])
-            if want["res"]:
+            if want["res"] or cap is not None:      # (a capture reads every layer's residual input)
                 hs.append(layer.register_forward_pre_hook(r, with_kwargs=True))
             if want["head"]:
                 hs.append(layer.self_attn.o_proj.register_forward_pre_hook(o))
@@ -218,11 +218,13 @@ class Patcher:
         return start, kv
 
     @torch.no_grad()
-    def _staged(self, start: int, layout: list, lows: list, **hooks) -> torch.Tensor:
+    def _staged(self, start: int, layout: list, lows: list, stacks=None, **hooks) -> torch.Tensor:
         """[R, V] float32 log-probabilities at the last position of R rows, row r in base layout[r], run over positions
         start.. only, each from its own layer lows[r] (ascending) on: a row joins there with its base run's residual
-        input, its keys and values before start are its base run's (STAGED: no layer below a row's lowest patch runs)."""
+        input, its keys and values before start are its base run's (STAGED: no layer below a row's lowest patch runs);
+        stacks: the two runs' residuals and keys and values to use (_derive's), default the setup runs'."""
         m, T, S = self.core.model, self.T, self.T - start
+        res_st, kv_st = stacks or (self._res_st, self._kv_st)
         bi = self._to_dev(np.array([0 if b == "clean" else 1 for b in layout], dtype=np.int64))
         n_at = np.searchsorted(np.asarray(lows), np.arange(self.L), side="right")             # rows running each layer
         dt = m.embed_tokens.weight.dtype
@@ -239,12 +241,12 @@ class Patcher:
                 bd = bi.to(dev)
                 had = 0 if h is None else h.shape[0]
                 if n > had:
-                    new = self._res_st[i].to(dev)[bd[had:n], start:]
+                    new = res_st[i].to(dev)[bd[had:n], start:]
                     h = new if h is None else torch.cat([h.to(dev), new])
                 h = h.to(dev)
                 if emb is None or emb[0].device != dev:
                     emb = m.rotary_emb(h, pos[None].to(dev))
-                k, v = (t.to(dev)[:, :, :start].index_select(0, bd[:n]) for t in self._kv_st[i])
+                k, v = (t.to(dev)[:, :, :start].index_select(0, bd[:n]) for t in kv_st[i])
                 out = self.layers[i](h, attention_mask=mask.to(dev).expand(n, -1, -1, -1), position_ids=pos[None].to(dev),
                                      position_embeddings=emb, cache_position=pos.to(dev), use_cache=True,
                                      **{self._cache_kw: _Prefix(k, v)})
@@ -322,22 +324,49 @@ class Patcher:
         return answer_contrast.contrast(lp, self._sets_dev[1])
 
     @torch.no_grad()
-    def run(self, base: str, sets: list) -> list[float]:
+    def run(self, base: str, sets: list, given: list | None = None) -> list[float]:
         """Per set of units ("res", layer, pos) | ("head", layer, k, pos) | ("neuron", layer, pos, k), k an index or a
         tuple of them (a block), each set to its value in the other run (or in the run a fifth element names: "clean"
         or "corrupt", a head frozen at its value there; "zero": zeroed, a knockout), in the base run ("clean" or
         "corrupt"): the share of the gap lost (base clean) or restored (base corrupt). Every set is its own batch row,
-        so a batch carries one knockout or patch mask per row."""
-        return [v[0] for v in self._measure(sets, (base,))]
+        so a batch carries one knockout or patch mask per row. given: units patched beside every set (each set's share
+        is that of given + set), folded into the two runs once (_derive) so a set runs only from its own first position
+        and lowest layer."""
+        return [v[0] for v in self._measure(sets, (base,), given)]
 
-    def both(self, sets: list) -> list[tuple]:
-        """Per set: (lost share noising, restored share denoising), both runs of a set in one batch."""
-        return [tuple(v) for v in self._measure(sets, ("clean", "corrupt"))]
+    def both(self, sets: list, given: list | None = None) -> list[tuple]:
+        """Per set: (lost share noising, restored share denoising), both runs of a set in one batch (given: as run's)."""
+        return [tuple(v) for v in self._measure(sets, ("clean", "corrupt"), given)]
 
-    def _measure(self, sets: list, bases: tuple) -> list[list]:
+    @torch.no_grad()
+    def _derive(self, given: list) -> tuple:
+        """Both runs with given's units patched (each from the other run, as a set's), as _staged's stacks: the residual
+        inputs [2, T, d] and keys and values [2, KV, T, hd] per layer (the last given's cached)."""
+        key = tuple(tuple(tuple(x.reshape(-1).tolist()) if torch.is_tensor(x) else x for x in u) for u in given)
+        if getattr(self, "_derived", (None,))[0] == key:
+            return self._derived[1]
+        res, kv = {}, {}
+        for base in ("clean", "corrupt"):
+            idx = self._index([(0, base, given)], 0)
+            cap, keep = {}, []
+            self._last(self.ids[base], 1, keep=keep, cap=cap, **self._edits(idx, 0))
+            res[base], kv[base] = cap["res"], keep
+        stacks = ([torch.cat([res["clean"][i], res["corrupt"][i]]) for i in range(self.L)],
+                  [tuple(torch.cat([kv["clean"][i][j], kv["corrupt"][i][j]]) for j in (0, 1)) for i in range(self.L)])
+        self._derived = (key, stacks)
+        return stacks
+
+    def _measure(self, sets: list, bases: tuple, given: list | None = None) -> list[list]:
         """Per set, its share in each of bases. Units before the first differing token have the same value in both runs
         (patching them changes nothing): each set runs from the first position it touches, the bases' prefixes before it
-        cached (PREFIX); sets are grouped by that start, a group of fewer than ROWS sets joining the next lower start."""
+        cached (PREFIX); sets are grouped by that start, a group of fewer than ROWS sets joining the next lower start.
+        given (run's): the runs with given patched are the bases (STAGED; otherwise given joins each set)."""
+        stacks = None
+        if given:
+            if STAGED and LAYERS and PREFIX and self.first > 0:
+                stacks = self._derive(list(given))
+            else:
+                sets, given = [list(given) + list(st) for st in sets], None
         starts = [min([_pos(u) for u in st if _pos(u) >= self.first], default=self.T - 1) if PREFIX else 0 for st in sets]
         out, carry, pending = [None] * len(sets), [], []
         levels = sorted(set(starts), reverse=True)
@@ -345,7 +374,7 @@ class Patcher:
             carry += [b for b, v in enumerate(starts) if v == st]
             if len(carry) < self.rows and j < len(levels) - 1:
                 continue
-            pending += [([carry[k] for k in js], v) for js, v in self._run_from([sets[b] for b in carry], st, bases)]
+            pending += [([carry[k] for k in js], v) for js, v in self._run_from([sets[b] for b in carry], st, bases, given, stacks)]
             carry = []
         if pending:                                 # (read once a call: no wait between start groups)
             vals = iter(torch.cat([v for _, v in pending]).tolist())
@@ -354,10 +383,12 @@ class Patcher:
                     out[b] = next(vals)
         return out
 
-    def _run_from(self, sets: list, start: int, bases: tuple) -> list:
+    def _run_from(self, sets: list, start: int, bases: tuple, given: list | None = None, stacks=None) -> list:
         """_measure's shares for sets patching only positions from start on (those before it ignored), on the device:
         [(indices into sets, [their count, len(bases)])] per batch; a batch of R rows holds R / len(bases) sets, each
-        set's run in base k in row k x R / len(bases) + its place (STAGED: rows by lowest layer)."""
+        set's run in base k in row k x R / len(bases) + its place (STAGED: rows by lowest layer); given with stacks
+        (_measure's): a row's bases are the runs with given patched, given's units from its row's first position and
+        lowest layer on patched again (the row recomputes those)."""
         R = min(MAX_ROWS, max(self.rows, BATCH_TOKENS // (self.T - start))) if start > 0 else self.rows
         R = min(R, max(self.rows, len(sets) * len(bases)), self._fit(self.T - start))
         low = [min([u[1] for u in st if _pos(u) >= start], default=self.L - 1) if (LAYERS and PREFIX and start > 0) else 0
@@ -383,63 +414,18 @@ class Patcher:
                 per = Rb // len(bases)
                 layout = [bases[r // per] if r // per < len(bases) else bases[-1] for r in range(Rb)]
                 row = {(kb, jj): kb * per + jj for kb in range(len(bases)) for jj in range(len(part))}
-            by = {}                                          # (kind, source) -> layer -> rows, positions, indices
-            for kb, base in enumerate(bases):                # (built on the host, one transfer per kind and layer)
-                other = "corrupt" if base == "clean" else "clean"
-                for j, s in enumerate(part):
-                    b = row[(kb, j)]
-                    for u in s:
-                        if _pos(u) < start:
-                            continue
-                        if u[0] == "res":
-                            k, p, src = _ZERO, u[2], u[3] if len(u) > 3 else other
-                        else:
-                            k = u[2] if u[0] == "head" else u[3]
-                            k = (k.numpy() if torch.is_tensor(k) else np.asarray(k)).reshape(-1)
-                            p, src = (u[3] if u[0] == "head" else u[2]), (u[4] if len(u) > 4 else other)
-                        v = by.setdefault((u[0], src), {}).setdefault(u[1], ([], [], []))
-                        v[0].append(np.full(len(k), b))
-                        v[1].append(np.full(len(k), p))
-                        v[2].append(k)
-            idx = {key: {i: self._to_dev(np.stack([np.concatenate(a) for a in v]).astype(np.int64)) for i, v in d.items()}
-                   for key, d in by.items()}
-
-            def res(i, h):                                   # (h: the positions from start on)
-                for src in ("clean", "corrupt", "zero"):
-                    if i in idx.get(("res", src), {}):
-                        b, p, _ = (t.to(h.device) for t in idx[("res", src)][i])
-                        h = h.clone()
-                        h[b, p - start] = 0 if src == "zero" else self.act[src]["res"][i][p].to(h.device, h.dtype)
-                return h
-
-            def head(i, h):
-                for src in ("clean", "corrupt", "zero"):
-                    if i in idx.get(("head", src), {}):
-                        b, p, k = (t.to(h.device) for t in idx[("head", src)][i])
-                        B, T, _ = h.shape
-                        h4 = h.reshape(B, T, self.H, self.hd).clone()
-                        h4[b, p - start, k] = 0 if src == "zero" else \
-                            self.act[src]["head"][i].reshape(self.T, self.H, self.hd)[p, k].to(h.device, h.dtype)
-                        h = h4.reshape(B, T, self.H * self.hd)
-                return h
-
-            def neu(i, h):
-                for src in ("clean", "corrupt", "zero"):
-                    if i in idx.get(("neuron", src), {}):
-                        b, p, n = (t.to(h.device) for t in idx[("neuron", src)][i])
-                        h = h.clone()
-                        h[b, p - start, n] = 0 if src == "zero" else self.act[src]["neu"][i][p, n].to(h.device, h.dtype)
-                return h
-            only = {k: {i for (kind, _), d in idx.items() if kind == name for i in d} for k, name in
-                    (("res", "res"), ("head", "head"), ("neu", "neuron"))}
+            again = (lambda j: [u for u in given if _pos(u) >= start and u[1] >= low[js[j]]]) if given else (lambda j: [])
+            idx = self._index([(row[(kb, j)], base, list(s) + again(j)) for kb, base in enumerate(bases)
+                               for j, s in enumerate(part)], start)
+            edits = self._edits(idx, start)
             if staged:
-                lp = self._staged(start, layout, [r[0] for r in rows], res=res, head=head, neu=neu, only=only)
+                lp = self._staged(start, layout, [r[0] for r in rows], stacks=stacks, **edits)
             else:
                 x = torch.stack([self._ids_dev[k] for k in layout])
                 cache = self._prefix(x, start, tuple(layout)) if start > 0 else None
                 layer0 = min(low[j] for j in js)
                 h0 = None if layer0 == 0 else torch.stack([self.act[k]["res"][layer0][start:] for k in layout]).to(self.dev)
-                lp = self._last(x, Rb, cache=cache, layer0=layer0, h0=h0, res=res, head=head, neu=neu, only=only)
+                lp = self._last(x, Rb, cache=cache, layer0=layer0, h0=h0, **edits)
             c = self._contrast(lp)[self._to_dev(np.array([[row[(kb, jj)] for jj in range(len(part))] for kb in range(len(bases))],
                                                          dtype=np.int64))]                 # [bases, sets]
             got = []
@@ -447,6 +433,60 @@ class Patcher:
                 got.append(((self.c["clean"] - c[kb]) if base == "clean" else (c[kb] - self.c["corrupt"])) / self.gap)
             pending.append((js, torch.stack(got, 1)))       # (read by _measure: no wait between batches)
         return pending
+
+    def _index(self, rows: list, start: int) -> dict:
+        """rows [(batch row, base, units)] as edit indices on the device: (kind, source) -> layer -> [3, n] (rows,
+        positions, indices); units before start ignored (built on the host, one transfer per kind and layer)."""
+        by = {}
+        for b, base, units in rows:
+            other = "corrupt" if base == "clean" else "clean"
+            for u in units:
+                if _pos(u) < start:
+                    continue
+                if u[0] == "res":
+                    k, p, src = _ZERO, u[2], u[3] if len(u) > 3 else other
+                else:
+                    k = u[2] if u[0] == "head" else u[3]
+                    k = (k.numpy() if torch.is_tensor(k) else np.asarray(k)).reshape(-1)
+                    p, src = (u[3] if u[0] == "head" else u[2]), (u[4] if len(u) > 4 else other)
+                v = by.setdefault((u[0], src), {}).setdefault(u[1], ([], [], []))
+                v[0].append(np.full(len(k), b))
+                v[1].append(np.full(len(k), p))
+                v[2].append(k)
+        return {key: {i: self._to_dev(np.stack([np.concatenate(a) for a in v]).astype(np.int64)) for i, v in d.items()}
+                for key, d in by.items()}
+
+    def _edits(self, idx: dict, start: int) -> dict:
+        """_hooks' res, head, neu and only for _index's indices, over the positions from start on."""
+        def res(i, h):
+            for src in ("clean", "corrupt", "zero"):
+                if i in idx.get(("res", src), {}):
+                    b, p, _ = (t.to(h.device) for t in idx[("res", src)][i])
+                    h = h.clone()
+                    h[b, p - start] = 0 if src == "zero" else self.act[src]["res"][i][p].to(h.device, h.dtype)
+            return h
+
+        def head(i, h):
+            for src in ("clean", "corrupt", "zero"):
+                if i in idx.get(("head", src), {}):
+                    b, p, k = (t.to(h.device) for t in idx[("head", src)][i])
+                    B, T, _ = h.shape
+                    h4 = h.reshape(B, T, self.H, self.hd).clone()
+                    h4[b, p - start, k] = 0 if src == "zero" else \
+                        self.act[src]["head"][i].reshape(self.T, self.H, self.hd)[p, k].to(h.device, h.dtype)
+                    h = h4.reshape(B, T, self.H * self.hd)
+            return h
+
+        def neu(i, h):
+            for src in ("clean", "corrupt", "zero"):
+                if i in idx.get(("neuron", src), {}):
+                    b, p, n = (t.to(h.device) for t in idx[("neuron", src)][i])
+                    h = h.clone()
+                    h[b, p - start, n] = 0 if src == "zero" else self.act[src]["neu"][i][p, n].to(h.device, h.dtype)
+            return h
+        only = {k: {i for (kind, _), d in idx.items() if kind == name for i in d} for k, name in
+                (("res", "res"), ("head", "head"), ("neu", "neuron"))}
+        return {"res": res, "head": head, "neu": neu, "only": only}
 
     def scores(self) -> dict:
         """Attribution estimates per head [L, T, H] and neuron [L, T, D]: max over directions of |patch difference x the
@@ -619,7 +659,7 @@ def cut(pt: Patcher, sc: dict, kind: str, positions, done: dict, log=None, searc
             base = pt.both([order])[0]              # its share what it adds to their joint shares (units that matter only
                                                     # together with others: AND-like denoising, OR-like noising)
             def beside(sets, have=list(order), base=base):
-                return [(a - base[0], b - base[1]) for a, b in pt.both([have + st for st in sets])]
+                return [(a - base[0], b - base[1]) for a, b in pt.both(sets, given=have)]
             new = group_test(pt, sc, eps, {}, kinds=(kind,), positions=search, measure=beside, log=log)
             new = sorted([u for u in new if u not in singles], key=lambda u: -max(abs(new[u][0]), abs(new[u][1])))
             for u in new:

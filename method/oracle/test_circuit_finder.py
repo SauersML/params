@@ -172,3 +172,19 @@ def test_any_rows_per_batch(tiny, monkeypatch):
     ref = got[False, cf.BATCH_TOKENS]
     for v in got.values():
         assert all(abs(a[0] - b[0]) < 1e-5 and abs(a[1] - b[1]) < 1e-5 for a, b in zip(v, ref))
+
+
+def test_given_equals_joined_sets(tiny, monkeypatch):
+    pt, clean, corrupt = tiny
+    pt.setup(clean, corrupt)
+    T, f = pt.T, pt.first
+    given = [("neuron", 0, f, (2, 9)), ("res", 1, f + 2), ("head", 1, 3, T - 1), ("neuron", 1, T - 1, 4)]
+    sets = [[("neuron", 1, f + 1, (0, 7))], [("res", 0, f + 1)], [("head", 0, 2, f + 1)], [("neuron", 0, T - 1, 3)],
+            [("res", 1, f + 2)], [("neuron", 1, T - 1, 5, "zero")], [("neuron", 0, f, 2)]]
+    for staged in (True, False):
+        monkeypatch.setattr(cf, "STAGED", staged)
+        a = pt.both(sets, given=given)
+        b = pt.both([given + st for st in sets])
+        c = pt.run("corrupt", sets, given=given)
+        for x, y, z in zip(a, b, c):
+            assert abs(x[0] - y[0]) < 1e-5 and abs(x[1] - y[1]) < 1e-5 and abs(x[1] - z) < 1e-5

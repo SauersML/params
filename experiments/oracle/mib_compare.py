@@ -351,7 +351,7 @@ def nodes(model, graph, dl, metric, log=print, rows: int = 32) -> dict:
 
 
 def eliminate(model, graph, dl, metric, log=print, rows: int = 32, cands: int = 8, delta: float = 0.02,
-              order: str = "noise") -> dict:
+              order: str = "noise", noise=None) -> dict:
     """The finder's prune at MIB's units (node circuits, every decision a measured run of node_sets on the attribution
     examples): from the whole model, blocks of writers are removed in rounds. A round measures CANDS consecutive blocks
     of the remaining writers taken in ORDER (noise: each writer's output patched alone, the smallest change first) and
@@ -359,7 +359,8 @@ def eliminate(model, graph, dl, metric, log=print, rows: int = 32, cands: int = 
     closest to 1; when even that block moves F by more than DELTA the blocks halve (down to one writer, removed even
     so: the circuit must shrink), and after DELTA-quiet rounds they double back. A node removed later ranks higher; an
     edge's score is the earlier removal time of its two ends (the logits never removed), so MIB's top-k is the node
-    circuit at that step plus edges of the next node out. Writes graph.scores; returns the removal record."""
+    circuit at that step plus edges of the next node out. NOISE: the writer tests' changes when already measured
+    (nodes()). Writes graph.scores; returns the removal record."""
     import torch
 
     cfg = model.cfg
@@ -372,7 +373,10 @@ def eliminate(model, graph, dl, metric, log=print, rows: int = 32, cands: int = 
     gap = full - m_corrupt
     F = lambda m: (m - m_corrupt) / gap  # noqa: E731
     rec = {"full": full, "counterfactual": m_corrupt, "tests": 0}
-    if order == "noise":  # each writer alone set to its counterfactual output
+    if noise is not None:
+        noise = torch.tensor(noise)
+        rec["noise"] = noise.tolist()
+    elif order == "noise":  # each writer alone set to its counterfactual output
         alone = torch.ones(nf, nf, dtype=torch.bool)
         alone[torch.arange(nf), torch.arange(nf)] = False
         ms = node_sets(model, batches, n_ex, alone, metric, rows)
@@ -533,7 +537,8 @@ def areas(faith) -> tuple[float, float]:
 
 def select(model, task, mname, method, out, dl, n_rank, metric, refine, rows, test_n, eval_batch, log) -> dict:
     """Per circuit size, the circuit of whichever proposal (METHOD = select:A+B+..., each a ranking: an attribution
-    method of MIB's in both its absolute and signed order, measured, or nodes) has the measured faithfulness nearest 1 on the
+    method of MIB's in both its absolute and signed order, measured, nodes or eliminate, which reuses nodes' tests when
+    it follows it) has the measured faithfulness nearest 1 on the
     attribution examples (MIB's evaluate_graph on the train pairs); MIB's submission format (2), one circuit per size.
     Scored on the test split as MIB's evaluate_area_under_curve scores a ranking, each size's circuit as chosen."""
     import torch
@@ -553,6 +558,8 @@ def select(model, task, mname, method, out, dl, n_rank, metric, refine, rows, te
             rec["measured"] = measured(model, g, dl, m1, refine, log, None, rows)
         elif c == "nodes":
             rec["nodes"] = nodes(model, g, dl, m1, log, rows)
+        elif c == "eliminate":
+            rec["eliminate"] = eliminate(model, g, dl, m1, log, rows, noise=rec.get("nodes", {}).get("noise"))
         else:
             attribute(model, g, dl, partial(metric, mean=True, loss=True), c, "patching", ig_steps=5, intervention_dataloader=dl)
         graphs[c] = g

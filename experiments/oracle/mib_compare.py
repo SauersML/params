@@ -91,7 +91,7 @@ def data(model, task: str, mname: str, split: str, n: int | None, batch: int):
     return ds.to_dataloader(batch_size=batch), len(ds)
 
 
-def measured(model, graph, dl, metric, refine: int, log=print) -> dict:
+def measured(model, graph, dl, metric, refine: int, log=print, limit: int | None = None) -> dict:
     """The measured ranking (module docstring) into graph.scores; returns every test's change."""
     import torch
 
@@ -107,13 +107,13 @@ def measured(model, graph, dl, metric, refine: int, log=print) -> dict:
     full = m_with(lambda g: None)
     t0 = time.time()
     writers = torch.zeros(graph.n_forward)
-    for f in range(graph.n_forward):
+    for f in range(graph.n_forward if limit is None else min(limit, graph.n_forward)):  # (limit: a smoke run's first few)
         if real[f].any():
             writers[f] = abs(full - m_with(lambda g, f=f: g[f].fill_(False)))
         if f % 100 == 0:
             log(f"writers {f}/{graph.n_forward}, {time.time() - t0:.0f} s")
     readers = torch.zeros(graph.n_backward)
-    for b in range(graph.n_backward):
+    for b in range(graph.n_backward if limit is None else min(limit, graph.n_backward)):
         if real[:, b].any():
             readers[b] = abs(full - m_with(lambda g, b=b: g[:, b].fill_(False)))
         if b % 200 == 0:
@@ -136,7 +136,7 @@ def measured(model, graph, dl, metric, refine: int, log=print) -> dict:
 
 
 def rank(task: str, mname: str, method: str, out: Path, n: int, refine: int, batch: int, test_n: int | None = None,
-         log=print) -> dict:
+         log=print, limit: int | None = None) -> dict:
     import torch
 
     from eap.attribute import attribute
@@ -151,7 +151,7 @@ def rank(task: str, mname: str, method: str, out: Path, n: int, refine: int, bat
     t0 = time.time()
     rec = {"task": task, "model": mname, "method": method, "rank_examples": n_rank, "edges": int(graph.real_edge_mask.sum())}
     if method == "measured":
-        rec["measured"] = measured(model, graph, dl, partial(metric, mean=False, loss=False), refine, log)
+        rec["measured"] = measured(model, graph, dl, partial(metric, mean=False, loss=False), refine, log, limit)
     else:
         attribute(model, graph, dl, partial(metric, mean=True, loss=True), method, "patching", ig_steps=5,
                   intervention_dataloader=dl)
@@ -160,6 +160,9 @@ def rank(task: str, mname: str, method: str, out: Path, n: int, refine: int, bat
     tdl, n_test = data(model, task, mname, "test", test_n, batch)
     rec["test_examples"] = n_test
     for absolute in (True, False):
+        if not absolute and float(graph.scores[graph.real_edge_mask].min()) >= 0:  # (no negative score: the same ranking)
+            rec["abs_False"] = rec["abs_True"]
+            continue
         t1 = time.time()
         counts, cpr, cmd, avg, faith = evaluate_area_under_curve(model, graph, tdl, partial(metric, mean=False, loss=False),
                                                                  level="edge", absolute=absolute, quiet=True)
@@ -192,13 +195,14 @@ def main():
     ap.add_argument("--refine", type=int, default=REFINE)
     ap.add_argument("--batch", type=int, default=16)
     ap.add_argument("--test-n", type=int, default=None, help="MIB's test split's first examples only (a smoke run)")
+    ap.add_argument("--limit", type=int, default=None, help="the first writers and readers only (a smoke run)")
     a = ap.parse_args()
     sys.path[:0] = [str(MIB), str(MIB / "EAP-IG" / "src")]
     if a.cmd == "table":
         print(table(a.args))
         return
     task, mname, method, out = a.args
-    rank(task, mname, method, Path(out), a.n, a.refine, a.batch, a.test_n, log=lambda s: print(s, flush=True))
+    rank(task, mname, method, Path(out), a.n, a.refine, a.batch, a.test_n, log=lambda s: print(s, flush=True), limit=a.limit)
 
 
 if __name__ == "__main__":

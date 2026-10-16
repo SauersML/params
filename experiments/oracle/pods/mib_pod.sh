@@ -19,7 +19,7 @@ done; done
 CMD="export OMP_NUM_THREADS=4 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True HF_HUB_ENABLE_HF_TRANSFER=0; set -e; ln -sfn /workspace/runs/$NAME/mpd-data ~/mpd-data; mkdir -p $O/out ~/mib;
 tar -xzf $F/mib.tgz -C ~/mib; export MIB_DIR=~/mib/MIB-circuit-track;
 export PATH=\$HOME/.local/bin:\$PATH; V=/workspace/mibenv; uv venv -q --python 3.12 \$V > $O/pip.log 2>&1;  # (a fresh venv: MIB's TransformerLens 2.16 needs transformers 4 and datasets/huggingface_hub of its time, which the pod's environment does not hold)
-uv pip install -q --python \$V/bin/python 'transformer_lens==2.16.1' 'transformers==4.57.6' 'datasets<4' matplotlib >> $O/pip.log 2>&1; uv pip install -q --python \$V/bin/python --no-deps -e ~/mib/MIB-circuit-track/EAP-IG >> $O/pip.log 2>&1;
+uv pip install -q --python \$V/bin/python 'transformer_lens==2.16.1' 'transformers==4.57.6' 'datasets<4' 'pyarrow<20' matplotlib >> $O/pip.log 2>&1; uv pip install -q --python \$V/bin/python --no-deps -e ~/mib/MIB-circuit-track/EAP-IG >> $O/pip.log 2>&1;
 cd /Users/user/params/; ls /Users/user/params/experiments/oracle > /dev/null; nvidia-smi --query-gpu=name,memory.total --format=csv,noheader;
 (nvidia-smi --query-gpu=timestamp,utilization.gpu,memory.used --format=csv,noheader -l 30 > $O/gpu.log 2>&1 &);
 set +e; $RUNS echo all done"

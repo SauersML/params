@@ -46,12 +46,12 @@ REVISE = HEAD + """
 Your explanation of what makes the group fire was:
 {explanation}
 
-A reader who saw only that explanation wrote these texts to make the group fire as strongly as possible. After each: the largest group activation it reached at any token as a share of the group's corpus maximum (a pass needs one text at 0.30 or more), and that token:
+A reader who saw only that explanation wrote these texts to make the group fire as strongly as possible. After each: the largest group activation it reached at any token as a share of the group's corpus maximum (a pass needs one text at {fire:.2f} or more), and that token:
 {blind}
-It also wrote these near misses, texts on close subjects the explanation says should not make the group fire (each should stay below 0.30):
+It also wrote these near misses, texts on close subjects the explanation says should not make the group fire (each should stay below {fire:.2f}):
 {near}
 
-Revise the explanation so that texts written from it reach the group's maximum and close subjects stay below 0.30. Keep what the examples support; change what the reader's results show is wrong or missing. Write JSON with three fields, nothing else: "explanation", 1 to 4 sentences; "name", the shared cause in 2 to 5 words; "one_thing", true when the examples share one specific cause and false when they mix several unrelated ones."""
+Revise the explanation so that texts written from it reach the group's maximum and close subjects stay below {fire:.2f}. Keep what the examples support; change what the reader's results show is wrong or missing. Write JSON with three fields, nothing else: "explanation", 1 to 4 sentences; "name", the shared cause in 2 to 5 words; "one_thing", true when the examples share one specific cause and false when they mix several unrelated ones."""
 NEAR = HEAD + """
 
 Your explanation of what makes the group fire was:
@@ -117,6 +117,17 @@ def prepare(a) -> None:
     print(f"{len(rows)} groups, {sum(len(r['members']) for r in rows)} member poles to {a.out}")
 
 
+HBINS, HMAX = 3000, 1.5   # collect's histogram of a group's activation: bins of 0.0005 up to 1.5
+QS = (0.99, 0.999, 0.9999)
+FIRE_Q = 0.999           # a group fires beyond this quantile of its corpus activation (or 0.3 of its maximum, the larger)
+
+
+def quantiles(h) -> dict:
+    """The activation at each of QS from a collect histogram (upper bin edges)."""
+    c = np.cumsum(h) / max(int(np.sum(h)), 1)
+    return {str(q): float((int(np.searchsorted(c, q)) + 1) * HMAX / HBINS) for q in QS}
+
+
 def hooks(model, groups: list[dict], store: dict):
     """Forward pre-hooks on each member layer's down_proj: store[("g", gi)] gets the group's summed normalized member
     values [B, T] (divide by the member count for the activation)."""
@@ -154,6 +165,7 @@ def collect(a) -> None:
     toks, off = np.load(a.corpus / "tokens.npy", mmap_mode="r"), np.load(a.corpus / "offsets.npy")
     nd = int(np.searchsorted(off, a.tokens, side="left"))
     heaps = [[] for _ in groups]
+    hist = np.zeros((len(groups), HBINS + 1), dtype=np.int64)   # activation in [0, HMAX) in HBINS bins, the last >= HMAX
     store: dict = {}
     hs = hooks(m, groups, store)
     n = np.array([len(g["members"]) for g in groups], dtype=np.float32)
@@ -172,6 +184,8 @@ def collect(a) -> None:
             valid[:, 0] = False
             for gi in range(len(groups)):
                 act = (store[gi] / float(n[gi])).masked_fill(~valid.to(store[gi].device), 0).flatten()
+                v = act[valid.to(act.device).flatten()]
+                hist[gi] += torch.bincount((v / HMAX * HBINS).long().clamp(0, HBINS), minlength=HBINS + 1).cpu().numpy()
                 top = act.topk(min(a.top, act.numel()))
                 h = heaps[gi]
                 for v, j in zip(top.values.tolist(), top.indices.tolist()):
@@ -185,7 +199,7 @@ def collect(a) -> None:
     finally:
         for h in hs:
             h.remove()
-    out = [{**g, "max": max((v for v, _, _ in heaps[gi]), default=0.0),
+    out = [{**g, "max": max((v for v, _, _ in heaps[gi]), default=0.0), "hist": hist[gi].tolist(), "quantiles": quantiles(hist[gi]),
             "top": [{"value": v, "doc": d, "pos": p} for v, d, p in sorted(heaps[gi], reverse=True)]} for gi, g in enumerate(groups)]
     a.out.write_text(json.dumps({"model": a.model, "tokens": seen, "documents": nd, "groups": out}))
     print(f"{len(out)} groups over {seen} tokens to {a.out}")
@@ -215,8 +229,18 @@ def block(tok, exs, long: int) -> str:
     return "\n".join(lines)
 
 
+def fire_level(g: dict) -> float:
+    """The share of the group's maximum a text must reach to count as firing: the FIRE_Q quantile of the group's
+    corpus activation over its maximum, at least neuron_verify's FIRE (a mean over members is flat at the top: the 64th
+    best of 5M tokens sits at 0.59 of the maximum on the 8B dev groups, so 0.3 of the maximum alone was met by near misses)."""
+    import neuron_verify
+
+    q = (g.get("quantiles") or {}).get(str(FIRE_Q))
+    return max(neuron_verify.FIRE, min(q / g["max"], 0.95)) if q and g["max"] > 0 else neuron_verify.FIRE
+
+
 def item(g: dict, explanation: str | None) -> dict:
-    return {"group": g["id"], "members": g["members"], "pole": "+", "corpus_max": g["max"], "explanation": explanation}
+    return {"group": g["id"], "members": g["members"], "pole": "+", "corpus_max": g["max"], "explanation": explanation, "fire": fire_level(g)}
 
 
 def context_text(tok, e: dict, before: int = SHORT) -> tuple[str, str]:
@@ -310,7 +334,7 @@ def label(a) -> None:
         asks = []
         for v in fail:
             blind, near = al.feedback(tok, {**v["dev"], "pole": "+"})
-            asks.append(REVISE.format(**head(v["g"]), examples=ev(v["g"]), explanation=v["explanation"], blind=blind, near=near))
+            asks.append(REVISE.format(**head(v["g"]), examples=ev(v["g"]), explanation=v["explanation"], blind=blind, near=near, fire=fire_level(v["g"])))
         for v, t in zip(fail, wr(asks, max_tokens=500), strict=True):
             js = neuron_verify.parse_json(t) or {}
             if isinstance(js.get("explanation"), str) and js["explanation"].strip():
@@ -392,6 +416,33 @@ def label(a) -> None:
     log_spend(f"{tag} fresh-text scores", spent() - s0, f"{len(todo)} groups, both blind lengths, seed {a.seed}; {a.out}")
 
 
+def rescore(a) -> None:
+    """A labels file's input labels scored again on fresh texts at both blind lengths against a collect output that
+    has each group's corpus histogram (the FIRE_Q fire level); the earlier scores move to "scores_max30"."""
+    import neuron_verify
+    import reader_reward
+
+    doc = json.loads(a.top.read_text())
+    gs = {g["id"]: g for g in doc["groups"]}
+    rows = [json.loads(x) for x in a.labels.read_text().splitlines() if x.strip()]
+    rd = reader_reward.Reader(neuron_verify.READER, a.labels.parent)
+    measure = lambda rows_, seed=0: neuron_verify.remote_measure(a.measure_url, rows_, seed)  # noqa: E731
+    todo = [r for r in rows if r.get("writer_valid") and r["group"] in gs]
+    for r in todo:
+        if "scores" in r and "scores_max30" not in r:
+            r["scores_max30"] = r.pop("scores")
+    for length in ("short", "long"):
+        got = neuron_verify.judge(rd, measure(neuron_verify.plan(rd, [item(gs[r["group"]], r["explanation"]) for r in todo], length=length,
+                                                                 temperature=0.7, seed=a.seed), a.seed))
+        for r, g2 in zip(todo, got, strict=True):
+            r.setdefault("scores", {})[length] = {"seed": a.seed, "fire": g2.get("fire"), "valid": g2.get("valid"),
+                                                 "pass": bool(g2.get("valid") and g2.get("passes_t1")),
+                                                 **{k: g2.get(k) for k in ("blind_max", "near_miss_rate", "distant_rate", "steer_match")}}
+        print(f"{length}: {sum(r['scores'][length]['pass'] for r in todo)}/{len(todo)} groups pass at their fire level; ${rd.spend.total:.3f}", flush=True)
+    a.labels.write_text("".join(json.dumps(r, allow_nan=False) + "\n" for r in rows))
+    log_spend(f"varteach groups {a.labels.stem} rescore at q{FIRE_Q}", rd.spend.total, f"{len(todo)} groups, both blind lengths; {a.labels}")
+
+
 def estimate(a) -> None:
     """The Tinker cost of label on these groups before any call, from the writer's prompts' token counts and the
     measured shares of past runs (8B neuron arm 10-16: 0.46 of first drafts fail, 0.6 of those again; a reader plan 300
@@ -457,8 +508,13 @@ def main():
         lb.add_argument("--n", type=int, help="the first N groups")
         lb.add_argument("--seed", type=int, default=1)
         lb.add_argument("--margin", type=float, default=1.5)
+    rs = sub.add_parser("rescore")
+    rs.add_argument("--labels", type=Path, required=True)
+    rs.add_argument("--top", type=Path, required=True, help="a collect output with histograms")
+    rs.add_argument("--measure-url", required=True)
+    rs.add_argument("--seed", type=int, default=2)
     a = ap.parse_args()
-    {"prepare": prepare, "collect": collect, "label": label, "estimate": estimate}[a.what](a)
+    {"prepare": prepare, "collect": collect, "label": label, "estimate": estimate, "rescore": rescore}[a.what](a)
 
 
 if __name__ == "__main__":

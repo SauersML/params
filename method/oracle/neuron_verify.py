@@ -372,7 +372,7 @@ def plan(rd, items: list[dict], length: str = "short", temperature: float = 0.0,
         ask,raw=next(replies)
         prop=parse_json(raw)
         row={k:it.get(k) for k in ("layer","index","pole","corpus_max","explanation")}
-        if it.get("members"):row.update(members=it["members"],group=it.get("group"))
+        if it.get("members"):row.update(members=it["members"],group=it.get("group"),fire=it.get("fire"))
         row.update({"reader_class":type(rd).__name__,"reader_model":getattr(rd,"base",getattr(rd,"model",None)),
                     "verifier_source_sha256":source_sha256,"raw_proposal":raw,"proposal":prop,
                     "proposal_request":ask,"blind_length":length,"plan_sampling":sampling or None,
@@ -411,8 +411,9 @@ def measure(tg: Target, rows: list[dict], seed: int = 0) -> list[dict]:
             measured.append(ratio)
         got={};k0=0
         for k,xs in groups.items():got[k]=measured[k0:k0+len(xs)];k0+=len(xs)
-        blind=max(got["max_texts"]);near=sum(x>=FIRE for x in got["near_misses"])/NEAR
-        dist=sum(x>=FIRE for x in got["distant_texts"])/DISTANT
+        fire=float(row.get("fire") or FIRE)  # a group's own level (neuron_groups: its corpus quantile over its maximum)
+        blind=max(got["max_texts"]);near=sum(x>=fire for x in got["near_misses"])/NEAR
+        dist=sum(x>=fire for x in got["distant_texts"])/DISTANT
         value=(1 if row["pole"]=="+" else -1)*STEER*cm
         if not math.isfinite(value):raise ValueError("steering amplitude must be finite")
         on=tg.steered(None,None,value,row["members"]) if row.get("members") else tg.steered(row["layer"],row["index"],value)
@@ -424,7 +425,7 @@ def measure(tg: Target, rows: list[dict], seed: int = 0) -> list[dict]:
                     "distant_concept":prop["distant_concept"],"distant_rate":dist,"distant_values":got["distant_texts"],
                     "steering_prediction":prop["steering_prediction"],"steered":on,"unsteered":off,
                     "steer_request":JUDGE.format(prediction=prop["steering_prediction"],a=off if flip else on,b=on if flip else off),
-                    "steer_expected":"B" if flip else "A","passes_t1":blind>=FIRE and near<FIRE})
+                    "steer_expected":"B" if flip else "A","fire":fire,"passes_t1":blind>=fire and near<fire})
     return out
 
 

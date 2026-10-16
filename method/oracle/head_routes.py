@@ -9,6 +9,8 @@ Runner.run(ids, sets): one prompt, a batch of sets (one forward each, batched), 
   neuron  (layer, pos, index, value)   a neuron's value (down_proj's input) set;
   dq, dk  (layer, head, pos, delta)    added to the head's query or key at pos (after its norm and rotary embedding):
                                        a writer cut from that head's query or key alone (attention_after gives the delta);
+  dv      (layer, head, pos, delta)    added to the head's value at pos: a writer cut from that head's value alone
+                                       (value_after gives the delta);
   read    (layer, pos, index, delta)   the neuron recomputed from its MLP input (the stream after attention) less delta:
                                        a head's output, say, cut from that neuron alone.
 It returns the contrast of each set (log2 p(answer) - log2 of the alternatives' summed p at the last position) and with
@@ -110,7 +112,7 @@ class Runner:
             v = f(at.v_proj, hn).view(K, T, KV, hd).transpose(1, 2)
             q, k = q * cs + rotate_half(q) * sn, k * cs + rotate_half(k) * sn
             kh, vh = repeat_kv(k, H // KV), repeat_kv(v, H // KV)
-            for kind, t in (("dq", q), ("dk", kh)):
+            for kind, t in (("dq", q), ("dk", kh), ("dv", vh)):
                 for b, h, p, delta in E.get(kind, {}).get(L, []):
                     t[b, h, p] += delta.to(d, t.dtype)
             lg = (q @ kh.transpose(-1, -2)) * at.scaling
@@ -209,6 +211,22 @@ class Runner:
         return (a, new - base) if delta_out else a
 
     @torch.no_grad()
+    def value_after(self, st: dict, c: int, h: int, p: int, deltas: torch.Tensor) -> torch.Tensor:
+        """The change in head (c, h)'s value at p with each row of deltas [n, d] taken out of its value input there,
+        exact through the input norm [n, hd] (Runner's dv edit for the same cut)."""
+        layer = self.layers[c]
+        at, ln, d = layer.self_attn, layer.input_layernorm, self._d(c)
+        x, deltas = st["x"][c][p].to(d), deltas.to(d).float()
+        kv = h // (self.H // self.KV)
+        W, g = at.v_proj.weight[kv * self.hd:(kv + 1) * self.hd].float(), ln.weight.float()
+        r2 = x.pow(2).mean() + ln.variance_epsilon
+        r2n = r2 + (deltas.pow(2).sum(-1) - 2 * deltas @ x) / x.shape[-1]
+        new = ((g * x) @ W.T - (deltas * g) @ W.T) / r2n.sqrt()[:, None]
+        if at.v_proj.bias is not None:
+            new = new + at.v_proj.bias[kv * self.hd:(kv + 1) * self.hd].float()
+        return new - st["v"][c][kv, p].to(d)
+
+    @torch.no_grad()
     def readers_after(self, st: dict, c: int, h: int, pos: int, instead: torch.Tensor | None = None) -> dict:
         """Every neuron at pos in layers c.. recomputed with head (c, h)'s output at pos taken out of its MLP input (or
         replaced by instead, another run's write): {layer: [d_mlp] the change (new - base)}."""
@@ -230,7 +248,8 @@ def route_story(rn: Runner, st: dict, lost, c: int, h: int, q: int, p: int, writ
     share of the gap lost (or any measured score). Measured: the head unable to see p (knock); every neuron at p in
     earlier layers and every earlier head's output there taken out of its key input at p, and every neuron at q in
     earlier layers out of its query input at q (the attention q -> p after, exact), the writers largest by change cut
-    from that head's key or query alone in full runs; every neuron at q in layers c.. recomputed with the head's output
+    from that head's key or query alone in full runs; the same units out of its value input at p (what the head moves:
+    its output change at q, exact), the largest cut from its value alone in full runs; every neuron at q in layers c.. recomputed with the head's output
     taken out (exact), the readers largest by change zeroed alone (own_lost) and cut from the head alone (cut_lost) in
     full runs. other (the
     corrupted run's states of a patching pair): every cut a patch instead, the unit's write (or value) replaced by its
@@ -260,6 +279,21 @@ def route_story(rn: Runner, st: dict, lost, c: int, h: int, q: int, p: int, writ
         kind = "dk" if side == "key" else "dq"
         sh = lost([{kind: [(c, h, pos, z[3])]} for z in pick])
         out[side] = [{"unit": list(z[2]), "attention_change": z[1], "lost": s} for z, s in zip(pick, sh)]
+    cand = []  # the value at p: what the head moves, ranked by the size of the head's output change at q
+    Wo = rn.layers[c].self_attn.o_proj.weight[:, h * rn.hd:(h + 1) * rn.hd].float()
+    a_qp = st["A"][c][h, q, p]
+    for L in range(c):
+        dv = rn.value_after(st, c, h, p, nw(L, p))
+        size = (a_qp * dv.to(Wo.device) @ Wo.T).norm(dim=-1).cpu()
+        for j in torch.topk(size, min(writers, len(size))).indices.tolist():
+            cand.append((float(size[j]), ("neuron", L, j, float(st["h"][L][p, j])), dv[j]))
+        dv = rn.value_after(st, c, h, p, torch.stack([hw(L, g, p) for g in range(rn.H)]))
+        size = (a_qp * dv.to(Wo.device) @ Wo.T).norm(dim=-1).cpu()
+        cand += [(float(size[g]), ("head", L, g), dv[g]) for g in range(rn.H)]
+    cand.sort(key=lambda z: -z[0])
+    pick = [z for z in cand if z[1][0] == "neuron"][:writers] + [z for z in cand if z[1][0] == "head"][:max(1, writers // 4)]
+    sh = lost([{"dv": [(c, h, p, z[2])]} for z in pick])
+    out["value"] = [{"unit": list(z[1]), "output_change": z[0], "lost": s} for z, s in zip(pick, sh)]
     ch = rn.readers_after(st, c, h, q, None if other is None else rn.head_write(other, c, h, q))
     flat = sorted(((abs(float(v[j])), float(v[j]), L, j) for L, v in ch.items()
                    for j in torch.topk(v.abs(), min(readers, len(v))).indices.tolist()), key=lambda z: -z[0])[:readers]
@@ -289,6 +323,8 @@ def load(name: str, device: str | None = None, dtype: str = "float32"):
     else:
         dev = device or ("cuda" if torch.cuda.is_available() else "cpu")
         model = transformers.AutoModelForCausalLM.from_pretrained(name, dtype=torch.float32).to(dev)
+        if dev == "cpu":
+            torch.set_num_threads(8)
     return model.eval().requires_grad_(False)
 
 

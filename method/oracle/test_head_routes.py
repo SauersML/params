@@ -90,3 +90,17 @@ def test_route_story(tiny):
     assert len(head_routes.route_story(rn, st, lost, 2, 1, 9, 6, writers=3, readers=4, other=other)["readers"]) == 4
     car = head_routes.carriers(rn, st, lost, 9, 6, min_attention=0.0)
     assert len(car) == rn.L * rn.H
+
+
+def test_value_after_matches_the_cut(tiny):
+    model, ids, rn = tiny
+    st = rn.run(ids, [{}], capture=True)["states"]
+    c, h, q, p = 2, 1, 9, 6
+    deltas = rn.neuron_writes(st, 1, p)[:4]
+    dv = rn.value_after(st, c, h, p, deltas)
+    at = model.model.layers[c].self_attn
+    v = at.v_proj(model.model.layers[c].input_layernorm(st["x"][c][p] - deltas[0])).view(2, 8)[h // 2]
+    assert torch.allclose(dv[0], v - st["v"][c][h // 2, p], atol=1e-5)
+    s2 = rn.run(ids, [{"dv": [(c, h, p, dv[0])]}], capture=True)["states"]
+    want = st["z"][c][q, h] + st["A"][c][h, q, p] * dv[0]
+    assert torch.allclose(s2["z"][c][q, h], want, atol=1e-5)

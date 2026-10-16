@@ -42,6 +42,8 @@ contrast checked on the whole graph:
      graph) of the MEASURED edges of largest share of their reader's in-strength.
 
   python neuron_edges.py one MODEL TEXT.json OUT.json   (TEXT: ids, target, answer, alternatives, neurons)
+  python neuron_edges.py finder MODEL REC.json|REC_DIR OUT.json|OUT_DIR [--dtype bfloat16]
+                         (circuit_finder records: patching from the corrupted run, route knockouts on cross-position edges)
   python neuron_edges.py record MODEL REC.json|REC_DIR OUT.json|OUT_DIR --thr THR.pt [--adapter A] [--dtype bfloat16]
                          (a neuron_builder circuit in its reference; a directory: each record in it, those done skipped)
 """
@@ -94,7 +96,7 @@ class Edges:
 
     def __init__(self, model, ids: list[int], target: int, answer: list[int], alternatives: list[int], neurons: list,
                  thr: torch.Tensor | None = None, background: str = "circuit", massive: torch.Tensor | None = None,
-                 weak: str = "reference"):
+                 weak: str = "reference", corrupt_ids: list[int] | None = None):
         core = model.get_base_model() if hasattr(model, "get_base_model") else model
         cfg = core.config
         self.core, self.layers = core, core.model.layers
@@ -121,7 +123,8 @@ class Edges:
         self.resid_all = [(w, r) for w in self.N for r in self.N if w[0] < r[0] and w[1] == r[1]]
         self.n_routes = sum((r[0] - w[0]) * self.H for w in self.N for r in self.N if w[1] <= r[1] and w[0] < r[0])
         self._plans, self._cols, self._vcols, self._wos = {}, {}, {}, {}
-        self._J, self._G, self._dv_base, self._allin = None, None, None, None
+        self._J, self._G, self._dv_base, self._allin = None, None, {}, {}
+        self.patch, self.cbase = False, None  # (a patching pair: set below)
         self.fixed = None  # weak "reference": the reference run's zeroed values held zero in every run, none else
         # (the reference's set of values, so a cut moves the contrast smoothly; "run": every run zeroes its own weak values,
         # neuron_builder's, where a near-threshold value flips on float noise: 0.1 bits between CPU and GPU on f0)
@@ -129,6 +132,11 @@ class Edges:
             self.base = self._run(torch.zeros(1, 0, dtype=torch.bool), [], keep_states=True)
         if weak == "reference":
             self.fixed = [h != 0 for h in self.base["h"]]
+        if corrupt_ids is not None:  # a patching pair: a cut edge's reader reads what the edge brings in the corrupted run
+            assert thr is None and len(corrupt_ids) >= self.T, "patching uses the model itself on prompts of one length"
+            with torch.no_grad():
+                self.cbase = self._run(torch.zeros(1, 0, dtype=torch.bool), [], keep_states=True, ids=list(corrupt_ids)[:self.T])
+            self.patch = True
         self.c_full = float(self.base["contrast"][0]) if self.dt == torch.float32 else \
             self.contrasts(torch.zeros(1, 0, dtype=torch.bool), [])[0]  # (padded as every other forward)
 
@@ -229,11 +237,55 @@ class Edges:
             es, wi, ri = t(v, k[0])
             plan["route"][k] = (es, wi, ri, *ri.unique(return_inverse=True))
             plan["heads"].setdefault(k[0], []).append(k[1])
+        if self.patch:  # each reader layer's listed in-edges and what they bring in the corrupted run
+            plan["fixed"] = {}
+            by = {}
+            for e, ed in enumerate(edges):
+                by.setdefault(ed[-1][0], []).append(e)
+            for L, es in by.items():
+                d = self._d(L)
+                plan["fixed"][L] = (torch.tensor(es, dtype=torch.long, device=d),
+                                    torch.tensor([self.at[edges[e][-1]] - self.nb[L] for e in es], dtype=torch.long, device=d),
+                                    self._edge_vectors([edges[e] for e in es], "corrupt", d))
         self._plans = {id(edges): (edges, plan)}
         return plan
 
+    def _fixed(self, L: int, coef: torch.Tensor, plan: dict, rest: bool) -> torch.Tensor:
+        """Patching: what layer L's circuit neurons read instead of their cut in-edges, those edges in the corrupted run
+        [K, readers of L, d]."""
+        d, K, R = self._d(L), coef.shape[0], self.nb[L + 1] - self.nb[L]
+        P = self.P[self.nb[L]:self.nb[L + 1]].to(d)
+        F = (self._all_in("corrupt")[L][P][None] * float(rest)).expand(K, -1, -1)
+        if L in plan.get("fixed", {}):
+            es, rl, Vb = plan["fixed"][L]
+            C = torch.zeros(K, R, len(es), device=d)
+            C[:, rl, torch.arange(len(es), device=d)] = coef[:, es]
+            F = F + C @ Vb
+        return F
+
+    @torch.no_grad()
+    def _edge_vectors(self, edges: list, which: str, d) -> torch.Tensor:
+        """What each edge brings into its reader's MLP input in that run [len(edges), d] (on card d)."""
+        H, KV, hd = self.H, self.KV, self.hd
+        cols, h0, dvs, base = self._cols_on(d), self._h0(which).to(d), self._dvs(which), self._states(which)
+        V = torch.zeros(len(edges), cols.shape[1], device=d)
+        groups = {}
+        for i, e in enumerate(edges):
+            groups.setdefault(None if len(e) == 2 else e[1], []).append((i, self.at[e[0]], e[-1][1]))
+        for g, xs in groups.items():
+            i, w, q = (torch.tensor(t, device=d) for t in zip(*xs))
+            if g is None:
+                V[i] = h0[w, None] * cols[w]
+                continue
+            c, h = g
+            dc = self._d(c)
+            w, q = w.to(dc), q.to(dc)
+            z = base["A"][c][h, q, self.P.to(dc)[w]][:, None] * dvs[c][w, h // (H // KV)]
+            V[i] = (z @ self._wo(c)[:, h * hd:(h + 1) * hd].T).to(d)
+        return V
+
     def _run(self, cuts: torch.Tensor, edges: list, rest: bool = False, keep_states: bool = False,
-             probe: list | None = None) -> dict:
+             probe: list | None = None, ids: list[int] | None = None) -> dict:
         """The contrast of each row of cuts [K, len(edges)], every candidate not in edges as in the reference or (rest)
         cut as well. probe: per layer a tensor [T, d_mlp] added to the neurons' activations (zeros requiring grad: the
         contrast's gradient at them)."""
@@ -243,7 +295,7 @@ class Edges:
         coef = (cuts.float() if len(edges) else torch.zeros(K, 0)) - float(rest)  # per listed edge: cut 1, as run 0,
         # kept against a cut rest -1 (added back)
         plan = self._plan(edges)
-        x = core.model.embed_tokens(torch.tensor([self.ids], device=self.dev).expand(K, -1)).float()
+        x = core.model.embed_tokens(torch.tensor([ids or self.ids], device=self.dev).expand(K, -1)).float()
         cos, sin = core.model.rotary_emb(x, torch.arange(T, device=self.dev)[None])
         D = torch.zeros(K, N, x.shape[-1])  # per circuit neuron, what its listed cut edges take from its input
         Hc = torch.zeros(K, N)  # the circuit neurons' activations in this run
@@ -295,6 +347,8 @@ class Edges:
                 inp = x[:, P[rs]] - D[:, rs]
                 if rest:
                     inp = inp - S[:, P[rs]] - R[:, P[rs]]
+                if self.patch:  # (the cut edges' readers read what those edges bring in the corrupted run)
+                    inp = inp + self._fixed(L, coef, plan, rest)
                 hr = self._mlp_act(layer, inp).gather(-1, Jn[rs][None, :, None].expand(K, -1, 1))[..., 0]
                 hr = self._weak(L, hr, Jn[rs]) if self.fixed is None else hr * self.fixed[L].to(d)[P[rs], Jn[rs]][None]
                 hm = hm.index_put((kk[:, None], P[rs][None], Jn[rs][None]), hr)
@@ -387,28 +441,32 @@ class Edges:
 
     # -- each reader's in-edges, measured on the reader -------------------------------------------------------------
 
-    def _h0(self) -> torch.Tensor:
-        """The circuit neurons' activations in the base run [N] (on the first card)."""
+    def _states(self, which: str) -> dict:
+        return self.base if which == "clean" else self.cbase
+
+    def _h0(self, which: str = "clean") -> torch.Tensor:
+        """The circuit neurons' activations in the base run (or the corrupted one) [N] (on the first card)."""
         if not self.N:
             return torch.zeros(0, device=self.dev)
-        return torch.stack([self.base["h"][L][p, j].to(self.dev) for L, p, j in self.N])
+        return torch.stack([self._states(which)["h"][L][p, j].to(self.dev) for L, p, j in self.N])
 
-    def _dvs(self) -> dict:
-        """Per head layer c, the base run's value change at each circuit writer below c when its write leaves layer c's
+    def _dvs(self, which: str = "clean") -> dict:
+        """Per head layer c, that run's value change at each circuit writer below c when its write leaves layer c's
         input there [nb[c], KV, hd] (_dv; kept, on layer c's card)."""
-        if self._dv_base is None:
-            h0, base = self._h0(), self.base
-            self._dv_base = {c: self._dv(c, base["x"][c][None], base["v"][c][None], h0[:self.nb[c]].to(self._d(c))[None])[0]
-                             for c in range(1, self.L) if self.nb[c]}
-        return self._dv_base
+        if which not in self._dv_base:
+            h0, base = self._h0(which), self._states(which)
+            self._dv_base[which] = {c: self._dv(c, base["x"][c][None], base["v"][c][None], h0[:self.nb[c]].to(self._d(c))[None])[0]
+                                    for c in range(1, self.L) if self.nb[c]}
+        return self._dv_base[which]
 
-    def _all_in(self) -> list:
-        """Per layer L, what every circuit in-edge brings into layer L's MLP input at each position in the base run [T, d]
+    def _all_in(self, which: str = "clean") -> list:
+        """Per layer L, what every circuit in-edge brings into layer L's MLP input at each position in that run [T, d]
         (the circuit's writes below L at the position, plus every head's output change there through layers up to L from
         every circuit writer below that layer; kept, on layer L's card)."""
-        if self._allin is None:
-            T, H, KV, hd, h0, dvs = self.T, self.H, self.KV, self.hd, self._h0(), self._dvs()
-            dm = self.base["x"][0].shape[-1]
+        if which not in self._allin:
+            T, H, KV, hd, h0, dvs = self.T, self.H, self.KV, self.hd, self._h0(which), self._dvs(which)
+            base = self._states(which)
+            dm = base["x"][0].shape[-1]
             S = R = None
             out = []
             for L, layer in enumerate(self.layers):
@@ -417,25 +475,26 @@ class Edges:
                 R = torch.zeros(T, dm, device=d) if R is None else R.to(d)
                 if L in dvs:
                     dV = torch.zeros(T, KV, hd, device=d).index_add(0, self.P[:self.nb[L]].to(d), dvs[L])
-                    z = self.base["A"][L] @ dV.transpose(0, 1).repeat_interleave(H // KV, 0)  # [H, T, hd]
+                    z = base["A"][L] @ dV.transpose(0, 1).repeat_interleave(H // KV, 0)  # [H, T, hd]
                     R = R + z.transpose(0, 1).reshape(T, H * hd) @ self._wo(L).T
                 out.append(S + R)
                 rs = torch.arange(self.nb[L], self.nb[L + 1], device=d)
                 if len(rs):
                     S = S.index_add(0, self.P.to(d)[rs], h0.to(d)[rs, None] * self._cols_on(d)[rs])
-            self._allin = out
-        return self._allin
+            self._allin[which] = out
+        return self._allin[which]
 
     @torch.no_grad()
     def in_edges(self, M: int) -> list[tuple[list, torch.Tensor]]:
         """Per circuit neuron as a reader (N's order): its candidate in-edges of the M largest |local effect| and those
         effects, largest first. The local effect is the reader's input Jacobian times what the edge brings in the base
-        run, a ranking only (local_curves measures the reader). Routes are scored a head layer at a time (every writer
+        run (patching: less what it brings in the corrupted run), a ranking only (local_curves measures the reader). Routes are scored a head layer at a time (every writer
         below it, reader above it and head at once), each reader's best M carried."""
         N, H, KV, hd, base, dev = len(self.N), self.H, self.KV, self.hd, self.base, self.dev
         if not N:
             return []
         J, h0, dvs = self.jacobians(), self._h0(), self._dvs()
+        h0b, dvb = (self._h0("corrupt"), self._dvs("corrupt")) if self.patch else (None, None)
         Jm = torch.stack([J[n].to(dev) for n in self.N])
         best_m = torch.full((N, M), -1.0)  # |effect| (-1: no candidate)
         best_s = torch.zeros(N, M)
@@ -451,7 +510,7 @@ class Edges:
             best_i[rows] = i2.gather(1, u[..., None].expand(-1, -1, 3))
 
         P, lay = self.P.to(dev), torch.tensor([n[0] for n in self.N], device=dev)
-        s = (Jm @ self._cols_on(dev).T) * h0[None]  # resid [reader, writer]
+        s = (Jm @ self._cols_on(dev).T) * (h0 if h0b is None else h0 - h0b)[None]  # resid [reader, writer]
         ok = (P[:, None] == P[None]) & (lay[None] < lay[:, None])
         carry(torch.arange(N), s.abs().masked_fill(~ok, -1.0), s,
               lambda t: torch.stack([t, torch.full_like(t, -1), torch.zeros_like(t)], -1))
@@ -464,7 +523,11 @@ class Edges:
             dv = dv[:, torch.arange(H, device=dc) // (H // KV)]  # [W, H, hd]
             U = torch.einsum("rd,dhk->rhk", Jm[nb:].to(dc), self._wo(c).view(-1, H, hd))  # [R, H, hd]
             a = base["A"][c][:, Pd[nb:]][:, :, Pd[:nb]].permute(1, 2, 0)  # [R, W, H]
-            s = (a * torch.einsum("rhk,whk->rwh", U, dv)).flatten(1)  # [R, W H]
+            s = a * torch.einsum("rhk,whk->rwh", U, dv)
+            if dvb is not None:  # (patching: less what the edge brings in the corrupted run)
+                ab = self.cbase["A"][c][:, Pd[nb:]][:, :, Pd[:nb]].permute(1, 2, 0)
+                s = s - ab * torch.einsum("rhk,whk->rwh", U, dvb[c][:, torch.arange(H, device=dc) // (H // KV)])
+            s = s.flatten(1)  # [R, W H]
             ok = (Pd[:nb][None] <= Pd[nb:][:, None])[..., None].expand(-1, -1, H).flatten(1)
             carry(torch.arange(nb, N), s.abs().masked_fill(~ok, -1.0), s,
                   lambda t, c=c: torch.stack([t // H, torch.full_like(t, c), t % H], -1))
@@ -482,12 +545,16 @@ class Edges:
                 yield L, list(range(a, min(a + size, self.nb[L + 1])))
 
     @torch.no_grad()
-    def _vectors(self, rows: list[int], cands: list, K: int) -> torch.Tensor:
+    def _vectors(self, rows: list[int], cands: list, K: int, which: str | None = None) -> torch.Tensor:
         """What the first K candidate in-edges of each reader of rows (one layer's) bring into its MLP input in the base
-        run [len(rows), K, d] (zero past a reader's candidates; on the layer's card)."""
+        run [len(rows), K, d] (zero past a reader's candidates; on the layer's card); patching (which None): less what
+        they bring in the corrupted run."""
+        if which is None:
+            V = self._vectors(rows, cands, K, "clean")
+            return V - self._vectors(rows, cands, K, "corrupt") if self.patch else V
         L = self.N[rows[0]][0]
         d, H, KV, hd = self._d(L), self.H, self.KV, self.hd
-        cols, h0, dvs = self._cols_on(d), self._h0().to(d), self._dvs()
+        cols, h0, dvs, base = self._cols_on(d), self._h0(which).to(d), self._dvs(which), self._states(which)
         V = torch.zeros(len(rows), K, cols.shape[1], device=d)
         groups = {}
         for a, i in enumerate(rows):
@@ -501,7 +568,7 @@ class Edges:
             c, h = g
             dc = self._d(c)
             w, q = w.to(dc), q.to(dc)
-            z = self.base["A"][c][h, q, self.P.to(dc)[w]][:, None] * dvs[c][w, h // (H // KV)]  # [n, hd]
+            z = base["A"][c][h, q, self.P.to(dc)[w]][:, None] * dvs[c][w, h // (H // KV)]  # [n, hd]
             V[a, s] = (z @ self._wo(c)[:, h * hd:(h + 1) * hd].T).to(d)
         return V
 
@@ -517,9 +584,11 @@ class Edges:
         return layer.mlp.act_fn(gate) * torch.einsum("rkd,rd->rk", Xn, self._w(layer.mlp.up_proj, rows=js) * g)
 
     def _cut_input(self, L: int, rows: list[int]) -> torch.Tensor:
-        """The readers rows' (layer L's) MLP inputs in the base run less what every circuit in-edge brings [len(rows), d]."""
+        """The readers rows' (layer L's) MLP inputs in the base run less what every circuit in-edge brings [len(rows), d]
+        (patching: plus what they bring in the corrupted run)."""
         q = self.P[rows].to(self._d(L))
-        return self._mid_stream(L)[q] - self._all_in()[L][q]
+        x = self._mid_stream(L)[q] - self._all_in()[L][q]
+        return x + self._all_in("corrupt")[L][q] if self.patch else x
 
     @torch.no_grad()
     def local_curves(self, cands: list, chunk: int = 64) -> list[torch.Tensor]:
@@ -735,6 +804,30 @@ def graph(ed: Edges, got: dict, tok=None) -> dict:
                                     "full_causal_completeness_certified": False}}
 
 
+def finder_graph(model, tok, rec: dict, log=print) -> dict:
+    """A circuit_finder record's edge graph by patching (its clean and corrupted prompts, every cut a patch from the
+    corrupted run), with route knockouts for every cross-position edge: each head attending from the reader's position
+    to the writer's (at least 0.01) unable to see the writer's position alone, its share of the gap lost
+    (head_routes.carriers)."""
+    import head_routes
+    ids, bad = rec["ids"], rec["corrupted"]
+    ed = Edges(model, ids, len(ids) - 1, [rec["answer"]], list(rec["alternatives"]),
+               [(n["layer"], n["pos"], n["neuron"]) for n in rec["nodes"]], background="model", corrupt_ids=bad)
+    got = prune(ed, log=log)
+    g = graph(ed, got, tok)
+    rn = head_routes.Runner(model)
+    rn.answer, rn.alternatives = [rec["answer"]], list(rec["alternatives"])
+    run = rn.run(ids, [{}], capture=True)
+    c, cb = run["contrast"][0], rn.run(bad, [{}])["contrast"][0]
+    lost = lambda sets: [(c - x) / (c - cb) for x in rn.run(ids, sets)["contrast"]]  # noqa: E731
+    pairs = sorted({(e["dst_pos"], e["src_pos"]) for e in g["edges"] if e["src_pos"] != e["dst_pos"]})
+    g["routes"] = [{"q": q, "p": p, "carriers": head_routes.carriers(rn, run["states"], lost, q, p)} for q, p in pairs]
+    g.update(id=rec.get("id"), text_id=rec.get("id"), user=rec.get("user"), corrupt_user=rec.get("corrupt_user"),
+             corrupted=bad, model=rec.get("model"), finder=rec.get("finder"), cut="patch from the corrupted run",
+             gap=c - cb)
+    return g
+
+
 def load(name: str, device: str | None = None, dtype: str = "float32"):
     """An HF causal LM for the stage: float32 on one card, or bfloat16 split over every card (device_map auto), its
     weights without gradients."""
@@ -744,13 +837,15 @@ def load(name: str, device: str | None = None, dtype: str = "float32"):
     else:
         dev = device or ("cuda" if torch.cuda.is_available() else "cpu")
         model = transformers.AutoModelForCausalLM.from_pretrained(name, dtype=torch.float32).to(dev)
+        if dev == "cpu":
+            torch.set_num_threads(8)
     return model.eval().requires_grad_(False)  # (the stage's gradients are at activations: no weight gradient, 8B's
     # float32 one did not fit an L40)
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("cmd", choices=("one", "record"))
+    ap.add_argument("cmd", choices=("one", "record", "finder"))
     ap.add_argument("model")
     ap.add_argument("text", type=Path, help="one: TEXT.json; record: a neuron_builder record (OUT/<id>.json) or a "
                     "directory of them")
@@ -772,6 +867,22 @@ def main():
         from peft import PeftModel
 
         model = PeftModel.from_pretrained(model, a.adapter).eval().requires_grad_(False)
+    if a.cmd == "finder":  # circuit_finder records: the patching pair, every cut a patch from the corrupted run
+        files = sorted(a.text.glob("*.json")) if a.text.is_dir() else [a.text]
+        if a.text.is_dir():
+            a.out.mkdir(parents=True, exist_ok=True)
+        for src in files:
+            dst = a.out / src.name if a.text.is_dir() else a.out
+            if a.text.is_dir() and dst.exists():
+                continue
+            t0 = time.time()
+            rec = json.loads(src.read_text())
+            g = finder_graph(model, tok, rec, log=lambda m: print(f"{src.stem}: {m}", flush=True))
+            g["seconds"] = round(time.time() - t0, 2)
+            dst.write_text(json.dumps(g))
+            print(f"{src.stem}: {len(g['nodes'])} neurons, {len(g['edges'])} edges, {len(g['routes'])} routes, "
+                  f"{g['seconds']} s", flush=True)
+        return
     if a.cmd == "record":  # neuron_builder circuits: each one's prompt, answer, alternatives and units, its reference
         import neuron_builder
 

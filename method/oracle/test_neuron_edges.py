@@ -224,3 +224,31 @@ def test_dev_ranking_uses_full_model_gradient_and_matches_finite_difference(tiny
     assert got == [(int(i // 400), int((i // 40) % 10), int(i % 40)) for i in order]
     assert all(p.grad is None for p in model.parameters())
     assert all(not layer.mlp.down_proj._forward_pre_hooks for layer in model.model.layers)
+
+
+def test_patching_pair(tiny):
+    """Patching (a corrupted prompt of the same length): a cut edge's reader reads what the edge brings in the corrupted
+    run; the per-position sums agree with every edge listed; the local curves end at the base activation and start at
+    the reader with every in-edge patched."""
+    model, ids, neurons = tiny
+    bad = list(ids)
+    bad[6] = (bad[6] + 5) % 48
+    ed = neuron_edges.Edges(model, ids, 9, [3], [5, 7], neurons, background="model", corrupt_ids=bad)
+    cands, every = every_edge(ed)
+    E = len(every)
+    assert ed.contrasts(torch.zeros(1, E, dtype=torch.bool), every, rest=True)[0] == pytest.approx(ed.c_full, abs=1e-4)
+    none = ed.contrasts(torch.zeros(1, 0, dtype=torch.bool), [], rest=True)[0]
+    assert none == pytest.approx(ed.contrasts(torch.ones(1, E, dtype=torch.bool), every)[0], abs=1e-4)
+    half = torch.arange(E)[None] % 2 == 0
+    assert ed.contrasts(half, every, rest=True)[0] == pytest.approx(ed.contrasts(half, every)[0], abs=1e-4)
+    for e in [x for x in every if len(x) == 2][:5]:  # one resid edge patched: its reader from its input less the clean
+        r = e[1]                                      # write plus the corrupted one
+        got = float(ed._run(torch.ones(1, 1, dtype=torch.bool), [e], keep_states=True)["h"][r[0]][r[1], r[2]])
+        v = ed._edge_vectors([e], "clean", "cpu")[0] - ed._edge_vectors([e], "corrupt", "cpu")[0]
+        want = ed._acts(r[0], [ed.at[r]], (ed._mid_stream(r[0])[r[1]] - v)[None, None])
+        assert got == pytest.approx(float(want), rel=1e-4, abs=1e-6)
+    curves, h0 = ed.local_curves(cands), ed._h0()
+    for i, (es, _) in enumerate(cands):
+        assert float(curves[i][-1]) == pytest.approx(float(h0[i]), rel=1e-4, abs=1e-6)
+    got = neuron_edges.prune(ed, log=lambda m: None)
+    assert got["record"]["met"]

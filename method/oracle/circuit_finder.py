@@ -13,8 +13,8 @@ before the first differing token have equal values in both runs.
   denoising (sufficiency): the corrupted run with only a set patched from the clean run; restored = (c - c_corrupt) / gap
 A circuit passes when both shares are at least PASS.
 Search (every decision a measured run; gradients only order):
- 1. positions: each layer's residual input at each position from the first differing token, denoised alone (the map of
-    where the answer's information sits, recorded);
+ 1. positions: each layer's residual input at each position from the first differing token, noised and denoised alone
+    (the map of where the answer's information sits, recorded);
  2. group testing over blocks of one layer's neurons (or heads) at one position, each noised and denoised alone; a block
     whose larger |share| reaches EPS is split in two halves of its units ordered by their attribution estimate |patch
     difference x gradient| (the larger of the clean run's gradient for noising and the corrupted run's for denoising),
@@ -22,7 +22,8 @@ Search (every decision a measured run; gradients only order):
  3. a cut: the single units of one kind at some positions in measured order (the larger |share|), the curve of both
     shares as they are added in that order, the smallest prefix that passes, then single units removed while it still
     passes; when no prefix passes, EPS falls by EPS_STEP and step 2 searches again (blocks measured before reused), at
-    most EPS_ROUNDS. Three cuts make the circuit, each passing alone with everything else computing:
+    most EPS_ROUNDS (TARGETED: only inside the first level's blocks that hold the missing share). Three cuts make the
+    circuit, each passing alone with everything else computing:
       readout: neurons at the answer position;
       movers: heads at the answer position (where each looks recorded);
       source: neurons at the positions from the first differing token to the one before the answer;
@@ -35,7 +36,9 @@ Search (every decision a measured run; gradients only order):
     are measured at every size to 16 and eight sizes per doubling after, the passing size found by bisection;
  4. reported: the neurons with their stage, poles, regimes and measured shares alone, the movers, each cut's curve and
     size, the residual map, seconds.
-Every run is a batch of exactly ROWS (padded), so bfloat16 kernels do not change with the batch size.
+Engine (Patcher.run): a batch runs only the positions from the first it patches and the layers from the lowest, from the
+two runs' own keys, values and residuals (no weak zeroing here, so this equals the full run to float error); a set's
+noising and denoising share a batch; rows per batch grow as positions shrink, bounded by free memory.
 
   circuit_finder.py questions QUESTIONS.json OUT [--split dev] [--model Qwen/Qwen3-8B] [--dtype float32] [--adapter A]
   circuit_finder.py cases OUT --cases santa,preeclampsia [--model Qwen/Qwen3-32B --dtype bfloat16 --device auto]
@@ -59,6 +62,10 @@ PASS = 0.7            # the spec's share for necessity (lost) and sufficiency (r
 EPS = 0.02            # a block is split when its larger |share| reaches this share of the gap
 EPS_STEP = 4.0
 EPS_ROUNDS = 3
+TARGETED = False      # refine only the first level's blocks that hold the missing share (the smallest prefix of them, in
+# measured order, that patched whole beside the singles found passes), not every block at EPS / EPS_STEP. Off: on
+# Qwen3-1.7B capital/France p0 and p1 the source cut came out unmet (87 and 49 singles in 3 blocks refined twice), met
+# with 6 neurons when every block is refined
 ROWS = 32
 ATTENDS = 3           # source positions recorded per head
 PREFIX = True         # a batch whose patches all lie at or after a position runs only the positions from there on, the
@@ -69,8 +76,6 @@ LAYERS = True         # a cached batch also runs only the layers from the lowest
 # residual there (the layers below see nothing changed); a batch's sets' lowest layers lie within LAYER_BIN of each other
 LAYER_BIN = 64        # (8 split the residual map's 36 sets a position into small batches, each a full read of the weights:
 # Qwen3-8B bfloat16, A6000, the map 2.5 -> 3.9 s, the source cut 8.6 -> 8.3 s)
-COARSE = False        # group testing over several positions starts from each position's units of every layer as one
-# block (the source cut: most positions carry nothing); off, every (layer, position) block is measured first
 BATCH_TOKENS = 1024   # a cached batch runs max(ROWS, BATCH_TOKENS / its positions) rows (at most MAX_ROWS): a forward of
 MAX_ROWS = 1024       # few positions reads every weight for few tokens (no weak zeroing: the batch size moves a share by
 # float error only). Qwen3-8B bfloat16 on an A6000, capital/France p0-p2: 16.5-17.5 s a question at 256, 13.5-14.6 at
@@ -416,23 +421,17 @@ def _pos(u: tuple) -> int:
     return u[2] if u[0] in ("res", "neuron") else u[3]
 
 
-def group_test(pt: Patcher, sc: dict, eps: float, done: dict, kinds=("neuron",), positions=None, measure=None, log=None) -> dict:
+def group_test(pt: Patcher, sc: dict, eps: float, done: dict, kinds=("neuron",), positions=None, measure=None, log=None,
+               blocks=None) -> dict:
     """Group testing (module docstring): every single unit reached, {unit: (lost, restored)}. A block is (kind, layer,
     pos, lo, hi): the units lo..hi-1 of that layer and position in descending attribution order; measure(sets) gives each
-    set's pair of shares (default Patcher.both); done holds the blocks measured before (at a larger eps), reused."""
+    set's pair of shares (default Patcher.both); done holds the blocks measured before (at a larger eps), reused; blocks:
+    the blocks to start from (default every (layer, position) block at positions)."""
     measure = measure or pt.both
     order = {k: v.argsort(-1, descending=True) for k, v in sc.items()}                # [L, T, H] and [L, T, D]
     positions = range(pt.first, pt.T) if positions is None else positions
-    if COARSE and len(positions) > 1:               # (COARSE: each position's units of every layer first, as one block;
-        pb = [(k, -1, p) for p in positions for k in kinds]          # only the positions reaching eps split by layer)
-        todo = [b for b in pb if b not in done]
-        sets = [[unit(b[0], i, b[2], order[b[0]][i, b[2]]) for i in range(pt.L)] for b in todo]
-        for b, r in zip(todo, measure(sets)):
-            done[b] = r
-        positions = [b[2] for b in pb if max(abs(done[b][0]), abs(done[b][1])) >= eps]
-        if log:
-            log(f"    positions: {len(pb)} blocks, {len(positions)} split")
-    blocks = [(k, i, p, 0, order[k].shape[-1]) for i in range(pt.L) for p in positions for k in kinds]
+    if blocks is None:
+        blocks = [(k, i, p, 0, order[k].shape[-1]) for i in range(pt.L) for p in positions for k in kinds]
     singles, level = {}, 0
     while blocks:
         todo = [b for b in blocks if b not in done]
@@ -468,33 +467,50 @@ def grid(n: int) -> list[int]:
     return sorted(set(ks))
 
 
-def cut(pt: Patcher, sc: dict, kind: str, positions, done: dict, log=None) -> dict:
-    """The smallest set of one kind of unit at the given positions that passes (module docstring, steps 2-3)."""
+def cut(pt: Patcher, sc: dict, kind: str, positions, done: dict, log=None, search=None) -> dict:
+    """The smallest set of one kind of unit at the given positions that passes (module docstring, steps 2-3); search:
+    the positions group testing starts at (default positions; the ceiling patches every one of positions)."""
     width = pt.H if kind == "head" else pt.D
     every = [unit(kind, i, p, torch.arange(width)) for i in range(pt.L) for p in positions]
     ceiling = pt.both([every])[0]                   # every unit of the kind there: when it fails no subset is searched
     reach = ceiling[0] >= PASS and ceiling[1] >= PASS
-    eps, singles, ok = EPS, {}, None
+    search = list(positions) if search is None else list(search)
+    eps, singles, ok, ks, curve, blocks, refined = EPS, {}, None, [], [], None, []
+    passes = lambda r: r[0] >= PASS and r[1] >= PASS  # noqa: E731
+
+    def smallest(n, sets_of):                       # the smallest k in 1..n whose set passes: a log grid, then bisection
+        g = grid(n)
+        got = pt.both([sets_of(k) for k in g])
+        met = [k for k, r in zip(g, got) if passes(r)]
+        if not met:
+            return None, g, got
+        hi = met[0]
+        lo = max([k for k in g if k < hi] + [0])
+        while hi - lo > 1:
+            mid = (lo + hi) // 2
+            lo, hi = (lo, mid) if passes(pt.both([sets_of(mid)])[0]) else (mid, hi)
+        return hi, g, got
     for rnd in range(EPS_ROUNDS if reach else 1):
-        singles.update(group_test(pt, sc, eps, done, kinds=(kind,), positions=positions, log=log))
+        singles.update(group_test(pt, sc, eps, done, kinds=(kind,), positions=search, blocks=blocks, log=log))
         order = sorted(singles, key=lambda u: -max(abs(singles[u][0]), abs(singles[u][1])))
-        ks = grid(len(order))
-        curve = pt.both([order[:k] for k in ks])
-        met = [k for k, (lost, rest) in zip(ks, curve) if lost >= PASS and rest >= PASS]
-        if met:                                     # the smallest passing prefix: bisection below the first grid size
-            hi = met[0]
-            lo = max([k for k in ks if k < hi] + [0])
-            while hi - lo > 1:
-                mid = (lo + hi) // 2
-                lost, rest = pt.both([order[:mid]])[0]
-                lo, hi = (lo, mid) if lost >= PASS and rest >= PASS else (mid, hi)
-            ok = hi
+        ok, ks, curve = smallest(len(order), lambda k: order[:k])
         if log:
-            log(f"  {kind}s at {positions[0]}..{positions[-1]}, eps {eps:.4f}: {len(order)} single units, passing prefix {ok}, "
-                f"every one there {ceiling[0]:.2f}/{ceiling[1]:.2f}")
-        if ok:
+            log(f"  {kind}s at {positions[0]}..{positions[-1]} (searched {len(search)}), eps {eps:.4f}: {len(order)} single "
+                f"units, passing prefix {ok}, every one there {ceiling[0]:.2f}/{ceiling[1]:.2f}")
+        if ok or not reach or rnd == EPS_ROUNDS - 1:
             break
-        eps /= EPS_STEP
+        if not TARGETED:                            # EPS falls and group testing runs again over every block
+            eps /= EPS_STEP
+            continue
+        # targeted refinement: the first level's blocks in measured order (the larger |share|), the smallest prefix of
+        # them that, patched whole beside every single found, passes; group testing at eps / EPS_STEP inside those only
+        first = sorted([(kind, i, p, 0, width) for i in range(pt.L) for p in search],
+                       key=lambda bl: -max(abs(done[bl][0]), abs(done[bl][1])) if bl in done else 0.0)
+        j, _, _ = smallest(len(first), lambda j: order + [unit(kind, bl[1], bl[2], torch.arange(width)) for bl in first[:j]])
+        if j is None:                               # every block whole beside the singles fails: nothing to refine
+            break
+        blocks, eps = first[:j], eps / EPS_STEP
+        refined.append(j)
     circ = order[:ok] if ok else list(order)
     if ok and len(circ) > 1:                        # units whose removal alone still passes, then removed one at a time
         alone = pt.both([[v for v in circ if v != u] for u in circ])           # from the least effective while it passes
@@ -505,7 +521,8 @@ def cut(pt: Patcher, sc: dict, kind: str, positions, done: dict, log=None) -> di
                 circ = trial
     lost, rest = pt.both([circ])[0] if circ else (0.0, 0.0)
     return {"units": circ, "singles": singles, "met": bool(ok) and lost >= PASS and rest >= PASS, "lost": lost, "restored": rest,
-            "eps": eps, "found": len(singles), "ceiling": list(ceiling), "reachable": reach,
+            "eps": eps, "found": len(singles), "ceiling": list(ceiling), "reachable": reach, "refined": refined,
+            "searched": search,
             "curve": [{"k": k, "lost": a, "restored": b} for k, (a, b) in zip(ks, curve)]}
 
 
@@ -519,14 +536,22 @@ def find(pt: Patcher, clean: list[int], corrupt: list[int], answers: list[int] |
                    seconds=round(time.perf_counter() - t0, 2))
         return rec
     pos = list(range(pt.first, pt.T))
-    rmap = pt.run("corrupt", [[("res", i, p)] for i in range(pt.L) for p in pos])
-    rec["residual_map"] = {"positions": pos, "restored": [rmap[i * len(pos):(i + 1) * len(pos)] for i in range(pt.L)]}
+    rmap = pt.both([[("res", i, p)] for i in range(pt.L) for p in pos])     # [L x positions] (lost, restored)
+    n = len(pos)
+    rec["residual_map"] = {"positions": pos, "lost": [[rmap[i * n + j][0] for j in range(n)] for i in range(pt.L)],
+                           "restored": [[rmap[i * n + j][1] for j in range(n)] for i in range(pt.L)]}
+    # the source cut searches every position: a screen of positions by their residual map lost circuits (Qwen3-1.7B
+    # capital/France p0 and p1: the source cut unmet when positions whose residual reaches EPS were searched, [8, 11, 13]
+    # of 8..22, and when the fewest positions passing the ceiling were, [8]; met with 6 neurons over every position):
+    # positions each moving under EPS alone matter together, and a whole residual's parts cancel
+    source = pos[:-1]
+    rec["source_positions"] = source
     sc = pt.scores()
     rec["seconds_setup"] = round(time.perf_counter() - t0, 2)
     last, done = pt.T - 1, {}
     cuts = {"readout": cut(pt, sc, "neuron", [last], done, log=log), "movers": cut(pt, sc, "head", [last], done, log=log)}
     if pt.first < last:
-        cuts["source"] = cut(pt, sc, "neuron", list(range(pt.first, last)), done, log=log)
+        cuts["source"] = cut(pt, sc, "neuron", list(range(pt.first, last)), done, log=log, search=source)
     # each mover's share of the source cut's effect: the head frozen at its base-run value while the source cut is patched
     src = cuts.get("source", {}).get("units", [])
     if src:
@@ -552,7 +577,8 @@ def find(pt: Patcher, clean: list[int], corrupt: list[int], answers: list[int] |
         routes.append({"layer": i, "head": h, "pos": p, "attends": pt.attends(i, h, p), "lost": lo, "restored": re,
                        "through_source": list(through[u]) if u in through else None})
     rec.update(nodes=nodes, routes=routes, met=all(c["met"] for k, c in cuts.items() if k != "readout" or c["reachable"]),
-               cuts={k: {f: c[f] for f in ("met", "lost", "restored", "eps", "found", "ceiling", "reachable", "curve")}
+               cuts={k: {f: c[f] for f in ("met", "lost", "restored", "eps", "found", "ceiling", "reachable", "curve", "refined",
+                                           "searched")}
                      | {"size": len(c["units"])} for k, c in cuts.items()},
                size=len(nodes), seconds=round(time.perf_counter() - t0, 2))
     if log:

@@ -79,6 +79,11 @@ def test_find_record(tiny, monkeypatch):
         if c["met"]:
             assert c["lost"] >= cf.PASS and c["restored"] >= cf.PASS
     assert rec["met"] == all(c["met"] for k, c in rec["cuts"].items() if k != "readout" or c["reachable"])
+    rm = rec["residual_map"]
+    assert len(rm["lost"]) == len(rm["restored"]) == pt.L and all(len(r) == len(rm["positions"]) for r in rm["lost"])
+    if "source" in rec["cuts"]:
+        assert rec["cuts"]["source"]["searched"] == rec["source_positions"]
+        assert all(rec["first_diff"] <= p < pt.T - 1 for p in rec["source_positions"])
     for c in rec["cuts"].values():
         assert c["reachable"] == (c["ceiling"][0] >= cf.PASS and c["ceiling"][1] >= cf.PASS)
 

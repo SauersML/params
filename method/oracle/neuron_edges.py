@@ -876,6 +876,15 @@ def finder_graph(model, tok, rec: dict, log=print) -> dict:
     return g
 
 
+def free():
+    """Return a finished record's GPU memory (its Edges' float32 weight copies and states) before the next: on Qwen3-8B
+    a directory of taboo records filled an L40 by the fourth."""
+    import gc
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
 def load(name: str, device: str | None = None, dtype: str = "float32"):
     """An HF causal LM for the stage: float32 on one card, or bfloat16 split over every card (device_map auto), its
     weights without gradients."""
@@ -916,6 +925,7 @@ def main():
             dst = a.out / src.name if a.text.is_dir() else a.out
             t0 = time.time()
             g = finder_graph(m, tok, rec, log=lambda msg: print(f"{src.stem}: {msg}", flush=True))
+            free()
             g["adapter"] = a.adapter or rec.get("adapter")
             g["seconds"] = round(time.time() - t0, 2)  # (this stage; the circuit's build is the record's seconds)
             g["build_seconds"] = rec.get("seconds")

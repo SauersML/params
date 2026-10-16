@@ -506,6 +506,10 @@ def main():
         else:
             got = finder_routes(rn, rec)
         got["adapter"] = a.adapter or rec.get("adapter")
+        import gc  # (each record's states and float32 weight copies freed before the next)
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         got["seconds"] = round(time.time() - t0, 2)
         dst.write_text(json.dumps(got))
         print(f"{f.stem}: {len(got.get('routes', got.get('heads', [])))} routes, {got['seconds']} s", flush=True)

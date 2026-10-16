@@ -952,40 +952,64 @@ def finder_graph(model, tok, rec: dict, log=print) -> dict:
 
 @torch.no_grad()
 def mover_edges(rn, st: dict, sb: dict, lost, rec: dict) -> list[dict]:
-    """Edges between a circuit's mover heads and its neurons, by patching from the corrupted run: per mover (rec's
-    routes), each circuit source neuron below it whose write it moves (its patched write taken out of the head's value
-    input at its position: the head's output change at the answer position, exact) and all of them at once in a full run
-    (value_group_lost); each circuit readout neuron at the answer position in its layer or above (the head's patched
-    output taken out of that neuron's input: its value change, exact) and all of them at once (readers_group_lost)."""
+    """Edges between a circuit's mover heads and its neurons, by patching from the corrupted run. Per mover (rec's
+    routes: head (L, h) at the answer position q), each circuit neuron below L at a position up to q, its write's change
+    (clean - corrupted) taken out of the head's key and value inputs at its position (and its query input at q): the
+    head's output change at q, exact with the rest of the head as in the clean run ("inputs": its size and its share of
+    the head's own change, clean - corrupted, by projection), and all of them at once per input and over every input in
+    full runs ("group_lost": shares of the gap lost); each circuit readout neuron at q in layer L or above, the head's
+    change taken out of its input (its value change, exact) and all of them at once (readers_group_lost). Every write's
+    change is computed once and every mover's group cuts are one batch of runs (on two Qwen3-8B copy texts the value
+    input alone took 2.1 and 10.1 s, a float32 copy of down_proj per neuron and mover; its groups lost under 1% of the
+    gap where the movers lost 74-86%)."""
     from head_routes import weight  # noqa: PLC0415
-    src = [(n["layer"], n["pos"], n["neuron"]) for n in rec.get("nodes", []) if n.get("stage") == "source"]
-    rdo = [(n["layer"], n["pos"], n["neuron"]) for n in rec.get("nodes", []) if n.get("stage") == "readout"]
-    out = []
+    nodes = [n for n in rec.get("nodes", []) if n.get("stage") in ("source", "readout")]
+    units = sorted({(n["layer"], n["pos"], n["neuron"]) for n in nodes})
+    rdo = sorted({(n["layer"], n["pos"], n["neuron"]) for n in nodes if n["stage"] == "readout"})
+    by, diff = {}, {}
+    for Ln, p, j in units:
+        by.setdefault((Ln, p), []).append(j)
+    for (Ln, p), js in by.items():
+        W = weight(rn.layers[Ln].mlp.down_proj)[:, js].float()
+        dh = st["h"][Ln][p, js].to(W.device) - sb["h"][Ln][p, js].to(W.device)
+        diff.update(zip(((Ln, p, j) for j in js), (W * dh).T))
+    out, sets, slots = [], [], []
+    kinds = {"key": "dk", "value": "dv", "query": "dq"}
     for r in rec.get("routes", []):
         L, h, q = r["layer"], r["head"], r["pos"]
-        e = {"head": [L, h], "pos": q, "value": [], "readers": [], "value_group_lost": None, "readers_group_lost": None}
-        Wo = weight(rn.layers[L].self_attn.o_proj)[:, h * rn.hd:(h + 1) * rn.hd].float()
-        byp, edits = {}, []
-        for Ln, p, j in src:
-            if Ln < L and p <= q:
-                byp.setdefault(p, []).append((Ln, j))
-        for p, ns in sorted(byp.items()):
-            ws = torch.stack([rn.neuron_writes(st, Ln, p, [j])[0] - rn.neuron_writes(sb, Ln, p, [j])[0].to(Wo.device)
-                              for Ln, j in ns])
-            dv = rn.value_after(st, L, h, p, ws).to(Wo.device)
-            a = float(st["A"][L][h, q, p])
-            size = (a * dv @ Wo.T).norm(dim=-1)
-            e["value"] += [{"neuron": [Ln, p, j], "output_change": float(z)} for (Ln, j), z in zip(ns, size)]
-            edits.append((L, h, p, rn.value_after(st, L, h, p, ws.sum(0)[None])[0]))
+        own = rn.head_write(st, L, h, q) - rn.head_write(sb, L, h, q).to(rn._d(L))
+        e = {"head": [L, h], "pos": q, "inputs": [], "group_lost": {}, "readers": [], "readers_group_lost": None}
+        byp, edits = {}, {}
+        for u in units:
+            if u[0] < L and u[1] <= q:
+                byp.setdefault(u[1], []).append(u)
+        for p, us in sorted(byp.items()):
+            ws = torch.stack([diff[u] for u in us])
+            for side in ("key", "value") + (("query",) if p == q else ()):
+                ch, _ = rn.output_after(st, L, h, q, p, ws, side)
+                ch = ch.to(own.device)
+                share = -(ch @ own) / own.pow(2).sum()
+                e["inputs"] += [{"neuron": list(u), "input": side, "output_change": float(z), "share": float(x)}
+                                for u, z, x in zip(us, ch.norm(dim=-1), share)]
+                edits.setdefault(side, []).append((L, h, p, rn.output_after(st, L, h, q, p, ws.sum(0)[None], side)[1][0]))
+        for side, ed in edits.items():
+            slots.append((e, side))
+            sets.append({kinds[side]: ed})
         if edits:
-            e["value_group_lost"] = lost([{"dv": edits}])[0]
+            slots.append((e, "all"))
+            sets.append({kinds[side]: ed for side, ed in edits.items()})
         rs = [(Ln, j) for Ln, p, j in rdo if p == q and Ln >= L]
         if rs:
-            delta = rn.head_write(st, L, h, q) - rn.head_write(sb, L, h, q).to(Wo.device)
             ch = rn.readers_after(st, L, h, q, rn.head_write(sb, L, h, q))
             e["readers"] = [{"neuron": [Ln, q, j], "value_change": float(ch[Ln][j])} for Ln, j in rs]
-            e["readers_group_lost"] = lost([{"read": [(Ln, q, j, delta) for Ln, j in rs]}])[0]
+            slots.append((e, "readers"))
+            sets.append({"read": [(Ln, q, j, own) for Ln, j in rs]})
         out.append(e)
+    for (e, side), x in zip(slots, lost(sets) if sets else []):
+        if side == "readers":
+            e["readers_group_lost"] = x
+        else:
+            e["group_lost"][side] = x
     return out
 
 

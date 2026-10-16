@@ -195,3 +195,16 @@ def test_named_routes(tiny):
     named = h["patch"]["named_key_writers"]
     assert named[2] == {"neuron": [2, 0], "below_head": False} and "lost" in named[0]
     assert out["carriers"] and out["carrier_curve"]["k"][-1] == len(out["carriers"])
+
+
+def test_output_after_matches_the_cut(tiny):
+    _, ids, rn = tiny
+    st = rn.run(ids, [{}], capture=True)["states"]
+    c, h, q = 2, 1, 9
+    for side, p in (("key", 6), ("value", 6), ("query", 9)):
+        deltas = rn.neuron_writes(st, 1, p)[:3]
+        ch, edit = rn.output_after(st, c, h, q, p, deltas, side)
+        for i in range(len(deltas)):
+            s2 = rn.run(ids, [{{"key": "dk", "value": "dv", "query": "dq"}[side]: [(c, h, p, edit[i])]}], capture=True)
+            want = rn.head_write(s2["states"], c, h, q) - rn.head_write(st, c, h, q)
+            assert torch.allclose(ch[i], want, atol=1e-5)

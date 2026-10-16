@@ -1,7 +1,7 @@
 """V2 through the circuit finder: copy texts (copy_circuit.make_texts, raw text, no chat template) as patching pairs for
 circuit_finder.find, the movers cut's route groups where copying spreads over heads, and every circuit's edges
-(neuron_edges.finder_graph). One record per usable text (the copied word the clean run's top, the gap at least
-copy_circuit.GAP_MIN bits).
+(neuron_edges.finder_graph). The answer is the copied word; a text whose gap is under copy_circuit.GAP_MIN bits is
+skipped (its record says why).
 
   python experiments/oracle/copy_finder.py OUT [--model Qwen/Qwen3-8B] [--dtype bfloat16] [--n 24]
 writes OUT/<id>.json.
@@ -38,6 +38,7 @@ def main():
     model = transformers.AutoModelForCausalLM.from_pretrained(a.model, dtype=getattr(torch, a.dtype), device_map="auto")
     model = model.eval().requires_grad_(False)
     pt = cf.Patcher(model, tok)
+    cf.MIN_GAP = max(cf.MIN_GAP, copy_circuit.GAP_MIN)
     t0 = time.time()
     log = lambda m: print(f"{time.time() - t0:7.1f}s {m}", flush=True)  # noqa: E731
     first = True
@@ -49,7 +50,7 @@ def main():
             pt.setup(t["ids"], t["corrupt_ids"])
             first = False
         log(t["id"])
-        rec = cf.find(pt, t["ids"], t["corrupt_ids"], log=log)
+        rec = cf.find(pt, t["ids"], t["corrupt_ids"], answers=[t["answer"]], log=log)
         rec.update(id=t["id"], ids=t["ids"], corrupted=t["corrupt_ids"], text=t["text"], template=t["template"],
                    copy_positions=t["pos"], word=t["word"], model=a.model, dtype=a.dtype, finder="circuit_finder")
         if rec.get("answer") is not None:

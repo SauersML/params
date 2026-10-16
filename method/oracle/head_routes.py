@@ -228,10 +228,11 @@ class Runner:
 
     @torch.no_grad()
     def attention_after(self, st: dict, c: int, h: int, q: int, p: int, deltas: torch.Tensor, side: str = "key",
-                        delta_out: bool = False):
+                        delta_out: bool = False, full: bool = False):
         """Head (c, h)'s attention from q to p with each row of deltas [n, d] (residual vectors) taken out of its key input
-        at p (side "key") or its query input at q ("query"), exact [n]; delta_out: also the change in that key or query
-        after norm and rotary [n, hd] (Runner's dk / dq edit for the same cut)."""
+        at p (side "key") or its query input at q ("query"), exact [n] (full: from q to every position, [n, q + 1]);
+        delta_out: also the change in that key or query after norm and rotary [n, hd] (Runner's dk / dq edit for the
+        same cut)."""
         layer = self.layers[c]
         at, ln, d = layer.self_attn, layer.input_layernorm, self._d(c)
         pos = p if side == "key" else q
@@ -259,8 +260,24 @@ class Runner:
         else:
             row = (new @ st["k"][c][h // (self.H // self.KV), :q + 1].to(d).T) * at.scaling  # [n, q + 1]
             base = st["q"][c][h, q].to(d)
-        a = row.softmax(-1)[:, p]
+        a = row.softmax(-1) if full else row.softmax(-1)[:, p]
         return (a, new - base) if delta_out else a
+
+    @torch.no_grad()
+    def output_after(self, st: dict, c: int, h: int, q: int, p: int, deltas: torch.Tensor, side: str):
+        """Head (c, h)'s output change at q as written into the stream [n, d], with each row of deltas [n, d] taken out
+        of its key or value input at p or its query input at q (side "key", "value" or "query"), the rest of the head as
+        in st, exact; and each cut's Runner edit (dk, dv or dq) [n, hd]."""
+        d, kv = self._d(c), h // (self.H // self.KV)
+        a0, V = st["A"][c][h, q, :q + 1].to(d), st["v"][c][kv, :q + 1].to(d)
+        if side == "value":
+            edit = self.value_after(st, c, h, p, deltas)
+            dz = a0[p] * edit
+        else:
+            a, edit = self.attention_after(st, c, h, q, p, deltas, side=side, delta_out=True, full=True)
+            dz = (a - a0) @ V
+        Wo = weight(self.layers[c].self_attn.o_proj)[:, h * self.hd:(h + 1) * self.hd].float()
+        return dz.to(Wo.device) @ Wo.T, edit
 
     @torch.no_grad()
     def value_after(self, st: dict, c: int, h: int, p: int, deltas: torch.Tensor) -> torch.Tensor:

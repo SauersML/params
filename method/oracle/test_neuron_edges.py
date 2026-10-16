@@ -267,8 +267,8 @@ def test_finder_graph_keeps_cut_summary_and_marks_source_provenance(monkeypatch)
 
 
 def test_finder_graph_mover_edges(tiny):
-    """A finder record's graph carries mover-head edges: the circuit's source neurons through each mover's value and its
-    readout neurons reading its output, each group cut measured."""
+    """A finder record's graph carries mover-head edges: the circuit's neurons through each mover's key and value (and
+    query at its position), its readout neurons reading its output, each group cut measured."""
     model, ids, neurons = tiny
     bad = list(ids)
     bad[5] = (bad[5] + 7) % 48
@@ -278,5 +278,8 @@ def test_finder_graph_mover_edges(tiny):
            "routes": [{"layer": 2, "head": 1, "pos": 9}, {"layer": 1, "head": 0, "pos": 9}]}
     g = neuron_edges.finder_graph(model, None, rec, log=lambda m: None)
     he = {tuple(e["head"]): e for e in g["head_edges"]}
-    assert len(he[(2, 1)]["value"]) == 2 and len(he[(2, 1)]["readers"]) == 2 and he[(2, 1)]["value_group_lost"] is not None
-    assert len(he[(1, 0)]["value"]) == 1 and len(he[(1, 0)]["readers"]) == 2
+    sides = lambda e: sorted((tuple(x["neuron"]), x["input"]) for x in e["inputs"])  # noqa: E731
+    assert sides(he[(2, 1)]) == [((0, 5, 3), "key"), ((0, 5, 3), "value"), ((1, 6, 8), "key"), ((1, 6, 8), "value")]
+    assert set(he[(2, 1)]["group_lost"]) == {"key", "value", "all"} and len(he[(2, 1)]["readers"]) == 2
+    assert sides(he[(1, 0)]) == [((0, 5, 3), "key"), ((0, 5, 3), "value")] and len(he[(1, 0)]["readers"]) == 2
+    assert he[(1, 0)]["readers_group_lost"] is not None

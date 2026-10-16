@@ -336,7 +336,8 @@ def load(name: str, device: str | None = None, dtype: str = "float32"):
 def finder_routes(rn: Runner, rec: dict, writers: int = 16, readers: int = 16, min_attention: float = 0.01) -> dict:
     """A circuit_finder record's mover heads as routes (route_story, cuts zeroing and patching from the corrupted run, and
     carriers), each from the answer position to the source it looks at most from the first changed token on."""
-    rn.answer, rn.alternatives = [rec["answer"]], list(rec["alternatives"])
+    rn.answer = [int(t) for t in (rec.get("answer_tokens") or [rec["answer"]])]  # (the word contrast's token sets)
+    rn.alternatives = [int(t) for t in rec["alternatives"]]
     ids, bad = rec["ids"], rec["corrupted"]
     clean, corrupt = rn.run(ids, [{}], capture=True), rn.run(bad, [{}], capture=True)
     c, cb = clean["contrast"][0], corrupt["contrast"][0]

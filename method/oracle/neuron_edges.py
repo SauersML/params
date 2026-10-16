@@ -797,11 +797,20 @@ def graph(ed: Edges, got: dict, tok=None) -> dict:
             "edges": out, "record": got["record"],
             "cut": {"none": got["record"].get("contrast_all_edges"), "graph_edges": got["record"].get("contrast_graph_cut"),
                     "every_edge": got["record"].get("contrast_no_edges")},  # (the contrast with those edges cut together)
+            "route_note": "A route edge is a value-path cut: each head's attention pattern is held at its value in the run, "
+                          "so a writer's effect through where a head looks (its query or key) is not part of any edge.",
             "route_cut_semantics": {"path": "value_ov", "attention_pattern": "current_run_fixed_in_local_value_delta",
                                     "head_input_norm": "recomputed_after_writer_write_subtraction",
                                     "reader_mlp": "recomputed_norm_gate_up", "combined_routes": "sum_of_individual_value_deltas",
                                     "query_key_effects_included": False, "full_writer_ablation_equivalent": False,
                                     "full_causal_completeness_certified": False}}
+
+
+def answer_sets(rec: dict) -> tuple[list[int], list[int]]:
+    """A record's contrast token sets: every token of the answer's word (answer_tokens; else the answer token) against
+    every token of the alternatives (answer_contrast.py's word contrast)."""
+    answer = rec.get("answer_tokens") or [rec["answer"]]
+    return [int(t) for t in answer], [int(t) for t in rec["alternatives"]]
 
 
 def finder_graph(model, tok, rec: dict, log=print) -> dict:
@@ -811,12 +820,13 @@ def finder_graph(model, tok, rec: dict, log=print) -> dict:
     (head_routes.carriers)."""
     import head_routes
     ids, bad = rec["ids"], rec["corrupted"]
-    ed = Edges(model, ids, len(ids) - 1, [rec["answer"]], list(rec["alternatives"]),
+    answer, alts = answer_sets(rec)
+    ed = Edges(model, ids, len(ids) - 1, answer, alts,
                [(n["layer"], n["pos"], n["neuron"]) for n in rec["nodes"]], background="model", corrupt_ids=bad)
     got = prune(ed, log=log)
     g = graph(ed, got, tok)
     rn = head_routes.Runner(model)
-    rn.answer, rn.alternatives = [rec["answer"]], list(rec["alternatives"])
+    rn.answer, rn.alternatives = answer, alts
     run = rn.run(ids, [{}], capture=True)
     c, cb = run["contrast"][0], rn.run(bad, [{}])["contrast"][0]
     lost = lambda sets: [(c - x) / (c - cb) for x in rn.run(ids, sets)["contrast"]]  # noqa: E731
@@ -824,7 +834,7 @@ def finder_graph(model, tok, rec: dict, log=print) -> dict:
     g["routes"] = [{"q": q, "p": p, "carriers": head_routes.carriers(rn, run["states"], lost, q, p)} for q, p in pairs]
     g.update(id=rec.get("id"), text_id=rec.get("id"), user=rec.get("user"), corrupt_user=rec.get("corrupt_user"),
              corrupted=bad, model=rec.get("model"), finder=rec.get("finder"), cut="patch from the corrupted run",
-             gap=c - cb)
+             gap=c - cb, answer_word=rec.get("answer_word"), alternative_words=rec.get("alternative_words"))
     return g
 
 
@@ -878,7 +888,9 @@ def main():
             t0 = time.time()
             rec = json.loads(src.read_text())
             g = finder_graph(model, tok, rec, log=lambda m: print(f"{src.stem}: {m}", flush=True))
-            g["seconds"] = round(time.time() - t0, 2)
+            g["seconds"] = round(time.time() - t0, 2)  # (this stage; the circuit's build is the record's seconds)
+            g["build_seconds"] = rec.get("seconds")
+            g["seconds_total"] = round(g["seconds"] + (rec.get("seconds") or 0.0), 2)
             dst.write_text(json.dumps(g))
             print(f"{src.stem}: {len(g['nodes'])} neurons, {len(g['edges'])} edges, {len(g['routes'])} routes, "
                   f"{g['seconds']} s", flush=True)

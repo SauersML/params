@@ -20,6 +20,8 @@ union (additivity); the top stage-1 hits alone (--assoc: assoc.py's summary.json
   screen.py design OUT.jsonl --assoc SUMMARY.json [--focus T ...] [--top 20]   stage 1's top hits as single poles
   screen.py design OUT.jsonl --random N                       N random single poles (the singles' null)
   screen.py runsets PHENOME DESIGN.jsonl OUT.jsonl --thr T2.pt [--shard k/K]   a design's sets run on the panel
+  screen.py refine PHENOME OUT.jsonl --results L0.jsonl ... --thr T2.pt [--focus T ...] [--split 4] [--max-sets 1500]
+                                                              the group testing's levels run one after another
 The pilot (16 random sets per size, 86 traits, 8 prompts each): reruns are exact (0.0), so a set's change is its own
 joint effect, not noise; the spread across random sets grows from 0.07 bits (16 poles) to 0.55 (4,096); two sets of 256
 add to their union's change with slope 0.86 (correlation 0.94 over traits). The screen therefore measures groups
@@ -210,6 +212,65 @@ def runsets(a) -> None:
     print(f"ran {len(todo)} sets into {a.out}")
 
 
+def next_level(res: dict, traits: list[str], top: int, floor: float, share: float, split: int, rng) -> list[dict]:
+    """The group testing's next level: per trait, the frontier sets (measured, more than one pole, not yet split) whose
+    |change| is at least floor bits and share of the trait's largest frontier |change|, its top largest; each such set
+    split at random into split parts (ids: the set's id + "/0", "/1", ...)."""
+    frontier = [r for i_, r in res.items() if len(r["units"]) > 1 and i_ + "/0" not in res]
+    pick = set()
+    for t in traits:
+        ranked = sorted(frontier, key=lambda r: -abs(r["change"][t]))
+        if ranked:
+            best = abs(ranked[0]["change"][t])
+            pick |= {r["id"] for r in ranked[:top] if abs(r["change"][t]) >= max(floor, share * best)}
+    out = []
+    for r in frontier:
+        if r["id"] in pick:
+            u = list(r["units"])
+            rng.shuffle(u)
+            k = min(split, len(u))
+            out += [{"id": f"{r['id']}/{j}", "units": u[j::k]} for j in range(k)]
+    return out
+
+
+def refine(a) -> None:
+    """The group testing run level after level in one process (the model loaded once): from the screen's results
+    (level 0 and any levels already run, all in OUT when resuming), next_level's sets for the focus traits run on the
+    panel and appended to OUT, until no set qualifies or --max-sets have run."""
+    import torch
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    dev = a.device or ("cuda" if torch.cuda.is_available() else "cpu")
+    res = {r["id"]: r for f in a.results + ([a.out] if a.out.exists() else []) for r in map(json.loads, f.read_text().splitlines())}
+    tok = AutoTokenizer.from_pretrained(a.model)
+    model = AutoModelForCausalLM.from_pretrained(a.model, dtype=torch.bfloat16).to(dev).eval()
+    nr = nb.Neurons(model, tok)
+    nr.load(a.thr)
+    nr.thr = None
+    panel = Panel(a.phenome, nr, a.panel)
+    base = panel.run()
+    traits = a.focus or sorted(base)
+    rng = random.Random(a.seed)
+    ran, level, t0 = 0, 0, time.time()
+    with a.out.open("a") as fh:
+        while ran < a.max_sets:
+            sets = next_level(res, traits, a.top, a.floor, a.share, a.split, rng)[:a.max_sets - ran]
+            if not sets:
+                break
+            level += 1
+            for st in sets:
+                e, r = cc.knockout_edit(nr, [("N", int(l_), int(n), int(pl), None) for l_, n, pl in st["units"]])
+                got = panel.run(e, r)
+                rec = {"id": st["id"], "units": st["units"], "change": {n: got[n] - base[n] for n in base}}
+                res[st["id"]] = rec
+                fh.write(json.dumps(rec) + "\n")
+                fh.flush()
+                ran += 1
+            sizes = sorted({len(st["units"]) for st in sets})
+            print(f"level {level}: {len(sets)} sets of {sizes[0]}-{sizes[-1]} poles; {ran} sets, {(time.time() - t0) / ran:.1f} s a set", flush=True)
+    print(f"refined {ran} sets into {a.out}")
+
+
 def design(a) -> None:
     """Knockout sets for the screen.
       --level0   every pole of the model (layers x neurons x 2 poles) shuffled into groups of --group
@@ -242,21 +303,7 @@ def design(a) -> None:
                     out.append({"id": f"S/{u[0]}.{u[1]}{'+' if u[2] > 0 else '-'}", "units": [list(u)], "from": t})
     else:
         res = {r["id"]: r for f in a.results for r in map(json.loads, f.read_text().splitlines())}
-        traits = a.focus or sorted(next(iter(res.values()))["change"])
-        frontier = [r for i_, r in res.items() if len(r["units"]) > 1 and i_ + "/a" not in res]
-        pick = set()
-        for t in traits:
-            ranked = sorted(frontier, key=lambda r: -abs(r["change"][t]))
-            if not ranked:
-                continue
-            best = abs(ranked[0]["change"][t])
-            pick |= {r["id"] for r in ranked[:a.top] if abs(r["change"][t]) >= max(a.floor, a.share * best)}
-        for r in frontier:
-            if r["id"] in pick:
-                u = list(r["units"])
-                rng.shuffle(u)
-                h = len(u) // 2
-                out += [{"id": r["id"] + "/a", "units": u[:h]}, {"id": r["id"] + "/b", "units": u[h:]}]
+        out = next_level(res, a.focus or sorted(next(iter(res.values()))["change"]), a.top, a.floor, a.share, a.split, rng)
     a.out.write_text("".join(json.dumps(x) + "\n" for x in out))
     print(f"{len(out)} sets, {sum(len(x['units']) for x in out)} poles, to {a.out}")
 
@@ -302,9 +349,25 @@ def main():
     d.add_argument("--top", type=int, default=8)
     d.add_argument("--floor", type=float, default=0.05)
     d.add_argument("--share", type=float, default=0.25)
+    d.add_argument("--split", type=int, default=2)
     d.add_argument("--seed", type=int, default=15)
+    f = sub.add_parser("refine")
+    f.add_argument("phenome", type=Path)
+    f.add_argument("out", type=Path)
+    f.add_argument("--results", type=Path, nargs="+", required=True)
+    f.add_argument("--thr", type=Path, required=True)
+    f.add_argument("--focus", nargs="*")
+    f.add_argument("--top", type=int, default=6)
+    f.add_argument("--floor", type=float, default=0.1)
+    f.add_argument("--share", type=float, default=0.25)
+    f.add_argument("--split", type=int, default=4)
+    f.add_argument("--max-sets", type=int, default=1500)
+    f.add_argument("--seed", type=int, default=15)
+    f.add_argument("--model", default="Qwen/Qwen3-8B")
+    f.add_argument("--panel", type=int, default=PANEL)
+    f.add_argument("--device")
     a = ap.parse_args()
-    {"pilot": pilot, "runsets": runsets, "design": design}[a.cmd](a)
+    {"pilot": pilot, "runsets": runsets, "design": design, "refine": refine}[a.cmd](a)
 
 
 if __name__ == "__main__":

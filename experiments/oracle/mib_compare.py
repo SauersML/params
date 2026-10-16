@@ -253,6 +253,9 @@ def measured(model, graph, dl, metric, refine: int, log=print, limit: int | None
             readers[b] = writers[1 + int(hook.split(".")[1]) * (cfg.n_heads + 1) + cfg.n_heads]
     log(f"readers {len(bs)}, {time.time() - t0:.0f} s")
     score = torch.minimum(writers[:, None], readers[None, :]) * real
+    if refine > 0 and 0.001 * int(real.sum()) >= refine:  # (the refined edges reorder only within the top REFINE, inside
+        log(f"refine skipped: MIB's smallest circuit, {int(0.001 * int(real.sum()))} edges, holds every refined edge")  # every MIB size here)
+        refine = 0
     top = score.flatten().argsort(descending=True)[:refine].tolist()
     edges = [divmod(e, nb) for e in top]
     cfg.use_split_qkv_input = True  # (an edge into a head's q, k or v adds at its own input)

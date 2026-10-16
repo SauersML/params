@@ -22,6 +22,10 @@ circuit sizes, seconds (ranking, per attribution example), and for measured ever
   mib_compare.py rank TASK MODEL METHOD OUT [--n 32] [--refine 1000] [--batch 16] [--eval-batch B] [--rows 32] [--test-n N]
       [--from PREV.json --order block|none|paths]   (measured: an earlier run's tests scored again, no new tests)
   mib_compare.py table OUT [...]
+  mib_compare.py finder TASK MODEL OUT [--n 32]   circuit_finder's circuits of MIB's first train pairs (Hugging Face model)
+  mib_compare.py convert TASK MODEL OUT [IMPORTANCES.pt ...] [--test-n N]   those circuits as MIB circuits on its test
+      split, each ranking's top-k at the same edge counts beside them (finder_circuits)
+Every ranking's edge scores go to OUT/submission/METHOD/TASK_MODEL/importances.pt, the leaderboard's layout.
 MODEL: MIB's names (gpt2, qwen2.5, gemma2, llama3); llama3's and gemma2's weights from WEIGHTS (ungated copies of
 meta-llama/Llama-3.1-8B and google/gemma-2-2b) placed in the HF cache under the official names (alias_weights, by prep).
 --n -1: MIB's own attribution examples (replicate.sh: 1000 for ioi, mcqa's whole train split, 100 for the rest).
@@ -70,10 +74,12 @@ def load(model: str):
     from transformer_lens import HookedTransformer
 
     from MIB_circuit_track.utils import MODEL_NAME_TO_FULLNAME
+    dev = "cuda" if torch.cuda.is_available() else "cpu"  # (never the Mac's GPU, which TransformerLens would pick)
     if model in ("qwen2.5", "gemma2", "llama3"):
-        m = HookedTransformer.from_pretrained(MODEL_NAME_TO_FULLNAME[model], attn_implementation="eager", torch_dtype=torch.bfloat16)
+        m = HookedTransformer.from_pretrained(MODEL_NAME_TO_FULLNAME[model], attn_implementation="eager", torch_dtype=torch.bfloat16,
+                                              device=dev)
     else:
-        m = HookedTransformer.from_pretrained(MODEL_NAME_TO_FULLNAME[model])
+        m = HookedTransformer.from_pretrained(MODEL_NAME_TO_FULLNAME[model], device=dev)
     m.cfg.use_split_qkv_input = True  # (MIB's settings)
     m.cfg.use_attn_result = True
     m.cfg.use_hook_mlp_in = True
@@ -116,6 +122,24 @@ def node_hooks(cfg, nf: int, nb: int):
     return writer, reader, reader_in
 
 
+def prepare(model, dl, metric, names):
+    """Each batch of a dataloader as (tokens, attention mask, lengths, labels, clean cache, counterfactual cache, clean
+    metric, counterfactual metric), the caches holding NAMES; the number of examples and both runs' mean metrics."""
+    import torch
+
+    from eap.utils import tokenize_plus
+    batches = []
+    for clean, corrupted, label in dl:
+        ct, am, il, _ = tokenize_plus(model, clean)
+        xt = tokenize_plus(model, corrupted)[0]
+        with torch.inference_mode():
+            xl, xc = model.run_with_cache(xt, attention_mask=am, names_filter=lambda n: n in names)
+            cl, cc = model.run_with_cache(ct, attention_mask=am, names_filter=lambda n: n in names)
+        batches.append((ct, am, il, label, cc, xc, metric(cl, None, il, label).float(), metric(xl, None, il, label).float()))
+    n_ex = sum(len(b[2]) for b in batches)
+    return batches, n_ex, float(sum(b[6].sum() for b in batches)) / n_ex, float(sum(b[7].sum() for b in batches)) / n_ex
+
+
 def measured(model, graph, dl, metric, refine: int, log=print, limit: int | None = None, rows: int = 32) -> dict:
     """The measured ranking (module docstring) into graph.scores; returns every test's change. Each test is MIB's
     patching run computed directly (test_mib_compare.py checks equality with evaluate_graph): a writer with all its
@@ -127,7 +151,6 @@ def measured(model, graph, dl, metric, refine: int, log=print, limit: int | None
     q, k, v inputs on only for the edge tests."""
     import torch
 
-    from eap.utils import tokenize_plus
     cfg = model.cfg
     nf, nb = graph.n_forward, graph.n_backward
     real = graph.real_edge_mask
@@ -136,17 +159,7 @@ def measured(model, graph, dl, metric, refine: int, log=print, limit: int | None
                               for h in ("attn.hook_z", "attn.hook_q", "attn.hook_k", "attn.hook_v", "hook_mlp_out", "hook_resid_pre")}
     saved = (cfg.use_attn_result, cfg.use_split_qkv_input)
     cfg.use_attn_result = cfg.use_split_qkv_input = False
-    batches = []
-    for clean, corrupted, label in dl:
-        ct, am, il, _ = tokenize_plus(model, clean)
-        xt = tokenize_plus(model, corrupted)[0]
-        with torch.inference_mode():
-            xl, xc = model.run_with_cache(xt, attention_mask=am, names_filter=lambda n: n in names)
-            cl, cc = model.run_with_cache(ct, attention_mask=am, names_filter=lambda n: n in names)
-        batches.append((ct, am, il, label, cc, xc, metric(cl, None, il, label).float(), metric(xl, None, il, label).float()))
-    n_ex = sum(len(b[2]) for b in batches)
-    full = float(sum(b[6].sum() for b in batches)) / n_ex
-    m_corrupt = float(sum(b[7].sum() for b in batches)) / n_ex
+    batches, n_ex, full, m_corrupt = prepare(model, dl, metric, names)
 
     def delta(f, cc, xc):  # counterfactual - clean output of writer f, [batch, pos, d_model]
         hook, h = writer(f)
@@ -244,6 +257,139 @@ def measured(model, graph, dl, metric, refine: int, log=print, limit: int | None
     return rec
 
 
+def node_sets(model, batches, n_ex: int, masks, metric, rows: int = 32) -> list[float]:
+    """MIB's patching run of node circuits: mask [tests, n_forward] says which writers (the input, every head, every
+    MLP) are in each circuit, whose every edge between the input, its nodes and the logits is kept; every other writer's
+    output is the counterfactual run's for every reader. That is the clean run with each writer outside the circuit set
+    to its counterfactual output (a reader outside it computes nothing any kept node reads). Returns each mean metric."""
+    import torch
+
+    cfg = model.cfg
+    H, NL = cfg.n_heads, cfg.n_layers
+    head_ix = torch.tensor([[1 + L * (H + 1) + h for h in range(H)] for L in range(NL)])
+    mlp_ix = torch.tensor([1 + L * (H + 1) + H for L in range(NL)])
+    masks = masks.bool()
+    out = [0.0] * len(masks)
+    for ct, am, il, label, cc, xc, _, _ in batches:
+        B = ct.shape[0]
+        G = max(1, rows // B)
+        for g0 in range(0, len(masks), G):
+            mk = masks[g0:g0 + G].to(ct.device)
+            n = len(mk)
+
+            def fn(act, hook):
+                a = act.view(n, B, *act.shape[1:])
+                if hook.name == "hook_embed":
+                    keep = mk[:, 0].view(n, 1, 1, 1)
+                elif hook.name.endswith("attn.hook_z"):
+                    keep = mk[:, head_ix[int(hook.name.split(".")[1])]].view(n, 1, 1, H, 1)
+                else:
+                    keep = mk[:, mlp_ix[int(hook.name.split(".")[1])]].view(n, 1, 1, 1)
+                return torch.where(keep, a, xc[hook.name].unsqueeze(0)).view(act.shape)
+            hooks = [("hook_embed", fn)] + [(f"blocks.{L}.{h}", fn) for L in range(NL) for h in ("attn.hook_z", "hook_mlp_out")]
+            rep = lambda x: x.repeat(n, *[1] * (x.dim() - 1)) if torch.is_tensor(x) else list(x) * n  # noqa: E731
+            with torch.inference_mode(), model.hooks(fwd_hooks=hooks):
+                lg = model(rep(ct), attention_mask=rep(am))
+            m = metric(lg, None, rep(il), rep(label)).float().view(n, B).sum(1)
+            for g in range(n):
+                out[g0 + g] += float(m[g])
+    return [o / n_ex for o in out]
+
+
+def node_edges(graph, keep):
+    """The edges of the node circuit KEEP (writers, [n_forward] bool): every real edge from a kept writer to a reader of
+    a kept node or the logits; with their count."""
+    import torch
+
+    cfg = graph.cfg
+    H, NL = cfg["n_heads"], cfg["n_layers"]
+    rd = torch.zeros(graph.n_backward, dtype=torch.bool)
+    rd[-1] = True
+    for L in range(NL):
+        for h in range(H):
+            rd[[L * (3 * H + 1) + q * H + h for q in range(3)]] = keep[1 + L * (H + 1) + h]
+        rd[L * (3 * H + 1) + 3 * H] = keep[1 + L * (H + 1) + H]
+    e = graph.real_edge_mask & keep[:, None] & rd[None, :]
+    return e, int(e.sum())
+
+
+def eliminate(model, graph, dl, metric, log=print, rows: int = 32, cands: int = 8, delta: float = 0.02,
+              order: str = "noise") -> dict:
+    """The finder's prune at MIB's units (node circuits, every decision a measured run of node_sets on the attribution
+    examples): from the whole model, blocks of writers are removed in rounds. A round measures CANDS consecutive blocks
+    of the remaining writers taken in ORDER (noise: each writer's output patched alone, the smallest change first) and
+    removes the block whose circuit's faithfulness F = (m - m_counterfactual) / (m_clean - m_counterfactual) lies
+    closest to 1; when even that block moves F by more than DELTA the blocks halve (down to one writer, removed even
+    so: the circuit must shrink), and after DELTA-quiet rounds they double back. A node removed later ranks higher; an
+    edge's score is the earlier removal time of its two ends (the logits never removed), so MIB's top-k is the node
+    circuit at that step plus edges of the next node out. Writes graph.scores; returns the removal record."""
+    import torch
+
+    cfg = model.cfg
+    nf = graph.n_forward
+    names = {"hook_embed"} | {f"blocks.{L}.{h}" for L in range(cfg.n_layers) for h in ("attn.hook_z", "hook_mlp_out")}
+    saved = (cfg.use_attn_result, cfg.use_split_qkv_input)
+    cfg.use_attn_result = cfg.use_split_qkv_input = False
+    t0 = time.time()
+    batches, n_ex, full, m_corrupt = prepare(model, dl, metric, names)
+    gap = full - m_corrupt
+    F = lambda m: (m - m_corrupt) / gap  # noqa: E731
+    rec = {"full": full, "counterfactual": m_corrupt, "tests": 0}
+    if order == "noise":  # each writer alone set to its counterfactual output
+        alone = torch.ones(nf, nf, dtype=torch.bool)
+        alone[torch.arange(nf), torch.arange(nf)] = False
+        ms = node_sets(model, batches, n_ex, alone, metric, rows)
+        noise = torch.tensor([abs(full - m) for m in ms])
+        rec["noise"] = noise.tolist()
+        rec["tests"] += nf
+    else:
+        raise ValueError(order)
+    log(f"order: {nf} writers alone, {time.time() - t0:.0f} s")
+    keep = torch.ones(nf, dtype=torch.bool)
+    rest = [int(i) for i in noise.argsort()]  # (the writers still in, smallest change first)
+    f_cur, size = 1.0, max(1, len(rest) // 64)
+    steps = []  # (removed writers, F after)
+    quiet = 0
+    while rest:
+        blocks = [rest[i:i + size] for i in range(0, min(len(rest), cands * size), size)]
+        ms = []
+        for b in blocks:
+            k = keep.clone()
+            k[b] = False
+            ms.append(k)
+        fs = [F(m) for m in node_sets(model, batches, n_ex, torch.stack(ms), metric, rows)]
+        rec["tests"] += len(blocks)
+        j = min(range(len(blocks)), key=lambda i: abs(fs[i] - 1))
+        if abs(fs[j] - f_cur) > delta and size > 1:
+            size = max(1, size // 2)
+            quiet = 0
+            continue
+        keep[blocks[j]] = False
+        rest = [w for w in rest if keep[w]]
+        steps.append((blocks[j], fs[j]))
+        quiet = quiet + 1 if abs(fs[j] - f_cur) <= delta else 0
+        f_cur = fs[j]
+        if quiet >= 4:
+            size, quiet = min(size * 2, max(1, len(rest) // 64)), 0
+    log(f"eliminated in {len(steps)} steps, {rec['tests']} tests, {time.time() - t0:.0f} s")
+    when = torch.zeros(nf)  # (removal step: later is more important)
+    for t, (b, _) in enumerate(steps):
+        for w in sorted(b, key=lambda w: -float(noise[w])):  # (within a block, the larger change ranks higher)
+            when[w] = t + float(noise[w]) / (float(noise.max()) + 1e-9) * 0.5
+    big = float(len(steps) + 1)
+    rd = torch.full((graph.n_backward,), big)
+    H = cfg.n_heads
+    for L in range(cfg.n_layers):
+        for h in range(H):
+            rd[[L * (3 * H + 1) + q * H + h for q in range(3)]] = when[1 + L * (H + 1) + h]
+        rd[L * (3 * H + 1) + 3 * H] = when[1 + L * (H + 1) + H]
+    graph.scores[:] = (torch.minimum(when[:, None], rd[None, :]) + 1) * graph.real_edge_mask
+    cfg.use_attn_result, cfg.use_split_qkv_input = saved
+    rec["steps"] = [[b, f] for b, f in steps]
+    rec["seconds_tests"] = time.time() - t0
+    return rec
+
+
 def measured_scores(real, rec: dict, order: str = "block"):
     """The measured ranking's edge scores from its tests: min(writer, reader) on every real edge; order "block" puts the
     refined edges (the top REFINE by that score) first, ordered by their own single-edge changes, "none" keeps the
@@ -302,11 +448,17 @@ def rank(task: str, mname: str, method: str, out: Path, n: int, refine: int, bat
         rec.update(order=order, tests_from=str(prev))
     elif method == "measured":
         rec["measured"] = measured(model, graph, dl, partial(metric, mean=False, loss=False), refine, log, limit, rows)
+    elif method == "eliminate":
+        rec["eliminate"] = eliminate(model, graph, dl, partial(metric, mean=False, loss=False), log, rows)
     else:
         attribute(model, graph, dl, partial(metric, mean=True, loss=True), method, "patching", ig_steps=5,
                   intervention_dataloader=dl)
     rec["seconds_rank"] = time.time() - t0
     rec["seconds_per_example"] = rec["seconds_rank"] / max(n_rank, 1)
+    name = f"{method}{'' if order == 'block' or method != 'measured' else '-' + order}"
+    sub = out / "submission" / name / f"{task.replace('_', '-')}_{mname}"  # (MIB's leaderboard layout: one folder per
+    sub.mkdir(parents=True, exist_ok=True)                                  # task and model, the edge scores in it)
+    graph.to_pt(str(sub / "importances.pt"))
     tdl, n_test = data(model, task, mname, "test", test_n, eval_batch or batch)
     rec["test_examples"] = n_test
     for absolute in (True, False):
@@ -320,9 +472,118 @@ def rank(task: str, mname: str, method: str, out: Path, n: int, refine: int, bat
                                   "seconds_eval": time.time() - t1}
         log(f"{task} {mname} {method} absolute={absolute}: CMD {cmd:.3f} CPR {cpr:.3f}")
     out.mkdir(parents=True, exist_ok=True)
-    (out / f"{task}_{mname}_{method}{'' if order == 'block' or method != 'measured' else '-' + order}.json").write_text(json.dumps(rec))
+    (out / f"{task}_{mname}_{name}.json").write_text(json.dumps(rec))
     torch.cuda.empty_cache() if torch.cuda.is_available() else None
     return rec
+
+
+def finder(task: str, mname: str, out: Path, n: int, log=print, rows: int = 32) -> list[dict]:
+    """circuit_finder (method/oracle) on the first n pairs of MIB's train split, on the Hugging Face model, with MIB's own
+    contrast: the answer set MIB's correct token and the alternatives its counterfactual token (explicit_sets), so the
+    finder's contrast is MIB's logit difference in bits. Each pair as MIB (TransformerLens' to_tokens) tokenizes it: BOS,
+    or EOS where the tokenizer has no BOS (Qwen-2.5, GPT-2), then the text; pairs of unequal length are skipped (the
+    finder patches position by position).
+    Writes OUT/finder_TASK_MODEL/<i>.json (the finder's record without its singles)."""
+    import torch
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    from MIB_circuit_track.utils import MODEL_NAME_TO_FULLNAME
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "method" / "oracle"))
+    import circuit_finder as cf
+    name = MODEL_NAME_TO_FULLNAME[mname]
+    tok = AutoTokenizer.from_pretrained(name)
+    cuda = torch.cuda.is_available()
+    model = AutoModelForCausalLM.from_pretrained(name, dtype=torch.bfloat16 if cuda else torch.float32,
+                                                 device_map="cuda" if cuda else "cpu").eval()
+    model.requires_grad_(False)
+    pt = cf.Patcher(model, tok, rows=rows)
+    from MIB_circuit_track.dataset import HFEAPDataset
+    from MIB_circuit_track.utils import TASKS_TO_HF_NAMES
+    ds = HFEAPDataset(f"mib-bench/{TASKS_TO_HF_NAMES[task]}", tok, split="train", task=task, model_name=mname, num_examples=n)
+    d = out / f"finder_{task}_{mname}"
+    d.mkdir(parents=True, exist_ok=True)
+    setup = pt.setup
+    recs = []
+    for i in range(len(ds)):
+        clean, corrupt, (good, bad) = ds[i]
+        bos = tok.bos_token_id if tok.bos_token_id is not None else tok.eos_token_id
+        ids = [[bos] + tok(t, add_special_tokens=False)["input_ids"] for t in (clean, corrupt)]
+        if len(ids[0]) != len(ids[1]):
+            log(f"{i}: prompts of {len(ids[0])} and {len(ids[1])} tokens, skipped")
+            continue
+        sets = {"answer": [int(good)], "alternatives": [int(bad)]}
+        pt.setup = lambda c, k, answers=None, **kw: setup(c, k, explicit_sets=sets, **kw)  # (find() calls setup itself)
+        t0 = time.time()
+        rec = cf.find(pt, ids[0], ids[1], None)
+        rec.pop("singles", None)
+        rec.update(i=i, seconds_wall=time.time() - t0, task=task, model=mname)
+        (d / f"{i}.json").write_text(json.dumps(rec))
+        recs.append(rec)
+        log(f"{i}: gap {rec.get('gap', 0):.2f} bits, met {rec.get('met')}, {len(rec.get('nodes', []))} neurons, "
+            f"{len(rec.get('routes', []))} heads, {rec['seconds_wall']:.1f} s")
+    pt.setup = setup
+    del model, pt
+    torch.cuda.empty_cache()
+    return recs
+
+
+def finder_circuits(task: str, mname: str, out: Path, batch: int, test_n: int | None, against: list[Path], log=print) -> dict:
+    """The finder's per-pair circuits as MIB circuits, scored by MIB's evaluate_graph on its test split: a neuron at
+    (layer, position) becomes that layer's whole MLP at every position, a head at a position the head (its q, k and v
+    inputs) at every position, and a circuit of node set S holds every edge between the input, S and the logits. S is
+    every node in at least t of the pairs' circuits (met or not), for each t. Each of AGAINST's rankings (importances.pt)
+    is scored at the same edge counts (MIB's top-k with its pruning)."""
+    import torch
+
+    from eap.evaluate import evaluate_baseline, evaluate_graph
+    from eap.graph import Graph
+    from MIB_circuit_track.metrics import get_metric
+    recs = [json.loads(f.read_text()) for f in sorted((out / f"finder_{task}_{mname}").glob("*.json"))]
+    recs = [r for r in recs if not r.get("skipped")]
+    model = load(mname)
+    metric = partial(get_metric("logit_diff", task, model.tokenizer, model), mean=False, loss=False)
+    tdl, n_test = data(model, task, mname, "test", test_n, batch)
+    full = float(evaluate_baseline(model, tdl, metric, quiet=True).mean())
+    g0 = Graph.from_model(model)
+    g0.apply_topn(0, True)
+    none = float(evaluate_graph(model, g0, tdl, metric, quiet=True).mean())
+    count = {}
+    for r in recs:
+        S = {f"m{u['layer']}" for u in r.get("nodes", [])} | {f"a{u['layer']}.h{u['head']}" for u in r.get("routes", [])}
+        for x in S:
+            count[x] = count.get(x, 0) + 1
+    res = {"task": task, "model": mname, "pairs": len(recs), "met": sum(bool(r.get("met")) for r in recs), "full": full,
+           "none": none, "test_examples": n_test, "node_counts": count, "circuits": []}
+    ts = sorted(set(count.values()), reverse=True)
+    for t in ts:
+        S = {x for x, c in count.items() if c >= t}
+        g = Graph.from_model(model)
+        g.in_graph[:] = False
+        fw = [0] + [g.forward_index(g.nodes[x], attn_slice=False) for x in S]
+        bw = [g.n_backward - 1]
+        for x in S:
+            node = g.nodes[x]
+            bw += [g.backward_index(node, qkv=q, attn_slice=False) for q in "qkv"] if x.startswith("a") else [g.backward_index(node)]
+        fi, bi = torch.tensor(fw), torch.tensor(bw)
+        g.in_graph[fi[:, None], bi[None, :]] = True
+        g.in_graph &= g.real_edge_mask
+        g.nodes_in_graph[:] = False
+        g.nodes_in_graph[fi] = True
+        g.prune()
+        k = int(g.in_graph.sum())
+        m = float(evaluate_graph(model, g, tdl, metric, quiet=True).mean())
+        row = {"t": t, "nodes": len(S), "mlps": sum(x.startswith("m") for x in S), "heads": sum(x.startswith("a") for x in S),
+               "edges": k, "pct": k / int(g.real_edge_mask.sum()), "F": (m - none) / (full - none), "against": {}}
+        for p in against:
+            h = Graph.from_pt(str(p))
+            h.apply_topn(k, True, prune=True)
+            mh = float(evaluate_graph(model, h, tdl, metric, quiet=True).mean())
+            row["against"][p.parent.parent.name] = (mh - none) / (full - none)
+        log(f"t {t}: {len(S)} nodes ({row['mlps']} MLPs, {row['heads']} heads), {k} edges ({100 * row['pct']:.2f}%): F {row['F']:.3f}; "
+            + ", ".join(f"{a} {v:.3f}" for a, v in row["against"].items()))
+        res["circuits"].append(row)
+    (out / f"finder_{task}_{mname}.json").write_text(json.dumps(res))
+    return res
 
 
 def table(paths) -> str:
@@ -339,7 +600,7 @@ def table(paths) -> str:
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("cmd", choices=("prep", "rank", "table"))
+    ap.add_argument("cmd", choices=("prep", "rank", "table", "finder", "convert"))
     ap.add_argument("args", nargs="+")
     ap.add_argument("--n", type=int, default=32)
     ap.add_argument("--refine", type=int, default=REFINE)
@@ -363,6 +624,15 @@ def main():
             alias_weights(mname)
         else:  # (the weights and tokenizer into the cache while online)
             load(mname)
+        return
+    if a.cmd == "finder":
+        task, mname, out = a.args
+        finder(task, mname, Path(out), a.n, log=lambda s: print(s, flush=True), rows=a.rows)
+        return
+    if a.cmd == "convert":
+        task, mname, out, *against = a.args
+        finder_circuits(task, mname, Path(out), a.eval_batch or a.batch, a.test_n, [Path(x) for x in against],
+                        log=lambda s: print(s, flush=True))
         return
     task, mname, method, out = a.args
     rank(task, mname, method, Path(out), a.n, a.refine, a.batch, a.test_n, log=lambda s: print(s, flush=True), limit=a.limit,

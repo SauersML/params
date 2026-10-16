@@ -49,12 +49,12 @@ class _NoCuda:
         return torch.zeros(*a, **k)
 
 
-@pytest.mark.parametrize("shape", sorted(SHAPES))
-def test_measured_equals_evaluate_graph(monkeypatch, shape):
+def tiny(monkeypatch, shape):
+    """A tiny model of SHAPE in MIB's settings, two batches of pairs (one token changed) and eap.evaluate, patched to
+    read token lists."""
     tl = pytest.importorskip("transformer_lens")
     eval_mod = pytest.importorskip("eap.evaluate")
     import eap.utils
-    from eap.graph import Graph
     torch.manual_seed(0)
     cfg = tl.HookedTransformerConfig(n_layers=3, d_model=32, d_head=8, n_heads=4, d_mlp=48, d_vocab=50, n_ctx=16,
                                      dtype=torch.float32, device="cpu", **SHAPES[shape])
@@ -77,6 +77,13 @@ def test_measured_equals_evaluate_graph(monkeypatch, shape):
         x[:, 2] = torch.randint(0, 50, (3,), generator=g)
         dl.append(([" ".join(map(str, r.tolist())) for r in c], [" ".join(map(str, r.tolist())) for r in x],
                    torch.randint(0, 50, (3, 2), generator=g)))
+    return model, dl, eval_mod
+
+
+@pytest.mark.parametrize("shape", sorted(SHAPES))
+def test_measured_equals_evaluate_graph(monkeypatch, shape):
+    from eap.graph import Graph
+    model, dl, eval_mod = tiny(monkeypatch, shape)
     graph = Graph.from_model(model)
     rec = mc.measured(model, graph, dl, metric, refine=12, log=lambda s: None, rows=6)
     real = graph.real_edge_mask.clone()
@@ -112,3 +119,36 @@ def test_measured_equals_evaluate_graph(monkeypatch, shape):
     assert len(every["single"]) == int(real.sum())  # (every edge alone: each writer's change through each reader's input)
     for f, b, _, d in every["single"]:
         assert d == pytest.approx(abs(full - m_with(lambda x, f=f, b=b: x[f, b].fill_(False))), abs=1e-4), (f, b)
+
+
+@pytest.mark.parametrize("shape", sorted(SHAPES))
+def test_node_sets_and_eliminate(monkeypatch, shape):
+    """node_sets' circuits equal evaluate_graph's with node_edges' edges (MIB's pruning on: every node circuit is whole),
+    and eliminate's ranking puts each step's node circuit first."""
+    from eap.graph import Graph
+    model, dl, eval_mod = tiny(monkeypatch, shape)
+    graph = Graph.from_model(model)
+    nf = graph.n_forward
+    g = torch.Generator().manual_seed(2)
+    masks = torch.rand(6, nf, generator=g) < 0.6
+    masks[:3, 0] = True  # (the input in some circuits, out of others)
+    names = {"hook_embed"} | {f"blocks.{L}.{h}" for L in range(3) for h in ("attn.hook_z", "hook_mlp_out")}
+    saved = (model.cfg.use_attn_result, model.cfg.use_split_qkv_input)
+    model.cfg.use_attn_result = model.cfg.use_split_qkv_input = False
+    batches, n_ex, full, _ = mc.prepare(model, dl, metric, names)
+    got = mc.node_sets(model, batches, n_ex, masks, metric, rows=6)
+    model.cfg.use_attn_result, model.cfg.use_split_qkv_input = saved
+    for k, m in zip(masks, got):
+        e, _ = mc.node_edges(graph, k)
+        graph.in_graph[:] = e
+        graph.nodes_in_graph[:] = k
+        want = float(eval_mod.evaluate_graph(model, graph, dl, metric, quiet=True, intervention="patching").mean())
+        assert m == pytest.approx(want, abs=1e-4)
+    rec = mc.eliminate(model, graph, dl, metric, log=lambda s: None, rows=6, cands=3)
+    assert sum(len(b) for b, _ in rec["steps"]) == nf
+    keep = torch.ones(nf, dtype=torch.bool)
+    for b, f in rec["steps"][:-1]:  # (after each step, the top edges are exactly that step's node circuit)
+        keep[b] = False
+        e, n = mc.node_edges(graph, keep)
+        top = graph.scores.flatten().argsort(descending=True)[:n]
+        assert set(top.tolist()) == set(e.flatten().nonzero().flatten().tolist())

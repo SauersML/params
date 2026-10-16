@@ -22,7 +22,11 @@ Search (every decision a measured run; gradients only order):
  3. a cut: the single units of one kind at some positions in measured order (the larger |share|), the curve of both
     shares as they are added in that order, the smallest prefix that passes, then single units removed while it still
     passes; when no prefix passes, EPS falls by EPS_STEP and step 2 searches again (blocks measured before reused), at
-    most EPS_ROUNDS (TARGETED: only inside the first level's blocks that hold the missing share). Three cuts make the
+    most EPS_ROUNDS (TARGETED: only inside the first level's blocks that hold the missing share), never below the
+    cut's noise floor: the largest |share| a no-op patch reaches (every layer's units at every searched position set
+    to their values in the row's own run, measured as the blocks are; bfloat16 batches of different shapes differ by
+    float error), so no block is split on noise. When no prefix passes at the floor, the cut's size is the smallest
+    number of whole (layer, position) blocks, in measured order, that passes (its curve recorded). Three cuts make the
     circuit, each passing alone with everything else computing:
       readout: neurons at the answer position;
       movers: heads at the answer position (where each looks recorded);
@@ -67,6 +71,8 @@ EPS_ROUNDS = 3
 CONDITIONAL = True    # after a round with no passing prefix, group testing again at the same eps with every block measured
 # beside the singles found (what it adds to them); eps falls only when that finds none (the global eps/4 round took 33 min
 # on Qwen3-8B capital/Egypt/p1 and 40+ min on an owl pair's source cut)
+FLOOR = True          # eps never below the measured share of a no-op patch (Qwen3-8B bfloat16 capital/Finland/p0: the
+# source cut's eps / 4 round at 0.005 split 34,644 blocks to single units, a passing prefix of 21,598)
 TARGETED = False      # refine only the first level's blocks that hold the missing share (the smallest prefix of them, in
 # measured order, that patched whole beside the singles found passes), not every block at EPS / EPS_STEP. Off: on
 # Qwen3-1.7B capital/France p0 and p1 the source cut came out unmet (87 and 49 singles in 3 blocks refined twice), met
@@ -352,7 +358,8 @@ class Patcher:
     def run(self, base: str, sets: list, given: list | None = None) -> list[float]:
         """Per set of units ("res", layer, pos) | ("head", layer, k, pos) | ("neuron", layer, pos, k), k an index or a
         tuple of them (a block), each set to its value in the other run (or in the run a fifth element names: "clean"
-        or "corrupt", a head frozen at its value there; "zero": zeroed, a knockout), in the base run ("clean" or
+        or "corrupt", a head frozen at its value there; "self": the row's own base run, a no-op patch; "zero": zeroed, a
+        knockout), in the base run ("clean" or
         "corrupt"): the share of the gap lost (base clean) or restored (base corrupt). Every set is its own batch row,
         so a batch carries one knockout or patch mask per row. given: units patched beside every set (each set's share
         is that of given + set), folded into the two runs once (_derive) so a set runs only from its own first position
@@ -474,6 +481,7 @@ class Patcher:
                     k = u[2] if u[0] == "head" else u[3]
                     k = (k.numpy() if torch.is_tensor(k) else np.asarray(k)).reshape(-1)
                     p, src = (u[3] if u[0] == "head" else u[2]), (u[4] if len(u) > 4 else other)
+                src = base if src == "self" else src
                 v = by.setdefault((u[0], src), {}).setdefault(u[1], ([], [], []))
                 v[0].append(np.full(len(k), b))
                 v[1].append(np.full(len(k), p))
@@ -652,6 +660,17 @@ def grid(n: int) -> list[int]:
     return sorted(set(ks))
 
 
+def floor(pt: Patcher, kind: str, positions, measure=None) -> float:
+    """The noise floor of measure's shares (default Patcher.both): the largest |share| over no-op patches, every layer's
+    units of kind at each of positions set to their values in the row's own run, measured as group testing's first
+    level is (FLOOR; 0 off)."""
+    if not FLOOR:
+        return 0.0
+    width = pt.H if kind == "head" else pt.D
+    nulls = [[unit(kind, i, p, torch.arange(width)) + ("self",)] for i in range(pt.L) for p in positions]
+    return max(max(abs(a), abs(b)) for a, b in (measure or pt.both)(nulls))
+
+
 def cut(pt: Patcher, sc: dict, kind: str, positions, done: dict, log=None, search=None) -> dict:
     """The smallest set of one kind of unit at the given positions that passes (module docstring, steps 2-3); search:
     the positions group testing starts at (default positions; the ceiling patches every one of positions)."""
@@ -660,12 +679,13 @@ def cut(pt: Patcher, sc: dict, kind: str, positions, done: dict, log=None, searc
     ceiling = pt.both([every])[0]                   # every unit of the kind there: when it fails no subset is searched
     reach = ceiling[0] >= PASS and ceiling[1] >= PASS
     search = list(positions) if search is None else list(search)
-    eps, singles, ok, ks, curve, blocks, refined = EPS, {}, None, [], [], None, []
+    noise = floor(pt, kind, search) if reach else 0.0
+    eps, singles, ok, ks, curve, blocks, refined, floors = max(EPS, noise), {}, None, [], [], None, [], [noise]
     passes = lambda r: r[0] >= PASS and r[1] >= PASS  # noqa: E731
 
-    def smallest(n, sets_of):                       # the smallest k in 1..n whose set passes: a log grid, then bisection
-        g = grid(n)
-        got = pt.both([sets_of(k) for k in g])
+    def smallest(n, sets_of, alone=False):          # the smallest k in 1..n whose set passes: a log grid, then bisection
+        g = grid(n)                                 # (alone: each set its own call, sets of millions of units)
+        got = [pt.both([sets_of(k)])[0] for k in g] if alone else pt.both([sets_of(k) for k in g])
         met = [k for k, r in zip(g, got) if passes(r)]
         if not met:
             return None, g, got
@@ -685,7 +705,8 @@ def cut(pt: Patcher, sc: dict, kind: str, positions, done: dict, log=None, searc
                                                     # together with others: AND-like denoising, OR-like noising)
             def beside(sets, have=list(order), base=base):
                 return [(a - base[0], b - base[1]) for a, b in pt.both(sets, given=have)]
-            new = group_test(pt, sc, eps, {}, kinds=(kind,), positions=search, measure=beside, log=log)
+            floors.append(floor(pt, kind, search, beside))
+            new = group_test(pt, sc, max(eps, floors[-1]), {}, kinds=(kind,), positions=search, measure=beside, log=log)
             new = sorted([u for u in new if u not in singles], key=lambda u: -max(abs(new[u][0]), abs(new[u][1])))
             for u in new:
                 singles[u] = None                   # (its share alone: measured below)
@@ -693,16 +714,18 @@ def cut(pt: Patcher, sc: dict, kind: str, positions, done: dict, log=None, searc
             order = order + new
         ok, ks, curve = smallest(len(order), lambda k: order[:k])
         if log:
-            log(f"  {kind}s at {positions[0]}..{positions[-1]} (searched {len(search)}), eps {eps:.4f}: {len(order)} single "
-                f"units, passing prefix {ok}, every one there {ceiling[0]:.2f}/{ceiling[1]:.2f}")
+            log(f"  {kind}s at {positions[0]}..{positions[-1]} (searched {len(search)}), eps {eps:.4f} (floor {floors[-1]:.4f}): "
+                f"{len(order)} single units, passing prefix {ok}, every one there {ceiling[0]:.2f}/{ceiling[1]:.2f}")
         if ok or not reach or rnd == EPS_ROUNDS - 1:
             break
         if CONDITIONAL and (rnd == 0 or cond_next):  # next: conditional group testing at the same eps
             cond_next = rnd == 0 or bool(cond)
             if cond_next:
                 continue
+        if eps <= noise:                            # at the noise floor: no lower round
+            break
         if not TARGETED:                            # EPS falls and group testing runs again over every block
-            eps /= EPS_STEP
+            eps = max(eps / EPS_STEP, noise)
             continue
         # targeted refinement: the first level's blocks in measured order (the larger |share|), the smallest prefix of
         # them that, patched whole beside every single found, passes; group testing at eps / EPS_STEP inside those only
@@ -711,7 +734,7 @@ def cut(pt: Patcher, sc: dict, kind: str, positions, done: dict, log=None, searc
         j, _, _ = smallest(len(first), lambda j: order + [unit(kind, bl[1], bl[2], torch.arange(width)) for bl in first[:j]])
         if j is None:                               # every block whole beside the singles fails: nothing to refine
             break
-        blocks, eps = first[:j], eps / EPS_STEP
+        blocks, eps = first[:j], max(eps / EPS_STEP, noise)
         refined.append(j)
     alone = [u for u in singles if singles[u] is None]      # conditional singles' shares alone, for the record
     for u, r in zip(alone, pt.both([[u] for u in alone])):
@@ -725,9 +748,16 @@ def cut(pt: Patcher, sc: dict, kind: str, positions, done: dict, log=None, searc
             if lost >= PASS and rest >= PASS:
                 circ = trial
     lost, rest = pt.both([circ])[0] if circ else (0.0, 0.0)
+    spread = None
+    if reach and not ok:                            # no sparse cut above the floor: whole (layer, position) blocks in
+        first = sorted([(kind, i, p, 0, width) for i in range(pt.L) for p in positions],     # measured order
+                       key=lambda bl: -max(abs(done[bl][0]), abs(done[bl][1])) if bl in done else 0.0)
+        j, g, got = smallest(len(first), lambda j: [unit(kind, bl[1], bl[2], torch.arange(width)) for bl in first[:j]], alone=True)
+        spread = {"blocks": j, "units": None if j is None else j * width, "order": [[bl[1], bl[2]] for bl in first],
+                  "curve": [{"k": k, "lost": a, "restored": b} for k, (a, b) in zip(g, got)]}
     return {"units": circ, "singles": singles, "met": bool(ok) and lost >= PASS and rest >= PASS, "lost": lost, "restored": rest,
-            "eps": eps, "found": len(singles), "ceiling": list(ceiling), "reachable": reach, "refined": refined,
-            "conditional": len(cond),
+            "eps": eps, "floor": floors, "found": len(singles), "ceiling": list(ceiling), "reachable": reach, "refined": refined,
+            "conditional": len(cond), "spread": spread,
             "searched": search,
             "curve": [{"k": k, "lost": a, "restored": b} for k, (a, b) in zip(ks, curve)]}
 
@@ -804,8 +834,8 @@ def find(pt: Patcher, clean: list[int], corrupt: list[int], answers: list[int] |
     rec["singles"] = {k: [single(u, c["singles"][u]) for u in sorted(c["singles"], key=lambda u: -max(map(abs, c["singles"][u])))
                           [:SINGLES_KEPT]] for k, c in cuts.items()}
     rec.update(nodes=nodes, routes=routes, met=all(c["met"] for k, c in cuts.items() if k != "readout" or c["reachable"]),
-               cuts={k: {f: c[f] for f in ("met", "lost", "restored", "eps", "found", "ceiling", "reachable", "curve", "refined", "conditional",
-                                           "searched")}
+               cuts={k: {f: c[f] for f in ("met", "lost", "restored", "eps", "floor", "found", "ceiling", "reachable", "curve", "refined",
+                                           "conditional", "spread", "searched")}
                      | {"size": len(c["units"])} for k, c in cuts.items()},
                size=len(nodes), seconds=round(time.perf_counter() - t0, 2))
     if log:

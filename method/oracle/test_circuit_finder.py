@@ -1,6 +1,7 @@
 """Checks of the patching-pair circuit finder (circuit_finder.py) on a tiny random Qwen3: patching the whole residual
 input of the first layer gives the other run exactly, a block patch equals its units patched one by one, a unit frozen
-at its value in the base run changes nothing, and find()'s record is consistent with its own measurements.
+at its value in the base run changes nothing, find()'s record is consistent with its own measurements, and a cut's
+eps stays at or above its measured noise floor.
 
   ~/mpd-data/venv/bin/python -m pytest method/oracle/test_circuit_finder.py -q
 """
@@ -89,6 +90,35 @@ def test_find_record(tiny, monkeypatch):
         assert all(rec["first_diff"] <= p < pt.T - 1 for p in rec["source_positions"])
     for c in rec["cuts"].values():
         assert c["reachable"] == (c["ceiling"][0] >= cf.PASS and c["ceiling"][1] >= cf.PASS)
+
+
+def test_noise_floor(tiny, monkeypatch):
+    """A no-op patch ("self") changes neither run, so a float32 floor is float error; a cut never runs eps below its
+    floor, and with no passing prefix there its size is the whole blocks' curve."""
+    pt, clean, corrupt = tiny
+    pt.setup(clean, corrupt)
+    a, b = pt.both([[("neuron", 1, 6, (3, 5, 9), "self"), ("head", 0, (1, 2), 7, "self")]])[0]
+    assert abs(a) < 1e-6 and abs(b) < 1e-6
+    assert cf.floor(pt, "neuron", range(pt.first, pt.T - 1)) < 1e-5
+    sc = pt.scores()
+    monkeypatch.setattr(cf, "floor", lambda *a, **k: 10.0)     # every share below the floor: no single unit, no lower round
+    reached = 0
+    for kind, positions in (("neuron", list(range(pt.first, pt.T))), ("head", [pt.T - 1]), ("neuron", list(range(pt.first, pt.T - 1)))):
+        c = cf.cut(pt, sc, kind, positions, {})
+        if not c["reachable"]:
+            assert c["spread"] is None and c["floor"] == [0.0]
+            continue
+        reached += 1
+        assert c["eps"] == 10.0 and c["found"] == 0 and not c["met"] and c["floor"][0] == 10.0
+        width = pt.H if kind == "head" else pt.D
+        sp = c["spread"]
+        assert sp["blocks"] is not None and sp["units"] == sp["blocks"] * width
+        blocks = [cf.unit(kind, i, p, torch.arange(width)) for i, p in sp["order"][:sp["blocks"]]]
+        lost, rest = pt.both([blocks])[0]
+        assert lost >= cf.PASS and rest >= cf.PASS
+        at = [x for x in sp["curve"] if x["k"] == sp["blocks"]]
+        assert not at or abs(at[0]["lost"] - lost) < 1e-5
+    assert reached
 
 
 def test_prefix_cache_equals_full_runs(tiny, monkeypatch):

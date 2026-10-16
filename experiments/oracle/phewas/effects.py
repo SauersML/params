@@ -215,6 +215,52 @@ def nearness(a) -> None:
         print(f"  {b['bin']:>6} traits moved: {b['n']:3d} poles, mean {b['mean']}")
 
 
+def epistasis(a) -> None:
+    """Pairwise interactions of knocked-out poles (a design of singles "E1/...", pairs "E2/a&b" and larger sets, run on
+    the same panel): per trait and pair, I = change(a and b) - change(a) - change(b); a larger set's change against the
+    sum of its singles'. Reported per focus trait: the pairs' interactions against their additive prediction (slope
+    and correlation of the joint change on the sum), the largest interactions, and each larger set."""
+    res = load(a.changes)
+    single = {tuple(r["units"][0]): r["change"] for i, r in res.items() if i.startswith("E1/")}
+    names = sorted(next(iter(single.values())))
+    nm = lambda u: f"L{u[0]}.N{u[1]}{'+' if u[2] > 0 else '-'}"  # noqa: E731
+    out = {"traits": {}, "sets": []}
+    for t in a.focus or names:
+        add, joint, rows = [], [], []
+        for i, r in res.items():
+            if not i.startswith("E2/"):
+                continue
+            u, v = (tuple(x) for x in r["units"])
+            if u in single and v in single:
+                s_ = single[u][t] + single[v][t]
+                add.append(s_)
+                joint.append(r["change"][t])
+                rows.append({"pair": f"{nm(u)} & {nm(v)}", "a": single[u][t], "b": single[v][t], "joint": r["change"][t],
+                             "interaction": r["change"][t] - s_})
+        add_, joint_ = np.array(add), np.array(joint)
+        slope = float(np.polyfit(add_, joint_, 1)[0]) if len(add_) > 2 else None
+        corr = float(np.corrcoef(add_, joint_)[0, 1]) if len(add_) > 2 else None
+        rows.sort(key=lambda r_: -abs(r_["interaction"]))
+        out["traits"][t] = {"pairs": len(rows), "slope_joint_on_sum": slope, "corr_joint_sum": corr,
+                            "mean_abs_interaction": float(np.mean([abs(r_["interaction"]) for r_ in rows])) if rows else None,
+                            "mean_abs_sum": float(np.mean(np.abs(add_))) if len(add_) else None, "largest": rows[:8]}
+    for i, r in res.items():
+        if i.startswith(("E1/", "E2/")):
+            continue
+        us = [tuple(x) for x in r["units"]]
+        if all(u in single for u in us):
+            out["sets"].append({"id": i, "poles": len(us), "change": {t: r["change"][t] for t in (a.focus or names)},
+                                "sum_of_singles": {t: float(sum(single[u][t] for u in us)) for t in (a.focus or names)}})
+    a.out.write_text(json.dumps(out, indent=1))
+    for t, v in out["traits"].items():
+        print(f"{t}: {v['pairs']} pairs, joint = {v['slope_joint_on_sum']:.2f} x sum (r {v['corr_joint_sum']:.2f}); mean |interaction| "
+              f"{v['mean_abs_interaction']:.2f} against mean |sum| {v['mean_abs_sum']:.2f}; largest: "
+              + "; ".join(f"{r_['pair']} {r_['joint']:+.2f} vs {r_['a'] + r_['b']:+.2f}" for r_ in v["largest"][:3]))
+    for st in out["sets"]:
+        print(f"{st['id']} ({st['poles']} poles): " + "; ".join(f"{t} {st['change'][t]:+.2f} vs sum {st['sum_of_singles'][t]:+.2f}"
+                                                                for t in list(st["change"])[:4]))
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -235,12 +281,16 @@ def main():
     r = sub.add_parser("correlation")
     r.add_argument("changes", type=Path, nargs="+")
     r.add_argument("out", type=Path)
+    ep = sub.add_parser("epistasis")
+    ep.add_argument("changes", type=Path, nargs="+")
+    ep.add_argument("out", type=Path)
+    ep.add_argument("--focus", nargs="*")
     nn = sub.add_parser("nearness")
     nn.add_argument("changes", type=Path, nargs="+")
     nn.add_argument("out", type=Path)
     nn.add_argument("--reps", type=int, default=200)
     a = ap.parse_args()
-    {"concentration": concentration, "singles": singles, "finemap": finemap, "correlation": correlation, "nearness": nearness}[a.cmd](a)
+    {"concentration": concentration, "singles": singles, "finemap": finemap, "correlation": correlation, "nearness": nearness, "epistasis": epistasis}[a.cmd](a)
 
 
 if __name__ == "__main__":

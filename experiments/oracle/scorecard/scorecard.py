@@ -167,10 +167,10 @@ def freeze(a) -> None:
     print(man.read_text())
 
 
-def oracle_meta(name: str, label: str, kind: str, reads: str) -> Path:
+def oracle_meta(name: str, label: str, kind: str, reads: str, figure: bool = True) -> Path:
     d = ANS / name
     d.mkdir(parents=True, exist_ok=True)
-    (d / "oracle.json").write_text(json.dumps({"label": label, "kind": kind, "reads": reads}, indent=1))
+    (d / "oracle.json").write_text(json.dumps({"label": label, "kind": kind, "reads": reads, "figure": figure}, indent=1))
     return d
 
 
@@ -204,7 +204,8 @@ def ingest_rc(tag: str, src: Path, labels: dict) -> None:
             continue
         assert all(g["q"] == t["q"] for g, t in zip(got, test))
         lab, reads = labels.get(oracle, (oracle, "?"))
-        d = oracle_meta(f"{tag}.{oracle}.{how}", f"{lab}, {how} input", "baseline" if oracle == "T0" else "reader", reads)
+        d = oracle_meta(f"{tag}.{oracle}.{how}", f"{lab}, {how} input", "baseline" if oracle == "T0" else "reader", reads,
+                        figure=oracle == "T-correct" and how != "mismatch")
         wjl(d / "o1.jsonl", [{"item": o1_id(t), "answer": g["got"], "claim_pass": g.get("claim_pass"),
                               "claim_specific": g.get("claim_specific")} for g, t in zip(got, test)])
         print("ingested", d.name, len(got))
@@ -442,6 +443,94 @@ def score(a) -> None:
               f"({r['units']} {'contexts' if r['target'] == 'O1' else 'organisms' if r['target'] in ('O2', 'O3') else 'units'})"
               + (f" exact: {r['exact']}" if r.get("exact") else ""))
     print(f"-> {ROOT / 'table.tsv'}")
+    figure(rows, meta)
+
+
+SHORT = {"best-constant": "best constant answer", "name-prior": "name-prior (each group's usual outcome)",
+         "rc1.T0.correct": "released AO 8B", "ao8b": "released AO 8B",
+         "rc1.T-correct.none": "trained reader, no circuit", "rc1.T-correct.names": "trained reader, group names only",
+         "rc1.T-correct.correct": "trained reader, circuit", "prompt397": "Qwen3.5-397B prompted (circuit as text)"}
+
+
+SHORT_O2 = {"prompt397": "Qwen3.5-397B prompted (the organism's answers)"}
+
+
+def figure(rows: list[dict], meta: dict) -> None:
+    """O1 (every question and the names-differ subset), O2 (organisms named exactly), O5, with 95% intervals; O3 and O4
+    once measured. Baselines light blue, untrained strong readers amber, trained oracles dark blue."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    plt.rcParams.update({"font.family": "Helvetica Neue", "font.size": 22, "axes.labelsize": 22, "xtick.labelsize": 20,
+                         "ytick.labelsize": 20, "figure.facecolor": "white", "axes.facecolor": "white", "savefig.facecolor": "white"})
+    color = lambda n: "#9DB9DD" if meta.get(n, {}).get("kind") == "baseline" and n != "prompt397" else (  # noqa: E731
+        "#E09F3E" if n == "prompt397" or "untrained" in n else "#2F6DB5")
+    show = lambda n: meta.get(n, {}).get("figure", True)  # noqa: E731
+    lab = lambda n: SHORT.get(n, meta.get(n, {}).get("label", n))  # noqa: E731
+    get = lambda n, t, m: next((r for r in rows if r["oracle"] == n and r["target"] == t and r["metric"] == m), None)  # noqa: E731
+    o1 = [n for n in dict.fromkeys(r["oracle"] for r in rows if r["target"] == "O1" and r["metric"] == "all") if show(n)]
+    o1.sort(key=lambda n: get(n, "O1", "all")["value"])
+    o2 = [n for n in dict.fromkeys(r["oracle"] for r in rows if r["target"] == "O2") if show(n)]
+    o5 = [(n, m) for n, m in dict.fromkeys((r["oracle"], r["metric"]) for r in rows if r["target"] == "O5") if show(n)]
+    hs = [max(len(o1), 1) * 0.9 + 1.5, len(o2) * 2 * 0.7 + 1.5, (len(o5) + 2) * 0.8 + 1.2]
+    fig, axs = plt.subplots(3, 1, figsize=(18, sum(hs)), gridspec_kw={"height_ratios": hs})
+    for ax in axs:
+        for sp in ("top", "right"):
+            ax.spines[sp].set_visible(False)
+    ax = axs[0]
+    for k, n in enumerate(o1):
+        for m, dy, fill in (("all", 0.15, True), ("names differ", -0.15, False)):
+            r = get(n, "O1", m)
+            if r:
+                ax.plot([r["lo"], r["hi"]], [k + dy] * 2, color=color(n), lw=3, solid_capstyle="round")
+                ax.plot(r["value"], k + dy, "o", ms=14, color=color(n), mfc=color(n) if fill else "white", mew=3)
+        r = get(n, "O1", "all")
+        ax.text(max(r["hi"], (get(n, "O1", "names differ") or r)["hi"]) + 0.015, k + 0.15, f"{r['value']:.2f}", va="center", fontsize=20)
+    np_ = get("name-prior", "O1", "all")
+    if np_:
+        ax.axvline(np_["value"], color="#9DB9DD", lw=2, ls="--", zorder=0)
+    ax.set_yticks(range(len(o1)), [lab(n) for n in o1])
+    ax.set_xlim(0, 1.0)
+    ax.set_xlabel("share of circuit questions answered right on 40 unseen texts")
+    ax.plot([], [], "o", ms=14, color="#555555", label="all 292 questions")
+    ax.plot([], [], "o", ms=14, color="#555555", mfc="white", mew=3, label="the 210 where names do not decide")
+    ax.legend(loc="lower left", bbox_to_anchor=(0.0, 1.0), ncol=2, frameon=False, fontsize=19)
+    ax = axs[1]
+    ys, labels = [], []
+    for k, n in enumerate(o2):
+        for j, b in enumerate(BUDGETS):
+            y = k * 2 + j
+            tot = sum(get(n, "O2", f"{s} exact @{b}")["value"] * get(n, "O2", f"{s} exact @{b}")["n"]
+                      for s in ("E1", "e1b") if get(n, "O2", f"{s} exact @{b}"))
+            nn = sum(get(n, "O2", f"{s} exact @{b}")["n"] for s in ("E1", "e1b") if get(n, "O2", f"{s} exact @{b}"))
+            ax.barh(y, tot, color=color(n), height=0.7)
+            ax.text(max(tot, 0) + 0.08, y, f"{round(tot)} of {nn}", va="center", fontsize=20)
+            ys.append(y)
+            labels.append(f"{SHORT_O2.get(n, lab(n))}, {b} target passes")
+    ax.set_yticks(ys, labels)
+    ax.set_xlim(0, 7)
+    ax.set_xlabel("hidden-behaviour organisms whose behaviour, trigger and entity are named exactly")
+    ax = axs[2]
+    names = {"li": "Li et al. patching test", "taboo": "AO taboo secret words"}
+    ref = {"li": [("Li et al. trained self-explainer", PUBLISHED["li_self_explainer"]), ("untrained, as published", PUBLISHED["li_untrained"])],
+           "taboo": [("AO paper", PUBLISHED["ao_taboo_paper"])]}
+    for k, (n, m) in enumerate(o5):
+        r = get(n, "O5", m)
+        ax.plot([r["lo"], r["hi"]], [k] * 2, color=color(n), lw=3)
+        ax.plot(r["value"], k, "o", ms=14, color=color(n))
+        ax.text(r["value"], k - 0.38, f"{r['value']:.3f}", ha="center", fontsize=20)
+        for j, (t, v) in enumerate(ref[m]):
+            ax.plot(v, k, "|", ms=30, mew=3, color="#222222")
+            ax.text(v, k + 0.32 + 0.0 * j, t, ha="center", fontsize=17)
+    ax.set_yticks(range(len(o5)), [f"{lab(n)}: {names[m]}" for n, m in o5])
+    ax.set_ylim(-0.75, len(o5) - 0.2)
+    ax.set_xlim(0, 1.0)
+    ax.set_xlabel("exact match (black ticks: published numbers)")
+    fig.suptitle("Oracle scorecard on Qwen3-8B", x=0.02, ha="left", fontsize=30, fontweight="bold")
+    fig.tight_layout()
+    FIG.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(FIG, dpi=110, bbox_inches="tight", pad_inches=0.3)
+    print(f"figure -> {FIG}")
 
 
 def main():

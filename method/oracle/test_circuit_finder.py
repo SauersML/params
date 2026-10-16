@@ -97,3 +97,22 @@ def test_prefix_cache_equals_full_runs(tiny, monkeypatch):
         got[on] = pt.both(sets) + pt.both(sets[:2])           # (a second call reuses the cache)
     for a, b in zip(got[True], got[False]):
         assert abs(a[0] - b[0]) < 1e-5 and abs(a[1] - b[1]) < 1e-5
+
+
+def test_zero_is_a_knockout(tiny):
+    pt, clean, corrupt = tiny
+    pt.setup(clean, corrupt)
+    i, p = 1, pt.T - 1
+    ks = list(range(pt.D))
+    got = pt.run("clean", [[("neuron", i, p, ks, "zero")]])[0]
+    with torch.no_grad():
+        def z(mod, args):
+            h = args[0].clone()
+            h[:, p] = 0
+            return (h,) + tuple(args[1:])
+        hk = pt.layers[i].mlp.down_proj.register_forward_pre_hook(z)
+        try:
+            c = float(pt._contrast(pt._last(clean, pt.rows))[0])
+        finally:
+            hk.remove()
+    assert abs(got - (pt.c["clean"] - c) / pt.gap) < 1e-5

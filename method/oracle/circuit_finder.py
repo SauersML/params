@@ -193,8 +193,9 @@ class Patcher:
     def run(self, base: str, sets: list) -> list[float]:
         """Per set of units ("res", layer, pos) | ("head", layer, k, pos) | ("neuron", layer, pos, k), k an index or a
         tuple of them (a block), each set to its value in the other run (or in the run a fifth element names: "clean"
-        or "corrupt", a head frozen at its value there), in the base run ("clean" or "corrupt"): the share of the gap
-        lost (base clean) or restored (base corrupt)."""
+        or "corrupt", a head frozen at its value there; "zero": zeroed, a knockout), in the base run ("clean" or
+        "corrupt"): the share of the gap lost (base clean) or restored (base corrupt). Every set is its own batch row,
+        so a batch carries one knockout or patch mask per row."""
         return [v[0] for v in self._measure(sets, (base,))]
 
     def both(self, sets: list) -> list[tuple]:
@@ -251,29 +252,30 @@ class Patcher:
                          for i, v in d.items()} for key, d in by.items()}
 
             def res(i, h):                                   # (h: the positions from start on)
-                for src in ("clean", "corrupt"):
+                for src in ("clean", "corrupt", "zero"):
                     if i in idx.get(("res", src), {}):
                         b, p, _ = (t.to(h.device) for t in idx[("res", src)][i])
                         h = h.clone()
-                        h[b, p - start] = self.act[src]["res"][i][p].to(h.device, h.dtype)
+                        h[b, p - start] = 0 if src == "zero" else self.act[src]["res"][i][p].to(h.device, h.dtype)
                 return h
 
             def head(i, h):
-                for src in ("clean", "corrupt"):
+                for src in ("clean", "corrupt", "zero"):
                     if i in idx.get(("head", src), {}):
                         b, p, k = (t.to(h.device) for t in idx[("head", src)][i])
                         B, T, _ = h.shape
                         h4 = h.reshape(B, T, self.H, self.hd).clone()
-                        h4[b, p - start, k] = self.act[src]["head"][i].reshape(self.T, self.H, self.hd)[p, k].to(h.device, h.dtype)
+                        h4[b, p - start, k] = 0 if src == "zero" else \
+                            self.act[src]["head"][i].reshape(self.T, self.H, self.hd)[p, k].to(h.device, h.dtype)
                         h = h4.reshape(B, T, self.H * self.hd)
                 return h
 
             def neu(i, h):
-                for src in ("clean", "corrupt"):
+                for src in ("clean", "corrupt", "zero"):
                     if i in idx.get(("neuron", src), {}):
                         b, p, n = (t.to(h.device) for t in idx[("neuron", src)][i])
                         h = h.clone()
-                        h[b, p - start, n] = self.act[src]["neu"][i][p, n].to(h.device, h.dtype)
+                        h[b, p - start, n] = 0 if src == "zero" else self.act[src]["neu"][i][p, n].to(h.device, h.dtype)
                 return h
             c = self._contrast(self._last(x, R, cache=cache, res=res, head=head, neu=neu))
             got = []

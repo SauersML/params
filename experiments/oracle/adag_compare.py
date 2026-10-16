@@ -14,7 +14,8 @@ Search (every decision a measured run; the gradient only orders): every neuron's
 respect to a scale on it at every position (one backward pass; the score: log p(X) - log p(answer), -log p(answer), or
 the best other token's log p - log p(answer)), the CAND most promising zeroed one at a time and ranked by their measured
 change in the score, then the smallest prefix of that order that succeeds (a grid, then bisection) and a trim (each unit
-removed while the set still succeeds, least effective first). Side effect: the mean KL (bits) of the next-token
+removed while the set still succeeds, least effective first; every size of a grid round and every removal of a trim
+round in one batch). Side effect: the mean KL (bits) of the next-token
 distributions over every position of UNRELATED texts, the set zeroed against not.
 Their numbers are the paper's, beside ours; ADAG's target (the sum of the top-5 logits) is not used: ours is log
 probability.
@@ -187,12 +188,13 @@ def search(run: Runner, tok, ids: list[int], kind: str, A: int, X: int | None, l
     order = [cand[i] for i in sorted(range(len(cand)), key=lambda i: -gain[i])]
     tried = {}
 
-    def test(k):
-        if k not in tried:
-            l = run.last(ids, [order[:k]])[0]
+    def test_many(ks):  # every size in one batched run (the sizes are independent sets)
+        ks = [k for k in ks if k not in tried]
+        for k, l in zip(ks, run.last(ids, [order[:k] for k in ks]) if ks else []):
             tried[k] = (ok(l), l)
-        return tried[k][0]
-    hit = next((k for k in GRID if k <= len(order) and test(k)), None)
+    sizes = [k for k in GRID if k <= len(order)]
+    test_many(sizes)
+    hit = next((k for k in sizes if tried[k][0]), None)
     rec = {"goal": kind, "target": None if X is None else tok.decode([X]), "p_target_goal": p_target, "answer": tok.decode([A]), "p_answer": p0,
            "candidates": len(cand), "single_best": max(gain) if gain else None}
     if hit is None:
@@ -203,17 +205,26 @@ def search(run: Runner, tok, ids: list[int], kind: str, A: int, X: int | None, l
         log(f"{kind} {rec['target']}: no set of up to {len(order)} neurons succeeds; best at {best}: top {rec['top_after']!r}")
         return rec
     lo = max([k for k in GRID if k < hit] + [0])
-    while hit - lo > 1:  # bisect the grid's gap
-        mid = (lo + hit) // 2
-        if test(mid):
-            hit = mid
-        else:
-            lo = mid
+    while hit - lo > 1:  # the grid's gap searched ROWS - 1 sizes a batch (the smallest passing size, as bisection's)
+        step = max(1, (hit - lo) // ROWS)
+        pts = list(range(lo + step, hit, step))[:ROWS - 1] or [lo + 1]
+        test_many(pts)
+        passing = [k for k in pts if tried[k][0]]
+        if passing:
+            hit = min(passing)
+        lo = max([k for k in pts if k < hit and not tried[k][0]] + [lo])
     S = list(order[:hit])
-    for u in reversed(order[:hit]):  # trim: least effective first
-        T = [v for v in S if v != u]
-        if T and ok(run.last(ids, [T])[0]):
-            S = T
+    rest = list(reversed(order[:hit]))  # trim, least effective first: each round tests every remaining removal from the
+    while rest:  # current set in one batch; the first that still succeeds is taken (as one removal at a time would)
+        trials = [u for u in rest if len(S) > 1]
+        if not trials:
+            break
+        res = run.last(ids, [[v for v in S if v != u] for u in trials])
+        first = next((i for i, l in enumerate(res) if ok(l)), None)
+        if first is None:
+            break
+        S = [v for v in S if v != trials[first]]
+        rest = trials[first + 1:]
     la = run.last(ids, [S])[0]
     rec.update(found=True, prefix=hit, neurons=len(S), units=[list(u) for u in S], top_after=tok.decode([int(la.argmax())]),
                p_answer_after=float(la[A].exp()), p_target_after=None if X is None else float(la[X].exp()),
@@ -321,6 +332,7 @@ def alias(official: str, copy: str, fetch: list[str]) -> None:
 
 
 def main():
+    global ROWS
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("cmd", choices=("run", "transfer", "alias", "finder"))
     ap.add_argument("out", type=Path, help="run, transfer: the records; alias: the gated model's id")
@@ -328,8 +340,10 @@ def main():
     ap.add_argument("--cases", default="capitals_llama,math_llama")
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--n", type=int, default=8, help="finder: ADAG's first n capitals prompts")
+    ap.add_argument("--rows", type=int, default=ROWS, help="runs a forward pass (Qwen3-32B over two GPUs: 64 keeps them busy)")
     ap.add_argument("--dtype", default="bfloat16", choices=("float32", "bfloat16"))
     a = ap.parse_args()
+    ROWS = a.rows
     if a.cmd == "alias":
         alias(str(a.out), a.more[0], a.more[1:])
         return

@@ -1,9 +1,9 @@
 """Question-scoped circuits by the patching pair (the lead's 10-15 CIRCUIT FINDER spec, ~/mpd-data/team/direction_1015.txt).
 
 A question is two prompts of the same length run through the same model: clean (the model gives the answer y, its top
-token) and corrupted (a key word swapped; the model gives another answer). The contrast is log2 p(y) - log2 of the summed
-p of the alternatives (the clean run's ALTERNATIVES likeliest others and the corrupted run's top token); gap = c_clean -
-c_corrupt.
+token) and corrupted (a key word swapped; the model gives another answer b). The contrast is log2 p(y) - log2 of the
+summed p of the ALTERNATIVES alternatives (b first, then the clean run's likeliest tokens other than y and b), at the
+last position; gap = c_clean - c_corrupt, at least MIN_GAP bits (neuron_scorecard's pair_alts and contrast).
 Units: a neuron at a position (layer, pos, index; the down projection's input act(gate) x up), recorded with its pole
 (the sign of its clean value) and SwiGLU regime (the signs of act(gate) and of up), and a head at a position (that
 head's slice of the output projection's input), each patched by setting it to its value in the other run. Positions
@@ -46,6 +46,7 @@ import time
 import torch
 
 ALTERNATIVES = 5
+MIN_GAP = 1.0         # bits: a pair counts when the answers differ and c_clean - c_corrupt reaches this
 PASS = 0.7            # the spec's share for necessity (lost) and sufficiency (restored)
 EPS = 0.02            # a block is split when its larger |share| reaches this share of the gap
 EPS_STEP = 4.0
@@ -136,10 +137,10 @@ class Patcher:
             lp[k] = self._last(ids, self.rows, cap=cap)[0]
             self.act[k] = {n: [t[0] for t in v] for n, v in cap.items()}           # per layer [T, dim]
         self.y = int(lp["clean"].argmax()) if not answers else max(answers, key=lambda z: float(lp["clean"][z]))
-        alt = [int(z) for z in lp["clean"].topk(ALTERNATIVES + 1).indices.tolist() if z != self.y][:ALTERNATIVES]
         yc = int(lp["corrupt"].argmax())
-        if yc != self.y and yc not in alt:
-            alt.append(yc)
+        alt = ([yc] if yc != self.y else []) + [int(z) for z in lp["clean"].topk(ALTERNATIVES + 2).indices.tolist()
+                                                if z not in (self.y, yc)]
+        alt = alt[:ALTERNATIVES]                    # (neuron_scorecard.pair_alts: the judge's contrast, number for number)
         self.alt = torch.tensor(alt, device=lp["clean"].device)
         self.c = {k: float(self._contrast(v[None])[0]) for k, v in lp.items()}
         self.gap = self.c["clean"] - self.c["corrupt"]
@@ -306,8 +307,9 @@ def find(pt: Patcher, clean: list[int], corrupt: list[int], answers: list[int] |
     t0 = time.perf_counter()
     rec = pt.setup(clean, corrupt, answers)
     rec["tokens"] = pt.T
-    if rec["gap"] <= 0 or rec["answer"] == rec["corrupt_answer"]:
-        rec.update(met=False, skipped="the corrupted run gives the same answer", seconds=round(time.perf_counter() - t0, 2))
+    if rec["gap"] < MIN_GAP or rec["answer"] == rec["corrupt_answer"]:
+        rec.update(met=False, skipped="the corrupted run gives the same answer or the gap is under MIN_GAP bits",
+                   seconds=round(time.perf_counter() - t0, 2))
         return rec
     pos = list(range(pt.first, pt.T))
     rmap = pt.run("corrupt", [[("res", i, p)] for i in range(pt.L) for p in pos])
@@ -446,6 +448,7 @@ def main():
     ap.add_argument("--dtype", default="float32", choices=("float32", "bfloat16"))
     ap.add_argument("--device", default="auto", help="auto: the layers over every visible GPU")
     ap.add_argument("--word", default=None, help="taboo: the organism's secret word")
+    ap.add_argument("--rev", default=None, help="the finder's commit, written into every record")
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--offset", type=int, default=0)
     ap.add_argument("--stride", type=int, default=1)
@@ -490,7 +493,7 @@ def main():
         rec = find(pt, clean, corrupt, extra.pop("answers"), log=log)
         rec.update(id=qid, ids=clean, corrupted=corrupt, answer_text=tok.decode([rec["answer"]]),
                    corrupt_answer_text=tok.decode([rec["corrupt_answer"]]), model=a.model, adapter=a.adapter, dtype=a.dtype,
-                   finder="circuit_finder", **extra)
+                   finder="circuit_finder", finder_rev=a.rev, **extra)
         path.write_text(json.dumps(rec))
 
 

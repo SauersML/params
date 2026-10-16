@@ -198,6 +198,21 @@ def units(tx: Text, circ: dict, src) -> dict:
     return s
 
 
+def attach_atlas(path: Path, root: Path, k: int = 8):
+    """Each circuit neuron's atlas record in circuit.json: per pole its largest activations' tokens (with a few tokens
+    before) and values, its firing rates, and the tokens it pushes up and down most (direct logit effect)."""
+    import atlas
+    at = atlas.Atlas(root)
+    c = json.loads(path.read_text())
+    for n in c["neurons"]:
+        r = at.neuron(n["layer"], n["neuron"], k=k)
+        n["atlas"] = {p: [{"token": e["token"], "before": e["before"][-40:], "value": round(e["value"], 2), "regime": e["regime"]}
+                          for e in r[p]] for p in ("+", "-")}
+        n["atlas"].update(max=r["max"], rates=r["rates"], logits=r.get("logits"))
+    path.write_text(json.dumps(c))
+    print(f"atlas examples for {len(c['neurons'])} neurons -> {path}")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("out", type=Path)
@@ -206,7 +221,11 @@ def main():
     ap.add_argument("--device", default=None)
     ap.add_argument("--n", type=int, default=60)
     ap.add_argument("--dev", type=int, default=20)
+    ap.add_argument("--atlas", type=Path, default=None, help="only add each circuit neuron's atlas examples to "
+                    "OUT/circuit.json (the neuron atlas's root for the model, experiments/oracle/atlas.py)")
     a = ap.parse_args()
+    if a.atlas:
+        return attach_atlas(a.out / "circuit.json", a.atlas)
     import transformers
     t0 = time.time()
     a.out.mkdir(parents=True, exist_ok=True)

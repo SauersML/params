@@ -727,29 +727,41 @@ def prune(ed: Edges, log=print) -> dict:
     readers = readers[:k][::-1]  # (weakest first)
     queue = [list(b) for b in torch.tensor(readers, dtype=torch.long).tensor_split(min(HALVE_BLOCKS, len(readers)))
              if len(b)] if len(readers) > 1 else []
-    while queue:  # halving over readers' in-edge groups, a forward's blocks a round: each block's groups cut alone, the
-        blocks, queue = queue[:ed.B], queue[ed.B:]  # passing ones together
+    pending = None  # (the last round's passing blocks, gone with all of them cut): checked in the next round's forward
+    while queue or pending:  # halving over readers' in-edge groups, a forward's blocks a round: each block's groups cut
+        blocks, queue = queue[:ed.B], queue[ed.B:]  # alone, the passing ones together (that check rides in the next
+        on = pending[1] if pending else gone  # round's forward, the round's blocks tried as if it passes)
         trial = []
         for b in blocks:
-            t = gone.clone()
+            t = on.clone()
             t[cut_of(b)] = True
             trial.append(t)
+        if pending:
+            trial.append(pending[1])
         cs = ed.contrasts(torch.stack(trial), listed, rest=True)
-        measured += len(blocks)
-        passed = [b for b, c in zip(blocks, cs) if ok(c)]
-        if passed:
-            t = gone.clone()
-            t[cut_of([i for b in passed for i in b])] = True
-            measured += 1
-            if ok(ed.contrasts(t[None], listed, rest=True)[0]):
-                gone = t
-            else:  # together they fail: one at a time
-                for b in passed:
+        measured += len(trial)
+        if pending:
+            passed_before, together = pending
+            pending = None
+            if ok(cs[-1]):
+                gone = together
+            else:  # together they fail: one at a time, and this round's blocks again from what stands
+                for b in passed_before:
                     t = gone.clone()
                     t[cut_of(b)] = True
                     measured += 1
                     if ok(ed.contrasts(t[None], listed, rest=True)[0]):
                         gone = t
+                queue = blocks + queue
+                continue
+        passed = [b for b, c in zip(blocks, cs) if ok(c)]
+        if len(passed) == 1:  # (one block: its own test was the together check)
+            gone = gone.clone()
+            gone[cut_of(passed[0])] = True
+        elif passed:
+            t = gone.clone()
+            t[cut_of([i for b in passed for i in b])] = True
+            pending = (passed, t)
         queue = [list(h) for b, c in zip(blocks, cs) if not ok(c) and len(b) > 1
                  for h in torch.tensor(b).tensor_split(2)] + queue
     keep = (~gone).nonzero().flatten()

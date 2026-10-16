@@ -27,7 +27,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from reads_circuit import answer_class  # noqa: E402
+from reads_circuit import MIN_CLASS, answer_class  # noqa: E402
 
 HOME = Path.home()
 RECORDS = HOME / "mpd-data/cluster/finder_8b_dev4"
@@ -83,17 +83,32 @@ def q_tok(s: str) -> str:
     return "'" + s.replace("\n", "\\n") + "'"
 
 
-def context_facts(W, mx, e: dict, rec: dict, labels: dict, has_apply: bool) -> dict:
+def context_facts(W, mx, e: dict, rec: dict, labels: dict, has_apply: bool, ref: dict | None = None) -> dict:
     """The numbers the text input states for one context (one rc text): every group the questions name, from rc's own
-    groups map, with its members' finder measurements, plus the context's answer, lead, contrast pair and heads."""
+    groups map, with its members' finder measurements, plus the context's answer, lead, contrast pair and heads. With
+    ref (measure's: claim_check's reference at the answer position) the answer, alternatives and lead are claim_check's
+    and every direct effect is in its bits (through the final norm at the reference's RMS); without, the finder's
+    word-level answer and alternatives and logits before the norm."""
     torch = W.torch
     ids = e["ctx"]
     T = len(ids)
     toks = [W.tok.decode([t]) for t in ids]
     node = {(d["layer"], d["neuron"], d["pos"]): d for d in rec["nodes"]}
-    y, alts = rec["answer"], rec["alternatives"]
-    U = W.rows([y] + alts)
-    du = (U[0] - U[1:].mean(0)) * W.g  # a write's direct effect on the lead (logits before the final norm's 1/rms)
+    if ref:
+        y, alts = ref["top"][0][0], [t for t, _ in ref["top"][1:]]
+        lps = torch.tensor([l for _, l in ref["top"]])
+        w = torch.softmax(lps[1:], 0)
+        U = W.rows([y] + alts)
+        scale = 1 / (ref["rms"] * math.log(2))
+        du = (U[0] - (w[:, None] * U[1:]).sum(0)) * W.g * scale  # a write's direct effect on claim_check's lead, bits
+        lead = float((lps[0] - torch.logsumexp(lps[1:], 0)) / math.log(2))
+        probs = [math.exp(l) for _, l in ref["top"]]
+        size = 1 / (ref["rms"] * math.sqrt(W.g.shape[0]))  # a write's norm as a share of the residual's at the answer
+    else:
+        y, alts = rec["answer"], rec["alternatives"]
+        U = W.rows([y] + alts)
+        du = (U[0] - U[1:].mean(0)) * W.g  # a write's direct effect on the lead (logits before the final norm's 1/rms)
+        lead, probs, size = rec["contrast"]["clean"], None, None
     groups = {}
     for gname, members in e["groups"].items():
         ms = []
@@ -112,6 +127,8 @@ def context_facts(W, mx, e: dict, rec: dict, labels: dict, has_apply: bool) -> d
             m = float(mx[L, N])
             ms.append({"name": u, "layer": L, "neuron": N, "pole": pole, "pos": pos, "tok": toks[pos], "value": v,
                        "max": m, "frac": abs(v) / m if m else 0.0, "corrupt": d.get("corrupt"),
+                       "size": float(abs(v) * c.norm() * size) if size else None,
+                       "steer_size": float(STEER * m * c.norm() * size) if size else None,
                        "lost": d.get("lost"), "restored": d.get("restored"), "stage": d.get("stage"),
                        "direct": float(v * (c @ du)) if at_answer else None,
                        "direct_steer": float(STEER * m * pole * (c @ du)) if at_answer else None})
@@ -134,7 +151,7 @@ def context_facts(W, mx, e: dict, rec: dict, labels: dict, has_apply: bool) -> d
               "lost": r.get("lost"), "restored": r.get("restored")} for r in rec.get("routes", [])]
     return {"id": e["id"], "tokens": toks, "user": rec.get("user"), "corrupt_user": rec.get("corrupt_user"),
             "answer": W.tok.decode([y]), "corrupt_answer": rec.get("corrupt_answer_text"), "alternatives": [W.tok.decode([a]) for a in alts],
-            "lead": rec["contrast"]["clean"], "lead_corrupt": rec["contrast"]["corrupt"], "heads": heads, "groups": groups,
+            "probs": probs, "bits": bool(ref), "lead": lead, "lead_corrupt": rec["contrast"]["corrupt"], "heads": heads, "groups": groups,
             "met": rec.get("met"), "size": rec.get("size")}
 
 
@@ -218,6 +235,7 @@ def facts(a) -> None:
         if any((sc.get(k) or {}).get("pass") for k in ("short", "long")):
             labels[int(r["group"][1:])] = {"short": r["short"], "output": r["output"] if (r.get("output_scores") or {}).get("pass") else None}
     apply = {p.name for p in (RECORDS / "apply").glob("*.json")}
+    ref = json.loads(a.measure.read_text()) if a.measure else {}
     out = {}
     for f in ("train_correct.jsonl", "test_correct.jsonl"):
         for x in (a.rc / f).read_text().splitlines():
@@ -225,7 +243,7 @@ def facts(a) -> None:
             if e["id"] in out:
                 continue
             rec = json.loads((RECORDS / "out" / rec_file(e["id"])).read_text())
-            out[e["id"]] = context_facts(W, mx, e, rec, labels, rec_file(e["id"]) in apply)
+            out[e["id"]] = context_facts(W, mx, e, rec, labels, rec_file(e["id"]) in apply, ref.get(e["id"]))
             print(e["id"], len(out[e["id"]]["groups"]), flush=True)
     a.out.write_text(json.dumps(out))
 
@@ -240,15 +258,17 @@ def serialize(F: dict, how: str = "full") -> str:
     """The circuit as text. how: "full" (every measured number), "names" (groups and members' names only: the
     names-only control), "none" (the text alone)."""
     toks = F["tokens"]
-    lines = [f"Text: {F['user']!r}", f"The model's next token: {q_tok(F['answer'])}; the alternatives: "
-             f"{', '.join(q_tok(t) for t in F['alternatives'])}" + (f"; its lead over them: {F['lead']:.1f} bits." if how == "full" else ".")]
+    pr = lambda k: f" ({F['probs'][k]:.2f})" if how == "full" and F.get("probs") else ""  # noqa: E731
+    lines = [f"Text: {F['user']!r}", f"The model's next token: {q_tok(F['answer'])}{pr(0)}; the alternatives: "
+             f"{', '.join(q_tok(t) + pr(k + 1) for k, t in enumerate(F['alternatives']))}" +
+             (f"; its lead over them: {F['lead']:.1f} bits." if how == "full" else ".")]
+    unit = " bits" if F.get("bits") else ""
     if how == "none":
         return "\n".join(lines) + "\n"
     if how == "full":
-        lines.append(f"Contrast pair: with {F['corrupt_user']!r} the model gives {q_tok(F['corrupt_answer'] or '?')} "
-                     f"(lead {F['lead_corrupt']:.1f} bits). Shares below: of that gap, lost when the unit takes its value "
-                     f"from the contrast text (noising) and restored when it alone keeps its value in the contrast text "
-                     f"(denoising).")
+        lines.append(f"Contrast pair: with {F['corrupt_user']!r} the model gives {q_tok(F['corrupt_answer'] or '?')}. "
+                     f"Shares below: of the gap between the two texts, lost when the unit takes its value from the contrast "
+                     f"text (noising) and restored when it alone keeps its value in the contrast text (denoising).")
         if F["heads"]:
             lines.append("Heads at the answer position:")
             for h in F["heads"][:6]:
@@ -264,15 +284,19 @@ def serialize(F: dict, how: str = "full") -> str:
         n = len(g["members"])
         lines.append(f"  {gname}{lab}, {n} neuron{'' if n == 1 else 's'}:")
         if how == "full" and g.get("promotes"):
-            lines.append(f"    write at the answer: lead {num(g['write_direct'], 1)}; promotes {', '.join(q_tok(t) for t in g['promotes'])}; "
+            lines.append(f"    write at the answer: lead {num(g['write_direct'], 1)}{unit}; promotes {', '.join(q_tok(t) for t in g['promotes'])}; "
                          f"suppresses {', '.join(q_tok(t) for t in g['suppresses'])}")
         for m in g["members"]:
             at = f"{m['name']} at {q_tok(m['tok'])}"
             if how != "full":
                 lines.append(f"    {at}")
                 continue
-            extra = f"; direct on lead {num(m['direct'], 1)}, at 3x max {num(m['direct_steer'], 1)}" if m["direct"] is not None else ""
-            lines.append(f"    {at}: {m['frac']:.2f} of max (value {m['value']:.3g}, contrast text {num(m['corrupt'], 3) if m['corrupt'] is not None else '?'}); "
+            extra = ""
+            if m["direct"] is not None:
+                extra = f"; its write on the lead {num(m['direct'], 1)}{unit}, turned up {num(m['direct_steer'], 1)}{unit}"
+                if m.get("size") is not None:
+                    extra += f" (sizes {m['size']:.2f} and {m['steer_size']:.2f} of the residual)"
+            lines.append(f"    {at}: value {m['value']:.3g} = {m['frac']:.2f} of max (contrast text {num(m['corrupt'], 3) if m['corrupt'] is not None else '?'}); "
                          f"noising {num(m['lost'])}, denoising {num(m['restored'])}{extra}")
     return "\n".join(lines) + "\n"
 
@@ -316,7 +340,8 @@ def qfeatures(e: dict, F: dict) -> list[float]:
             s("lost"), s("restored"), mxa("lost"), mxa("restored"), math.log1p(abs(s("lost"))), math.log1p(abs(s("restored"))),
             max(m["frac"] for m in ms), sum(m["frac"] for m in ms), d, ds, math.copysign(math.log1p(abs(d)), d),
             math.copysign(math.log1p(abs(ds)), ds), F["lead"], math.log1p(max(F["lead"], 0)),
-            sum(m["stage"] == "readout" for m in ms) / len(ms)]
+            sum(m["stage"] == "readout" for m in ms) / len(ms),
+            math.sqrt(sum((m.get("size") or 0.0) ** 2 for m in at)), math.sqrt(sum((m.get("steer_size") or 0.0) ** 2 for m in at))]
 
 
 def name_prior(train: list[dict], test: list[dict], key) -> list[str]:
@@ -354,7 +379,12 @@ def check(a) -> None:
         te = [(i, e) for i, e in enumerate(test) if e["cat"] == c]
         X = np.array([qfeatures(e, F[e["id"]]) for e in tr])
         sc = StandardScaler().fit(X)
-        m = LogisticRegression(C=a.C, max_iter=5000, class_weight="balanced").fit(sc.transform(X), [answer_class(e) for e in tr])
+        if a.model == "gbm":
+            from sklearn.ensemble import HistGradientBoostingClassifier
+            m = HistGradientBoostingClassifier(max_depth=3, learning_rate=0.05, max_iter=200, class_weight="balanced",
+                                               random_state=0).fit(sc.transform(X), [answer_class(e) for e in tr])
+        else:
+            m = LogisticRegression(C=a.C, max_iter=5000, class_weight="balanced").fit(sc.transform(X), [answer_class(e) for e in tr])
         for (i, e), p in zip(te, m.predict(sc.transform(np.array([qfeatures(e, F[e["id"]]) for _, e in te])))):
             pred[i] = p
     p = [pred[i] for i in range(len(test))]
@@ -385,25 +415,69 @@ def load_rc(rc: Path) -> tuple[list[dict], list[dict], dict]:
     return train, test, donor
 
 
-def user_text(F: dict, e: dict, how: str, D: dict | None = None) -> str:
+def user_text(F: dict, e: dict, how: str, D: dict | None = None, first: bool = False) -> str:
+    """The circuit, then the question (one context's questions share their prefix, cached when sampled); first: the
+    question also before the circuit, so that the circuit's tokens are read knowing what is asked."""
     body = serialize(mismatch(F, D), "full") if how == "mismatch" else serialize(F, how)
-    return body + "\n" + e["q"]  # (the circuit first: one context's questions share their prefix, cached when sampled)
+    return (f"Question: {e['q']}\n\n" if first else "") + body + "\n" + e["q"]
+
+
+def recap(F: dict, e: dict, how: str) -> str:
+    """The answer's first line, "Read: ...": the asked groups' numbers copied from the input (summed over members),
+    so that the outcome is written beside them (a mechanical plan before the answer; scoring drops it)."""
+    T = len(F["tokens"])
+    out = []
+    for gname in e["claim"]["units"]:
+        g = F["groups"][gname]
+        ms = g["members"]
+        pos = sorted({q_tok(m["tok"]) + f" @{m['pos'] if m['pos'] >= 0 else T + m['pos']}" for m in ms})
+        x = f"{gname} {len(ms)} at {', '.join(pos)}"
+        if how in ("full", "mismatch"):
+            s = lambda k: sum(m[k] or 0.0 for m in ms)  # noqa: E731
+            x += f"; noising {s('lost'):+.2f}, denoising {s('restored'):+.2f}, largest {max(m['frac'] for m in ms):.2f} of max"
+            at = [m for m in ms if m["direct"] is not None]
+            if at:
+                x += f"; write on the lead {sum(m['direct'] for m in at):+.1f}, turned up {sum(m['direct_steer'] for m in at):+.1f}"
+        out.append(x)
+    return "Read: " + "; ".join(out)
+
+
+def strip_read(text: str) -> str:
+    return text.split("\n", 1)[1] if text.startswith("Read:") and "\n" in text else text
 
 
 def rows(a) -> None:
+    """SFT rows per training input (full, names) and test questions per input (full, names, mismatch, none); --balance:
+    each question kind's answer classes repeated up to its largest class (the held-out set is balanced; the training
+    set is half "unchanged"); --recap: a "Read:" line before the answer; --first: the question before the circuit too."""
+    import random
+
     F = json.loads(a.facts.read_text())
     train, test, donor = load_rc(a.rc)
+    if a.balance:
+        rng = random.Random(0)
+        by = collections.defaultdict(list)
+        for e in train:
+            by[(e["cat"], answer_class(e))].append(e)
+        bal = []
+        for c in sorted({e["cat"] for e in train}):
+            ks = [k for k in by if k[0] == c]
+            top = max(len(by[k]) for k in ks)
+            for k in ks:  # (a class too rare to be in the balanced held-out set, flips, is kept as it is)
+                bal += by[k] + ([rng.choice(by[k]) for _ in range(top - len(by[k]))] if len(by[k]) >= MIN_CLASS else [])
+        train = bal
     a.out.mkdir(parents=True, exist_ok=True)
     for how in ("full", "names"):
         with (a.out / f"train_{how}.jsonl").open("w") as f:
             for k, e in enumerate(train):
-                f.write(json.dumps({"prompt": [{"role": "user", "content": user_text(F[e["id"]], e, how)}],
-                                    "completion": [{"role": "assistant", "content": e["a"]}],
+                ans = (recap(F[e["id"]], e, how) + "\n" if a.recap else "") + e["a"]
+                f.write(json.dumps({"prompt": [{"role": "user", "content": user_text(F[e["id"]], e, how, first=a.first)}],
+                                    "completion": [{"role": "assistant", "content": ans}],
                                     "info": {"task": f"{e['id']}#{k}", "cat": e["cat"]}}) + "\n")
     for how in ("full", "names", "mismatch", "none"):
         with (a.out / f"test_{how}.jsonl").open("w") as f:
             for k, e in enumerate(test):
-                f.write(json.dumps({"task": f"{e['id']}#{k}", "question": user_text(F[e["id"]], e, how, F[donor[e["id"]]]),
+                f.write(json.dumps({"task": f"{e['id']}#{k}", "question": user_text(F[e["id"]], e, how, F[donor[e["id"]]], a.first),
                                     "cat": e["cat"], "a": e["a"], "id": e["id"]}) + "\n")
     from transformers import AutoTokenizer
     tok = AutoTokenizer.from_pretrained(str(next((HOME / ".cache/huggingface/hub/models--Qwen--Qwen3-8B/snapshots").iterdir())))
@@ -425,7 +499,7 @@ def sample(a) -> None:
     spend = tt.Spend(a.out.parent, a.base)
     service = tt.service_client()
     renderer, tokenizer = tt.renderer_for(a.base)
-    state = json.loads(a.state.read_text())["state"] if a.state else None
+    state = a.state if not a.state or a.state.startswith("tinker://") else json.loads(Path(a.state).read_text())["state"]
     sampler = (service.create_training_client_from_state(state).save_weights_and_get_sampling_client() if state
                else service.create_sampling_client(base_model=a.base))
     params = tinker.SamplingParams(max_tokens=a.max_tokens, temperature=0.0, stop=renderer.get_stop_sequences())
@@ -459,7 +533,7 @@ def score(a) -> None:
     for f in a.evals:
         rs = [json.loads(x) for x in f.read_text().splitlines()]
         assert [r["a"] for r in rs] == [e["a"] for e in test], f
-        tab[f.stem] = [answer_class({"cat": r["cat"], "a": r["got"]}) == g for r, g in zip(rs, gold)]
+        tab[f.stem] = [answer_class({"cat": r["cat"], "a": strip_read(r["got"])}) == g for r, g in zip(rs, gold)]
     cats = sorted({e["cat"] for e in test})
     print(f"{'':34s} {'all':>6s}" + "".join(f"{c:>9s}" for c in cats) + f"  varied(n={len(varied)})")
     for k, v in tab.items():
@@ -474,18 +548,24 @@ def main():
     f = sub.add_parser("facts")
     f.add_argument("--rc", type=Path, required=True)
     f.add_argument("--out", type=Path, required=True)
+    f.add_argument("--measure", type=Path, help="measure's output: claim_check's answer, alternatives and bits")
     c = sub.add_parser("check")
     c.add_argument("--rc", type=Path, required=True)
     c.add_argument("--facts", type=Path, required=True)
     c.add_argument("--C", type=float, default=0.3)
+    c.add_argument("--model", choices=("logistic", "gbm"), default="logistic", help="gbm: gradient-boosted trees (the "
+                   "input's information under a nonlinear reading, an upper reference for the logistic)")
     r = sub.add_parser("rows")
     r.add_argument("--rc", type=Path, required=True)
     r.add_argument("--facts", type=Path, required=True)
     r.add_argument("--out", type=Path, required=True)
+    r.add_argument("--balance", action="store_true")
+    r.add_argument("--recap", action="store_true")
+    r.add_argument("--first", action="store_true")
     s = sub.add_parser("sample")
     s.add_argument("questions", type=Path)
     s.add_argument("out", type=Path)
-    s.add_argument("--state", type=Path, help="tinker_train.py sft's DIR/state.json (none: the base model)")
+    s.add_argument("--state", help="a tinker:// state, or tinker_train.py sft's DIR/state.json (none: the base model)")
     s.add_argument("--base", default=MODEL)
     s.add_argument("--max-tokens", type=int, default=160)
     sc = sub.add_parser("score")

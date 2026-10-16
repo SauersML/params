@@ -1,0 +1,36 @@
+{
+  "schema": "native_local_mlx_execution_v1",
+  "model": "mlx-community/Qwen3.6-35B-A3B-4bit",
+  "model_revision": "38740b847e4cb78f352aba30aa41c76e08e6eb46",
+  "model_path": "/Users/user/.cache/huggingface/hub/models--mlx-community--Qwen3.6-35B-A3B-4bit/snapshots/38740b847e4cb78f352aba30aa41c76e08e6eb46",
+  "model_files_sha256": {
+    "config.json": "a822a9e48b0aafbe3144ec37d4fb067e178ed96615ce6e4420b3149893cc5767",
+    "model-00001-of-00004.safetensors": "09f3e6ecb0b7af6e6a38bc8169a134c821b0924c2679b2bb8f4426ad38d032b8",
+    "model-00002-of-00004.safetensors": "31dcdb1c49eebdb1505bd14e3cb33f9cf900bd2546b638f2464694ae763a033f",
+    "model-00003-of-00004.safetensors": "3e66de06a1f03dade16a612a368cfce4a4c9caa4efd7d28185454384082cec03",
+    "model-00004-of-00004.safetensors": "a5d0cf03519c26f8b506df6b0ba60526e5c08c8cea22d0c21ce92950e58a5422",
+    "model.safetensors.index.json": "0b28df60e33753a14e816d3b31577ae2c93884c58430a4a6de6ae9ea483842ea"
+  },
+  "runtime": {
+    "python": "3.12.14 (main, Sep  1 2026, 14:09:38) [Clang 22.1.3 ]",
+    "platform": "macOS-26.6-arm64-arm-64bit",
+    "mlx": "0.32.3",
+    "mlx_lm": "0.32.0",
+    "mlx_lm_source_sha256": {
+      "mlx_lm/generate.py": "4a3bf57f5679dac73791f069268866ab5b9336e58582d436b31133984e4b6971",
+      "mlx_lm/utils.py": "d442babbfd891bfa61ec9c6feead9024e206a333a357c5e4a07554c4ea138965",
+      "mlx_lm/sample_utils.py": "3aac92d804b6b91c82a4e2844697a8723de26f6af57e10013a482b967e739cfa",
+      "mlx_lm/tokenizer_utils.py": "ecb52655e86ff6d6db6a657601ece11f195e85971482eb2d0f40c20de17eb4c5"
+    }
+  },
+  "runner_sha256": "4286da805f0a754cead99ca02617237efa8d703202a9e62f6b72d39536a3d512",
+  "reader_manifest_sha256": "d0fbf3fd6acc23682aa45b5729f263dee6678c33bd93fe954799f20b3067a0e3",
+  "protocol": {
+    "max_tokens": 512,
+    "temperature": 0,
+    "prefill_step_size": 512,
+    "prompt_cache": null,
+    "draft_model": null,
+    "retries": 0
+  }
+}

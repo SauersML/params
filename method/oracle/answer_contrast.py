@@ -45,6 +45,13 @@ def script(w: str) -> str:
 
 
 @torch.no_grad()
+def last(x: torch.Tensor) -> torch.Tensor:
+    """logits_to_keep for the last position of x [B, T] as an index tensor: the model then projects a copy of that
+    position (logits_to_keep=1 projects a strided view, on which cuBLAS runs one matrix-vector product per row: Qwen3-8B
+    bfloat16 on an L40, 72 rows 106 ms against 1.6 ms)."""
+    return torch.tensor([x.shape[1] - 1], device=x.device)
+
+
 def token_sets(core, tok, ids: list[int], lp: torch.Tensor, b: int | None = None, answer_word: str | None = None,
                k: int = CANDIDATES, alts: int = ALTERNATIVES, steps: int = STEPS,
                candidate_batch_size: int | None = None) -> dict:
@@ -68,9 +75,9 @@ def token_sets(core, tok, ids: list[int], lp: torch.Tensor, b: int | None = None
     x = torch.tensor([list(ids) + [z] for z in cands], device=dev)
     for _ in range(steps):                                       # greedy continuation of every candidate
         if candidate_batch_size is None:
-            nxt = core(input_ids=x, logits_to_keep=1).logits[:, -1].argmax(-1, keepdim=True)
+            nxt = core(input_ids=x, logits_to_keep=last(x)).logits[:, -1].argmax(-1, keepdim=True)
         else:
-            nxt = torch.cat([core(input_ids=part, logits_to_keep=1).logits[:, -1].argmax(-1, keepdim=True)
+            nxt = torch.cat([core(input_ids=part, logits_to_keep=last(part)).logits[:, -1].argmax(-1, keepdim=True)
                              for part in x.split(candidate_batch_size)], dim=0)
         x = torch.cat([x, nxt], 1)
     words = {z: word(tok.decode(row[len(ids):].tolist())) for z, row in zip(cands, x)}

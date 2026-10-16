@@ -3,13 +3,14 @@ circuit_finder.find, the movers cut's route groups where copying spreads over he
 (neuron_edges.finder_graph). The answer is the copied word; a text whose gap is under copy_circuit.GAP_MIN bits is
 skipped (its record says why).
 
-  python experiments/oracle/copy_finder.py OUT [--model Qwen/Qwen3-8B] [--dtype bfloat16] [--n 24]
-writes OUT/<id>.json.
+  python experiments/oracle/copy_finder.py OUT [--model Qwen/Qwen3-8B] [--dtype bfloat16] [--n 24] [--max-seconds 180]
+writes OUT/<id>.json (a search running past --max-seconds is stopped and recorded as skipped).
 """
 from __future__ import annotations
 
 import argparse
 import json
+import signal
 import sys
 import time
 from pathlib import Path
@@ -24,6 +25,14 @@ import copy_circuit  # noqa: E402
 import neuron_edges  # noqa: E402
 
 
+class Late(Exception):
+    pass
+
+
+def late(*_):
+    raise Late
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("out", type=Path)
@@ -31,6 +40,7 @@ def main():
     ap.add_argument("--dtype", default="bfloat16", choices=("float32", "bfloat16"))
     ap.add_argument("--n", type=int, default=24)
     ap.add_argument("--edges", action=argparse.BooleanOptionalAction, default=True)
+    ap.add_argument("--max-seconds", type=int, default=180)
     a = ap.parse_args()
     import transformers
     a.out.mkdir(parents=True, exist_ok=True)
@@ -50,7 +60,15 @@ def main():
             pt.setup(t["ids"], t["corrupt_ids"])
             first = False
         log(t["id"])
-        rec = cf.find(pt, t["ids"], t["corrupt_ids"], answers=[t["answer"]], log=log)
+        signal.signal(signal.SIGALRM, late)
+        signal.alarm(a.max_seconds)
+        try:
+            rec = cf.find(pt, t["ids"], t["corrupt_ids"], answers=[t["answer"]], log=log)
+        except Late:
+            rec = {"met": False, "skipped": f"the search ran past {a.max_seconds} s", "seconds": a.max_seconds}
+            torch.cuda.empty_cache()
+        finally:
+            signal.alarm(0)
         rec.update(id=t["id"], ids=t["ids"], corrupted=t["corrupt_ids"], text=t["text"], template=t["template"],
                    copy_positions=t["pos"], word=t["word"], model=a.model, dtype=a.dtype, finder="circuit_finder")
         if rec.get("answer") is not None:
@@ -58,13 +76,15 @@ def main():
         if a.edges and not rec.get("skipped") and (rec.get("nodes") or rec.get("routes")):
             t1 = time.time()
             g = neuron_edges.finder_graph(model, tok, rec, log=log)
-            rec["graph"] = {k: g.get(k) for k in ("nodes", "edges", "head_edges", "routes", "record", "cut", "route_note", "seconds")}
+            rec["graph"] = {k: g.get(k) for k in ("nodes", "edges", "head_edges", "movers_inputs_lost", "routes", "record", "cut",
+                                              "route_note", "seconds")}
             rec["seconds_edges"] = round(time.time() - t1, 2)
             neuron_edges.free()
         path.write_text(json.dumps(rec))
         m = rec.get("cuts", {}).get("movers", {})
-        log(f"{t['id']}: met {rec.get('met')}, movers {m.get('size')} ({'route groups' if m.get('route_groups') else 'singles'}), "
-            f"{rec.get('seconds')} s + edges {rec.get('seconds_edges')} s")
+        log(f"{t['id']}: met {rec.get('met')} {rec.get('skipped') or ''}, movers {m.get('size')} "
+            f"({'route groups' if m.get('route_groups') else 'singles'}), {rec.get('seconds')} s + edges "
+            f"{rec.get('seconds_edges')} s; every mover's inputs lost {(rec.get('graph') or {}).get('movers_inputs_lost')}")
 
 
 if __name__ == "__main__":

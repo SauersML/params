@@ -282,4 +282,4 @@ def test_finder_graph_mover_edges(tiny):
     assert sides(he[(2, 1)]) == [((0, 5, 3), "key"), ((0, 5, 3), "value"), ((1, 6, 8), "key"), ((1, 6, 8), "value")]
     assert set(he[(2, 1)]["group_lost"]) == {"key", "value", "all"} and len(he[(2, 1)]["readers"]) == 2
     assert sides(he[(1, 0)]) == [((0, 5, 3), "key"), ((0, 5, 3), "value")] and len(he[(1, 0)]["readers"]) == 2
-    assert he[(1, 0)]["readers_group_lost"] is not None
+    assert he[(1, 0)]["readers_group_lost"] is not None and set(g["movers_inputs_lost"]) == {"key", "value", "all"}

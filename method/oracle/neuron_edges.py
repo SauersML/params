@@ -934,8 +934,8 @@ def finder_graph(model, tok, rec: dict, log=print) -> dict:
         car = head_routes.carriers(rn, run["states"], lost, q, p)
         g["routes"].append({"q": q, "p": p, "carriers": car, "carrier_curve": head_routes.carrier_curve(rn, lost, q, p, car)})
     sec["carriers"], t = round(time.time() - t, 3), time.time()
-    g["head_edges"] = mover_edges(rn, run["states"], rn.run(bad, [{}], capture=True)["states"], lost, rec) if rec.get("routes") \
-        else []
+    g["head_edges"], g["movers_inputs_lost"] = mover_edges(rn, run["states"], rn.run(bad, [{}], capture=True)["states"], lost,
+                                                           rec) if rec.get("routes") else ([], {})
     sec["mover_edges"] = round(time.time() - t, 3)
     g["seconds"] = sec
     g.update(id=rec.get("id"), text_id=rec.get("id"), user=rec.get("user"), corrupt_user=rec.get("corrupt_user"),
@@ -951,14 +951,15 @@ def finder_graph(model, tok, rec: dict, log=print) -> dict:
 
 
 @torch.no_grad()
-def mover_edges(rn, st: dict, sb: dict, lost, rec: dict) -> list[dict]:
+def mover_edges(rn, st: dict, sb: dict, lost, rec: dict) -> tuple[list[dict], dict]:
     """Edges between a circuit's mover heads and its neurons, by patching from the corrupted run. Per mover (rec's
     routes: head (L, h) at the answer position q), each circuit neuron below L at a position up to q, its write's change
     (clean - corrupted) taken out of the head's key and value inputs at its position (and its query input at q): the
     head's output change at q, exact with the rest of the head as in the clean run ("inputs": its size and its share of
     the head's own change, clean - corrupted, by projection), and all of them at once per input and over every input in
     full runs ("group_lost": shares of the gap lost); each circuit readout neuron at q in layer L or above, the head's
-    change taken out of its input (its value change, exact) and all of them at once (readers_group_lost). Every write's
+    change taken out of its input (its value change, exact) and all of them at once (readers_group_lost). With them,
+    every mover's inputs cut at once, per input and over every input: the share of the gap lost. Every write's
     change is computed once and every mover's group cuts are one batch of runs (on two Qwen3-8B copy texts the value
     input alone took 2.1 and 10.1 s, a float32 copy of down_proj per neuron and mover; its groups lost under 1% of the
     gap where the movers lost 74-86%)."""
@@ -973,7 +974,7 @@ def mover_edges(rn, st: dict, sb: dict, lost, rec: dict) -> list[dict]:
         W = weight(rn.layers[Ln].mlp.down_proj)[:, js].float()
         dh = st["h"][Ln][p, js].to(W.device) - sb["h"][Ln][p, js].to(W.device)
         diff.update(zip(((Ln, p, j) for j in js), (W * dh).T))
-    out, sets, slots = [], [], []
+    out, sets, slots, every = [], [], [], {}
     kinds = {"key": "dk", "value": "dv", "query": "dq"}
     for r in rec.get("routes", []):
         L, h, q = r["layer"], r["head"], r["pos"]
@@ -995,6 +996,7 @@ def mover_edges(rn, st: dict, sb: dict, lost, rec: dict) -> list[dict]:
         for side, ed in edits.items():
             slots.append((e, side))
             sets.append({kinds[side]: ed})
+            every.setdefault(side, []).extend(ed)
         if edits:
             slots.append((e, "all"))
             sets.append({kinds[side]: ed for side, ed in edits.items()})
@@ -1005,12 +1007,21 @@ def mover_edges(rn, st: dict, sb: dict, lost, rec: dict) -> list[dict]:
             slots.append((e, "readers"))
             sets.append({"read": [(Ln, q, j, own) for Ln, j in rs]})
         out.append(e)
+    total = {}
+    for side, ed in every.items():
+        slots.append((total, side))
+        sets.append({kinds[side]: ed})
+    if every:
+        slots.append((total, "all"))
+        sets.append({kinds[side]: ed for side, ed in every.items()})
     for (e, side), x in zip(slots, lost(sets) if sets else []):
         if side == "readers":
             e["readers_group_lost"] = x
+        elif e is total:
+            total[side] = x
         else:
             e["group_lost"][side] = x
-    return out
+    return out, total
 
 
 def free():

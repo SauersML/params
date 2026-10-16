@@ -290,7 +290,7 @@ class Oracle:
             h.remove()
         return tot / max(n, 1) if reduce else (tot, n)
 
-    def answers(self, exs: list[dict]) -> list[str]:
+    def answers(self, exs: list[dict], max_new: int = MAX_NEW) -> list[str]:
         """Greedy answers to a batch of examples (left-padded, each row's vectors at its own placeholders)."""
         torch = self.torch
         exs, prepared_vecs = self.prepare(exs)
@@ -309,7 +309,7 @@ class Oracle:
         h = self.hook(vecs, pos)
         try:
             with torch.no_grad():
-                g = self.m.generate(input_ids=ids, attention_mask=att, max_new_tokens=MAX_NEW, do_sample=False,
+                g = self.m.generate(input_ids=ids, attention_mask=att, max_new_tokens=max_new, do_sample=False,
                                     temperature=None, top_p=None, top_k=None, pad_token_id=self.tok.eos_token_id)
         finally:
             h.remove()

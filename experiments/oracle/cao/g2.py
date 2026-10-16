@@ -40,6 +40,7 @@ import h2h  # noqa: E402  (cao puts aoh2h on the path)
 STEER = 3.0     # claim_check's steer scale: x the neuron's calibration maximum
 MIN_SHOWN = 4
 HALF = 0.25     # bits: a change smaller than this is "almost none"
+ANSWER_TOKENS = 160  # an answer's sentence and its claim line (cao's 24 cut every claim off in the first 8B smoke)
 QUESTIONS = (("n_steer", 2), ("n_zero", 1), ("n_set", 1), ("n_sign", 1))
 
 
@@ -202,7 +203,7 @@ def evaluate(a) -> None:
     o.text_only = a.text_only
     got = []
     for k in range(0, len(exs), 16):
-        got += o.answers(exs[k:k + 16])
+        got += o.answers(exs[k:k + 16], max_new=ANSWER_TOKENS)
     nr = nb.Neurons(o.m, o.tok)
     nr.load(a.thr)
     claims, idx = [], []

@@ -8,6 +8,7 @@
 #   RUN=inf1 MODE=inference [PER=150] bash ... [HOURS]                                       inference.py build (never-made inferences)
 #   RUN=org1 MODE=organisms bash ... [HOURS]                                                  organisms.py all (planted truths)
 #   RUN=g2f MODE=g2finder QUESTIONS=<circuit questions .json> THR=<reference> [LIMIT=200] bash ...  circuit_finder on the dev split, then g2.py gen --records
+#   RUN=g2e MODE=g2eval G2EVAL=<g2 held-out items> ADAPTER_DIR=<adapter> THR=<reference> bash ...  g2.py eval, vectors and text-only
 #   RUN=g2r MODE=g2rec RECORDS=<circuit records dir> THR=<reference> bash ...              g2.py gen on circuits built elsewhere
 #   RUN=g2a MODE=g2 THR=<neuron_builder reference .pt> TEXTS=2000 [PROCS=2] [NECESSITY_ONLY=1] bash ... [HOURS]  g2.py gen
 #   RUN=oe1 MODE=orgeval ORGS=<organisms dir on the Mac> [ADAPTER_DIR=...] UPLOAD_MB=1500 bash ...  planted truths recovered
@@ -47,6 +48,8 @@ case $MODE in
   g2finder) WORK="python -u $S/method/oracle/circuit_finder.py questions $S/questions.json $O/circuits --split dev --limit ${LIMIT:-200} --stride ${STRIDE:-2} \
 --model $MODEL --dtype bfloat16 --device cuda > $O/finder.log 2>&1; \
 python -u g2.py gen --out $O/g2.jsonl --thr $S/thr.pt --texts ${LIMIT:-200} --records $O/circuits > $O/g2.log 2>&1" ;;
+  g2eval) WORK="python -u g2.py eval --items $S/g2eval.jsonl --thr $S/thr.pt --adapter $S/adapter --out $O/g2_eval.jsonl > $O/g2_eval.log 2>&1; \
+python -u g2.py eval --items $S/g2eval.jsonl --thr $S/thr.pt --adapter $S/adapter --out $O/g2_eval_text_only.jsonl --text-only > $O/g2_eval_text_only.log 2>&1" ;;
   g2rec) WORK="python -u g2.py gen --out $O/g2.jsonl --thr $S/thr.pt --texts 100000 --records $S/records > $O/g2.log 2>&1" ;;
   inference) WORK="python -u inference.py build --out $O/inference_items.jsonl --per ${PER:-150} > $O/inference.log 2>&1" ;;
   organisms) WORK="python -u organisms.py all --out $O/organisms > $O/organisms.log 2>&1 && \

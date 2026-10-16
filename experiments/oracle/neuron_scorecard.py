@@ -45,6 +45,10 @@ recomputed (summary()).
   neuron_scorecard.py score CIRCUIT [CIRCUIT ...] --out OUT [--questions FILE] [--dtype bfloat16] [--device auto]
       score circuit files (or directories of them) into OUT/<name>.json, OUT/rows.jsonl and the table
   neuron_scorecard.py table NAME=OUT [NAME=OUT ...]   finders side by side on the questions every set scored
+  neuron_scorecard.py motifs MOTIFS.json RECORDS_DIR [...] [--out FILE]   the essay's motif score on neuron_motifs' run:
+      per set (recurring group or activation factor) the correlation over its held-out texts between its usage (the share
+      of its poles in the text's circuit) and the damage its ablation does (neuron_motifs' measured drop), the median per
+      kind (the essay's ImageNet edge motifs: 0.35, activation factors: 0.00)
   neuron_scorecard.py check MODEL --out FILE [--questions FILE]   every question's patching pair on MODEL: the two
       answers, the gap and whether the pair is valid (the questions a finder can build on, and those the scorecard scores)
 
@@ -465,13 +469,44 @@ def table(sets: dict) -> str:
     return "\n".join(lines)
 
 
+def motif_scores(run: dict, recs: dict) -> dict:
+    """The essay's usage-damage score per set of a neuron_motifs run: Pearson and Spearman correlations over the held-out
+    texts (run["B"]) between usage, the share of the set's poles among the text's circuit's poles (neuron_motifs.poles_of),
+    and damage (run's per-text drops); per kind the median and the sets scored (a set used by no text, or by every text
+    alike, has no correlation)."""
+    import neuron_motifs
+
+    def corr(x, y):
+        x, y = np.asarray(x, float), np.asarray(y, float)
+        return None if x.std() == 0 or y.std() == 0 else float(np.corrcoef(x, y)[0, 1])
+
+    def ranks(v):  # average ranks (ties share theirs)
+        from scipy.stats import rankdata
+        return rankdata(v)
+    circ = [neuron_motifs.poles_of(recs[i]) if i in recs else None for i in run["B"]]
+    rows = []
+    for row in run["rows"]:
+        ps = set(row["poles"])
+        pairs = [(len(c & ps) / len(ps), d) for c, d in zip(circ, row["damage"]) if c is not None]
+        u, d = [p[0] for p in pairs], [p[1] for p in pairs]
+        rows.append({"kind": row["kind"], "rank": row["rank"], "size": len(ps), "texts": len(pairs), "pearson": corr(u, d),
+                     "spearman": corr(ranks(u), ranks(d)) if len(u) > 1 else None})
+    out = {"sets": rows}
+    for kind in ("group", "factor"):
+        for m in ("pearson", "spearman"):
+            v = [r[m] for r in rows if r["kind"] == kind and r[m] is not None]
+            out[f"{kind}_{m}_median"] = float(np.median(v)) if v else None
+            out[f"{kind}_scored"] = len(v)
+    return out
+
+
 def load(out: Path) -> list[dict]:
     return [json.loads(p.read_text()) for p in sorted(out.glob("*.json")) if p.name != "summary.json"]
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("cmd", choices=("score", "table", "check"))
+    ap.add_argument("cmd", choices=("score", "table", "check", "motifs"))
     ap.add_argument("paths", nargs="+")
     ap.add_argument("--out", type=Path)
     ap.add_argument("--questions", type=Path, default=circuit_questions.OUT)
@@ -480,6 +515,22 @@ def main():
     a = ap.parse_args()
     if a.cmd == "table":
         print(table({p.split("=", 1)[0]: load(Path(p.split("=", 1)[1])) for p in a.paths}))
+        return
+    if a.cmd == "motifs":
+        run = json.loads(Path(a.paths[0]).read_text())
+        recs = {}
+        for d in map(Path, a.paths[1:]):
+            for f in (sorted(x for x in d.iterdir() if x.suffix == ".json") if d.is_dir() else [d]):
+                r = json.loads(f.read_text())
+                if "id" in r:
+                    recs[r["id"]] = r
+        ms = motif_scores(run, recs)
+        if a.out:
+            a.out.write_text(json.dumps(ms))
+        print(f"usage-damage correlation over held-out texts (median per set): recurring groups Pearson {ms['group_pearson_median']} "
+              f"Spearman {ms['group_spearman_median']} ({ms['group_scored']} sets); activation factors Pearson "
+              f"{ms['factor_pearson_median']} Spearman {ms['factor_spearman_median']} ({ms['factor_scored']} sets); "
+              f"the essay's ImageNet: edge motifs 0.35, activation factors 0.00")
         return
     from transformers import AutoTokenizer
 

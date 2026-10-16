@@ -1,0 +1,193 @@
+{
+  "requests": 96,
+  "max_tokens": 512,
+  "temperature": 0,
+  "requests_sha256": "c93a70ff210a1ebad5651cf0fbd55ad8897647e49991025939fbe837cf852b55",
+  "mapping_sha256": "1d5518826f5add2258359a6beda9632a70e8313eb42ff5ee2161867395c6b955",
+  "panel_path": "/Users/user/mpd-data/scratch/native_next_experiment/lie_native_query_v1/manifest.json",
+  "panel_sha256": "979d8e08421c95aa480ea464fde0c12b70f6cd8d9d71eac2b3af7200a51ec885",
+  "discovery_sha256": "cb0f4240faab9a3760140f020a26ca73bb5f9b274a990c02f5a0ab6bd25716f2",
+  "public_observations_path": "/Users/user/mpd-data/cluster/root-lie-query-public-cpu-v1/output/result/public/public_observations.json",
+  "public_observations_sha256": "e408793b2c30451a84af202cfe284060db637266c1d87bf87d4b069d727ca9e2",
+  "frozen_baselines": {
+    "unchanged_delta_bits": 0,
+    "discovery_constant_delta_bits": -5.772481738405659
+  },
+  "frozen_query_baselines": {
+    "lie_direct_00": {
+      "static_readout_delta_bits": -5.835418464124281,
+      "regression_delta_bits": -7.900391676537783
+    },
+    "lie_direct_01": {
+      "static_readout_delta_bits": -7.718681855716396,
+      "regression_delta_bits": -3.7117042351736607
+    },
+    "lie_direct_02": {
+      "static_readout_delta_bits": -7.782707745590326,
+      "regression_delta_bits": -6.618921924487529
+    },
+    "lie_direct_03": {
+      "static_readout_delta_bits": -4.754663432327564,
+      "regression_delta_bits": -6.9125777861577244
+    },
+    "lie_direct_04": {
+      "static_readout_delta_bits": -8.294942435598927,
+      "regression_delta_bits": -6.444137681320363
+    },
+    "lie_direct_05": {
+      "static_readout_delta_bits": -8.328333846060955,
+      "regression_delta_bits": -5.284368736978276
+    },
+    "lie_direct_06": {
+      "static_readout_delta_bits": -6.345725229858751,
+      "regression_delta_bits": -6.166175496725284
+    },
+    "lie_direct_07": {
+      "static_readout_delta_bits": -7.9823721244591574,
+      "regression_delta_bits": -7.507004477743244
+    },
+    "truth_history_00": {
+      "static_readout_delta_bits": 2.3293569594228902,
+      "regression_delta_bits": 3.1014843436981496
+    },
+    "truth_history_01": {
+      "static_readout_delta_bits": 1.7945209866376028,
+      "regression_delta_bits": 2.255525267234001
+    },
+    "truth_history_02": {
+      "static_readout_delta_bits": 1.8585981947558161,
+      "regression_delta_bits": 2.5640213828426734
+    },
+    "truth_history_03": {
+      "static_readout_delta_bits": 3.53571940252503,
+      "regression_delta_bits": 1.2113227951371437
+    },
+    "truth_history_04": {
+      "static_readout_delta_bits": 1.9806386611786513,
+      "regression_delta_bits": 4.142573792508795
+    },
+    "truth_history_05": {
+      "static_readout_delta_bits": 2.1633994005248627,
+      "regression_delta_bits": 3.230186550233514
+    },
+    "truth_history_06": {
+      "static_readout_delta_bits": 1.4562642916655777,
+      "regression_delta_bits": 1.376807499576389
+    },
+    "truth_history_07": {
+      "static_readout_delta_bits": 1.825375723413498,
+      "regression_delta_bits": 0.10036397086509496
+    },
+    "truth_numeric_16_00": {
+      "static_readout_delta_bits": -9.662207145472058,
+      "regression_delta_bits": 0.6772077120467759
+    },
+    "truth_numeric_16_01": {
+      "static_readout_delta_bits": 2.8655017616571707,
+      "regression_delta_bits": 0.8730597567593517
+    },
+    "truth_numeric_16_02": {
+      "static_readout_delta_bits": -11.158613504483423,
+      "regression_delta_bits": -0.8176511395974604
+    },
+    "truth_numeric_16_03": {
+      "static_readout_delta_bits": 2.8697485311631183,
+      "regression_delta_bits": 0.4746277188129051
+    },
+    "truth_numeric_16_04": {
+      "static_readout_delta_bits": -10.865482145754779,
+      "regression_delta_bits": 6.826365932695925
+    },
+    "truth_numeric_16_05": {
+      "static_readout_delta_bits": -0.0518139518604831,
+      "regression_delta_bits": 9.421106507266536
+    },
+    "truth_numeric_16_06": {
+      "static_readout_delta_bits": -7.013556233865404,
+      "regression_delta_bits": -7.830589003541114
+    },
+    "truth_numeric_16_07": {
+      "static_readout_delta_bits": 2.0182825354111946,
+      "regression_delta_bits": -7.368964846309838
+    },
+    "truth_numeric_other_00": {
+      "static_readout_delta_bits": -11.420553655651183,
+      "regression_delta_bits": -0.6079044436156469
+    },
+    "truth_numeric_other_01": {
+      "static_readout_delta_bits": 2.2984182579807033,
+      "regression_delta_bits": -0.6480388104263837
+    },
+    "truth_numeric_other_02": {
+      "static_readout_delta_bits": -11.57815344146767,
+      "regression_delta_bits": 6.2164747645248575
+    },
+    "truth_numeric_other_03": {
+      "static_readout_delta_bits": 0.22538459880214143,
+      "regression_delta_bits": 8.78452992433696
+    },
+    "truth_numeric_other_04": {
+      "static_readout_delta_bits": -10.695396539523776,
+      "regression_delta_bits": -1.0618422278362707
+    },
+    "truth_numeric_other_05": {
+      "static_readout_delta_bits": 1.9082542020501911,
+      "regression_delta_bits": -0.5054313743014427
+    },
+    "truth_numeric_other_06": {
+      "static_readout_delta_bits": -12.448861355405187,
+      "regression_delta_bits": 8.246145937442938
+    },
+    "truth_numeric_other_07": {
+      "static_readout_delta_bits": -0.9261731536183216,
+      "regression_delta_bits": 12.982155085987172
+    }
+  },
+  "scoring": {
+    "loss": "min(abs(prediction-gold),60); invalid=60",
+    "primary": "paired mean error absent minus true across all32; stratified reports",
+    "utility": "must improve over unchanged, frozen static readout and frozen old-case ridge; compare paired intervals, no early stopping",
+    "interval": "bootstrap32questions10000draws seed7281",
+    "explanations": "retained, not verified",
+    "baseline_invalids": "all32 numeric score; behavior separately scoped to valid baseline"
+  },
+  "regression_model_path": "/Users/user/mpd-data/scratch/native_qa_bridge/query_ridge_v1/frozen_model.json",
+  "regression_model_sha256": "f3c59044141df883965c5b2315c123f2ea799796624b6c7b46722f94bfcd93c2",
+  "schema": "native_local_mlx_reader_v1",
+  "model": "mlx-community/Qwen3.6-35B-A3B-4bit",
+  "model_revision": "38740b847e4cb78f352aba30aa41c76e08e6eb46",
+  "backend": "mlx",
+  "quantization": "4bit",
+  "context_cap": 32768,
+  "api_calls": 0,
+  "api_spend_usd": 0,
+  "tokenizer_path": "/Users/user/.cache/huggingface/hub/models--mlx-community--Qwen3.6-35B-A3B-4bit/snapshots/38740b847e4cb78f352aba30aa41c76e08e6eb46",
+  "tokenizer_sha256": {
+    "tokenizer_config.json": "e98f1901ac6f0adff67b1d540bfa0c36ac1a0cf59eb72ed78146ef89aafa1182",
+    "config.json": "a822a9e48b0aafbe3144ec37d4fb067e178ed96615ce6e4420b3149893cc5767",
+    "tokenizer.json": "87a7830d63fcf43bf241c3c5242e96e62dd3fdc29224ca26fed8ea333db72de4",
+    "processor_config.json": "51c5f33646392e0bf1ed3e96be02504da47406c21c6cb86925d8908d1a6c4da7",
+    "generation_config.json": "e70c136c1b78ddc1fb0905bac8e733a4dc448d4f852a5dd75143fffc70be550e",
+    "chat_template.jinja": "e84f32a23fdda27689f868aa4a1a5621f41133e51a48d7f3efcbea2839574259",
+    "configuration.json": "c1b09db419119513247e9b8b912c4b9897106c9b20c6cada7e107d993c5435eb",
+    "vocab.json": "ce99b4cb2983d118806ce0a8b777a35b093e2000a503ebde25853284c9dfa003",
+    "model.safetensors.index.json": "0b28df60e33753a14e816d3b31577ae2c93884c58430a4a6de6ae9ea483842ea",
+    "video_preprocessor_config.json": "7768af27c1fafa9cc9011c1dc20067e03f8915e03b63504550e11d5066986d13",
+    "preprocessor_config.json": "27225450ac9c6529872ee1924fcb0962ff5634834f817040f444118116f4e516"
+  },
+  "model_files_sha256": {
+    "model-00001-of-00004.safetensors": "09f3e6ecb0b7af6e6a38bc8169a134c821b0924c2679b2bb8f4426ad38d032b8",
+    "model-00002-of-00004.safetensors": "31dcdb1c49eebdb1505bd14e3cb33f9cf900bd2546b638f2464694ae763a033f",
+    "model-00003-of-00004.safetensors": "3e66de06a1f03dade16a612a368cfce4a4c9caa4efd7d28185454384082cec03",
+    "model-00004-of-00004.safetensors": "a5d0cf03519c26f8b506df6b0ba60526e5c08c8cea22d0c21ce92950e58a5422",
+    "config.json": "a822a9e48b0aafbe3144ec37d4fb067e178ed96615ce6e4420b3149893cc5767",
+    "model.safetensors.index.json": "0b28df60e33753a14e816d3b31577ae2c93884c58430a4a6de6ae9ea483842ea"
+  },
+  "runner_sha256": "4286da805f0a754cead99ca02617237efa8d703202a9e62f6b72d39536a3d512",
+  "freezer_sha256": "873752a7ac2d74f82650e2c794af5a42190b706aed538ffee26215b6aba6ff75",
+  "source_frozen_manifest_path": "/Users/user/mpd-data/scratch/root/native_query_reader_v1/frozen/manifest.json",
+  "source_frozen_manifest_sha256": "6692ea7109543253bfb2fa54f4d6d294f5a415de2eab0f039395a9d6062be93a",
+  "source_requests_sha256": "2f9c01c8ee906acb95cbbdd37803329ecd5fdb39f2303768693a0ec3c3e55c44",
+  "source_chats_identical_tokens_after_local_render": 96,
+  "scope": "New local quantized 35B reader experiment authorized for Mac GPU. Not the unexecuted 397B API experiment. Same original 8B target, 32 questions, original native observations, old facts, three arms and numerical baselines. All first greedy answers and failures retained; no new gold before prediction publication. Quantization/backend/model changes limit comparison with other readers."
+}

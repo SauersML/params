@@ -1,0 +1,74 @@
+{
+  "model": "mlx-community/Qwen3.6-35B-A3B-4bit",
+  "revision": "38740b847e4cb78f352aba30aa41c76e08e6eb46",
+  "files": {
+    ".gitattributes": {
+      "bytes": 1570,
+      "sha256": null
+    },
+    "README.md": {
+      "bytes": 724,
+      "sha256": null
+    },
+    "chat_template.jinja": {
+      "bytes": 7764,
+      "sha256": null
+    },
+    "config.json": {
+      "bytes": 23591,
+      "sha256": null
+    },
+    "configuration.json": {
+      "bytes": 58,
+      "sha256": null
+    },
+    "generation_config.json": {
+      "bytes": 202,
+      "sha256": null
+    },
+    "model-00001-of-00004.safetensors": {
+      "bytes": 5288196018,
+      "sha256": "09f3e6ecb0b7af6e6a38bc8169a134c821b0924c2679b2bb8f4426ad38d032b8"
+    },
+    "model-00002-of-00004.safetensors": {
+      "bytes": 5368472749,
+      "sha256": "31dcdb1c49eebdb1505bd14e3cb33f9cf900bd2546b638f2464694ae763a033f"
+    },
+    "model-00003-of-00004.safetensors": {
+      "bytes": 5368324139,
+      "sha256": "3e66de06a1f03dade16a612a368cfce4a4c9caa4efd7d28185454384082cec03"
+    },
+    "model-00004-of-00004.safetensors": {
+      "bytes": 4377211365,
+      "sha256": "a5d0cf03519c26f8b506df6b0ba60526e5c08c8cea22d0c21ce92950e58a5422"
+    },
+    "model.safetensors.index.json": {
+      "bytes": 215755,
+      "sha256": null
+    },
+    "preprocessor_config.json": {
+      "bytes": 390,
+      "sha256": null
+    },
+    "processor_config.json": {
+      "bytes": 1312,
+      "sha256": null
+    },
+    "tokenizer.json": {
+      "bytes": 19989343,
+      "sha256": "87a7830d63fcf43bf241c3c5242e96e62dd3fdc29224ca26fed8ea333db72de4"
+    },
+    "tokenizer_config.json": {
+      "bytes": 1139,
+      "sha256": null
+    },
+    "video_preprocessor_config.json": {
+      "bytes": 385,
+      "sha256": null
+    },
+    "vocab.json": {
+      "bytes": 6722759,
+      "sha256": null
+    }
+  }
+}

@@ -170,7 +170,7 @@ class Patcher:
         return hs
 
     def _last(self, ids, B: int, cache=None, keep=None, layer0: int = 0, h0=None, **hooks) -> torch.Tensor:
-        """[B, V] float32 log-probabilities at the last position; with cache (_prefix: start, keys and values of positions
+        """[B, d] final hidden states at the last position (_head; _logp, _contrast); with cache (_prefix: start, keys and values of positions
         0..start-1 per layer) only the positions from start on run (the hooks see those), and with layer0 > 0 only the
         layers from layer0 on, from h0 [B, T - start, d] (the residual input of layer layer0 there); keep (a list): the
         run's first row's keys and values per layer appended to it."""
@@ -212,14 +212,17 @@ class Patcher:
         finally:
             for h in hs:
                 h.remove()
-        return torch.log_softmax(lg, -1)
+        return lg
 
     def _head(self, h: torch.Tensor) -> torch.Tensor:
-        """[B, V] float32 logits of the last position of h [B, S, d] (the final norm applied): the output projection on a
-        contiguous copy of that position (the model's own logits_to_keep slice is a strided view; a cuBLAS matrix-vector
-        kernel took 5.0 of 12.1 s of a Qwen3-8B question's GPU time on an A6000 before STAGED)."""
-        w = self.core.lm_head.weight
-        return self.core.lm_head(h[:, -1].to(w.device).contiguous()).float()
+        """[B, d] the last position of final hidden states h [B, S, d] (the final norm applied), a contiguous copy on the
+        output projection's card (the model's own logits_to_keep slice is a strided view: projected, a cuBLAS
+        matrix-vector kernel per row took 5.0 of 12.1 s of a Qwen3-8B question's GPU time on an A6000 before STAGED)."""
+        return h[:, -1].to(self.core.lm_head.weight.device).contiguous()
+
+    def _logp(self, hn: torch.Tensor) -> torch.Tensor:
+        """[B, V] float32 log-probabilities from final hidden states hn [B, d] (_last's, _staged's)."""
+        return torch.log_softmax(self.core.lm_head(hn).float(), -1)
 
     @torch.no_grad()
     def _prefix(self, x: torch.Tensor, start: int, layout: tuple):
@@ -236,7 +239,7 @@ class Patcher:
 
     @torch.no_grad()
     def _staged(self, start: int, layout: list, lows: list, stacks=None, **hooks) -> torch.Tensor:
-        """[R, V] float32 log-probabilities at the last position of R rows, row r in base layout[r], run over positions
+        """[R, d] final hidden states (_last's) at the last position of R rows, row r in base layout[r], run over positions
         start.. only, each from its own layer lows[r] (ascending) on: a row joins there with its base run's residual
         input, its keys and values before start are its base run's (STAGED: no layer below a row's lowest patch runs);
         stacks: the two runs' residuals and keys and values to use (_derive's), default the setup runs'."""
@@ -272,7 +275,7 @@ class Patcher:
         finally:
             for x in hs:
                 x.remove()
-        return torch.log_softmax(lg, -1)
+        return lg
 
     @torch.no_grad()
     def setup(self, clean: list[int], corrupt: list[int], answers: list[int] | None = None,
@@ -307,11 +310,12 @@ class Patcher:
         self.T = len(clean)
         self.first = next(p for p in range(self.T) if clean[p] != corrupt[p])
         self.act = {}
-        lp = {}
+        lp, hn = {}, {}
         self._base_kv = {}
         for k, ids in self.ids.items():
             cap, kv = {}, []
-            lp[k] = self._last(ids, self.rows, cap=cap, keep=kv if PREFIX else None)[0]
+            hn[k] = self._last(ids, self.rows, cap=cap, keep=kv if PREFIX else None)[:1]
+            lp[k] = self._logp(hn[k])[0]
             self.act[k] = {n: [t[0] for t in v] for n, v in cap.items()}           # per layer [T, dim]
             self._base_kv[k] = kv
         if PREFIX:                                  # both runs' residual inputs [2, T, d] and keys and values [2, KV, T, hd]
@@ -331,7 +335,7 @@ class Patcher:
         self._sets_dev = None
         self.y = self.sets["answer"][0]
         valid = self.sets.get("valid", True)
-        self.c = {k: float(self._contrast(v[None])[0]) for k, v in lp.items()} if valid else {"clean": 0.0, "corrupt": 0.0}
+        self.c = {k: float(self._contrast(v)[0]) for k, v in hn.items()} if valid else {"clean": 0.0, "corrupt": 0.0}
         self.gap = self.c["clean"] - self.c["corrupt"]
         return {"answer": self.y, "corrupt_answer": yc, "answer_tokens": self.sets["answer"], "alternatives": self.sets["alternatives"],
                 "answer_word": self.sets["answer_word"], "alternative_words": self.sets["alternative_words"], "valid": valid,
@@ -358,11 +362,16 @@ class Patcher:
         t = torch.from_numpy(a)
         return t.pin_memory().to(self.dev, non_blocking=True) if self.dev.type == "cuda" else t.to(self.dev)
 
-    def _contrast(self, lp: torch.Tensor) -> torch.Tensor:
-        if self._sets_dev is None or self._sets_dev[0] != lp.device:   # (the token sets on the device once a pair: a
-            self._sets_dev = (lp.device, {k: torch.as_tensor(self.sets[k], dtype=torch.long, device=lp.device)
-                                          for k in ("answer", "alternatives")})   # (host copy per batch waited for the GPU)
-        return answer_contrast.contrast(lp, self._sets_dev[1])
+    def _contrast(self, hn: torch.Tensor) -> torch.Tensor:
+        """[B] bits, log2 p(answer) - log2 p(alternatives) (answer_contrast's), from final hidden states hn [B, d]: the
+        answer's and the alternatives' logits only, in float32 (the softmax's normalizer cancels; a bfloat16 model's own
+        logits of ~20-30 round to 0.125-0.25, which moved a contrast by up to 0.36 bits, ~0.02 of a gap)."""
+        if self._sets_dev is None or self._sets_dev[0] != hn.device:   # (the two token sets' output rows once a pair)
+            a, o, W = list(self.sets["answer"]), list(self.sets["alternatives"]), self.core.lm_head.weight
+            self._sets_dev = (hn.device, W[torch.as_tensor(a + o, device=W.device)].float().to(hn.device), len(a))
+        _, W, na = self._sets_dev
+        z = hn.float() @ W.T
+        return (torch.logsumexp(z[:, :na], -1) - torch.logsumexp(z[:, na:], -1)) / math.log(2)
 
     @torch.no_grad()
     def run(self, base: str, sets: list, given: list | None = None) -> list[float]:

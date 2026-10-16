@@ -53,7 +53,7 @@ def counterfactual_pairs(pt: cf.Patcher, ids: list[int], k: int = CF_K) -> list[
     for s0 in range(0, len(tries), pt.rows):
         part = tries[s0:s0 + pt.rows]
         xs = torch.tensor([t for _, t in part] + [ids] * (pt.rows - len(part)), device=pt.dev)
-        out = torch.log_softmax(pt._head(pt.core.model(input_ids=xs).last_hidden_state), -1)[:len(part)]   # (Patcher._head)
+        out = pt._logp(pt._head(pt.core.model(input_ids=xs).last_hidden_state))[:len(part)]   # (Patcher._head, _logp)
         for (q, t), o in zip(part, out):
             if int(o.argmax()) != y:
                 d = float(lp[-1, y] - o[y])

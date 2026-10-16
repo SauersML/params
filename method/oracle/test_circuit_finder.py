@@ -273,3 +273,13 @@ def test_floor_measured_in_low_precision_only(tiny):
     lo.setup(clean, corrupt)
     f = cf.floor(lo, "neuron", range(lo.first, lo.T - 1))
     assert 0.0 <= f < 1.0
+
+
+def test_contrast_from_the_token_sets_logits(tiny):
+    """The contrast from the answer's and the alternatives' float32 logits equals answer_contrast's from every log
+    probability (the softmax's normalizer cancels)."""
+    pt, clean, corrupt = tiny
+    pt.setup(clean, corrupt)
+    hn = pt._last(clean, 4)
+    want = cf.answer_contrast.contrast(pt._logp(hn), {k: pt.sets[k] for k in ("answer", "alternatives")})
+    assert torch.allclose(pt._contrast(hn), want, atol=1e-4)

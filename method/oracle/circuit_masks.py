@@ -59,75 +59,86 @@ def _kinds_of(spec: dict) -> tuple:
     return tuple(spec["kinds"])
 
 
-@torch.no_grad()
-def _others(pt, layout: list, start: int) -> dict:
-    """Each row's other run's head outputs and neurons from start on: {"head"|"neuron": [L] [B, S, width]}."""
-    other = {"clean": "corrupt", "corrupt": "clean"}
-    return {kind: [torch.stack([pt.act[other[b]][key][i][start:] for b in layout]) for i in range(pt.L)]
-            for kind, key in (("head", "head"), ("neuron", "neu"))}
-
-
 def optimize(pt, specs: list, steps: int = STEPS, log=None, taus: list | None = None) -> list:
-    """Masks for specs [{"kinds": ("neuron",) | ("head",) | ("neuron", "head"), "positions": [...]}], optimized together
-    (two rows a spec); per spec {kind: theta [L, P, width]} (final logits, on the host) and the history of (lost,
-    restored, sum m) per step. taus: per spec the hinges' targets (lost, restored), default TAU for both."""
-    start = min(min(s["positions"]) for s in specs)
-    layout = [b for _ in specs for b in ("clean", "corrupt")]
-    B, S = len(layout), pt.T - start
-    width = {"neuron": pt.D, "head": pt.H}
-    devs = [l.mlp.down_proj.weight.device for l in pt.layers]
-    theta = [{k: torch.full((pt.L, len(s["positions"]), width[k]), INIT, device=pt.dev, requires_grad=True)
-              for k in _kinds_of(s)} for s in specs]
-    rel = [torch.tensor([p - start for p in s["positions"]], device=pt.dev) for s in specs]
-    others = _others(pt, layout, start)
-    opt = torch.optim.Adam([t for th in theta for t in th.values()], lr=LR)
-    x = torch.stack([pt._ids_dev[b] for b in layout])
-    cache = pt._prefix(x, start, tuple(layout))
-    kinds = sorted({k for s in specs for k in _kinds_of(s)})
-    only = {"res": set(), "head": set(range(pt.L)) if "head" in kinds else set(),
-            "neu": set(range(pt.L)) if "neuron" in kinds else set()}
-    zeros = {k: torch.zeros(S, width[k], device=pt.dev) for k in kinds}
+    """Masks for specs [{"kinds": ("neuron",) | ("head",) | ("neuron", "head"), "positions": [...]}] of the pair set up in
+    pt, optimized together (optimize_many's, one job)."""
+    return optimize_many([(pt, specs, taus)], steps=steps, log=log)[0]
+
+
+def optimize_many(jobs: list, steps: int = STEPS, log=None) -> list:
+    """Masks for several pairs at once: jobs [(pt, specs, taus)], Patchers of one model each set up on its own pair (prompts
+    of one length), every spec of every job two rows of one batch per step (a step reads every weight twice whatever
+    its rows: batched pairs cost about one). taus: per spec the hinges' targets (lost, restored), default TAU. Per job
+    and spec {kind: theta [L, P, width]} (final logits, on the host) and the history of (lost, restored, sum m) per step.
+    A mask edits only its own (row, position) entries: those rows' values gathered, moved toward the other run's and
+    put back."""
+    pt0 = jobs[0][0]
+    T = pt0.T
+    assert all(pt.T == T for pt, _, _ in jobs), "optimize_many: prompts of one length"
+    L, dev = pt0.L, pt0.dev
+    width = {"neuron": pt0.D, "head": pt0.H}
+    key = {"neuron": "neu", "head": "head"}
+    specs = [(q, s) for q, (pt, ss, _) in enumerate(jobs) for s in ss]          # global spec g: rows 2g (clean, noised)
+    start = min(min(s["positions"]) for _, s in specs)                           # and 2g + 1 (corrupted, denoised)
+    B, S = 2 * len(specs), T - start
+    kinds = sorted({k for _, s in specs for k in s["kinds"]})
+    pairs = {k: [(g, p) for g, (_, s) in enumerate(specs) if k in s["kinds"] for p in s["positions"]] for k in kinds}
+    rows = {k: torch.tensor([2 * g + b for g, _ in pairs[k] for b in (0, 1)], device=dev) for k in kinds}
+    pos = {k: torch.tensor([p - start for _, p in pairs[k] for _ in (0, 1)], device=dev) for k in kinds}
+    gof = {k: torch.tensor([g for g, _ in pairs[k]], device=dev) for k in kinds}
+    with torch.no_grad():                           # each pair's two rows' other-run values per layer [2N, width]
+        others = {k: [torch.stack([jobs[specs[g][0]][0].act[src][key[k]][i][p] for g, p in pairs[k]
+                                   for src in ("corrupt", "clean")]) for i in range(L)] for k in kinds}
+        x = torch.stack([jobs[q][0]._ids_dev[b] for q, _ in specs for b in ("clean", "corrupt")])
+        kv = [tuple(torch.cat([jobs[q][0]._base_kv[b][i][j][:, :, :start] for q, _ in specs for b in ("clean", "corrupt")])
+                    for j in (0, 1)) for i in range(L)]
+    theta = {k: torch.full((L, len(pairs[k]), width[k]), INIT, device=dev, requires_grad=True) for k in kinds}
+    opt = torch.optim.Adam(list(theta.values()), lr=LR)
+    only = {"res": set(), "head": set(range(L)) if "head" in kinds else set(), "neu": set(range(L)) if "neuron" in kinds else set()}
+    tau = torch.tensor([t for _, ss, taus in jobs for t in (taus or [(TAU, TAU)] * len(ss))], device=dev)
+    cc = torch.tensor([jobs[q][0].c["clean"] for q, _ in specs], device=dev)
+    cr = torch.tensor([jobs[q][0].c["corrupt"] for q, _ in specs], device=dev)
+    gap = torch.tensor([jobs[q][0].gap for q, _ in specs], device=dev)
+    spans, at = [], 0                               # each job's rows (consecutive)
+    for pt, ss, _ in jobs:
+        spans.append((pt, at, at + 2 * len(ss)))
+        at += 2 * len(ss)
     hist = [[] for _ in specs]
-    tau = torch.tensor(taus or [(TAU, TAU)] * len(specs), device=pt.dev)
-
-    def mask(kind, i, ms):                          # [B, S, width] this layer's mask over the batch's rows
-        rows = []
-        for j, s in enumerate(specs):
-            m = zeros[kind] if kind not in ms[j] else torch.index_copy(zeros[kind], 0, rel[j], ms[j][kind][i])
-            rows += [m, m]
-        return torch.stack(rows).to(devs[i])
-
     for step in range(steps):
-        ms = [{k: torch.sigmoid(t) for k, t in th.items()} for th in theta]
+        ms = {k: torch.sigmoid(t) for k, t in theta.items()}
 
-        def neu(i, h):
-            m = mask("neuron", i, ms).to(h.dtype)
-            return h + m * (others["neuron"][i].to(h.device, h.dtype) - h)
-
-        def head(i, h):
-            Bh, Sh, _ = h.shape
-            m = mask("head", i, ms).to(h.dtype)[..., None]
-            h4 = h.reshape(Bh, Sh, pt.H, pt.hd)
-            o4 = others["head"][i].to(h.device, h.dtype).reshape(Bh, Sh, pt.H, pt.hd)
-            return (h4 + m * (o4 - h4)).reshape(Bh, Sh, pt.H * pt.hd)
+        def edit(k, i, h):
+            d = h.device
+            r, p = rows[k].to(d), pos[k].to(d)
+            m = ms[k][i].to(d, h.dtype).repeat_interleave(2, 0)              # [2N, width]
+            sel, o = h[r, p], others[k][i].to(d, h.dtype)
+            if k == "head":
+                sel, o, m = sel.view(-1, pt0.H, pt0.hd), o.view(-1, pt0.H, pt0.hd), m[..., None]
+            return h.index_put((r, p), (sel + m * (o - sel)).reshape(len(r), -1))
         with torch.enable_grad():
-            c = pt._contrast(pt._last(x, B, cache=cache, neu=neu if "neuron" in kinds else None,
-                                      head=head if "head" in kinds else None, only=only))
-            lost = (pt.c["clean"] - c[0::2]) / pt.gap
-            rest = (c[1::2] - pt.c["corrupt"]) / pt.gap
-            size = torch.stack([sum(m.sum() for m in mj.values()) for mj in ms])
+            hn = pt0._last(x, B, cache=(start, kv), neu=(lambda i, h: edit("neuron", i, h)) if "neuron" in kinds else None,
+                           head=(lambda i, h: edit("head", i, h)) if "head" in kinds else None, only=only)
+            c = torch.cat([pt._contrast(hn[a:b]) for pt, a, b in spans])
+            lost, rest = (cc - c[0::2]) / gap, (c[1::2] - cr) / gap
+            size = sum(torch.zeros(len(specs), device=dev).index_add(0, gof[k], m.sum((0, 2))) for k, m in ms.items())
             loss = (torch.relu(tau[:, 0] - lost) + torch.relu(tau[:, 1] - rest)).sum() + LAMBDA * size.sum()
             opt.zero_grad(set_to_none=True)
             loss.backward()
         opt.step()
-        for j, (a, b, n) in enumerate(zip(lost.tolist(), rest.tolist(), size.tolist())):
-            hist[j].append((round(a, 4), round(b, 4), round(n, 1)))
-    if log:
-        for j, s in enumerate(specs):
-            a, b, n = hist[j][-1]
-            log(f"    mask {'+'.join(_kinds_of(s))} at {s['positions'][0]}..{s['positions'][-1]}: {steps} steps, "
-                f"lost {a:.2f}, restored {b:.2f}, sum m {n:.1f}")
-    return [{"theta": {k: t.detach().float().cpu() for k, t in th.items()}, "history": h} for th, h in zip(theta, hist)]
+        for g, (a, b, n) in enumerate(zip(lost.tolist(), rest.tolist(), size.tolist())):
+            hist[g].append((round(a, 4), round(b, 4), round(n, 1)))
+    out, th = [[] for _ in jobs], {k: t.detach().float().cpu() for k, t in theta.items()}
+    for g, (q, s) in enumerate(specs):
+        got = {}
+        for k in s["kinds"]:
+            idx = [n for n, (gg, _) in enumerate(pairs[k]) if gg == g]       # (in the order of s["positions"])
+            got[k] = th[k][:, idx]
+        out[q].append({"theta": got, "history": hist[g]})
+        if log:
+            a, b, n = hist[g][-1]
+            log(f"    mask {'+'.join(s['kinds'])} at {s['positions'][0]}..{s['positions'][-1]}{f' (pair {q})' if len(jobs) > 1 else ''}: "
+                f"{steps} steps, lost {a:.2f}, restored {b:.2f}, sum m {n:.1f}")
+    return out
 
 
 def ordered(spec: dict, theta: dict) -> tuple:
@@ -259,6 +270,15 @@ def family_order(pt, spec: dict, prior: dict) -> list:
 def search_all(pt, arm: str, log=None, steps: int = STEPS, prior: dict | None = None) -> dict:
     """Every cut of the pair set up in pt by arm: circuit_finder.cut's result per cut name. Arms: "mask"; "attr"; "am", attr
     first and masks on the cuts it leaves unmet (one batch); "fam", prior's units (family_order) first, then attr's."""
+    st = _before(pt, arm, log=log, prior=prior)
+    t0 = time.perf_counter()
+    got = optimize(pt, [st["specs"][n] for n in st["masked"]], steps=steps, log=log, taus=st["taus"]) if st["masked"] else []
+    return _after(pt, st, got, time.perf_counter() - t0, steps, log=log)
+
+
+def _before(pt, arm: str, log=None, prior: dict | None = None) -> dict:
+    """search_all up to the masks: every cut's ceiling, attr's (and fam's) cuts, and the cuts left for masks ("masked")
+    with their hinge targets."""
     specs = cuts_of(pt)
     names = list(specs)
     width = {"neuron": pt.D, "head": pt.H}
@@ -282,24 +302,84 @@ def search_all(pt, arm: str, log=None, steps: int = STEPS, prior: dict | None = 
                              {"attr": {"seconds": round(time.perf_counter() - (t0 if n == live[0] else t1), 2),
                                        **({"family_units": len(fam)} if arm == "fam" else {})}})
         live = [n for n in live if not out[n]["met"]] if arm == "am" else []
-    if arm in ("mask", "am") and live:
-        t0 = time.perf_counter()
-        taus = [tuple(min(TAU, max(cf.PASS + 0.05, c - 0.05)) for c in ceil[n]) for n in live]
-        got = dict(zip(live, optimize(pt, [specs[n] for n in live], steps=steps, log=log, taus=taus)))
-        t_opt = time.perf_counter() - t0
-        for n in live:
-            t1 = time.perf_counter()
-            order, kept = ordered(specs[n], got[n]["theta"])
-            res = verify(pt, order, log=log, name=n)
-            out[n] = _record(res, ceil[n], True, specs[n]["positions"],
-                             {"mask": {"kept": kept, "history": got[n]["history"][::max(1, steps // 20)],
-                                       "seconds_opt": round(t_opt, 2), "seconds_verify": round(time.perf_counter() - t1, 2),
-                                       **({"attr_unmet": out[n]["found"]} if n in out else {})}})
-    for n in names:
+    masked = live if arm in ("mask", "am") else []
+    return {"specs": specs, "names": names, "ceil": ceil, "reach": reach, "out": out, "masked": masked,
+            "taus": [tuple(min(TAU, max(cf.PASS + 0.05, c - 0.05)) for c in ceil[n]) for n in masked]}
+
+
+def _after(pt, st: dict, got: list, t_opt: float, steps: int, log=None) -> dict:
+    """search_all from the masks on: each masked cut's order (ordered) through verify; cuts with no result have no units."""
+    specs, ceil, out = st["specs"], st["ceil"], st["out"]
+    for n, g in zip(st["masked"], got):
+        t1 = time.perf_counter()
+        order, kept = ordered(specs[n], g["theta"])
+        res = verify(pt, order, log=log, name=n)
+        out[n] = _record(res, ceil[n], True, specs[n]["positions"],
+                         {"mask": {"kept": kept, "history": g["history"][::max(1, steps // 20)],
+                                   "seconds_opt": round(t_opt, 2), "seconds_verify": round(time.perf_counter() - t1, 2),
+                                   **({"attr_unmet": out[n]["found"]} if n in out else {})}})
+    for n in st["names"]:
         if n not in out:
             out[n] = _record({"units": [], "singles": {}, "met": False, "lost": 0.0, "restored": 0.0, "found": 0, "curve": []},
-                             ceil[n], reach[n], specs[n]["positions"], {})
+                             ceil[n], st["reach"][n], specs[n]["positions"], {})
     return out
+
+
+def _find_with(pt, clean, corrupt, answers, log, arm: str, cuts: dict, rec0: dict | None = None) -> dict:
+    """circuit_finder.find's record with cuts (search_all's) in place of its cut() (and rec0, setup's record, in place
+    of setting up again)."""
+    def cut(pt_, sc, kind, positions, done, log=None, search=None):
+        return cuts["movers" if kind == "head" else "readout" if list(positions) == [pt_.T - 1] else "source"]
+    saved_cut = cf.cut
+    cf.cut = cut
+    pt.scores = lambda: {}                          # (group testing's order: unused here)
+    if rec0 is not None:
+        pt.setup = lambda *a, **k: dict(rec0)
+    try:
+        rec = cf.find(pt, clean, corrupt, answers, log=log)
+    finally:
+        cf.cut = saved_cut
+        del pt.scores
+        if rec0 is not None:
+            del pt.setup
+    extra = {k: {n: c[k] for n, c in cuts.items() if k in c} for k in ("attr", "mask")}   # (find() copies its own fields
+    return {**rec, "search": arm, **{k: v for k, v in extra.items() if v}}                 # only)
+
+
+def find_batch(pts: list, items: list, arm: str = "mask", steps: int = STEPS, log=None, priors: list | None = None) -> list:
+    """find() for several pairs at once: items [(clean, corrupt, answers)], one Patcher each (pts, of one model). Every
+    pair is set up and its ceilings (and attr's cuts) measured, then the masks of every pair's masked cuts optimized in
+    one batch per prompt length (optimize_many), then each pair's measured steps and record. Each record's "seconds" is
+    the batch's wall time over its pairs."""
+    t0 = time.perf_counter()
+    recs, sts = [None] * len(items), [None] * len(items)
+    for j, (pt, (clean, corrupt, answers)) in enumerate(zip(pts, items)):
+        rec0 = pt.setup(clean, corrupt, answers)
+        if not rec0["valid"] or rec0["gap"] < cf.MIN_GAP or rec0["same_answer"]:
+            recs[j] = {**cf.find(pt, clean, corrupt, answers, log=log), "search": arm}
+            continue
+        sts[j] = (rec0, _before(pt, arm, log=log, prior=(priors or [None] * len(items))[j]))
+    by_T = {}
+    for j, x in enumerate(sts):
+        if x is not None and x[1]["masked"]:
+            by_T.setdefault(pts[j].T, []).append(j)
+    got, t_opt = {}, {}
+    for T, js in by_T.items():
+        t1 = time.perf_counter()
+        res = optimize_many([(pts[j], [sts[j][1]["specs"][n] for n in sts[j][1]["masked"]], sts[j][1]["taus"]) for j in js],
+                            steps=steps, log=log)
+        for j, r in zip(js, res):
+            got[j], t_opt[j] = r, (time.perf_counter() - t1) / len(js)
+    for j, x in enumerate(sts):
+        if x is None:
+            continue
+        clean, corrupt, answers = items[j]
+        cuts = _after(pts[j], x[1], got.get(j, []), t_opt.get(j, 0.0), steps, log=log)
+        recs[j] = _find_with(pts[j], clean, corrupt, answers, log, arm, cuts, rec0=x[0])
+    wall = time.perf_counter() - t0
+    for r in recs:
+        r.update(seconds_own=r.get("seconds"), seconds=round(wall / len(items), 2), batch=len(items))
+    return recs
 
 
 def find(pt, clean: list[int], corrupt: list[int], answers=None, log=None, arm: str = "mask", steps: int = STEPS,
@@ -307,25 +387,12 @@ def find(pt, clean: list[int], corrupt: list[int], answers=None, log=None, arm: 
     """circuit_finder.find with arm's search in place of group testing (its record, "search": arm)."""
     if arm == "group":
         return {**cf.find(pt, clean, corrupt, answers, log=log), "search": "group"}
-    keys = ("attr", "mask")
-    memo = {}
-
-    def cut(pt_, sc, kind, positions, done, log=None, search=None):
-        key = (tuple(pt_.ids["clean"]), tuple(pt_.ids["corrupt"]))
-        if memo.get("key") != key:
-            memo.update(key=key, cuts=search_all(pt_, arm, log=log, steps=steps, prior=prior))
-        name = "movers" if kind == "head" else "readout" if list(positions) == [pt_.T - 1] else "source"
-        return memo["cuts"][name]
-    saved_cut = cf.cut
-    cf.cut = cut
-    pt.scores = lambda: {}                          # (group testing's order: unused here; attr reads its own)
-    try:
-        rec = cf.find(pt, clean, corrupt, answers, log=log)
-    finally:
-        cf.cut = saved_cut
-        del pt.scores
-    extra = {k: {n: c[k] for n, c in memo.get("cuts", {}).items() if k in c} for k in keys}   # (find() copies its own
-    return {**rec, "search": arm, **{k: v for k, v in extra.items() if v}}                     # fields only)
+    t0 = time.perf_counter()
+    rec0 = pt.setup(clean, corrupt, answers)
+    if not rec0["valid"] or rec0["gap"] < cf.MIN_GAP or rec0["same_answer"]:
+        return {**cf.find(pt, clean, corrupt, answers, log=log), "search": arm}
+    rec = _find_with(pt, clean, corrupt, answers, log, arm, search_all(pt, arm, log=log, steps=steps, prior=prior), rec0=rec0)
+    return {**rec, "seconds": round(time.perf_counter() - t0, 2)}
 
 
 def main():
@@ -347,6 +414,8 @@ def main():
     ap.add_argument("--device", default="auto")
     ap.add_argument("--rev", default=None)
     ap.add_argument("--steps", type=int, default=STEPS)
+    ap.add_argument("--batch", type=int, default=1, help="mask and am: pairs whose masks are optimized in one batch "
+                    "(find_batch; a record's seconds the batch's wall time over its pairs)")
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--offset", type=int, default=0)
     ap.add_argument("--stride", type=int, default=1)
@@ -383,28 +452,44 @@ def main():
     for arm in arms:
         assert arm.split(":")[0] in ("mask", "group", "attr", "am", "fam"), arm
         (out / arm.replace(":", "_")).mkdir(exist_ok=True)
-    first = True
+    jobs = []
     for q in qs:
         clean, corrupt = cf.chat(tok, q["user"]) + pre(q), cf.chat(tok, q["corrupt_user"]) + pre(q)
         if len(clean) != len(corrupt):
             log(f"{q['id']}: prompts of {len(clean)} and {len(corrupt)} tokens, skipped")
             continue
+        jobs.append((q, clean, corrupt))
+    jobs.sort(key=lambda j: len(j[1]))              # (batches of one prompt length)
+    pts = [pt] + [cf.Patcher(model, tok) for _ in range(max(0, a.batch - 1))]
+    pt.setup(jobs[0][1], jobs[0][2])                # (a throwaway run: CUDA's first kernels)
+
+    def write(arm, q, clean, corrupt, rec):
+        rec.update(id=q["id"], ids=clean, corrupted=corrupt, answer_text=tok.decode([rec["answer"]]),
+                   corrupt_answer_text=tok.decode([rec["corrupt_answer"]]), model=a.model, dtype=a.dtype,
+                   finder="circuit_masks", finder_rev=a.rev, **{k: q[k] for k in ("user", "corrupt_user", "task", "key") if k in q})
+        (out / arm.replace(":", "_") / f"{q['id'].replace('/', '__')}.json").write_text(json.dumps(rec))
+
+    def prior_of(name, q):
+        return family_prior([r for r in priors if r.get("task") == q.get("task") and r["id"] != q["id"]]) if name == "fam" else None
+    for c0 in range(0, len(jobs), a.batch):
+        chunk = jobs[c0:c0 + a.batch]
         for arm in arms:
-            path = out / arm.replace(":", "_") / f"{q['id'].replace('/', '__')}.json"
-            if path.exists():
-                continue
-            if first:                               # (a throwaway run: CUDA's first kernels)
-                pt.setup(clean, corrupt)
-                first = False
-            log(f"{q['id']} ({arm})")
             name, _, n = arm.partition(":")
-            prior = family_prior([r for r in priors if r.get("task") == q.get("task") and r["id"] != q["id"]]) if name == "fam" else None
-            rec = find(pt, clean, corrupt, None, log=log, arm=name, steps=int(n) if n else a.steps, prior=prior)
-            rec.update(id=q["id"], ids=clean, corrupted=corrupt, answer_text=tok.decode([rec["answer"]]),
-                       corrupt_answer_text=tok.decode([rec["corrupt_answer"]]), model=a.model, dtype=a.dtype,
-                       finder="circuit_masks", finder_rev=a.rev,
-                       **{k: q[k] for k in ("user", "corrupt_user", "task", "key") if k in q})
-            path.write_text(json.dumps(rec))
+            steps = int(n) if n else a.steps
+            todo = [(q, cl, co) for q, cl, co in chunk
+                    if not (out / arm.replace(":", "_") / f"{q['id'].replace('/', '__')}.json").exists()]
+            if not todo:
+                continue
+            if a.batch > 1 and name in ("mask", "am"):
+                log(f"{len(todo)} pairs ({arm}, batched): " + ", ".join(q["id"] for q, _, _ in todo))
+                recs = find_batch(pts[:len(todo)], [(cl, co, None) for _, cl, co in todo], arm=name, steps=steps, log=log,
+                                  priors=[prior_of(name, q) for q, _, _ in todo])
+                for (q, cl, co), rec in zip(todo, recs):
+                    write(arm, q, cl, co, rec)
+                continue
+            for q, cl, co in todo:
+                log(f"{q['id']} ({arm})")
+                write(arm, q, cl, co, find(pt, cl, co, None, log=log, arm=name, steps=steps, prior=prior_of(name, q)))
 
 
 if __name__ == "__main__":

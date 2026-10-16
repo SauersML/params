@@ -31,11 +31,13 @@ pairs, every choice measured on every pair, so near-ties between units resolve t
              shares on each, so every reader of finder records reads a family record as is.
 
   circuit_family.py QUESTIONS.json OUT [--split dev] [--stride 1] [--variants 3] [--model Qwen/Qwen3-8B] [--dtype auto]
+      [--prior]   (each new pair's finder first tries the units the family's earlier pairs kept: prior_of)
 writes OUT/pairs/<pair>.json (finder records; existing ones are read, not rebuilt) and OUT/<family>.json;
   circuit_family.py RECORDS_DIR OUT --records NAME [--adapter A]    (an organism's finder records as one family)
 """
 from __future__ import annotations
 
+import collections
 import statistics
 import time
 
@@ -93,6 +95,23 @@ def candidates(recs: list[dict], tail: int, pool: str = "near") -> dict:
                 if max(abs(u["lost"]), abs(u["restored"])) >= low:
                     ks[key_of(stage, u, r, tail)] = None
     return {s: list(ks) for s, ks in out.items()}
+
+
+def prior_of(recs: list[dict], ids: list[int], corrupted: list[int]) -> dict | None:
+    """{stage: units} for circuit_finder.find's prior on a new pair of the family: the units earlier pairs' cuts kept
+    (keys by role, the most often kept first, ties first seen first), mapped into the new pair (None before any)."""
+    rs = [r for r in recs if r.get("cuts")]
+    if not rs:
+        return None
+    new = {"ids": ids, "tokens": len(ids), "first_diff": next(p for p in range(len(ids)) if ids[p] != corrupted[p])}
+    tail, out = tail_of(rs + [new]), {}
+    for stage in ("readout", "movers", "source"):
+        n = collections.Counter()
+        for r in rs:
+            for u in (r["routes"] if stage == "movers" else [x for x in r["nodes"] if x["stage"] == stage]):
+                n[key_of(stage, u, r, tail)] += 1
+        out[stage] = [u for u in (unit_of(k, new) for k, _ in n.most_common()) if u]
+    return out
 
 
 def patchers(pt: cf.Patcher, recs: list[dict]) -> list:
@@ -281,6 +300,8 @@ def main():
     ap.add_argument("--adapter", default=None)
     ap.add_argument("--dtype", default="auto", choices=("auto", "float32", "bfloat16"))
     ap.add_argument("--rows", type=int, default=cf.ROWS)
+    ap.add_argument("--prior", action="store_true", help="each new pair's finder tries the units earlier pairs of its "
+                    "family kept first (prior_of; its cuts' \"prior\" field says where they passed)")
     ap.add_argument("--rev", default=None)
     a = ap.parse_args()
     tok = AutoTokenizer.from_pretrained(a.model)
@@ -333,7 +354,7 @@ def main():
                 log(f"  {pid}: prompts of {len(clean)} and {len(corrupt)} tokens, skipped")
                 continue
             log(f"  {pid}")
-            rec = cf.find(pt, clean, corrupt, log=log)
+            rec = cf.find(pt, clean, corrupt, log=log, prior=prior_of(recs, clean, corrupt) if a.prior else None)
             rec.update(id=pid, ids=clean, corrupted=corrupt, user=user, corrupt_user=cuser, model=a.model, adapter=a.adapter,
                        dtype=a.dtype, finder="circuit_finder", finder_rev=a.rev)
             pp.write_text(json.dumps(rec))

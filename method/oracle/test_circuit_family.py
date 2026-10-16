@@ -64,6 +64,23 @@ def test_keys_map_back(pairs):
     assert all(set(ks) <= set(wide[s]) for s, ks in cand.items())
 
 
+def test_prior_maps_kept_units(pairs):
+    pt, recs = pairs
+    assert fam.prior_of([], recs[0]["ids"], recs[0]["corrupted"]) is None
+    pr = fam.prior_of(recs[:2], recs[2]["ids"], recs[2]["corrupted"])
+    tail = fam.tail_of(recs)
+    for s in ("readout", "movers", "source"):
+        kept = [fam.key_of(s, u, r, tail) for r in recs[:2]
+                for u in (r["routes"] if s == "movers" else [x for x in r["nodes"] if x["stage"] == s])]
+        assert set(pr[s]) == {u for u in (fam.unit_of(k, recs[2]) for k in kept) if u}
+    rec = cf.find(pt, recs[2]["ids"], recs[2]["corrupted"], prior=pr)
+    for s, c in rec["cuts"].items():                 # a cut from the prior holds only prior units
+        if c.get("prior") and not c["searched"]:
+            mine = ([("head", h["layer"], h["head"], h["pos"]) for h in rec["routes"]] if s == "movers" else
+                    [("neuron", n["layer"], n["pos"], n["neuron"]) for n in rec["nodes"] if n["stage"] == s])
+            assert set(mine) <= set(pr[s])
+
+
 def test_weights(pairs):
     pt, recs = pairs
     cand = fam.candidates(recs, fam.tail_of(recs))

@@ -34,6 +34,8 @@ import math
 import torch
 
 ROWS = 64
+PREFIX = True  # a forward computes only the positions from the first one an edit (or a watched neuron) names, its
+# attention reading the unedited run's keys and values before it (no edit reaches them)
 
 
 def rotate_half(x: torch.Tensor) -> torch.Tensor:
@@ -52,6 +54,7 @@ class Runner:
         self.dev = self.core.model.embed_tokens.weight.device
         self.rows = rows
         self.answer, self.alternatives = None, None
+        self._base = {}  # ids -> per layer the unedited run's keys [KV, T, hd] (after norm and rotary) and values
 
     def _d(self, L: int) -> torch.device:
         return self.layers[L].input_layernorm.weight.device
@@ -98,9 +101,20 @@ class Runner:
         core, H, KV, hd, f = self.core, self.H, self.KV, self.hd, self._f
         K, T = len(sets), len(ids)
         E = self._compile(sets)
-        x = core.model.embed_tokens(torch.tensor([ids], device=self.dev).expand(K, -1)).float()
-        cos, sin = core.model.rotary_emb(x, torch.arange(T, device=self.dev)[None])
-        cos, sin = cos[0].float(), sin[0].float()  # [T, hd]
+        s0 = 0                                      # the first position computed: every earlier one is the unedited run's
+        if PREFIX and not capture:
+            first = [it[2] if kind in ("knock", "head", "dq", "dk", "dv") else it[1]
+                     for kind, per in E.items() for items in per.values() for it in items]
+            s0 = min(first + [p for _, p, _ in watch] + [T - 1])
+            if s0 and tuple(ids) not in self._base:
+                st0 = self._forward(ids, [{}], True, [])["states"]
+                self._base[tuple(ids)] = (st0["k"], st0["v"])
+                while len(self._base) > 4:          # (a pair's two prompts and a few others)
+                    self._base.pop(next(iter(self._base)))
+        Ts = T - s0
+        x = core.model.embed_tokens(torch.tensor([ids[s0:]], device=self.dev).expand(K, -1)).float()
+        cos, sin = core.model.rotary_emb(x, torch.arange(s0, T, device=self.dev)[None])
+        cos, sin = cos[0].float(), sin[0].float()  # [Ts, hd]
         st = {k: [] for k in ("x", "q", "k", "v", "logits", "A", "z", "mid", "h")}
         st.update(cos=cos, sin=sin)
         seen = torch.zeros(K, len(watch))
@@ -109,35 +123,40 @@ class Runner:
             x, cs, sn = x.to(d), cos.to(d), sin.to(d)
             at = layer.self_attn
             hn = f(layer.input_layernorm, x)
-            q = f(at.q_norm, f(at.q_proj, hn).view(K, T, H, hd)).transpose(1, 2)
-            k = f(at.k_norm, f(at.k_proj, hn).view(K, T, KV, hd)).transpose(1, 2)
-            v = f(at.v_proj, hn).view(K, T, KV, hd).transpose(1, 2)
+            q = f(at.q_norm, f(at.q_proj, hn).view(K, Ts, H, hd)).transpose(1, 2)
+            k = f(at.k_norm, f(at.k_proj, hn).view(K, Ts, KV, hd)).transpose(1, 2)
+            v = f(at.v_proj, hn).view(K, Ts, KV, hd).transpose(1, 2)
             q, k = q * cs + rotate_half(q) * sn, k * cs + rotate_half(k) * sn
-            kh, vh = repeat_kv(k, H // KV), repeat_kv(v, H // KV)
-            for kind, t in (("dq", q), ("dk", kh), ("dv", vh)):
-                for b, h, p, delta in E.get(kind, {}).get(L, []):
-                    t[b, h, p] += delta.to(d, t.dtype)
+            kf, vf = k, v
+            if s0:                                  # every key and value: the unedited run's before s0
+                bk, bv = self._base[tuple(ids)]
+                kf = torch.cat([bk[L][:, :s0].to(d)[None].expand(K, -1, -1, -1), k], 2)
+                vf = torch.cat([bv[L][:, :s0].to(d)[None].expand(K, -1, -1, -1), v], 2)
+            kh, vh = repeat_kv(kf, H // KV), repeat_kv(vf, H // KV)
+            for kind, t, o in (("dq", q, s0), ("dk", kh, 0), ("dv", vh, 0)):   # (q holds the positions from s0; keys
+                for b, h, p, delta in E.get(kind, {}).get(L, []):              # and values every position)
+                    t[b, h, p - o] += delta.to(d, t.dtype)
             lg = (q @ kh.transpose(-1, -2)) * at.scaling
-            lg = lg.masked_fill(~torch.ones(T, T, dtype=torch.bool, device=d).tril(), float("-inf"))
+            lg = lg.masked_fill(~torch.ones(T, T, dtype=torch.bool, device=d).tril()[s0:], float("-inf"))
             for b, h, qq, p in E.get("knock", {}).get(L, []):
-                lg[b, h, qq, p] = float("-inf")
+                lg[b, h, qq - s0, p] = float("-inf")
             A = lg.softmax(-1)
-            z = (A @ vh).transpose(1, 2)  # [K, T, H, hd]
+            z = (A @ vh).transpose(1, 2)  # [K, Ts, H, hd]
             for b, h, p, val in E.get("head", {}).get(L, []):
-                z[b, p, h] = 0.0 if val is None else val.to(d, z.dtype)
+                z[b, p - s0, h] = 0.0 if val is None else val.to(d, z.dtype)
             if capture:
                 for key, val in (("x", x[0]), ("q", q[0]), ("k", k[0]), ("v", v[0]), ("logits", lg[0]), ("A", A[0]),
                                  ("z", z[0])):
                     st[key].append(val.detach().clone())
-            x = x + f(at.o_proj, z.reshape(K, T, H * hd))
+            x = x + f(at.o_proj, z.reshape(K, Ts, H * hd))
             hm = self._acts(layer, x)
             for b, p, j, delta in E.get("read", {}).get(L, []):
-                hm[b, p, j] = self._acts(layer, (x[b, p] - delta.to(d))[None], [j])[0, 0]
+                hm[b, p - s0, j] = self._acts(layer, (x[b, p - s0] - delta.to(d))[None], [j])[0, 0]
             for b, p, j, val in E.get("neuron", {}).get(L, []):
-                hm[b, p, j] = float(val)
+                hm[b, p - s0, j] = float(val)
             for w, (Lw, p, j) in enumerate(watch):
                 if Lw == L:
-                    seen[:, w] = hm[:, p, j].cpu()
+                    seen[:, w] = hm[:, p - s0, j].cpu()
             if capture:
                 st["mid"].append(x[0].detach().clone())
                 st["h"].append(hm[0].detach().clone())

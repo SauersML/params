@@ -66,6 +66,8 @@ BITS = tuple(round(2 ** (-i / 2), 4) for i in range(20))  # or each reader's err
 MEASURED = 512  # kept edges whose own cut from the graph is measured (those of largest share of their reader's strength)
 HALVE_BLOCKS = 8
 TOKENS = 1536  # cut sets a forward: this many tokens' worth (at least 16 sets)
+PREFIX = True  # a cut run computes only the positions from the circuit's first one on (every position before it is the
+# base run's: no cut reaches it), its attention reading the base run's keys and values there
 
 
 def weight(mod) -> torch.Tensor:
@@ -105,12 +107,13 @@ class Edges:
         self.eps = cfg.rms_norm_eps
         self.dev, self.dt = core.model.embed_tokens.weight.device, core.model.embed_tokens.weight.dtype
         self.T = target + 1
-        self.B = max(16, TOKENS // self.T)  # cut sets a forward
+        self.B = None  # cut sets a forward (below, from the positions a cut run computes)
         self.forwards = 0  # (contrasts' forwards so far)
         self.ids, self.target, self.answer, self.alternatives = list(ids)[:self.T], target, list(answer), list(alternatives)
         self.thr = None if thr is None else thr.to(self.dev, torch.float32)
         self.massive = None if massive is None else massive.float().cpu()
         self.N = sorted({(int(L), int(p), int(j)) for L, p, j in neurons if p < self.T})  # (by layer first)
+        self.B = max(16, TOKENS // (self.T - (min(n[1] for n in self.N) if PREFIX and self.N else 0)))
         self.at = {n: i for i, n in enumerate(self.N)}
         self.P = torch.tensor([n[1] for n in self.N], dtype=torch.long)
         self.Jn = torch.tensor([n[2] for n in self.N], dtype=torch.long)
@@ -195,14 +198,14 @@ class Edges:
             self._vcols[c] = (self._cols_on(dc)[:self.nb[c]] * g) @ self._w(layer.self_attn.v_proj).T
         return self._vcols[c]
 
-    def _dv(self, c: int, x: torch.Tensor, v: torch.Tensor, hw: torch.Tensor) -> torch.Tensor:
+    def _dv(self, c: int, x: torch.Tensor, v: torch.Tensor, hw: torch.Tensor, off: int = 0) -> torch.Tensor:
         """The change in layer c's values at each circuit writer's position when its write there leaves layer c's input
         (the writers below c; x [K, T, d] the stream entering layer c, v [K, KV, T, hd] its values, hw [K, W] the
-        writers' activations) [K, W, KV, hd]. Exact through the RMS norm: v(x) - v(x - h col) = (v(x) - b)(r' - r)/r' +
+        writers' activations; off: the first position x and v hold) [K, W, KV, hd]. Exact through the RMS norm: v(x) - v(x - h col) = (v(x) - b)(r' - r)/r' +
         h W_v(g col)/r', with r and r' the norm's rms of x and of x - h col."""
         K, W = hw.shape
         dc = x.device
-        cols, Pw = self._cols_on(dc)[:W], self.P[:W].to(dc)
+        cols, Pw = self._cols_on(dc)[:W], self.P[:W].to(dc) - off
         r2 = (x.pow(2).mean(-1) + self.eps)[:, Pw]  # [K, W]
         dots = (x @ cols.T)[:, Pw, torch.arange(W, device=dc)]  # each writer's column against the stream at its position
         dr2 = (hw * hw * cols.pow(2).sum(-1) - 2 * hw * dots) / x.shape[-1]  # r'^2 - r^2
@@ -292,74 +295,84 @@ class Edges:
         from transformers.models.qwen3.modeling_qwen3 import apply_rotary_pos_emb, repeat_kv
         core, H, KV, hd, T, f, N = self.core, self.H, self.KV, self.hd, self.T, self._f, len(self.N)
         K = max(cuts.shape[0], 1)
+        s0 = int(self.P.min()) if (PREFIX and N and not keep_states and probe is None and ids is None
+                                    and getattr(self, "base", None) is not None) else 0
+        Ts = T - s0  # (the positions run: from the circuit's first on; the base run's keys and values before it)
         coef = (cuts.float() if len(edges) else torch.zeros(K, 0)) - float(rest)  # per listed edge: cut 1, as run 0,
         # kept against a cut rest -1 (added back)
         plan = self._plan(edges)
-        x = core.model.embed_tokens(torch.tensor([ids or self.ids], device=self.dev).expand(K, -1)).float()
-        cos, sin = core.model.rotary_emb(x, torch.arange(T, device=self.dev)[None])
+        x = core.model.embed_tokens(torch.tensor([(ids or self.ids)[s0:]], device=self.dev).expand(K, -1)).float()
+        cos, sin = core.model.rotary_emb(x, torch.arange(s0, T, device=self.dev)[None])
         D = torch.zeros(K, N, x.shape[-1])  # per circuit neuron, what its listed cut edges take from its input
         Hc = torch.zeros(K, N)  # the circuit neurons' activations in this run
-        S = torch.zeros(K, T, x.shape[-1]) if rest else None  # (rest) per position, the circuit's writes so far ...
-        R = torch.zeros(K, T, x.shape[-1]) if rest else None  # ... and every route's change in the head outputs so far
+        S = torch.zeros(K, Ts, x.shape[-1]) if rest else None  # (rest) per position, the circuit's writes so far ...
+        R = torch.zeros(K, Ts, x.shape[-1]) if rest else None  # ... and every route's change in the head outputs so far
         P, Jn = self.P, self.Jn
-        states = {"x": [], "A": [], "v": [], "h": []}
+        Ps = P - s0  # (the circuit's positions among those run)
+        states = {"x": [], "A": [], "k": [], "v": [], "h": []}
         for L, layer in enumerate(self.layers):
             d = self._d(L)  # (every tensor of this layer's work on its card)
-            x, D, Hc, coef, P, Jn, cos, sin = (t.to(d) for t in (x, D, Hc, coef, P, Jn, cos, sin))
+            x, D, Hc, coef, P, Ps, Jn, cos, sin = (t.to(d) for t in (x, D, Hc, coef, P, Ps, Jn, cos, sin))
             if rest:
                 S, R = S.to(d), R.to(d)
-            kk, causal = torch.arange(K, device=d), torch.ones(T, T, dtype=torch.bool, device=d).tril()
+            kk, causal = torch.arange(K, device=d), torch.ones(T, T, dtype=torch.bool, device=d).tril()[s0:]
             at = layer.self_attn
             hn = f(layer.input_layernorm, x)
-            q = f(at.q_norm, f(at.q_proj, hn).view(K, T, H, hd)).transpose(1, 2)
-            k = f(at.k_norm, f(at.k_proj, hn).view(K, T, KV, hd)).transpose(1, 2)
-            v = f(at.v_proj, hn).view(K, T, KV, hd).transpose(1, 2)  # [K, KV, T, hd]
+            q = f(at.q_norm, f(at.q_proj, hn).view(K, Ts, H, hd)).transpose(1, 2)
+            k = f(at.k_norm, f(at.k_proj, hn).view(K, Ts, KV, hd)).transpose(1, 2)
+            v = f(at.v_proj, hn).view(K, Ts, KV, hd).transpose(1, 2)  # [K, KV, Ts, hd]
             q, k = apply_rotary_pos_emb(q, k, cos.float(), sin.float())
-            A = ((q @ repeat_kv(k, H // KV).transpose(-1, -2)) * at.scaling).masked_fill(~causal, float("-inf")).softmax(-1)
-            z = A @ repeat_kv(v, H // KV)  # [K, H, T, hd]
+            kf, vf = k, v
+            if s0:  # every key and value: the base run's before s0
+                kf = torch.cat([self.base["k"][L][:, :s0].to(d)[None].expand(K, -1, -1, -1), k], 2)
+                vf = torch.cat([self.base["v"][L][:, :s0].to(d)[None].expand(K, -1, -1, -1), v], 2)
+            A = ((q @ repeat_kv(kf, H // KV).transpose(-1, -2)) * at.scaling).masked_fill(~causal, float("-inf")).softmax(-1)
+            z = A @ repeat_kv(vf, H // KV)  # [K, H, Ts, hd]
             if keep_states:
                 states["x"].append(x[0].detach())
                 states["A"].append(A[0].detach())
+                states["k"].append(k[0].detach())
                 states["v"].append(v[0].detach())
             nb = self.nb[L]
             if nb and (rest or plan["heads"].get(L)):  # routes through this layer's heads
-                dv = self._dv(L, x, v, Hc[:, :nb])  # [K, nb, KV, hd]
+                dv = self._dv(L, x, v, Hc[:, :nb], s0)  # [K, nb, KV, hd]
                 Wo = self._wo(L)
                 if rest:  # every one: each position's head outputs from every writer's value change, summed
                     dV = torch.zeros(K, T, KV, hd, device=d).index_add(1, P[:nb], dv).transpose(1, 2)
-                    R = R + (A @ repeat_kv(dV, H // KV)).transpose(1, 2).reshape(K, T, H * hd) @ Wo.T
+                    R = R + (A @ repeat_kv(dV, H // KV)).transpose(1, 2).reshape(K, Ts, H * hd) @ Wo.T
                 for h in plan["heads"].get(L, []):  # the listed ones: the head's output change at the reader
                     es, wi, ri, ru, inv = (t.to(d) for t in plan["route"][(L, h)])
-                    dz = coef[:, es, None] * A[:, h][kk[:, None], P[ri][None], P[wi][None]][..., None] * dv[:, wi, h // (H // KV)]
+                    dz = coef[:, es, None] * A[:, h][kk[:, None], Ps[ri][None], P[wi][None]][..., None] * dv[:, wi, h // (H // KV)]
                     Z = torch.zeros(K, len(ru), hd, device=d).index_add(1, inv, dz)
                     D.index_add_(1, ru, Z @ Wo[:, h * hd:(h + 1) * hd].T)  # (in place: D is sets x neurons x d)
-            x = x + f(at.o_proj, z.transpose(1, 2).reshape(K, T, H * hd))
+            x = x + f(at.o_proj, z.transpose(1, 2).reshape(K, Ts, H * hd))
             hm = self._mlp_act(layer, x)
-            hm = self._weak(L, hm) if self.fixed is None else hm * self.fixed[L].to(d)[None]
+            hm = self._weak(L, hm) if self.fixed is None else hm * self.fixed[L].to(d)[None, s0:]
             if self.background == "circuit" and self.fixed is None:  # (strong candidates outside the circuit zeroed; position 0 and massive live)
-                off = ~self.keep[L].to(d)[None]
-                off[:, 0] = False
+                off = ~self.keep[L, s0:].to(d)[None]
+                if s0 == 0:
+                    off[:, 0] = False
                 if self.massive is not None:
                     off = off & (hm.abs() < float(self.massive[L]))
                 hm = hm.masked_fill(off, 0.0)
             rs = torch.arange(nb, self.nb[L + 1], device=d)  # the circuit's neurons of this layer
             if len(rs) and (len(edges) or rest):  # each from its own input
-                inp = x[:, P[rs]] - D[:, rs]
+                inp = x[:, Ps[rs]] - D[:, rs]
                 if rest:
-                    inp = inp - S[:, P[rs]] - R[:, P[rs]]
+                    inp = inp - S[:, Ps[rs]] - R[:, Ps[rs]]
                 if self.patch:  # (the cut edges' readers read what those edges bring in the corrupted run)
                     inp = inp + self._fixed(L, coef, plan, rest)
                 hr = self._mlp_act(layer, inp).gather(-1, Jn[rs][None, :, None].expand(K, -1, 1))[..., 0]
                 hr = self._weak(L, hr, Jn[rs]) if self.fixed is None else hr * self.fixed[L].to(d)[P[rs], Jn[rs]][None]
-                hm = hm.index_put((kk[:, None], P[rs][None], Jn[rs][None]), hr)
+                hm = hm.index_put((kk[:, None], Ps[rs][None], Jn[rs][None]), hr)
             if probe is not None:
                 hm = hm + probe[L].to(d)[None]
             if keep_states:
                 states["h"].append(hm[0].detach())
             if len(rs):
-                Hc = Hc.index_copy(1, rs, hm[kk[:, None], P[rs][None], Jn[rs][None]])
+                Hc = Hc.index_copy(1, rs, hm[kk[:, None], Ps[rs][None], Jn[rs][None]])
                 if rest:
-                    S.index_add_(1, P[rs], Hc[:, rs, None] * self._cols_on(d)[rs])
+                    S.index_add_(1, Ps[rs], Hc[:, rs, None] * self._cols_on(d)[rs])
             if L in plan["resid"]:  # the listed resid edges from this layer's writers: a coefficient per (reader, writer)
                 es, wi, wu, wl, ru, rl = plan["resid"][L]
                 C = torch.zeros(K, len(ru), len(wu), device=d)
@@ -367,7 +380,7 @@ class Edges:
                              coef[:, es] * Hc[:, wi], accumulate=True)
                 D.index_add_(1, ru, C @ self._cols_on(d)[wu])
             x = x + f(layer.mlp.down_proj, hm)
-        lp = torch.log_softmax(f(core.lm_head, f(core.model.norm, x[:, self.target])), -1).cpu()
+        lp = torch.log_softmax(f(core.lm_head, f(core.model.norm, x[:, self.target - s0])), -1).cpu()
         out = {"contrast": log2_contrast(lp, self.answer, self.alternatives), "lp": lp}
         if keep_states:
             out.update(states)

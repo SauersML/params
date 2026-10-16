@@ -252,3 +252,22 @@ def test_patching_pair(tiny):
         assert float(curves[i][-1]) == pytest.approx(float(h0[i]), rel=1e-4, abs=1e-6)
     got = neuron_edges.prune(ed, log=lambda m: None)
     assert got["record"]["met"]
+
+
+def test_prefix_runs_equal_full_runs(tiny, monkeypatch):
+    """A cut run computing only the positions from the circuit's first (the base run's keys and values before it) equals
+    the full run: listed cuts, the rest cut, and a patching pair."""
+    model, ids, neurons = tiny
+    g = torch.Generator().manual_seed(2)
+    bad = list(ids)
+    bad[7] = (bad[7] + 5) % 48
+    for kw in ({}, {"corrupt_ids": bad}):
+        ed = neuron_edges.Edges(model, ids, 9, [3], [5, 7], neurons, background="model", **kw)
+        _, es = every_edge(ed)
+        cuts = torch.rand(6, len(es), generator=g) < 0.3
+        got = {}
+        for on in (True, False):
+            monkeypatch.setattr(neuron_edges, "PREFIX", on)
+            got[on] = [ed.contrasts(cuts, es), ed.contrasts(cuts[:, :len(ed.resid_all)], ed.resid_all, rest=True)]
+        for a, b in zip(got[True], got[False]):
+            assert a == pytest.approx(b, abs=1e-4)

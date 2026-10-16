@@ -106,3 +106,22 @@ def test_value_after_matches_the_cut(tiny):
     s2 = rn.run(ids, [{"dv": [(c, h, p, dv[0])]}], capture=True)["states"]
     want = st["z"][c][q, h] + st["A"][c][h, q, p] * dv[0]
     assert torch.allclose(s2["z"][c][q, h], want, atol=1e-5)
+
+
+def test_prefix_runs_equal_full_runs(tiny, monkeypatch):
+    """A forward computing only the positions from the first one an edit names (the unedited run's keys and values
+    before it) equals the full forward, for every edit kind and watched neurons."""
+    _, ids, rn = tiny
+    g = torch.Generator().manual_seed(3)
+    r = lambda *s: torch.randn(*s, generator=g)  # noqa: E731
+    sets = [{"knock": [(1, 2, 9, 4), (2, 0, 7, 1)]}, {"head": [(0, 1, 6, None), (2, 3, 8, r(8))]},
+            {"neuron": [(1, 5, 3, 2.0)]}, {"dq": [(2, 1, 7, r(8))], "dk": [(1, 3, 6, r(8))], "dv": [(0, 2, 8, r(8))]},
+            {"read": [(2, 9, 11, r(32))]}, {}]
+    watch = [(2, 9, 5), (1, 6, 0)]
+    got = {}
+    for on in (True, False):
+        monkeypatch.setattr(head_routes, "PREFIX", on)
+        rn._base = {}
+        got[on] = rn.run(ids, sets, watch=watch)
+    assert torch.allclose(got[True]["lp"], got[False]["lp"], atol=1e-4)
+    assert torch.allclose(got[True]["watch"], got[False]["watch"], atol=1e-4)

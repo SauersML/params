@@ -95,6 +95,9 @@ def test_an_effect_random_units_also_produce_is_not_specific(tiny):
     assert ref["specific"] == ref["pass"]  # a prediction of nothing: specific when it passes
     assert same["pass"] and all(same["controls_pass"]) and not same["specific"]
     assert cc.effect_predicted({"contrast_change": {"op": "<=", "value": -2}}) and not cc.effect_predicted({"top_changes": False})
+    assert not cc.specific({"top_changes": False}, True, [False, False])  # (passes whatever the change)
+    assert cc.specific({"contrast_change": {"op": "within", "value": 0.25}}, True, [True, True])
+    assert not cc.specific({"top_changes": True}, True, [False, True]) and cc.specific({"top_changes": True}, True, [False, False])
 
 
 def nr_top(nr, ids):

@@ -22,7 +22,8 @@ Predictions: {"top": token} (the answer becomes token), {"top_changes": bool}, {
 Control: the same intervention on CONTROLS random sets of as many units (neurons: per layer and pole, other neurons of
 that layer; heads: other heads of that layer); a prediction of an effect is specific when it passes and no control set
 also passes (naming hundreds of neurons does not make a claim specific). A prediction that nothing changes is specific
-when it passes.
+when it passes, except {"top_changes": false}: the top token rarely moves, so that claim passes whatever the change and
+is never specific (state "nothing happens" with contrast_change "within").
 Side: the mean KL (bits) at the SIDE positions before the answer position, the intervention against the reference
 (neuron_builder's side effect).
 Cost, in rows of forward passes: the reference row once per prompt, one row per claim, CONTROLS rows per claim, one row
@@ -239,6 +240,17 @@ def holds(pred: dict, before: dict, after: dict, tok_id) -> bool:
     raise BadClaim("predict: top, top_changes, contrast_change or contrast")
 
 
+def specific(pred: dict, ok: bool, controls_pass: list) -> bool:
+    """A passing claim's specificity: an effect is specific when no control passes too; a no-change prediction is,
+    unless it is {"top_changes": false}, which passes on most prompts whatever the change (primerl's circuit-reading
+    test: a constant "barely matters" scored 0.96 on claim pass against 0.43 on the measured outcome class)."""
+    if not ok:
+        return False
+    if effect_predicted(pred):
+        return not any(controls_pass)
+    return "top_changes" not in pred
+
+
 def effect_predicted(pred: dict) -> bool:
     """Whether the prediction is of an effect (controls can then make it unspecific), not of nothing changing."""
     if "top" in pred:
@@ -341,7 +353,7 @@ def _prompt(nr: nb.Neurons, ids: list[int], claims: list[tuple], controls: int, 
             side = [at[q] for q in range(max(1, pos - SIDE), pos)]
             skl = float((ref[side].exp() * (ref[side] - lp[first, side])).sum(-1).mean() / math.log(2)) if side else 0.0
             results[k] = {
-                "pass": bool(ok), "specific": bool(ok and not (effect_predicted(c["predict"]) and any(ctl))),
+                "pass": bool(ok), "specific": specific(c["predict"], bool(ok), ctl),
                 "contrast_before": before["contrast"], "contrast_after": after["contrast"],
                 "change": after["contrast"] - before["contrast"], "top_before": nr.tok.decode([before["top"]]) if nr.tok else before["top"],
                 "top_after": nr.tok.decode([after["top"]]) if nr.tok else after["top"],

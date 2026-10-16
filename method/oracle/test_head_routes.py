@@ -125,3 +125,33 @@ def test_prefix_runs_equal_full_runs(tiny, monkeypatch):
         got[on] = rn.run(ids, sets, watch=watch)
     assert torch.allclose(got[True]["lp"], got[False]["lp"], atol=1e-4)
     assert torch.allclose(got[True]["watch"], got[False]["watch"], atol=1e-4)
+
+
+def test_adapter_weights(tiny):
+    """Under a LoRA adapter the local measurements read the adapted weights: they still equal the forward's cuts."""
+    peft = pytest.importorskip("peft")
+    import copy
+    model, ids, _ = tiny
+    torch.manual_seed(3)
+    pm = peft.get_peft_model(copy.deepcopy(model), peft.LoraConfig(r=4, target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
+                                                                                         "gate_proj", "up_proj", "down_proj"]))
+    for n, p in pm.named_parameters():
+        if "lora_B" in n:
+            torch.nn.init.normal_(p, std=0.2)
+    pm = pm.eval().requires_grad_(False)
+    rn = head_routes.Runner(pm)
+    rn.answer, rn.alternatives = [3], [5, 7]
+    with torch.no_grad():
+        want = torch.log_softmax(pm(input_ids=torch.tensor([ids])).logits[0, -1].float(), -1)
+    st = rn.run(ids, [{}], capture=True)["states"]
+    assert torch.allclose(rn.run(ids, [{}])["lp"][0], want, atol=1e-4)
+    c, h, q, p = 2, 3, 9, 5
+    deltas = rn.neuron_writes(st, 0, p)[:3]
+    a, dk = rn.attention_after(st, c, h, q, p, deltas, side="key", delta_out=True)
+    s2 = rn.run(ids, [{"dk": [(c, h, p, dk[0])]}], capture=True)["states"]
+    assert float(s2["A"][c][h, q, p]) == pytest.approx(float(a[0]), rel=1e-4, abs=1e-6)
+    hn = pm.base_model.model.model.layers[c].input_layernorm(st["x"][c][p] - deltas[0])
+    at = pm.base_model.model.model.layers[c].self_attn
+    t = at.k_norm(at.k_proj(hn).view(2, 8))[h // 2]
+    t = t * st["cos"][p] + head_routes.rotate_half(t) * st["sin"][p]
+    assert torch.allclose(dk[0], t - st["k"][c][h // 2, p], atol=1e-5)

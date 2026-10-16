@@ -34,6 +34,18 @@ import math
 import torch
 
 ROWS = 64
+
+
+def weight(mod) -> torch.Tensor:
+    """A linear module's effective weight [out, in]: its own, or under a LoRA adapter (peft) the base layer's plus each
+    active adapter's B A times its scaling (the local measurements read weights; the forward runs the modules)."""
+    if not hasattr(mod, "base_layer"):
+        return mod.weight
+    W = mod.base_layer.weight
+    for a in getattr(mod, "active_adapters", []):
+        if a in mod.lora_A:
+            W = W + (mod.lora_B[a].weight @ mod.lora_A[a].weight).to(W.dtype) * mod.scaling[a]
+    return W
 PREFIX = True  # a forward computes only the positions from the first one an edit (or a watched neuron) names, its
 # attention reading the unedited run's keys and values before it (no edit reaches them)
 
@@ -177,7 +189,7 @@ class Runner:
             return layer.mlp.act_fn(self._f(layer.mlp.gate_proj, n)) * self._f(layer.mlp.up_proj, n)
         ln = layer.post_attention_layernorm
         n = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + ln.variance_epsilon) * ln.weight.float().to(x.device)
-        wg, wu = layer.mlp.gate_proj.weight[js].float().to(x.device), layer.mlp.up_proj.weight[js].float().to(x.device)
+        wg, wu = weight(layer.mlp.gate_proj)[js].float().to(x.device), weight(layer.mlp.up_proj)[js].float().to(x.device)
         return layer.mlp.act_fn(n @ wg.T) * (n @ wu.T)
 
     # -- local measurements on captured states ---------------------------------------------------------------------
@@ -187,17 +199,17 @@ class Runner:
         layer = self.layers[L]
         ln, x = layer.post_attention_layernorm, st["mid"][L][pos].to(self._d(L))
         n = x * torch.rsqrt(x.pow(2).mean() + ln.variance_epsilon) * ln.weight.float()
-        return (float(layer.mlp.act_fn(n @ layer.mlp.gate_proj.weight[j].float())),
-                float(n @ layer.mlp.up_proj.weight[j].float()))
+        return (float(layer.mlp.act_fn(n @ weight(layer.mlp.gate_proj)[j].float())),
+                float(n @ weight(layer.mlp.up_proj)[j].float()))
 
     def head_write(self, st: dict, L: int, h: int, pos: int) -> torch.Tensor:
         """A head's output at pos as written into the stream [d] (o_proj's columns of that head times its output)."""
-        Wo = self.layers[L].self_attn.o_proj.weight[:, h * self.hd:(h + 1) * self.hd].float()
+        Wo = weight(self.layers[L].self_attn.o_proj)[:, h * self.hd:(h + 1) * self.hd].float()
         return Wo @ st["z"][L][pos, h].to(Wo.device)
 
     def neuron_writes(self, st: dict, L: int, pos: int, js=None) -> torch.Tensor:
         """Layer L's neurons' writes at pos [n, d] (value times down_proj column; js: those, else every one)."""
-        W = self.layers[L].mlp.down_proj.weight.float()
+        W = weight(self.layers[L].mlp.down_proj).float()
         hv = st["h"][L][pos].to(W.device)
         if js is not None:
             W, hv = W[:, js], hv[js]
@@ -218,9 +230,9 @@ class Runner:
         g = ln.weight.float()
         if side == "key":
             kv = h // (self.H // self.KV)
-            W, nrm = at.k_proj.weight[kv * self.hd:(kv + 1) * self.hd].float(), at.k_norm
+            W, nrm = weight(at.k_proj)[kv * self.hd:(kv + 1) * self.hd].float(), at.k_norm
         else:
-            W, nrm = at.q_proj.weight[h * self.hd:(h + 1) * self.hd].float(), at.q_norm
+            W, nrm = weight(at.q_proj)[h * self.hd:(h + 1) * self.hd].float(), at.q_norm
         r2 = x.pow(2).mean() + ln.variance_epsilon
         r2n = r2 + (deltas.pow(2).sum(-1) - 2 * deltas @ x) / D  # each cut stream's mean square (+ eps)
         pre = ((g * x) @ W.T - (deltas * g) @ W.T) / r2n.sqrt()[:, None]  # [n, hd]
@@ -247,7 +259,7 @@ class Runner:
         at, ln, d = layer.self_attn, layer.input_layernorm, self._d(c)
         x, deltas = st["x"][c][p].to(d), deltas.to(d).float()
         kv = h // (self.H // self.KV)
-        W, g = at.v_proj.weight[kv * self.hd:(kv + 1) * self.hd].float(), ln.weight.float()
+        W, g = weight(at.v_proj)[kv * self.hd:(kv + 1) * self.hd].float(), ln.weight.float()
         r2 = x.pow(2).mean() + ln.variance_epsilon
         r2n = r2 + (deltas.pow(2).sum(-1) - 2 * deltas @ x) / x.shape[-1]
         new = ((g * x) @ W.T - (deltas * g) @ W.T) / r2n.sqrt()[:, None]
@@ -293,7 +305,7 @@ def route_story(rn: Runner, st: dict, lost, c: int, h: int, q: int, p: int, writ
         w = rn.head_write(st, L, g, pos)
         return w if other is None else w - rn.head_write(other, L, g, pos).to(w.device)
     a0 = float(st["A"][c][h, q, p])
-    Wo = rn.layers[c].self_attn.o_proj.weight[:, h * rn.hd:(h + 1) * rn.hd].float()
+    Wo = weight(rn.layers[c].self_attn.o_proj)[:, h * rn.hd:(h + 1) * rn.hd].float()
     out = {"layer": c, "head": h, "q": q, "p": p, "attention": a0, "knock": lost([{"knock": [(c, h, q, p)]}])[0]}
     for side, pos in (("key", p), ("query", q), ("value", p)):
         def after(deltas):  # (each delta's size of change and the edit for its cut)
@@ -396,8 +408,13 @@ def main():
     ap.add_argument("out", type=Path)
     ap.add_argument("--dtype", default="float32", choices=("float32", "bfloat16"))
     ap.add_argument("--device", default=None)
+    ap.add_argument("--adapter", default=None, help="a peft adapter (an organism) on the model")
     a = ap.parse_args()
-    rn = Runner(load(a.model, a.device, a.dtype))
+    model = load(a.model, a.device, a.dtype)
+    if a.adapter:
+        from peft import PeftModel
+        model = PeftModel.from_pretrained(model, a.adapter).eval().requires_grad_(False)
+    rn = Runner(model)
     files = sorted(a.records.glob("*.json")) if a.records.is_dir() else [a.records]
     a.out.mkdir(parents=True, exist_ok=True)
     for f in files:

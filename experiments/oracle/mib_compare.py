@@ -261,7 +261,9 @@ def node_sets(model, batches, n_ex: int, masks, metric, rows: int = 32) -> list[
     """MIB's patching run of node circuits: mask [tests, n_forward] says which writers (the input, every head, every
     MLP) are in each circuit, whose every edge between the input, its nodes and the logits is kept; every other writer's
     output is the counterfactual run's for every reader. That is the clean run with each writer outside the circuit set
-    to its counterfactual output (a reader outside it computes nothing any kept node reads). Returns each mean metric."""
+    to its counterfactual output (a reader outside it computes nothing any kept node reads). A forward starts at its
+    circuits' lowest layer with a writer out, from the clean run's residual there (when the caches hold it). Returns
+    each mean metric."""
     import torch
 
     cfg = model.cfg
@@ -269,13 +271,19 @@ def node_sets(model, batches, n_ex: int, masks, metric, rows: int = 32) -> list[
     head_ix = torch.tensor([[1 + L * (H + 1) + h for h in range(H)] for L in range(NL)])
     mlp_ix = torch.tensor([1 + L * (H + 1) + H for L in range(NL)])
     masks = masks.bool()
+    layer = torch.tensor([0] + [L for L in range(NL) for _ in range(H + 1)])  # (each writer's layer; the input's 0)
+    low = torch.where(~masks, layer[None, :], NL).min(1).values
+    order = low.argsort().tolist()
     out = [0.0] * len(masks)
     for ct, am, il, label, cc, xc, _, _ in batches:
         B = ct.shape[0]
         G = max(1, rows // B)
         for g0 in range(0, len(masks), G):
-            mk = masks[g0:g0 + G].to(ct.device)
+            idx = order[g0:g0 + G]
+            mk = masks[idx].to(ct.device)
             n = len(mk)
+            s0 = int(low[idx].min())
+            s0 = 0 if s0 >= NL or (~masks[idx, 0]).any() or f"blocks.{s0}.hook_resid_pre" not in cc else s0
 
             def fn(act, hook):
                 a = act.view(n, B, *act.shape[1:])
@@ -289,10 +297,13 @@ def node_sets(model, batches, n_ex: int, masks, metric, rows: int = 32) -> list[
             hooks = [("hook_embed", fn)] + [(f"blocks.{L}.{h}", fn) for L in range(NL) for h in ("attn.hook_z", "hook_mlp_out")]
             rep = lambda x: x.repeat(n, *[1] * (x.dim() - 1)) if torch.is_tensor(x) else list(x) * n  # noqa: E731
             with torch.inference_mode(), model.hooks(fwd_hooks=hooks):
-                lg = model(rep(ct), attention_mask=rep(am))
+                if s0 == 0:
+                    lg = model(rep(ct), attention_mask=rep(am))
+                else:
+                    lg = model(rep(cc[f"blocks.{s0}.hook_resid_pre"]), start_at_layer=s0, attention_mask=rep(am))
             m = metric(lg, None, rep(il), rep(label)).float().view(n, B).sum(1)
-            for g in range(n):
-                out[g0 + g] += float(m[g])
+            for g, i in enumerate(idx):
+                out[i] += float(m[g])
     return [o / n_ex for o in out]
 
 
@@ -327,7 +338,7 @@ def eliminate(model, graph, dl, metric, log=print, rows: int = 32, cands: int = 
 
     cfg = model.cfg
     nf = graph.n_forward
-    names = {"hook_embed"} | {f"blocks.{L}.{h}" for L in range(cfg.n_layers) for h in ("attn.hook_z", "hook_mlp_out")}
+    names = {"hook_embed"} | {f"blocks.{L}.{h}" for L in range(cfg.n_layers) for h in ("attn.hook_z", "hook_mlp_out", "hook_resid_pre")}
     saved = (cfg.use_attn_result, cfg.use_split_qkv_input)
     cfg.use_attn_result = cfg.use_split_qkv_input = False
     t0 = time.time()

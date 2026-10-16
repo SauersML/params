@@ -22,7 +22,7 @@ for M in ${MODEL//,/ }; do for t in ${TASKS//,/ }; do [[ $VALID == *" ${t}_$M "*
   meth=${m%@*} ord=""; [[ $m == *@* ]] && ord="--order ${m#*@}"
   RUNS="$RUNS /workspace/mibenv/bin/python -B experiments/oracle/mib_compare.py rank $t $M $meth $O/out --n ${N:-32} --refine ${REFINE:-1000} --batch ${BATCH:-16} ${EVAL_BATCH:+--eval-batch $EVAL_BATCH} ${TEST_N:+--test-n $TEST_N} ${FROM:+--from $FROM} $ord > $O/${t}_${M}_$m.log 2>&1; echo \"exit \$?\" >> $O/${t}_${M}_$m.log;"
 done; done; done
-CMD="export OMP_NUM_THREADS=4 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True HF_HUB_ENABLE_HF_TRANSFER=0; set -e; ln -sfn /workspace/runs/$NAME/mpd-data ~/mpd-data; mkdir -p $O/out ~/mib;
+CMD="export OMP_NUM_THREADS=4 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True HF_HUB_ENABLE_HF_TRANSFER=0 PYTHONUNBUFFERED=1; set -e; ln -sfn /workspace/runs/$NAME/mpd-data ~/mpd-data; mkdir -p $O/out ~/mib;
 tar -xzf $F/mib.tgz -C ~/mib; export MIB_DIR=~/mib/MIB-circuit-track;
 export PATH=\$HOME/.local/bin:\$PATH; V=/workspace/mibenv; uv venv -q --python 3.12 \$V > $O/pip.log 2>&1;  # (a fresh venv: MIB's TransformerLens 2.16 needs transformers 4 and datasets/huggingface_hub of its time, which the pod's environment does not hold; torch 2.7.1's CUDA 12.6 build runs on hosts whose driver predates CUDA 13)
 uv pip install -q --python \$V/bin/python 'torch==2.7.1' 'transformer_lens==2.16.1' 'transformers==4.57.6' 'datasets<4' 'pyarrow<20' matplotlib >> $O/pip.log 2>&1; uv pip install -q --python \$V/bin/python --no-deps -e ~/mib/MIB-circuit-track/EAP-IG >> $O/pip.log 2>&1; \$V/bin/python -c 'import torch; assert torch.cuda.is_available()' >> $O/pip.log 2>&1;

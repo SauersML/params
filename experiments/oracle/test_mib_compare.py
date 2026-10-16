@@ -132,7 +132,8 @@ def test_node_sets_and_eliminate(monkeypatch, shape):
     g = torch.Generator().manual_seed(2)
     masks = torch.rand(6, nf, generator=g) < 0.6
     masks[:3, 0] = True  # (the input in some circuits, out of others)
-    names = {"hook_embed"} | {f"blocks.{L}.{h}" for L in range(3) for h in ("attn.hook_z", "hook_mlp_out")}
+    masks = torch.cat([masks, ~torch.eye(nf, dtype=torch.bool)[-4:]])  # (and single late writers out: forwards from a layer)
+    names = {"hook_embed"} | {f"blocks.{L}.{h}" for L in range(3) for h in ("attn.hook_z", "hook_mlp_out", "hook_resid_pre")}
     saved = (model.cfg.use_attn_result, model.cfg.use_split_qkv_input)
     model.cfg.use_attn_result = model.cfg.use_split_qkv_input = False
     batches, n_ex, full, _ = mc.prepare(model, dl, metric, names)

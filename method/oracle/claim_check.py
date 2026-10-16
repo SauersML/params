@@ -16,7 +16,9 @@ Semantics (neuron_builder's, inframove's 10-15):
   length) to their values on the source prompt's run, in the reference;
 - swap replaces tokens of the prompt (alone or with the units' intervention).
 Metric: the answer's contrast at the position, log2 p(answer) - log2 of the summed p of the alternatives (the
-reference's ALTERNATIVES likeliest other tokens unless given), neuron_builder's.
+reference's ALTERNATIVES likeliest other tokens unless given), neuron_builder's; "answer" may be a list of token ids, the
+answer word's tokens summed, with "alternatives" the other words' tokens (answer_contrast's word-level contrast, the
+circuit finder's: a record's answer_tokens and alternatives).
 Predictions: {"top": token} (the answer becomes token), {"top_changes": bool}, {"contrast_change": {"op", "value"}}
 (after - before, bits), {"contrast": {"op", "value"}} (after).
 Control: the same intervention on CONTROLS random sets of as many units (neurons: per layer and pole, other neurons of
@@ -221,9 +223,10 @@ def row_edit(nr: nb.Neurons, rows: list[dict]):
     return edit, route
 
 
-def contrast(lp: torch.Tensor, y: int, alts: list[int]) -> torch.Tensor:
-    """[B, V] log p -> [B] bits."""
-    return (lp[:, y] - torch.logsumexp(lp[:, alts], -1)) / math.log(2)
+def contrast(lp: torch.Tensor, y, alts: list[int]) -> torch.Tensor:
+    """[B, V] log p -> [B] bits; y one token or a word's token set (answer_contrast's "answer", summed)."""
+    ys = [y] if isinstance(y, int) else list(y)
+    return (torch.logsumexp(lp[:, ys], -1) - torch.logsumexp(lp[:, alts], -1)) / math.log(2)
 
 
 def holds(pred: dict, before: dict, after: dict, tok_id) -> bool:
@@ -341,10 +344,12 @@ def _prompt(nr: nb.Neurons, ids: list[int], claims: list[tuple], controls: int, 
     for k, c, pos, first, nctl, us in plan:
         try:
             j = at[pos]
-            y = tok_id(c["answer"]) if c.get("answer") is not None else int(ref[j].argmax())
+            ans = c.get("answer")
+            ys = ([tok_id(t) for t in ans] if isinstance(ans, list) else [tok_id(ans)] if ans is not None
+                  else [int(ref[j].argmax())])  # (a list: the answer word's tokens, answer_contrast's word-level set)
             alts = ([tok_id(t) for t in c["alternatives"]] if c.get("alternatives") else
-                    [t for t in ref[j].topk(nb.ALTERNATIVES + 1).indices.tolist() if t != y][:nb.ALTERNATIVES])
-            cs = contrast(lp[:, j], y, alts)
+                    [t for t in ref[j].topk(nb.ALTERNATIVES + len(ys)).indices.tolist() if t not in ys][:nb.ALTERNATIVES])
+            cs = contrast(lp[:, j], ys, alts)
             before = {"top": int(ref[j].argmax()), "contrast": float(cs[0])}
             state = lambda r: {"top": int(lp[r, j].argmax()), "contrast": float(cs[r])}  # noqa: E731
             after = state(first)

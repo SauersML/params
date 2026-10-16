@@ -1,7 +1,8 @@
 """The claim checker (claim_check.py) on a tiny random Qwen3 in neuron_builder's reference: a zero claim is the
 reference with the pole's strong values zeroed from position 1 on, claims give the same numbers alone and batched,
 patching from the prompt itself and steering by 0 change nothing, controls match the named units' layers and poles,
-an effect that random units also produce is not specific, and a bad claim is an error that leaves the others.
+an effect that random units also produce is not specific, a bad claim is an error that leaves the others, and a word
+answer sums its tokens against the given alternatives.
 
   ~/mpd-data/venv/bin/python -m pytest method/oracle/test_claim_check.py -q
 """
@@ -163,3 +164,16 @@ def test_a_knockout_set_is_row_edits_zero_in_every_row(tiny):
         a = nr.logits(x, list(range(len(ids))), edit=e1, route=r1)
         b = nr.logits(x, list(range(len(ids))), edit=e2, route=r2)
     assert torch.allclose(a, b, atol=1e-6)
+
+
+def test_a_word_answer_sums_its_tokens_against_the_given_alternatives(tiny):
+    nr, ids = tiny
+    with torch.no_grad():
+        lp = torch.log_softmax(nr.logits(torch.tensor([ids] * cc.ROWS), [len(ids) - 1])[:, 0], -1)[0]
+    order = lp.topk(8).indices.tolist()
+    word, alts = order[:2], order[2:6]
+    r = cc.check_many(nr, [claim(ids, answer=word, alternatives=alts)])[0]
+    want = float((torch.logsumexp(lp[word], 0) - torch.logsumexp(lp[alts], 0)) / math.log(2))
+    assert abs(r["contrast_before"] - want) < 1e-5
+    one = cc.check_many(nr, [claim(ids, answer=[order[0]])])[0]  # a one-token word is the token answer
+    assert one["contrast_before"] == cc.check_many(nr, [claim(ids, answer=order[0])])[0]["contrast_before"]

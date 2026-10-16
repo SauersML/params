@@ -84,19 +84,21 @@ def capture(pt: cf.Patcher, ids, units=None, base="clean") -> dict:
 
 
 def resample_ids(tok, q: dict, rec: dict, n: int, pool: dict | None = None) -> list:
-    """Up to n prompts of the record's own prompt with its key replaced by another key of its task (the question's string
-    "partners", then pool {task: keys}, every question set given), the clean prompt's length, its tokens before the
-    first differing position and a different token there (the record's template exactly: question sets differ in
-    their templates)."""
+    """Up to n prompts: the question's "resamples" (whole prompts, e.g. an organism's other non-trigger prompts), then the
+    record's own prompt with its key replaced by another key of its task (the question's string "partners", then pool
+    {task: keys}, every question set given); each of the clean prompt's length, its tokens before the first differing
+    position and a different token there (the record's template exactly: question sets differ in their templates)."""
     clean, first = rec["ids"], rec["first_diff"]
     user, key, task = rec.get("user", q.get("user")), rec.get("key", q.get("key")), rec.get("task", q.get("task"))
-    keys = [p for p in q.get("partners", []) if isinstance(p, str)] + sorted((pool or {}).get(task, ()))
+    cands = [(u, u) for u in q.get("resamples", [])]   # (whole prompts: an organism's other non-trigger prompts)
+    cands += [(k, user.replace(key, k)) for k in [p for p in q.get("partners", []) if isinstance(p, str)]
+              + sorted((pool or {}).get(task, ()))]
     out, seen = [], {key, q.get("corrupt_key"), rec.get("corrupt_key")}
-    for k in keys:
+    for k, text in cands:
         if k in seen:
             continue
         seen.add(k)
-        ids = cf.chat(tok, user.replace(key, k))
+        ids = cf.chat(tok, text)
         if len(ids) == len(clean) and ids[:first] == clean[:first] and ids[first] != clean[first]:  # (differs where the pair does)
             out.append((k, ids))
         if len(out) == n:

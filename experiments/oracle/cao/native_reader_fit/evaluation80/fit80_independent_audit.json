@@ -1,0 +1,99 @@
+{
+  "status": "PASS",
+  "prediction_sha256": "7608a74f45d8e232a1d8d2e605c94e5df401c819cfd36c6d8817289ccd9e4909",
+  "score_sha256": "4ed1752313035c3f313a139614234188e00fef505119ec54d8ddc80cf7875e41",
+  "adapter80_sha256": "376c803c9e232ca0fff3af42adda9e5d32bcfa80517c0b5e7a75b94da7949a7e",
+  "rows": 32,
+  "strict_valid": 32,
+  "split_rows": {
+    "train": 24,
+    "valid": 8
+  },
+  "rounded_3decimal_target_exact_matches": 0,
+  "diagnostics": {
+    "train": {
+      "mae": 1.1892904111727738,
+      "groups": {
+        "lie_direct": {
+          "rows": 6,
+          "mae": 0.5335091047722961,
+          "bias": -0.4666575755963816,
+          "sign_agree": 6,
+          "non_tied": 6
+        },
+        "truth_history": {
+          "rows": 6,
+          "mae": 1.8714108737928916,
+          "bias": -1.8714108737928916,
+          "sign_agree": 2,
+          "non_tied": 6
+        },
+        "truth_numeric_16": {
+          "rows": 6,
+          "mae": 1.2819302113171769,
+          "bias": -0.964513326700622,
+          "sign_agree": 3,
+          "non_tied": 6
+        },
+        "truth_numeric_other": {
+          "rows": 6,
+          "mae": 1.0703114548087305,
+          "bias": -0.47480959531484807,
+          "sign_agree": 4,
+          "non_tied": 6
+        }
+      },
+      "same_data_ridge_mae": 0.44304545355170366,
+      "zero_mae": 2.1321399063770787
+    },
+    "valid": {
+      "mae": 2.3006933830140444,
+      "groups": {
+        "lie_direct": {
+          "rows": 2,
+          "mae": 1.5546145273211989,
+          "bias": -0.8230269519036291,
+          "sign_agree": 2,
+          "non_tied": 2
+        },
+        "truth_history": {
+          "rows": 2,
+          "mae": 1.1356460791371854,
+          "bias": -1.1356460791371854,
+          "sign_agree": 0,
+          "non_tied": 2
+        },
+        "truth_numeric_16": {
+          "rows": 2,
+          "mae": 3.0447248048774123,
+          "bias": -3.0264823771435356,
+          "sign_agree": 2,
+          "non_tied": 2
+        },
+        "truth_numeric_other": {
+          "rows": 2,
+          "mae": 3.46778812072038,
+          "bias": -3.46778812072038,
+          "sign_agree": 0,
+          "non_tied": 2
+        }
+      },
+      "same_data_ridge_mae": 0.6870121095428022,
+      "zero_mae": 2.1939812177026
+    }
+  },
+  "completion_label_tokens": {
+    "mean": 27.9375,
+    "mean_numeric_value_tokens_standalone_encoding": 5.53125
+  },
+  "checks": [
+    "all input artifact hashes",
+    "config/adapter hashes and base receipt identity",
+    "32unique cases and exactsplit/rawgold binding",
+    "rawtoken decode and EOS/count/promptSHA parity",
+    "all32strictvalid,stored errors recomputed",
+    "groupMAE/bias independently recomputed"
+  ],
+  "limitation": "Training loss is teacher-forced average over mostly shared JSON/reason tokens; greedy numerical output does not reproduce training targets. No claim of unseen generalization, faithful explanations, or causal use of input evidence.",
+  "no_new_calls": true
+}

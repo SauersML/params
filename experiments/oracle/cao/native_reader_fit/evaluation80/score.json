@@ -1,0 +1,4295 @@
+{
+  "schema": "exposed_native_reader_training_fit_score_v1",
+  "scope": "Training-fit diagnostic only; no unseen generalization, semantic faithfulness or causal use of inputs established. Strict score retained; wordcount-only sensitivity explicitly secondary. No outcome filtering.",
+  "splits": {
+    "train": {
+      "scope": "24TRAIN resubstitution",
+      "modes": {
+        "strict": {
+          "predictors": {
+            "adapted": {
+              "rows": 24,
+              "capped_mae": 1.1892904111727738,
+              "invalids": 0,
+              "valid_numeric_rows": 24,
+              "bias_on_valid": -0.9443478428511858,
+              "sign": {
+                "non_tied_rows": 24,
+                "agree": 15,
+                "gold_ties": 0,
+                "prediction_ties": 0
+              }
+            },
+            "original_true": {
+              "rows": 24,
+              "capped_mae": 18.039222842751144,
+              "invalids": 6,
+              "valid_numeric_rows": 18,
+              "bias_on_valid": -3.7422486918079017,
+              "sign": {
+                "non_tied_rows": 18,
+                "agree": 11,
+                "gold_ties": 0,
+                "prediction_ties": 0
+              }
+            },
+            "unchanged_zero": {
+              "rows": 24,
+              "capped_mae": 2.1321399063770787,
+              "invalids": 0,
+              "valid_numeric_rows": 24,
+              "bias_on_valid": 1.144693823815481,
+              "sign": {
+                "non_tied_rows": 0,
+                "agree": 0,
+                "gold_ties": 0,
+                "prediction_ties": 24
+              }
+            },
+            "static": {
+              "rows": 24,
+              "capped_mae": 4.012235096838699,
+              "invalids": 0,
+              "valid_numeric_rows": 24,
+              "bias_on_valid": -2.368532309806754,
+              "sign": {
+                "non_tied_rows": 24,
+                "agree": 16,
+                "gold_ties": 0,
+                "prediction_ties": 0
+              }
+            },
+            "ridge": {
+              "rows": 24,
+              "capped_mae": 2.3439128123231883,
+              "invalids": 0,
+              "valid_numeric_rows": 24,
+              "bias_on_valid": 1.5307570076348576,
+              "sign": {
+                "non_tied_rows": 24,
+                "agree": 18,
+                "gold_ties": 0,
+                "prediction_ties": 0
+              }
+            },
+            "same_data_ridge": {
+              "rows": 24,
+              "capped_mae": 0.44304545355170366,
+              "invalids": 0,
+              "valid_numeric_rows": 24,
+              "bias_on_valid": 0.0,
+              "sign": {
+                "non_tied_rows": 24,
+                "agree": 22,
+                "gold_ties": 0,
+                "prediction_ties": 0
+              }
+            }
+          },
+          "comparator_minus_adapted_error": {
+            "original_true": {
+              "mean": 16.84993243157837,
+              "question_bootstrap95CI": [
+                7.397678351194428,
+                26.91151544450165
+              ],
+              "questions": 24,
+              "note": "Descriptive exposed cases, not generalization CI"
+            },
+            "unchanged_zero": {
+              "mean": 0.9428494952043049,
+              "question_bootstrap95CI": [
+                -0.08521145448262399,
+                2.058441163260325
+              ],
+              "questions": 24,
+              "note": "Descriptive exposed cases, not generalization CI"
+            },
+            "static": {
+              "mean": 2.822944685665926,
+              "question_bootstrap95CI": [
+                1.3462746318315495,
+                4.396782857452487
+              ],
+              "questions": 24,
+              "note": "Descriptive exposed cases, not generalization CI"
+            },
+            "ridge": {
+              "mean": 1.1546224011504147,
+              "question_bootstrap95CI": [
+                0.12269816776592327,
+                2.3553747698708336
+              ],
+              "questions": 24,
+              "note": "Descriptive exposed cases, not generalization CI"
+            },
+            "same_data_ridge": {
+              "mean": -0.7462449576210702,
+              "question_bootstrap95CI": [
+                -1.3355517027751862,
+                -0.22861256302379127
+              ],
+              "questions": 24,
+              "note": "Descriptive exposed cases, not generalization CI"
+            }
+          }
+        },
+        "reason_length_only_sensitivity": {
+          "predictors": {
+            "adapted": {
+              "rows": 24,
+              "capped_mae": 1.1892904111727738,
+              "invalids": 0,
+              "valid_numeric_rows": 24,
+              "bias_on_valid": -0.9443478428511858,
+              "sign": {
+                "non_tied_rows": 24,
+                "agree": 15,
+                "gold_ties": 0,
+                "prediction_ties": 0
+              }
+            },
+            "original_true": {
+              "rows": 24,
+              "capped_mae": 4.656227362174673,
+              "invalids": 0,
+              "valid_numeric_rows": 24,
+              "bias_on_valid": -4.234698612189697,
+              "sign": {
+                "non_tied_rows": 24,
+                "agree": 13,
+                "gold_ties": 0,
+                "prediction_ties": 0
+              }
+            },
+            "unchanged_zero": {
+              "rows": 24,
+              "capped_mae": 2.1321399063770787,
+              "invalids": 0,
+              "valid_numeric_rows": 24,
+              "bias_on_valid": 1.144693823815481,
+              "sign": {
+                "non_tied_rows": 0,
+                "agree": 0,
+                "gold_ties": 0,
+                "prediction_ties": 24
+              }
+            },
+            "static": {
+              "rows": 24,
+              "capped_mae": 4.012235096838699,
+              "invalids": 0,
+              "valid_numeric_rows": 24,
+              "bias_on_valid": -2.368532309806754,
+              "sign": {
+                "non_tied_rows": 24,
+                "agree": 16,
+                "gold_ties": 0,
+                "prediction_ties": 0
+              }
+            },
+            "ridge": {
+              "rows": 24,
+              "capped_mae": 2.3439128123231883,
+              "invalids": 0,
+              "valid_numeric_rows": 24,
+              "bias_on_valid": 1.5307570076348576,
+              "sign": {
+                "non_tied_rows": 24,
+                "agree": 18,
+                "gold_ties": 0,
+                "prediction_ties": 0
+              }
+            },
+            "same_data_ridge": {
+              "rows": 24,
+              "capped_mae": 0.44304545355170366,
+              "invalids": 0,
+              "valid_numeric_rows": 24,
+              "bias_on_valid": 0.0,
+              "sign": {
+                "non_tied_rows": 24,
+                "agree": 22,
+                "gold_ties": 0,
+                "prediction_ties": 0
+              }
+            }
+          },
+          "comparator_minus_adapted_error": {
+            "original_true": {
+              "mean": 3.4669369510018995,
+              "question_bootstrap95CI": [
+                2.1254504034916524,
+                4.870568824300737
+              ],
+              "questions": 24,
+              "note": "Descriptive exposed cases, not generalization CI"
+            },
+            "unchanged_zero": {
+              "mean": 0.9428494952043049,
+              "question_bootstrap95CI": [
+                -0.08521145448262399,
+                2.058441163260325
+              ],
+              "questions": 24,
+              "note": "Descriptive exposed cases, not generalization CI"
+            },
+            "static": {
+              "mean": 2.822944685665926,
+              "question_bootstrap95CI": [
+                1.3462746318315495,
+                4.396782857452487
+              ],
+              "questions": 24,
+              "note": "Descriptive exposed cases, not generalization CI"
+            },
+            "ridge": {
+              "mean": 1.1546224011504147,
+              "question_bootstrap95CI": [
+                0.12269816776592327,
+                2.3553747698708336
+              ],
+              "questions": 24,
+              "note": "Descriptive exposed cases, not generalization CI"
+            },
+            "same_data_ridge": {
+              "mean": -0.7462449576210702,
+              "question_bootstrap95CI": [
+                -1.3355517027751862,
+                -0.22861256302379127
+              ],
+              "questions": 24,
+              "note": "Descriptive exposed cases, not generalization CI"
+            }
+          }
+        }
+      },
+      "groups": {
+        "lie_direct": {
+          "strict": {
+            "predictors": {
+              "adapted": {
+                "rows": 6,
+                "capped_mae": 0.5335091047722961,
+                "invalids": 0,
+                "valid_numeric_rows": 6,
+                "bias_on_valid": -0.4666575755963816,
+                "sign": {
+                  "non_tied_rows": 6,
+                  "agree": 6,
+                  "gold_ties": 0,
+                  "prediction_ties": 0
+                }
+              },
+              "original_true": {
+                "rows": 6,
+                "capped_mae": 1.6165606529504284,
+                "invalids": 0,
+                "valid_numeric_rows": 6,
+                "bias_on_valid": -1.6165606529504284,
+                "sign": {
+                  "non_tied_rows": 6,
+                  "agree": 6,
+                  "gold_ties": 0,
+                  "prediction_ties": 0
+                }
+              },
+              "unchanged_zero": {
+                "rows": 6,
+                "capped_mae": 5.5010090910702845,
+                "invalids": 0,
+                "valid_numeric_rows": 6,
+                "bias_on_valid": 5.5010090910702845,
+                "sign": {
+                  "non_tied_rows": 0,
+                  "agree": 0,
+                  "gold_ties": 0,
+                  "prediction_ties": 6
+                }
+              },
+              "static": {
+                "rows": 6,
+                "capped_mae": 1.6181155388327895,
+                "invalids": 0,
+                "valid_numeric_rows": 6,
+                "bias_on_valid": -1.6181155388327895,
+                "sign": {
+                  "non_tied_rows": 6,
+                  "agree": 6,
+                  "gold_ties": 0,
+                  "prediction_ties": 0
+                }
+              },
+              "ridge": {
+                "rows": 6,
+                "capped_mae": 1.9146559240534406,
+                "invalids": 0,
+                "valid_numeric_rows": 6,
+                "bias_on_valid": -0.6443412490389376,
+                "sign": {
+                  "non_tied_rows": 6,
+                  "agree": 6,
+                  "gold_ties": 0,
+                  "prediction_ties": 0
+                }
+              },
+              "same_data_ridge": {
+                "rows": 6,
+                "capped_mae": 0.39597735492560276,
+                "invalids": 0,
+                "valid_numeric_rows": 6,
+                "bias_on_valid": 0.05735521723525213,
+                "sign": {
+                  "non_tied_rows": 6,
+                  "agree": 6,
+                  "gold_ties": 0,
+                  "prediction_ties": 0
+                }
+              }
+            },
+            "comparator_minus_adapted_error": {
+              "original_true": {
+                "mean": 1.0830515481781322,
+                "question_bootstrap95CI": [
+                  0.4194728213747605,
+                  1.746630274981504
+                ],
+                "questions": 6,
+                "note": "Descriptive exposed cases, not generalization CI"
+              },
+              "unchanged_zero": {
+                "mean": 4.96749998629799,
+                "question_bootstrap95CI": [
+                  3.7456039885187447,
+                  5.952498250252531
+                ],
+                "questions": 6,
+                "note": "Descriptive exposed cases, not generalization CI"
+              },
+              "static": {
+                "mean": 1.0846064340604935,
+                "question_bootstrap95CI": [
+                  0.4212588990350687,
+                  1.7479539690859187
+                ],
+                "questions": 6,
+                "note": "Descriptive exposed cases, not generalization CI"
+              },
+              "ridge": {
+                "mean": 1.3811468192811447,
+                "question_bootstrap95CI": [
+                  0.7164654991944012,
+                  2.029612890818252
+                ],
+                "questions": 6,
+                "note": "Descriptive exposed cases, not generalization CI"
+              },
+              "same_data_ridge": {
+                "mean": -0.13753174984669325,
+                "question_bootstrap95CI": [
+                  -0.5532654870352208,
+                  0.30770903416800505
+                ],
+                "questions": 6,
+                "note": "Descriptive exposed cases, not generalization CI"
+              }
+            }
+          },
+          "reason_length_only_sensitivity": {
+            "predictors": {
+              "adapted": {
+                "rows": 6,
+                "capped_mae": 0.5335091047722961,
+                "invalids": 0,
+                "valid_numeric_rows": 6,
+                "bias_on_valid": -0.4666575755963816,
+                "sign": {
+                  "non_tied_rows": 6,
+                  "agree": 6,
+                  "gold_ties": 0,
+                  "prediction_ties": 0
+                }
+              },
+              "original_true": {
+                "rows": 6,
+                "capped_mae": 1.6165606529504284,
+                "invalids": 0,
+                "valid_numeric_rows": 6,
+                "bias_on_valid": -1.6165606529504284,
+                "sign": {
+                  "non_tied_rows": 6,
+                  "agree": 6,
+                  "gold_ties": 0,
+                  "prediction_ties": 0
+                }
+              },
+              "unchanged_zero": {
+                "rows": 6,
+                "capped_mae": 5.5010090910702845,
+                "invalids": 0,
+                "valid_numeric_rows": 6,
+                "bias_on_valid": 5.5010090910702845,
+                "sign": {
+                  "non_tied_rows": 0,
+                  "agree": 0,
+                  "gold_ties": 0,
+                  "prediction_ties": 6
+                }
+              },
+              "static": {
+                "rows": 6,
+                "capped_mae": 1.6181155388327895,
+                "invalids": 0,
+                "valid_numeric_rows": 6,
+                "bias_on_valid": -1.6181155388327895,
+                "sign": {
+                  "non_tied_rows": 6,
+                  "agree": 6,
+                  "gold_ties": 0,
+                  "prediction_ties": 0
+                }
+              },
+              "ridge": {
+                "rows": 6,
+                "capped_mae": 1.9146559240534406,
+                "invalids": 0,
+                "valid_numeric_rows": 6,
+                "bias_on_valid": -0.6443412490389376,
+                "sign": {
+                  "non_tied_rows": 6,
+                  "agree": 6,
+                  "gold_ties": 0,
+                  "prediction_ties": 0
+                }
+              },
+              "same_data_ridge": {
+                "rows": 6,
+                "capped_mae": 0.39597735492560276,
+                "invalids": 0,
+                "valid_numeric_rows": 6,
+                "bias_on_valid": 0.05735521723525213,
+                "sign": {
+                  "non_tied_rows": 6,
+                  "agree": 6,
+                  "gold_ties": 0,
+                  "prediction_ties": 0
+                }
+              }
+            },
+            "comparator_minus_adapted_error": {
+              "original_true": {
+                "mean": 1.0830515481781322,
+                "question_bootstrap95CI": [
+                  0.4194728213747605,
+                  1.746630274981504
+                ],
+                "questions": 6,
+                "note": "Descriptive exposed cases, not generalization CI"
+              },
+              "unchanged_zero": {
+                "mean": 4.96749998629799,
+                "question_bootstrap95CI": [
+                  3.7456039885187447,
+                  5.952498250252531
+                ],
+                "questions": 6,
+                "note": "Descriptive exposed cases, not generalization CI"
+              },
+              "static": {
+                "mean": 1.0846064340604935,
+                "question_bootstrap95CI": [
+                  0.4212588990350687,
+                  1.7479539690859187
+                ],
+                "questions": 6,
+                "note": "Descriptive exposed cases, not generalization CI"
+              },
+              "ridge": {
+                "mean": 1.3811468192811447,
+                "question_bootstrap95CI": [
+                  0.7164654991944012,
+                  2.029612890818252
+                ],
+                "questions": 6,
+                "note": "Descriptive exposed cases, not generalization CI"
+              },
+              "same_data_ridge": {
+                "mean": -0.13753174984669325,
+                "question_bootstrap95CI": [
+                  -0.5532654870352208,
+                  0.30770903416800505
+                ],
+                "questions": 6,
+                "note": "Descriptive exposed cases, not generalization CI"
+              }
+            }
+          }
+        },
+        "truth_history": {
+          "strict": {
+            "predictors": {
+              "adapted": {
+                "rows": 6,
+                "capped_mae": 1.8714108737928916,
+                "invalids": 0,
+                "valid_numeric_rows": 6,
+                "bias_on_valid": -1.8714108737928916,
+                "sign": {
+                  "non_tied_rows": 6,
+                  "agree": 2,
+                  "gold_ties": 0,
+                  "prediction_ties": 0
+                }
+              },
+              "original_true": {
+                "rows": 6,
+                "capped_mae": 12.788272019892354,
+                "invalids": 1,
+                "valid_numeric_rows": 5,
+                "bias_on_valid": -3.345926423870823,
+                "sign": {
+                  "non_tied_rows": 5,
+                  "agree": 0,
+                  "gold_ties": 0,
+                  "prediction_ties": 0
+                }
+              },
+              "unchanged_zero": {
+                "rows": 6,
+                "capped_mae": 0.904244207126225,
+                "invalids": 0,
+                "valid_numeric_rows": 6,
+                "bias_on_valid": -0.904244207126225,
+                "sign": {
+                  "non_tied_rows": 0,
+                  "agree": 0,
+                  "gold_ties": 0,
+                  "prediction_ties": 6
+                }
+              },
+              "static": {
+                "rows": 6,
+                "capped_mae": 1.372794727047917,
+                "invalids": 0,
+                "valid_numeric_rows": 6,
+                "bias_on_valid": 1.372794727047917,
+                "sign": {
+                  "non_tied_rows": 6,
+                  "agree": 6,
+                  "gold_ties": 0,
+                  "prediction_ties": 0
+                }
+              },
+              "ridge": {
+                "rows": 6,
+                "capped_mae": 1.8651382586572411,
+                "invalids": 0,
+                "valid_numeric_rows": 6,
+                "bias_on_valid": 1.8466081481494878,
+                "sign": {
+                  "non_tied_rows": 6,
+                  "agree": 6,
+                  "gold_ties": 0,
+                  "prediction_ties": 0
+                }
+              },
+              "same_data_ridge": {
+                "rows": 6,
+                "capped_mae": 0.25527416236692696,
+                "invalids": 0,
+                "valid_numeric_rows": 6,
+                "bias_on_valid": -0.04590410755361803,
+                "sign": {
+                  "non_tied_rows": 6,
+                  "agree": 6,
+                  "gold_ties": 0,
+                  "prediction_ties": 0
+                }
+              }
+            },
+            "comparator_minus_adapted_error": {
+              "original_true": {
+                "mean": 10.916861146099462,
+                "question_bootstrap95CI": [
+                  0.5681666666666667,
+                  30.505916771631718
+                ],
+                "questions": 6,
+                "note": "Descriptive exposed cases, not generalization CI"
+              },
+              "unchanged_zero": {
+                "mean": -0.9671666666666666,
+                "question_bootstrap95CI": [
+                  -2.1501666666666663,
+                  0.08483333333333336
+                ],
+                "questions": 6,
+                "note": "Descriptive exposed cases, not generalization CI"
+              },
+              "static": {
+                "mean": -0.4986161467449745,
+                "question_bootstrap95CI": [
+                  -1.6177902121531371,
+                  0.5595747056357614
+                ],
+                "questions": 6,
+                "note": "Descriptive exposed cases, not generalization CI"
+              },
+              "ridge": {
+                "mean": -0.0062726151356506206,
+                "question_bootstrap95CI": [
+                  -1.94987960468473,
+                  1.2899003603418036
+                ],
+                "questions": 6,
+                "note": "Descriptive exposed cases, not generalization CI"
+              },
+              "same_data_ridge": {
+                "mean": -1.6161367114259646,
+                "question_bootstrap95CI": [
+                  -2.933766436530598,
+                  -0.3864152381093671
+                ],
+                "questions": 6,
+                "note": "Descriptive exposed cases, not generalization CI"
+              }
+            }
+          },
+          "reason_length_only_sensitivity": {
+            "predictors": {
+              "adapted": {
+                "rows": 6,
+                "capped_mae": 1.8714108737928916,
+                "invalids": 0,
+                "valid_numeric_rows": 6,
+                "bias_on_valid": -1.8714108737928916,
+                "sign": {
+                  "non_tied_rows": 6,
+                  "agree": 2,
+                  "gold_ties": 0,
+                  "prediction_ties": 0
+                }
+              },
+              "original_true": {
+                "rows": 6,
+                "capped_mae": 3.1809108737928917,
+                "invalids": 0,
+                "valid_numeric_rows": 6,
+                "bias_on_valid": -3.1809108737928917,
+                "sign": {
+                  "non_tied_rows": 6,
+                  "agree": 0,
+                  "gold_ties": 0,
+                  "prediction_ties": 0
+                }
+              },
+              "unchanged_zero": {
+                "rows": 6,
+                "capped_mae": 0.904244207126225,
+                "invalids": 0,
+                "valid_numeric_rows": 6,
+                "bias_on_valid": -0.904244207126225,
+                "sign": {
+                  "non_tied_rows": 0,
+                  "agree": 0,
+                  "gold_ties": 0,
+                  "prediction_ties": 6
+                }
+              },
+              "static": {
+                "rows": 6,
+                "capped_mae": 1.372794727047917,
+                "invalids": 0,
+                "valid_numeric_rows": 6,
+                "bias_on_valid": 1.372794727047917,
+                "sign": {
+                  "non_tied_rows": 6,
+                  "agree": 6,
+                  "gold_ties": 0,
+                  "prediction_ties": 0
+                }
+              },
+              "ridge": {
+                "rows": 6,
+                "capped_mae": 1.8651382586572411,
+                "invalids": 0,
+                "valid_numeric_rows": 6,
+                "bias_on_valid": 1.8466081481494878,
+                "sign": {
+                  "non_tied_rows": 6,
+                  "agree": 6,
+                  "gold_ties": 0,
+                  "prediction_ties": 0
+                }
+              },
+              "same_data_ridge": {
+                "rows": 6,
+                "capped_mae": 0.25527416236692696,
+                "invalids": 0,
+                "valid_numeric_rows": 6,
+                "bias_on_valid": -0.04590410755361803,
+                "sign": {
+                  "non_tied_rows": 6,
+                  "agree": 6,
+                  "gold_ties": 0,
+                  "prediction_ties": 0
+                }
+              }
+            },
+            "comparator_minus_adapted_error": {
+              "original_true": {
+                "mean": 1.3095,
+                "question_bootstrap95CI": [
+                  0.5436666666666667,
+                  2.0753333333333335
+                ],
+                "questions": 6,
+                "note": "Descriptive exposed cases, not generalization CI"
+              },
+              "unchanged_zero": {
+                "mean": -0.9671666666666666,
+                "question_bootstrap95CI": [
+                  -2.1501666666666663,
+                  0.08483333333333336
+                ],
+                "questions": 6,
+                "note": "Descriptive exposed cases, not generalization CI"
+              },
+              "static": {
+                "mean": -0.4986161467449745,
+                "question_bootstrap95CI": [
+                  -1.6177902121531371,
+                  0.5595747056357614
+                ],
+                "questions": 6,
+                "note": "Descriptive exposed cases, not generalization CI"
+              },
+              "ridge": {
+                "mean": -0.0062726151356506206,
+                "question_bootstrap95CI": [
+                  -1.94987960468473,
+                  1.2899003603418036
+                ],
+                "questions": 6,
+                "note": "Descriptive exposed cases, not generalization CI"
+              },
+              "same_data_ridge": {
+                "mean": -1.6161367114259646,
+                "question_bootstrap95CI": [
+                  -2.933766436530598,
+                  -0.3864152381093671
+                ],
+                "questions": 6,
+                "note": "Descriptive exposed cases, not generalization CI"
+              }
+            }
+          }
+        },
+        "truth_numeric_16": {
+          "strict": {
+            "predictors": {
+              "adapted": {
+                "rows": 6,
+                "capped_mae": 1.2819302113171769,
+                "invalids": 0,
+                "valid_numeric_rows": 6,
+                "bias_on_valid": -0.964513326700622,
+                "sign": {
+                  "non_tied_rows": 6,
+                  "agree": 3,
+                  "gold_ties": 0,
+                  "prediction_ties": 0
+                }
+              },
+              "original_true": {
+                "rows": 6,
+                "capped_mae": 31.83065061364212,
+                "invalids": 3,
+                "valid_numeric_rows": 3,
+                "bias_on_valid": -3.3425289653124004,
+                "sign": {
+                  "non_tied_rows": 3,
+                  "agree": 3,
+                  "gold_ties": 0,
+                  "prediction_ties": 0
+                }
+              },
+              "unchanged_zero": {
+                "rows": 6,
+                "capped_mae": 1.0542635446505102,
+                "invalids": 0,
+                "valid_numeric_rows": 6,
+                "bias_on_valid": -0.18217999336728852,
+                "sign": {
+                  "non_tied_rows": 0,
+                  "agree": 0,
+                  "gold_ties": 0,
+                  "prediction_ties": 6
+                }
+              },
+              "static": {
+                "rows": 6,
+                "capped_mae": 6.700755929765265,
+                "invalids": 0,
+                "valid_numeric_rows": 6,
+                "bias_on_valid": -4.515991069159031,
+                "sign": {
+                  "non_tied_rows": 6,
+                  "agree": 2,
+                  "gold_ties": 0,
+                  "prediction_ties": 0
+                }
+              },
+              "ridge": {
+                "rows": 6,
+                "capped_mae": 3.1409408304946154,
+                "invalids": 0,
+                "valid_numeric_rows": 6,
+                "bias_on_valid": 2.726939421296717,
+                "sign": {
+                  "non_tied_rows": 6,
+                  "agree": 1,
+                  "gold_ties": 0,
+                  "prediction_ties": 0
+                }
+              },
+              "same_data_ridge": {
+                "rows": 6,
+                "capped_mae": 0.764353657372587,
+                "invalids": 0,
+                "valid_numeric_rows": 6,
+                "bias_on_valid": -0.22157374048720227,
+                "sign": {
+                  "non_tied_rows": 6,
+                  "agree": 4,
+                  "gold_ties": 0,
+                  "prediction_ties": 0
+                }
+              }
+            },
+            "comparator_minus_adapted_error": {
+              "original_true": {
+                "mean": 30.548720402324946,
+                "question_bootstrap95CI": [
+                  10.90797701433704,
+                  49.75880939539919
+                ],
+                "questions": 6,
+                "note": "Descriptive exposed cases, not generalization CI"
+              },
+              "unchanged_zero": {
+                "mean": -0.2276666666666667,
+                "question_bootstrap95CI": [
+                  -1.0575,
+                  0.556
+                ],
+                "questions": 6,
+                "note": "Descriptive exposed cases, not generalization CI"
+              },
+              "static": {
+                "mean": 5.418825718448087,
+                "question_bootstrap95CI": [
+                  2.546236990287044,
+                  8.147642110694466
+                ],
+                "questions": 6,
+                "note": "Descriptive exposed cases, not generalization CI"
+              },
+              "ridge": {
+                "mean": 1.8590106191774385,
+                "question_bootstrap95CI": [
+                  -0.40236474734493677,
+                  5.0785396883672
+                ],
+                "questions": 6,
+                "note": "Descriptive exposed cases, not generalization CI"
+              },
+              "same_data_ridge": {
+                "mean": -0.5175765539445898,
+                "question_bootstrap95CI": [
+                  -1.5009794583549312,
+                  0.23090006978673627
+                ],
+                "questions": 6,
+                "note": "Descriptive exposed cases, not generalization CI"
+              }
+            }
+          },
+          "reason_length_only_sensitivity": {
+            "predictors": {
+              "adapted": {
+                "rows": 6,
+                "capped_mae": 1.2819302113171769,
+                "invalids": 0,
+                "valid_numeric_rows": 6,
+                "bias_on_valid": -0.964513326700622,
+                "sign": {
+                  "non_tied_rows": 6,
+                  "agree": 3,
+                  "gold_ties": 0,
+                  "prediction_ties": 0
+                }
+              },
+              "original_true": {
+                "rows": 6,
+                "capped_mae": 6.588232791019874,
+                "invalids": 0,
+                "valid_numeric_rows": 6,
+                "bias_on_valid": -6.428846660033955,
+                "sign": {
+                  "non_tied_rows": 6,
+                  "agree": 4,
+                  "gold_ties": 0,
+                  "prediction_ties": 0
+                }
+              },
+              "unchanged_zero": {
+                "rows": 6,
+                "capped_mae": 1.0542635446505102,
+                "invalids": 0,
+                "valid_numeric_rows": 6,
+                "bias_on_valid": -0.18217999336728852,
+                "sign": {
+                  "non_tied_rows": 0,
+                  "agree": 0,
+                  "gold_ties": 0,
+                  "prediction_ties": 6
+                }
+              },
+              "static": {
+                "rows": 6,
+                "capped_mae": 6.700755929765265,
+                "invalids": 0,
+                "valid_numeric_rows": 6,
+                "bias_on_valid": -4.515991069159031,
+                "sign": {
+                  "non_tied_rows": 6,
+                  "agree": 2,
+                  "gold_ties": 0,
+                  "prediction_ties": 0
+                }
+              },
+              "ridge": {
+                "rows": 6,
+                "capped_mae": 3.1409408304946154,
+                "invalids": 0,
+                "valid_numeric_rows": 6,
+                "bias_on_valid": 2.726939421296717,
+                "sign": {
+                  "non_tied_rows": 6,
+                  "agree": 1,
+                  "gold_ties": 0,
+                  "prediction_ties": 0
+                }
+              },
+              "same_data_ridge": {
+                "rows": 6,
+                "capped_mae": 0.764353657372587,
+                "invalids": 0,
+                "valid_numeric_rows": 6,
+                "bias_on_valid": -0.22157374048720227,
+                "sign": {
+                  "non_tied_rows": 6,
+                  "agree": 4,
+                  "gold_ties": 0,
+                  "prediction_ties": 0
+                }
+              }
+            },
+            "comparator_minus_adapted_error": {
+              "original_true": {
+                "mean": 5.306302579702698,
+                "question_bootstrap95CI": [
+                  2.433933384032954,
+                  8.095090012407455
+                ],
+                "questions": 6,
+                "note": "Descriptive exposed cases, not generalization CI"
+              },
+              "unchanged_zero": {
+                "mean": -0.2276666666666667,
+                "question_bootstrap95CI": [
+                  -1.0575,
+                  0.556
+                ],
+                "questions": 6,
+                "note": "Descriptive exposed cases, not generalization CI"
+              },
+              "static": {
+                "mean": 5.418825718448087,
+                "question_bootstrap95CI": [
+                  2.546236990287044,
+                  8.147642110694466
+                ],
+                "questions": 6,
+                "note": "Descriptive exposed cases, not generalization CI"
+              },
+              "ridge": {
+                "mean": 1.8590106191774385,
+                "question_bootstrap95CI": [
+                  -0.40236474734493677,
+                  5.0785396883672
+                ],
+                "questions": 6,
+                "note": "Descriptive exposed cases, not generalization CI"
+              },
+              "same_data_ridge": {
+                "mean": -0.5175765539445898,
+                "question_bootstrap95CI": [
+                  -1.5009794583549312,
+                  0.23090006978673627
+                ],
+                "questions": 6,
+                "note": "Descriptive exposed cases, not generalization CI"
+              }
+            }
+          }
+        },
+        "truth_numeric_other": {
+          "strict": {
+            "predictors": {
+              "adapted": {
+                "rows": 6,
+                "capped_mae": 1.0703114548087305,
+                "invalids": 0,
+                "valid_numeric_rows": 6,
+                "bias_on_valid": -0.47480959531484807,
+                "sign": {
+                  "non_tied_rows": 6,
+                  "agree": 4,
+                  "gold_ties": 0,
+                  "prediction_ties": 0
+                }
+              },
+              "original_true": {
+                "rows": 6,
+                "capped_mae": 25.921408084519673,
+                "invalids": 2,
+                "valid_numeric_rows": 4,
+                "bias_on_valid": -7.725973379887083,
+                "sign": {
+                  "non_tied_rows": 4,
+                  "agree": 2,
+                  "gold_ties": 0,
+                  "prediction_ties": 0
+                }
+              },
+              "unchanged_zero": {
+                "rows": 6,
+                "capped_mae": 1.0690427826612943,
+                "invalids": 0,
+                "valid_numeric_rows": 6,
+                "bias_on_valid": 0.16419040468515197,
+                "sign": {
+                  "non_tied_rows": 0,
+                  "agree": 0,
+                  "gold_ties": 0,
+                  "prediction_ties": 6
+                }
+              },
+              "static": {
+                "rows": 6,
+                "capped_mae": 6.357274191708828,
+                "invalids": 0,
+                "valid_numeric_rows": 6,
+                "bias_on_valid": -4.712817358283114,
+                "sign": {
+                  "non_tied_rows": 6,
+                  "agree": 2,
+                  "gold_ties": 0,
+                  "prediction_ties": 0
+                }
+              },
+              "ridge": {
+                "rows": 6,
+                "capped_mae": 2.4549162360874566,
+                "invalids": 0,
+                "valid_numeric_rows": 6,
+                "bias_on_valid": 2.193821710132164,
+                "sign": {
+                  "non_tied_rows": 6,
+                  "agree": 5,
+                  "gold_ties": 0,
+                  "prediction_ties": 0
+                }
+              },
+              "same_data_ridge": {
+                "rows": 6,
+                "capped_mae": 0.35657663954169777,
+                "invalids": 0,
+                "valid_numeric_rows": 6,
+                "bias_on_valid": 0.21012263080556823,
+                "sign": {
+                  "non_tied_rows": 6,
+                  "agree": 6,
+                  "gold_ties": 0,
+                  "prediction_ties": 0
+                }
+              }
+            },
+            "comparator_minus_adapted_error": {
+              "original_true": {
+                "mean": 24.85109662971094,
+                "question_bootstrap95CI": [
+                  6.906652840721719,
+                  42.90787974331005
+                ],
+                "questions": 6,
+                "note": "Descriptive exposed cases, not generalization CI"
+              },
+              "unchanged_zero": {
+                "mean": -0.0012686721474362932,
+                "question_bootstrap95CI": [
+                  -0.8574896123502777,
+                  0.835591097979683
+                ],
+                "questions": 6,
+                "note": "Descriptive exposed cases, not generalization CI"
+              },
+              "static": {
+                "mean": 5.286962736900096,
+                "question_bootstrap95CI": [
+                  2.2162799598139817,
+                  8.254072322062564
+                ],
+                "questions": 6,
+                "note": "Descriptive exposed cases, not generalization CI"
+              },
+              "ridge": {
+                "mean": 1.3846047812787259,
+                "question_bootstrap95CI": [
+                  -0.5255461362330006,
+                  4.474140940663758
+                ],
+                "questions": 6,
+                "note": "Descriptive exposed cases, not generalization CI"
+              },
+              "same_data_ridge": {
+                "mean": -0.7137348152670328,
+                "question_bootstrap95CI": [
+                  -2.1265684464946126,
+                  0.23216950747378165
+                ],
+                "questions": 6,
+                "note": "Descriptive exposed cases, not generalization CI"
+              }
+            }
+          },
+          "reason_length_only_sensitivity": {
+            "predictors": {
+              "adapted": {
+                "rows": 6,
+                "capped_mae": 1.0703114548087305,
+                "invalids": 0,
+                "valid_numeric_rows": 6,
+                "bias_on_valid": -0.47480959531484807,
+                "sign": {
+                  "non_tied_rows": 6,
+                  "agree": 4,
+                  "gold_ties": 0,
+                  "prediction_ties": 0
+                }
+              },
+              "original_true": {
+                "rows": 6,
+                "capped_mae": 7.239205130935498,
+                "invalids": 0,
+                "valid_numeric_rows": 6,
+                "bias_on_valid": -5.712476261981514,
+                "sign": {
+                  "non_tied_rows": 6,
+                  "agree": 3,
+                  "gold_ties": 0,
+                  "prediction_ties": 0
+                }
+              },
+              "unchanged_zero": {
+                "rows": 6,
+                "capped_mae": 1.0690427826612943,
+                "invalids": 0,
+                "valid_numeric_rows": 6,
+                "bias_on_valid": 0.16419040468515197,
+                "sign": {
+                  "non_tied_rows": 0,
+                  "agree": 0,
+                  "gold_ties": 0,
+                  "prediction_ties": 6
+                }
+              },
+              "static": {
+                "rows": 6,
+                "capped_mae": 6.357274191708828,
+                "invalids": 0,
+                "valid_numeric_rows": 6,
+                "bias_on_valid": -4.712817358283114,
+                "sign": {
+                  "non_tied_rows": 6,
+                  "agree": 2,
+                  "gold_ties": 0,
+                  "prediction_ties": 0
+                }
+              },
+              "ridge": {
+                "rows": 6,
+                "capped_mae": 2.4549162360874566,
+                "invalids": 0,
+                "valid_numeric_rows": 6,
+                "bias_on_valid": 2.193821710132164,
+                "sign": {
+                  "non_tied_rows": 6,
+                  "agree": 5,
+                  "gold_ties": 0,
+                  "prediction_ties": 0
+                }
+              },
+              "same_data_ridge": {
+                "rows": 6,
+                "capped_mae": 0.35657663954169777,
+                "invalids": 0,
+                "valid_numeric_rows": 6,
+                "bias_on_valid": 0.21012263080556823,
+                "sign": {
+                  "non_tied_rows": 6,
+                  "agree": 6,
+                  "gold_ties": 0,
+                  "prediction_ties": 0
+                }
+              }
+            },
+            "comparator_minus_adapted_error": {
+              "original_true": {
+                "mean": 6.168893676126768,
+                "question_bootstrap95CI": [
+                  3.4405924979282854,
+                  8.830634511531814
+                ],
+                "questions": 6,
+                "note": "Descriptive exposed cases, not generalization CI"
+              },
+              "unchanged_zero": {
+                "mean": -0.0012686721474362932,
+                "question_bootstrap95CI": [
+                  -0.8574896123502777,
+                  0.835591097979683
+                ],
+                "questions": 6,
+                "note": "Descriptive exposed cases, not generalization CI"
+              },
+              "static": {
+                "mean": 5.286962736900096,
+                "question_bootstrap95CI": [
+                  2.2162799598139817,
+                  8.254072322062564
+                ],
+                "questions": 6,
+                "note": "Descriptive exposed cases, not generalization CI"
+              },
+              "ridge": {
+                "mean": 1.3846047812787259,
+                "question_bootstrap95CI": [
+                  -0.5255461362330006,
+                  4.474140940663758
+                ],
+                "questions": 6,
+                "note": "Descriptive exposed cases, not generalization CI"
+              },
+              "same_data_ridge": {
+                "mean": -0.7137348152670328,
+                "question_bootstrap95CI": [
+                  -2.1265684464946126,
+                  0.23216950747378165
+                ],
+                "questions": 6,
+                "note": "Descriptive exposed cases, not generalization CI"
+              }
+            }
+          }
+        }
+      }
+    },
+    "valid": {
+      "scope": "8DEV already exposed; not pristine",
+      "modes": {
+        "strict": {
+          "predictors": {
+            "adapted": {
+              "rows": 8,
+              "capped_mae": 2.3006933830140444,
+              "invalids": 0,
+              "valid_numeric_rows": 8,
+              "bias_on_valid": -2.1132358822261823,
+              "sign": {
+                "non_tied_rows": 8,
+                "agree": 4,
+                "gold_ties": 0,
+                "prediction_ties": 0
+              }
+            },
+            "original_true": {
+              "rows": 8,
+              "capped_mae": 18.8742787753244,
+              "invalids": 2,
+              "valid_numeric_rows": 6,
+              "bias_on_valid": -5.165705033765865,
+              "sign": {
+                "non_tied_rows": 6,
+                "agree": 3,
+                "gold_ties": 0,
+                "prediction_ties": 0
+              }
+            },
+            "unchanged_zero": {
+              "rows": 8,
+              "capped_mae": 2.1939812177026,
+              "invalids": 0,
+              "valid_numeric_rows": 8,
+              "bias_on_valid": 0.7870141177738172,
+              "sign": {
+                "non_tied_rows": 0,
+                "agree": 0,
+                "gold_ties": 0,
+                "prediction_ties": 8
+              }
+            },
+            "static": {
+              "rows": 8,
+              "capped_mae": 4.006299780553196,
+              "invalids": 0,
+              "valid_numeric_rows": 8,
+              "bias_on_valid": -2.8900815755657514,
+              "sign": {
+                "non_tied_rows": 8,
+                "agree": 5,
+                "gold_ties": 0,
+                "prediction_ties": 0
+              }
+            },
+            "ridge": {
+              "rows": 8,
+              "capped_mae": 4.284053400737886,
+              "invalids": 0,
+              "valid_numeric_rows": 8,
+              "bias_on_valid": 0.016106451467831517,
+              "sign": {
+                "non_tied_rows": 8,
+                "agree": 8,
+                "gold_ties": 0,
+                "prediction_ties": 0
+              }
+            },
+            "same_data_ridge": {
+              "rows": 8,
+              "capped_mae": 0.6870121095428022,
+              "invalids": 0,
+              "valid_numeric_rows": 8,
+              "bias_on_valid": -0.2643751813774021,
+              "sign": {
+                "non_tied_rows": 8,
+                "agree": 8,
+                "gold_ties": 0,
+                "prediction_ties": 0
+              }
+            }
+          },
+          "comparator_minus_adapted_error": {
+            "original_true": {
+              "mean": 16.573585392310356,
+              "question_bootstrap95CI": [
+                1.4511159737274983,
+                37.31991644777209
+              ],
+              "questions": 8,
+              "note": "Descriptive exposed cases, not generalization CI"
+            },
+            "unchanged_zero": {
+              "mean": -0.10671216531144401,
+              "question_bootstrap95CI": [
+                -2.1106189302609115,
+                2.118875
+              ],
+              "questions": 8,
+              "note": "Descriptive exposed cases, not generalization CI"
+            },
+            "static": {
+              "mean": 1.7056063975391516,
+              "question_bootstrap95CI": [
+                -0.12596620927789906,
+                4.502758420914135
+              ],
+              "questions": 8,
+              "note": "Descriptive exposed cases, not generalization CI"
+            },
+            "ridge": {
+              "mean": 1.9833600177238417,
+              "question_bootstrap95CI": [
+                -0.6682984185869643,
+                5.364042540446372
+              ],
+              "questions": 8,
+              "note": "Descriptive exposed cases, not generalization CI"
+            },
+            "same_data_ridge": {
+              "mean": -1.613681273471242,
+              "question_bootstrap95CI": [
+                -3.0630073977173744,
+                -0.30994746023498615
+              ],
+              "questions": 8,
+              "note": "Descriptive exposed cases, not generalization CI"
+            }
+          }
+        },
+        "reason_length_only_sensitivity": {
+          "predictors": {
+            "adapted": {
+              "rows": 8,
+              "capped_mae": 2.3006933830140444,
+              "invalids": 0,
+              "valid_numeric_rows": 8,
+              "bias_on_valid": -2.1132358822261823,
+              "sign": {
+                "non_tied_rows": 8,
+                "agree": 4,
+                "gold_ties": 0,
+                "prediction_ties": 0
+              }
+            },
+            "original_true": {
+              "rows": 8,
+              "capped_mae": 4.216965728385757,
+              "invalids": 0,
+              "valid_numeric_rows": 8,
+              "bias_on_valid": -4.216965728385757,
+              "sign": {
+                "non_tied_rows": 8,
+                "agree": 4,
+                "gold_ties": 0,
+                "prediction_ties": 0
+              }
+            },
+            "unchanged_zero": {
+              "rows": 8,
+              "capped_mae": 2.1939812177026,
+              "invalids": 0,
+              "valid_numeric_rows": 8,
+              "bias_on_valid": 0.7870141177738172,
+              "sign": {
+                "non_tied_rows": 0,
+                "agree": 0,
+                "gold_ties": 0,
+                "prediction_ties": 8
+              }
+            },
+            "static": {
+              "rows": 8,
+              "capped_mae": 4.006299780553196,
+              "invalids": 0,
+              "valid_numeric_rows": 8,
+              "bias_on_valid": -2.8900815755657514,
+              "sign": {
+                "non_tied_rows": 8,
+                "agree": 5,
+                "gold_ties": 0,
+                "prediction_ties": 0
+              }
+            },
+            "ridge": {
+              "rows": 8,
+              "capped_mae": 4.284053400737886,
+              "invalids": 0,
+              "valid_numeric_rows": 8,
+              "bias_on_valid": 0.016106451467831517,
+              "sign": {
+                "non_tied_rows": 8,
+                "agree": 8,
+                "gold_ties": 0,
+                "prediction_ties": 0
+              }
+            },
+            "same_data_ridge": {
+              "rows": 8,
+              "capped_mae": 0.6870121095428022,
+              "invalids": 0,
+              "valid_numeric_rows": 8,
+              "bias_on_valid": -0.2643751813774021,
+              "sign": {
+                "non_tied_rows": 8,
+                "agree": 8,
+                "gold_ties": 0,
+                "prediction_ties": 0
+              }
+            }
+          },
+          "comparator_minus_adapted_error": {
+            "original_true": {
+              "mean": 1.9162723453717132,
+              "question_bootstrap95CI": [
+                0.3116866938451341,
+                4.58019941998586
+              ],
+              "questions": 8,
+              "note": "Descriptive exposed cases, not generalization CI"
+            },
+            "unchanged_zero": {
+              "mean": -0.10671216531144401,
+              "question_bootstrap95CI": [
+                -2.1106189302609115,
+                2.118875
+              ],
+              "questions": 8,
+              "note": "Descriptive exposed cases, not generalization CI"
+            },
+            "static": {
+              "mean": 1.7056063975391516,
+              "question_bootstrap95CI": [
+                -0.12596620927789906,
+                4.502758420914135
+              ],
+              "questions": 8,
+              "note": "Descriptive exposed cases, not generalization CI"
+            },
+            "ridge": {
+              "mean": 1.9833600177238417,
+              "question_bootstrap95CI": [
+                -0.6682984185869643,
+                5.364042540446372
+              ],
+              "questions": 8,
+              "note": "Descriptive exposed cases, not generalization CI"
+            },
+            "same_data_ridge": {
+              "mean": -1.613681273471242,
+              "question_bootstrap95CI": [
+                -3.0630073977173744,
+                -0.30994746023498615
+              ],
+              "questions": 8,
+              "note": "Descriptive exposed cases, not generalization CI"
+            }
+          }
+        }
+      },
+      "groups": {
+        "lie_direct": {
+          "strict": {
+            "predictors": {
+              "adapted": {
+                "rows": 2,
+                "capped_mae": 1.5546145273211989,
+                "invalids": 0,
+                "valid_numeric_rows": 2,
+                "bias_on_valid": -0.8230269519036291,
+                "sign": {
+                  "non_tied_rows": 2,
+                  "agree": 2,
+                  "gold_ties": 0,
+                  "prediction_ties": 0
+                }
+              },
+              "original_true": {
+                "rows": 2,
+                "capped_mae": 1.7540269519036291,
+                "invalids": 0,
+                "valid_numeric_rows": 2,
+                "bias_on_valid": -1.7540269519036291,
+                "sign": {
+                  "non_tied_rows": 2,
+                  "agree": 2,
+                  "gold_ties": 0,
+                  "prediction_ties": 0
+                }
+              },
+              "unchanged_zero": {
+                "rows": 2,
+                "capped_mae": 5.410973048096371,
+                "invalids": 0,
+                "valid_numeric_rows": 2,
+                "bias_on_valid": 5.410973048096371,
+                "sign": {
+                  "non_tied_rows": 0,
+                  "agree": 0,
+                  "gold_ties": 0,
+                  "prediction_ties": 2
+                }
+              },
+              "static": {
+                "rows": 2,
+                "capped_mae": 1.7530756290625835,
+                "invalids": 0,
+                "valid_numeric_rows": 2,
+                "bias_on_valid": -1.7530756290625835,
+                "sign": {
+                  "non_tied_rows": 2,
+                  "agree": 2,
+                  "gold_ties": 0,
+                  "prediction_ties": 0
+                }
+              },
+              "ridge": {
+                "rows": 2,
+                "capped_mae": 1.4256169391378932,
+                "invalids": 0,
+                "valid_numeric_rows": 2,
+                "bias_on_valid": -1.4256169391378932,
+                "sign": {
+                  "non_tied_rows": 2,
+                  "agree": 2,
+                  "gold_ties": 0,
+                  "prediction_ties": 0
+                }
+              },
+              "same_data_ridge": {
+                "rows": 2,
+                "capped_mae": 0.5296197216490703,
+                "invalids": 0,
+                "valid_numeric_rows": 2,
+                "bias_on_valid": -0.09378209707748009,
+                "sign": {
+                  "non_tied_rows": 2,
+                  "agree": 2,
+                  "gold_ties": 0,
+                  "prediction_ties": 0
+                }
+              }
+            },
+            "comparator_minus_adapted_error": {
+              "original_true": {
+                "mean": 0.19941242458243025,
+                "question_bootstrap95CI": [
+                  0.004999999999999893,
+                  0.3938248491648606
+                ],
+                "questions": 2,
+                "note": "Descriptive exposed cases, not generalization CI"
+              },
+              "unchanged_zero": {
+                "mean": 3.856358520775172,
+                "question_bootstrap95CI": [
+                  1.5897170415503439,
+                  6.123
+                ],
+                "questions": 2,
+                "note": "Descriptive exposed cases, not generalization CI"
+              },
+              "static": {
+                "mean": 0.19846110174138465,
+                "question_bootstrap95CI": [
+                  0.0007252298587516748,
+                  0.3961969736240176
+                ],
+                "questions": 2,
+                "note": "Descriptive exposed cases, not generalization CI"
+              },
+              "ridge": {
+                "mean": -0.12899758818330564,
+                "question_bootstrap95CI": [
+                  -0.17882450327471577,
+                  -0.07917067309189552
+                ],
+                "questions": 2,
+                "note": "Descriptive exposed cases, not generalization CI"
+              },
+              "same_data_ridge": {
+                "mean": -1.0249948056721285,
+                "question_bootstrap95CI": [
+                  -1.7542396604982775,
+                  -0.29574995084597955
+                ],
+                "questions": 2,
+                "note": "Descriptive exposed cases, not generalization CI"
+              }
+            }
+          },
+          "reason_length_only_sensitivity": {
+            "predictors": {
+              "adapted": {
+                "rows": 2,
+                "capped_mae": 1.5546145273211989,
+                "invalids": 0,
+                "valid_numeric_rows": 2,
+                "bias_on_valid": -0.8230269519036291,
+                "sign": {
+                  "non_tied_rows": 2,
+                  "agree": 2,
+                  "gold_ties": 0,
+                  "prediction_ties": 0
+                }
+              },
+              "original_true": {
+                "rows": 2,
+                "capped_mae": 1.7540269519036291,
+                "invalids": 0,
+                "valid_numeric_rows": 2,
+                "bias_on_valid": -1.7540269519036291,
+                "sign": {
+                  "non_tied_rows": 2,
+                  "agree": 2,
+                  "gold_ties": 0,
+                  "prediction_ties": 0
+                }
+              },
+              "unchanged_zero": {
+                "rows": 2,
+                "capped_mae": 5.410973048096371,
+                "invalids": 0,
+                "valid_numeric_rows": 2,
+                "bias_on_valid": 5.410973048096371,
+                "sign": {
+                  "non_tied_rows": 0,
+                  "agree": 0,
+                  "gold_ties": 0,
+                  "prediction_ties": 2
+                }
+              },
+              "static": {
+                "rows": 2,
+                "capped_mae": 1.7530756290625835,
+                "invalids": 0,
+                "valid_numeric_rows": 2,
+                "bias_on_valid": -1.7530756290625835,
+                "sign": {
+                  "non_tied_rows": 2,
+                  "agree": 2,
+                  "gold_ties": 0,
+                  "prediction_ties": 0
+                }
+              },
+              "ridge": {
+                "rows": 2,
+                "capped_mae": 1.4256169391378932,
+                "invalids": 0,
+                "valid_numeric_rows": 2,
+                "bias_on_valid": -1.4256169391378932,
+                "sign": {
+                  "non_tied_rows": 2,
+                  "agree": 2,
+                  "gold_ties": 0,
+                  "prediction_ties": 0
+                }
+              },
+              "same_data_ridge": {
+                "rows": 2,
+                "capped_mae": 0.5296197216490703,
+                "invalids": 0,
+                "valid_numeric_rows": 2,
+                "bias_on_valid": -0.09378209707748009,
+                "sign": {
+                  "non_tied_rows": 2,
+                  "agree": 2,
+                  "gold_ties": 0,
+                  "prediction_ties": 0
+                }
+              }
+            },
+            "comparator_minus_adapted_error": {
+              "original_true": {
+                "mean": 0.19941242458243025,
+                "question_bootstrap95CI": [
+                  0.004999999999999893,
+                  0.3938248491648606
+                ],
+                "questions": 2,
+                "note": "Descriptive exposed cases, not generalization CI"
+              },
+              "unchanged_zero": {
+                "mean": 3.856358520775172,
+                "question_bootstrap95CI": [
+                  1.5897170415503439,
+                  6.123
+                ],
+                "questions": 2,
+                "note": "Descriptive exposed cases, not generalization CI"
+              },
+              "static": {
+                "mean": 0.19846110174138465,
+                "question_bootstrap95CI": [
+                  0.0007252298587516748,
+                  0.3961969736240176
+                ],
+                "questions": 2,
+                "note": "Descriptive exposed cases, not generalization CI"
+              },
+              "ridge": {
+                "mean": -0.12899758818330564,
+                "question_bootstrap95CI": [
+                  -0.17882450327471577,
+                  -0.07917067309189552
+                ],
+                "questions": 2,
+                "note": "Descriptive exposed cases, not generalization CI"
+              },
+              "same_data_ridge": {
+                "mean": -1.0249948056721285,
+                "question_bootstrap95CI": [
+                  -1.7542396604982775,
+                  -0.29574995084597955
+                ],
+                "questions": 2,
+                "note": "Descriptive exposed cases, not generalization CI"
+              }
+            }
+          }
+        },
+        "truth_history": {
+          "strict": {
+            "predictors": {
+              "adapted": {
+                "rows": 2,
+                "capped_mae": 1.1356460791371854,
+                "invalids": 0,
+                "valid_numeric_rows": 2,
+                "bias_on_valid": -1.1356460791371854,
+                "sign": {
+                  "non_tied_rows": 2,
+                  "agree": 0,
+                  "gold_ties": 0,
+                  "prediction_ties": 0
+                }
+              },
+              "original_true": {
+                "rows": 2,
+                "capped_mae": 2.2426460791371854,
+                "invalids": 0,
+                "valid_numeric_rows": 2,
+                "bias_on_valid": -2.2426460791371854,
+                "sign": {
+                  "non_tied_rows": 2,
+                  "agree": 0,
+                  "gold_ties": 0,
+                  "prediction_ties": 0
+                }
+              },
+              "unchanged_zero": {
+                "rows": 2,
+                "capped_mae": 0.5976460791371854,
+                "invalids": 0,
+                "valid_numeric_rows": 2,
+                "bias_on_valid": -0.5976460791371854,
+                "sign": {
+                  "non_tied_rows": 0,
+                  "agree": 0,
+                  "gold_ties": 0,
+                  "prediction_ties": 2
+                }
+              },
+              "static": {
+                "rows": 2,
+                "capped_mae": 1.0431739284023525,
+                "invalids": 0,
+                "valid_numeric_rows": 2,
+                "bias_on_valid": 1.0431739284023525,
+                "sign": {
+                  "non_tied_rows": 2,
+                  "agree": 2,
+                  "gold_ties": 0,
+                  "prediction_ties": 0
+                }
+              },
+              "ridge": {
+                "rows": 2,
+                "capped_mae": 0.2639749707499638,
+                "invalids": 0,
+                "valid_numeric_rows": 2,
+                "bias_on_valid": 0.14093965608355663,
+                "sign": {
+                  "non_tied_rows": 2,
+                  "agree": 2,
+                  "gold_ties": 0,
+                  "prediction_ties": 0
+                }
+              },
+              "same_data_ridge": {
+                "rows": 2,
+                "capped_mae": 0.7901197010900596,
+                "invalids": 0,
+                "valid_numeric_rows": 2,
+                "bias_on_valid": 0.4645903869999506,
+                "sign": {
+                  "non_tied_rows": 2,
+                  "agree": 2,
+                  "gold_ties": 0,
+                  "prediction_ties": 0
+                }
+              }
+            },
+            "comparator_minus_adapted_error": {
+              "original_true": {
+                "mean": 1.107,
+                "question_bootstrap95CI": [
+                  0.726,
+                  1.488
+                ],
+                "questions": 2,
+                "note": "Descriptive exposed cases, not generalization CI"
+              },
+              "unchanged_zero": {
+                "mean": -0.538,
+                "question_bootstrap95CI": [
+                  -0.734,
+                  -0.3420000000000001
+                ],
+                "questions": 2,
+                "note": "Descriptive exposed cases, not generalization CI"
+              },
+              "static": {
+                "mean": -0.09247215073483295,
+                "question_bootstrap95CI": [
+                  -1.2215214538201595,
+                  1.0365771523504936
+                ],
+                "questions": 2,
+                "note": "Descriptive exposed cases, not generalization CI"
+              },
+              "ridge": {
+                "mean": -0.8716711083872216,
+                "question_bootstrap95CI": [
+                  -1.3009782459093482,
+                  -0.44236397086509505
+                ],
+                "questions": 2,
+                "note": "Descriptive exposed cases, not generalization CI"
+              },
+              "same_data_ridge": {
+                "mean": -0.3455263780471258,
+                "question_bootstrap95CI": [
+                  -1.3803635586527596,
+                  0.689310802558508
+                ],
+                "questions": 2,
+                "note": "Descriptive exposed cases, not generalization CI"
+              }
+            }
+          },
+          "reason_length_only_sensitivity": {
+            "predictors": {
+              "adapted": {
+                "rows": 2,
+                "capped_mae": 1.1356460791371854,
+                "invalids": 0,
+                "valid_numeric_rows": 2,
+                "bias_on_valid": -1.1356460791371854,
+                "sign": {
+                  "non_tied_rows": 2,
+                  "agree": 0,
+                  "gold_ties": 0,
+                  "prediction_ties": 0
+                }
+              },
+              "original_true": {
+                "rows": 2,
+                "capped_mae": 2.2426460791371854,
+                "invalids": 0,
+                "valid_numeric_rows": 2,
+                "bias_on_valid": -2.2426460791371854,
+                "sign": {
+                  "non_tied_rows": 2,
+                  "agree": 0,
+                  "gold_ties": 0,
+                  "prediction_ties": 0
+                }
+              },
+              "unchanged_zero": {
+                "rows": 2,
+                "capped_mae": 0.5976460791371854,
+                "invalids": 0,
+                "valid_numeric_rows": 2,
+                "bias_on_valid": -0.5976460791371854,
+                "sign": {
+                  "non_tied_rows": 0,
+                  "agree": 0,
+                  "gold_ties": 0,
+                  "prediction_ties": 2
+                }
+              },
+              "static": {
+                "rows": 2,
+                "capped_mae": 1.0431739284023525,
+                "invalids": 0,
+                "valid_numeric_rows": 2,
+                "bias_on_valid": 1.0431739284023525,
+                "sign": {
+                  "non_tied_rows": 2,
+                  "agree": 2,
+                  "gold_ties": 0,
+                  "prediction_ties": 0
+                }
+              },
+              "ridge": {
+                "rows": 2,
+                "capped_mae": 0.2639749707499638,
+                "invalids": 0,
+                "valid_numeric_rows": 2,
+                "bias_on_valid": 0.14093965608355663,
+                "sign": {
+                  "non_tied_rows": 2,
+                  "agree": 2,
+                  "gold_ties": 0,
+                  "prediction_ties": 0
+                }
+              },
+              "same_data_ridge": {
+                "rows": 2,
+                "capped_mae": 0.7901197010900596,
+                "invalids": 0,
+                "valid_numeric_rows": 2,
+                "bias_on_valid": 0.4645903869999506,
+                "sign": {
+                  "non_tied_rows": 2,
+                  "agree": 2,
+                  "gold_ties": 0,
+                  "prediction_ties": 0
+                }
+              }
+            },
+            "comparator_minus_adapted_error": {
+              "original_true": {
+                "mean": 1.107,
+                "question_bootstrap95CI": [
+                  0.726,
+                  1.488
+                ],
+                "questions": 2,
+                "note": "Descriptive exposed cases, not generalization CI"
+              },
+              "unchanged_zero": {
+                "mean": -0.538,
+                "question_bootstrap95CI": [
+                  -0.734,
+                  -0.3420000000000001
+                ],
+                "questions": 2,
+                "note": "Descriptive exposed cases, not generalization CI"
+              },
+              "static": {
+                "mean": -0.09247215073483295,
+                "question_bootstrap95CI": [
+                  -1.2215214538201595,
+                  1.0365771523504936
+                ],
+                "questions": 2,
+                "note": "Descriptive exposed cases, not generalization CI"
+              },
+              "ridge": {
+                "mean": -0.8716711083872216,
+                "question_bootstrap95CI": [
+                  -1.3009782459093482,
+                  -0.44236397086509505
+                ],
+                "questions": 2,
+                "note": "Descriptive exposed cases, not generalization CI"
+              },
+              "same_data_ridge": {
+                "mean": -0.3455263780471258,
+                "question_bootstrap95CI": [
+                  -1.3803635586527596,
+                  0.689310802558508
+                ],
+                "questions": 2,
+                "note": "Descriptive exposed cases, not generalization CI"
+              }
+            }
+          }
+        },
+        "truth_numeric_16": {
+          "strict": {
+            "predictors": {
+              "adapted": {
+                "rows": 2,
+                "capped_mae": 3.0447248048774123,
+                "invalids": 0,
+                "valid_numeric_rows": 2,
+                "bias_on_valid": -3.0264823771435356,
+                "sign": {
+                  "non_tied_rows": 2,
+                  "agree": 2,
+                  "gold_ties": 0,
+                  "prediction_ties": 0
+                }
+              },
+              "original_true": {
+                "rows": 2,
+                "capped_mae": 33.13588170794318,
+                "invalids": 1,
+                "valid_numeric_rows": 1,
+                "bias_on_valid": -6.271763415886352,
+                "sign": {
+                  "non_tied_rows": 1,
+                  "agree": 1,
+                  "gold_ties": 0,
+                  "prediction_ties": 0
+                }
+              },
+              "unchanged_zero": {
+                "rows": 2,
+                "capped_mae": 0.551017622856464,
+                "invalids": 0,
+                "valid_numeric_rows": 2,
+                "bias_on_valid": 0.551017622856464,
+                "sign": {
+                  "non_tied_rows": 0,
+                  "agree": 0,
+                  "gold_ties": 0,
+                  "prediction_ties": 2
+                }
+              },
+              "static": {
+                "rows": 2,
+                "capped_mae": 4.3251441895157114,
+                "invalids": 0,
+                "valid_numeric_rows": 2,
+                "bias_on_valid": -1.9466192263706406,
+                "sign": {
+                  "non_tied_rows": 2,
+                  "agree": 1,
+                  "gold_ties": 0,
+                  "prediction_ties": 0
+                }
+              },
+              "ridge": {
+                "rows": 2,
+                "capped_mae": 7.048759302069012,
+                "invalids": 0,
+                "valid_numeric_rows": 2,
+                "bias_on_valid": -7.048759302069012,
+                "sign": {
+                  "non_tied_rows": 2,
+                  "agree": 2,
+                  "gold_ties": 0,
+                  "prediction_ties": 0
+                }
+              },
+              "same_data_ridge": {
+                "rows": 2,
+                "capped_mae": 0.5696249443014043,
+                "invalids": 0,
+                "valid_numeric_rows": 2,
+                "bias_on_valid": -0.5696249443014043,
+                "sign": {
+                  "non_tied_rows": 2,
+                  "agree": 2,
+                  "gold_ties": 0,
+                  "prediction_ties": 0
+                }
+              }
+            },
+            "comparator_minus_adapted_error": {
+              "original_true": {
+                "mean": 30.091156903065766,
+                "question_bootstrap95CI": [
+                  0.2005562338654041,
+                  59.981757572266126
+                ],
+                "questions": 2,
+                "note": "Descriptive exposed cases, not generalization CI"
+              },
+              "unchanged_zero": {
+                "mean": -2.493707182020948,
+                "question_bootstrap95CI": [
+                  -5.329414364041896,
+                  0.342
+                ],
+                "questions": 2,
+                "note": "Descriptive exposed cases, not generalization CI"
+              },
+              "static": {
+                "mean": 1.2804193846382994,
+                "question_bootstrap95CI": [
+                  0.2005562338654041,
+                  2.3602825354111947
+                ],
+                "questions": 2,
+                "note": "Descriptive exposed cases, not generalization CI"
+              },
+              "ridge": {
+                "mean": 4.0040344971916,
+                "question_bootstrap95CI": [
+                  1.0175890035411141,
+                  6.990479990842085
+                ],
+                "questions": 2,
+                "note": "Descriptive exposed cases, not generalization CI"
+              },
+              "same_data_ridge": {
+                "mean": -2.475099860576008,
+                "question_bootstrap95CI": [
+                  -5.4192349482008995,
+                  0.46903522704888373
+                ],
+                "questions": 2,
+                "note": "Descriptive exposed cases, not generalization CI"
+              }
+            }
+          },
+          "reason_length_only_sensitivity": {
+            "predictors": {
+              "adapted": {
+                "rows": 2,
+                "capped_mae": 3.0447248048774123,
+                "invalids": 0,
+                "valid_numeric_rows": 2,
+                "bias_on_valid": -3.0264823771435356,
+                "sign": {
+                  "non_tied_rows": 2,
+                  "agree": 2,
+                  "gold_ties": 0,
+                  "prediction_ties": 0
+                }
+              },
+              "original_true": {
+                "rows": 2,
+                "capped_mae": 3.964901761781835,
+                "invalids": 0,
+                "valid_numeric_rows": 2,
+                "bias_on_valid": -3.964901761781835,
+                "sign": {
+                  "non_tied_rows": 2,
+                  "agree": 2,
+                  "gold_ties": 0,
+                  "prediction_ties": 0
+                }
+              },
+              "unchanged_zero": {
+                "rows": 2,
+                "capped_mae": 0.551017622856464,
+                "invalids": 0,
+                "valid_numeric_rows": 2,
+                "bias_on_valid": 0.551017622856464,
+                "sign": {
+                  "non_tied_rows": 0,
+                  "agree": 0,
+                  "gold_ties": 0,
+                  "prediction_ties": 2
+                }
+              },
+              "static": {
+                "rows": 2,
+                "capped_mae": 4.3251441895157114,
+                "invalids": 0,
+                "valid_numeric_rows": 2,
+                "bias_on_valid": -1.9466192263706406,
+                "sign": {
+                  "non_tied_rows": 2,
+                  "agree": 1,
+                  "gold_ties": 0,
+                  "prediction_ties": 0
+                }
+              },
+              "ridge": {
+                "rows": 2,
+                "capped_mae": 7.048759302069012,
+                "invalids": 0,
+                "valid_numeric_rows": 2,
+                "bias_on_valid": -7.048759302069012,
+                "sign": {
+                  "non_tied_rows": 2,
+                  "agree": 2,
+                  "gold_ties": 0,
+                  "prediction_ties": 0
+                }
+              },
+              "same_data_ridge": {
+                "rows": 2,
+                "capped_mae": 0.5696249443014043,
+                "invalids": 0,
+                "valid_numeric_rows": 2,
+                "bias_on_valid": -0.5696249443014043,
+                "sign": {
+                  "non_tied_rows": 2,
+                  "agree": 2,
+                  "gold_ties": 0,
+                  "prediction_ties": 0
+                }
+              }
+            },
+            "comparator_minus_adapted_error": {
+              "original_true": {
+                "mean": 0.9201769569044231,
+                "question_bootstrap95CI": [
+                  0.2005562338654041,
+                  1.6397976799434422
+                ],
+                "questions": 2,
+                "note": "Descriptive exposed cases, not generalization CI"
+              },
+              "unchanged_zero": {
+                "mean": -2.493707182020948,
+                "question_bootstrap95CI": [
+                  -5.329414364041896,
+                  0.342
+                ],
+                "questions": 2,
+                "note": "Descriptive exposed cases, not generalization CI"
+              },
+              "static": {
+                "mean": 1.2804193846382994,
+                "question_bootstrap95CI": [
+                  0.2005562338654041,
+                  2.3602825354111947
+                ],
+                "questions": 2,
+                "note": "Descriptive exposed cases, not generalization CI"
+              },
+              "ridge": {
+                "mean": 4.0040344971916,
+                "question_bootstrap95CI": [
+                  1.0175890035411141,
+                  6.990479990842085
+                ],
+                "questions": 2,
+                "note": "Descriptive exposed cases, not generalization CI"
+              },
+              "same_data_ridge": {
+                "mean": -2.475099860576008,
+                "question_bootstrap95CI": [
+                  -5.4192349482008995,
+                  0.46903522704888373
+                ],
+                "questions": 2,
+                "note": "Descriptive exposed cases, not generalization CI"
+              }
+            }
+          }
+        },
+        "truth_numeric_other": {
+          "strict": {
+            "predictors": {
+              "adapted": {
+                "rows": 2,
+                "capped_mae": 3.46778812072038,
+                "invalids": 0,
+                "valid_numeric_rows": 2,
+                "bias_on_valid": -3.46778812072038,
+                "sign": {
+                  "non_tied_rows": 2,
+                  "agree": 0,
+                  "gold_ties": 0,
+                  "prediction_ties": 0
+                }
+              },
+              "original_true": {
+                "rows": 2,
+                "capped_mae": 38.364560362313604,
+                "invalids": 1,
+                "valid_numeric_rows": 1,
+                "bias_on_valid": -16.729120724627208,
+                "sign": {
+                  "non_tied_rows": 1,
+                  "agree": 0,
+                  "gold_ties": 0,
+                  "prediction_ties": 0
+                }
+              },
+              "unchanged_zero": {
+                "rows": 2,
+                "capped_mae": 2.21628812072038,
+                "invalids": 0,
+                "valid_numeric_rows": 2,
+                "bias_on_valid": -2.21628812072038,
+                "sign": {
+                  "non_tied_rows": 0,
+                  "agree": 0,
+                  "gold_ties": 0,
+                  "prediction_ties": 2
+                }
+              },
+              "static": {
+                "rows": 2,
+                "capped_mae": 8.903805375232135,
+                "invalids": 0,
+                "valid_numeric_rows": 2,
+                "bias_on_valid": -8.903805375232135,
+                "sign": {
+                  "non_tied_rows": 2,
+                  "agree": 0,
+                  "gold_ties": 0,
+                  "prediction_ties": 0
+                }
+              },
+              "ridge": {
+                "rows": 2,
+                "capped_mae": 8.397862390994675,
+                "invalids": 0,
+                "valid_numeric_rows": 2,
+                "bias_on_valid": 8.397862390994675,
+                "sign": {
+                  "non_tied_rows": 2,
+                  "agree": 2,
+                  "gold_ties": 0,
+                  "prediction_ties": 0
+                }
+              },
+              "same_data_ridge": {
+                "rows": 2,
+                "capped_mae": 0.8586840711306747,
+                "invalids": 0,
+                "valid_numeric_rows": 2,
+                "bias_on_valid": -0.8586840711306747,
+                "sign": {
+                  "non_tied_rows": 2,
+                  "agree": 2,
+                  "gold_ties": 0,
+                  "prediction_ties": 0
+                }
+              }
+            },
+            "comparator_minus_adapted_error": {
+              "original_true": {
+                "mean": 34.896772241593226,
+                "question_bootstrap95CI": [
+                  10.876999999999999,
+                  58.91654448318645
+                ],
+                "questions": 2,
+                "note": "Descriptive exposed cases, not generalization CI"
+              },
+              "unchanged_zero": {
+                "mean": -1.2515000000000003,
+                "question_bootstrap95CI": [
+                  -1.5730000000000004,
+                  -0.9300000000000002
+                ],
+                "questions": 2,
+                "note": "Descriptive exposed cases, not generalization CI"
+              },
+              "static": {
+                "mean": 5.436017254511755,
+                "question_bootstrap95CI": [
+                  -0.003826846381678628,
+                  10.875861355405188
+                ],
+                "questions": 2,
+                "note": "Descriptive exposed cases, not generalization CI"
+              },
+              "ridge": {
+                "mean": 4.930074270274295,
+                "question_bootstrap95CI": [
+                  -1.88509551181148,
+                  11.74524405236007
+                ],
+                "questions": 2,
+                "note": "Descriptive exposed cases, not generalization CI"
+              },
+              "same_data_ridge": {
+                "mean": -2.6091040495897055,
+                "question_bootstrap95CI": [
+                  -4.226165629927273,
+                  -0.9920424692521381
+                ],
+                "questions": 2,
+                "note": "Descriptive exposed cases, not generalization CI"
+              }
+            }
+          },
+          "reason_length_only_sensitivity": {
+            "predictors": {
+              "adapted": {
+                "rows": 2,
+                "capped_mae": 3.46778812072038,
+                "invalids": 0,
+                "valid_numeric_rows": 2,
+                "bias_on_valid": -3.46778812072038,
+                "sign": {
+                  "non_tied_rows": 2,
+                  "agree": 0,
+                  "gold_ties": 0,
+                  "prediction_ties": 0
+                }
+              },
+              "original_true": {
+                "rows": 2,
+                "capped_mae": 8.90628812072038,
+                "invalids": 0,
+                "valid_numeric_rows": 2,
+                "bias_on_valid": -8.90628812072038,
+                "sign": {
+                  "non_tied_rows": 2,
+                  "agree": 0,
+                  "gold_ties": 0,
+                  "prediction_ties": 0
+                }
+              },
+              "unchanged_zero": {
+                "rows": 2,
+                "capped_mae": 2.21628812072038,
+                "invalids": 0,
+                "valid_numeric_rows": 2,
+                "bias_on_valid": -2.21628812072038,
+                "sign": {
+                  "non_tied_rows": 0,
+                  "agree": 0,
+                  "gold_ties": 0,
+                  "prediction_ties": 2
+                }
+              },
+              "static": {
+                "rows": 2,
+                "capped_mae": 8.903805375232135,
+                "invalids": 0,
+                "valid_numeric_rows": 2,
+                "bias_on_valid": -8.903805375232135,
+                "sign": {
+                  "non_tied_rows": 2,
+                  "agree": 0,
+                  "gold_ties": 0,
+                  "prediction_ties": 0
+                }
+              },
+              "ridge": {
+                "rows": 2,
+                "capped_mae": 8.397862390994675,
+                "invalids": 0,
+                "valid_numeric_rows": 2,
+                "bias_on_valid": 8.397862390994675,
+                "sign": {
+                  "non_tied_rows": 2,
+                  "agree": 2,
+                  "gold_ties": 0,
+                  "prediction_ties": 0
+                }
+              },
+              "same_data_ridge": {
+                "rows": 2,
+                "capped_mae": 0.8586840711306747,
+                "invalids": 0,
+                "valid_numeric_rows": 2,
+                "bias_on_valid": -0.8586840711306747,
+                "sign": {
+                  "non_tied_rows": 2,
+                  "agree": 2,
+                  "gold_ties": 0,
+                  "prediction_ties": 0
+                }
+              }
+            },
+            "comparator_minus_adapted_error": {
+              "original_true": {
+                "mean": 5.4384999999999994,
+                "question_bootstrap95CI": [
+                  0.0,
+                  10.876999999999999
+                ],
+                "questions": 2,
+                "note": "Descriptive exposed cases, not generalization CI"
+              },
+              "unchanged_zero": {
+                "mean": -1.2515000000000003,
+                "question_bootstrap95CI": [
+                  -1.5730000000000004,
+                  -0.9300000000000002
+                ],
+                "questions": 2,
+                "note": "Descriptive exposed cases, not generalization CI"
+              },
+              "static": {
+                "mean": 5.436017254511755,
+                "question_bootstrap95CI": [
+                  -0.003826846381678628,
+                  10.875861355405188
+                ],
+                "questions": 2,
+                "note": "Descriptive exposed cases, not generalization CI"
+              },
+              "ridge": {
+                "mean": 4.930074270274295,
+                "question_bootstrap95CI": [
+                  -1.88509551181148,
+                  11.74524405236007
+                ],
+                "questions": 2,
+                "note": "Descriptive exposed cases, not generalization CI"
+              },
+              "same_data_ridge": {
+                "mean": -2.6091040495897055,
+                "question_bootstrap95CI": [
+                  -4.226165629927273,
+                  -0.9920424692521381
+                ],
+                "questions": 2,
+                "note": "Descriptive exposed cases, not generalization CI"
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "rows": [
+    {
+      "case_id": "lie_direct_00",
+      "split": "train",
+      "group": "lie_direct",
+      "gold_delta_bits": -4.869529503245728,
+      "modes": {
+        "strict": {
+          "losses": {
+            "adapted": 0.9704704967542721,
+            "original_true": 0.9658889608785532,
+            "unchanged_zero": 4.869529503245728,
+            "static": 0.9658889608785532,
+            "ridge": 3.0308621732920553,
+            "same_data_ridge": 0.03593026024218382
+          },
+          "invalids": {
+            "adapted": null,
+            "original_true": null
+          },
+          "numbers": {
+            "adapted": -5.84,
+            "original_true": -5.835418464124281,
+            "unchanged_zero": 0.0,
+            "static": -5.835418464124281,
+            "ridge": -7.900391676537783,
+            "same_data_ridge": -4.905459763487912
+          }
+        },
+        "reason_length_only_sensitivity": {
+          "losses": {
+            "adapted": 0.9704704967542721,
+            "original_true": 0.9658889608785532,
+            "unchanged_zero": 4.869529503245728,
+            "static": 0.9658889608785532,
+            "ridge": 3.0308621732920553,
+            "same_data_ridge": 0.03593026024218382
+          },
+          "invalids": {
+            "adapted": null,
+            "original_true": null
+          },
+          "numbers": {
+            "adapted": -5.84,
+            "original_true": -5.835418464124281,
+            "unchanged_zero": 0.0,
+            "static": -5.835418464124281,
+            "ridge": -7.900391676537783,
+            "same_data_ridge": -4.905459763487912
+          }
+        }
+      }
+    },
+    {
+      "case_id": "lie_direct_01",
+      "split": "train",
+      "group": "lie_direct",
+      "gold_delta_bits": -6.493180298440484,
+      "modes": {
+        "strict": {
+          "losses": {
+            "adapted": 0.34981970155951636,
+            "original_true": 1.2268197015595161,
+            "unchanged_zero": 6.493180298440484,
+            "static": 1.225501557275912,
+            "ridge": 2.781476063266823,
+            "same_data_ridge": 1.1637260760465304
+          },
+          "invalids": {
+            "adapted": null,
+            "original_true": null
+          },
+          "numbers": {
+            "adapted": -6.843,
+            "original_true": -7.72,
+            "unchanged_zero": 0.0,
+            "static": -7.718681855716396,
+            "ridge": -3.7117042351736607,
+            "same_data_ridge": -5.329454222393953
+          }
+        },
+        "reason_length_only_sensitivity": {
+          "losses": {
+            "adapted": 0.34981970155951636,
+            "original_true": 1.2268197015595161,
+            "unchanged_zero": 6.493180298440484,
+            "static": 1.225501557275912,
+            "ridge": 2.781476063266823,
+            "same_data_ridge": 1.1637260760465304
+          },
+          "invalids": {
+            "adapted": null,
+            "original_true": null
+          },
+          "numbers": {
+            "adapted": -6.843,
+            "original_true": -7.72,
+            "unchanged_zero": 0.0,
+            "static": -7.718681855716396,
+            "ridge": -3.7117042351736607,
+            "same_data_ridge": -5.329454222393953
+          }
+        }
+      }
+    },
+    {
+      "case_id": "lie_direct_02",
+      "split": "train",
+      "group": "lie_direct",
+      "gold_delta_bits": -5.591134153876623,
+      "modes": {
+        "strict": {
+          "losses": {
+            "adapted": 0.5318658461233774,
+            "original_true": 2.1888658461233774,
+            "unchanged_zero": 5.591134153876623,
+            "static": 2.191573591713703,
+            "ridge": 1.0277877706109058,
+            "same_data_ridge": 0.13652749547339127
+          },
+          "invalids": {
+            "adapted": null,
+            "original_true": null
+          },
+          "numbers": {
+            "adapted": -6.123,
+            "original_true": -7.78,
+            "unchanged_zero": 0.0,
+            "static": -7.782707745590326,
+            "ridge": -6.618921924487529,
+            "same_data_ridge": -5.454606658403232
+          }
+        },
+        "reason_length_only_sensitivity": {
+          "losses": {
+            "adapted": 0.5318658461233774,
+            "original_true": 2.1888658461233774,
+            "unchanged_zero": 5.591134153876623,
+            "static": 2.191573591713703,
+            "ridge": 1.0277877706109058,
+            "same_data_ridge": 0.13652749547339127
+          },
+          "invalids": {
+            "adapted": null,
+            "original_true": null
+          },
+          "numbers": {
+            "adapted": -6.123,
+            "original_true": -7.78,
+            "unchanged_zero": 0.0,
+            "static": -7.782707745590326,
+            "ridge": -6.618921924487529,
+            "same_data_ridge": -5.454606658403232
+          }
+        }
+      }
+    },
+    {
+      "case_id": "lie_direct_03",
+      "split": "train",
+      "group": "lie_direct",
+      "gold_delta_bits": -3.6056560033311325,
+      "modes": {
+        "strict": {
+          "losses": {
+            "adapted": 1.148343996668867,
+            "original_true": 1.1443439966688675,
+            "unchanged_zero": 3.6056560033311325,
+            "static": 1.1490074289964314,
+            "ridge": 3.306921782826592,
+            "same_data_ridge": 0.7299049822467669
+          },
+          "invalids": {
+            "adapted": null,
+            "original_true": null
+          },
+          "numbers": {
+            "adapted": -4.754,
+            "original_true": -4.75,
+            "unchanged_zero": 0.0,
+            "static": -4.754663432327564,
+            "ridge": -6.9125777861577244,
+            "same_data_ridge": -4.335560985577899
+          }
+        },
+        "reason_length_only_sensitivity": {
+          "losses": {
+            "adapted": 1.148343996668867,
+            "original_true": 1.1443439966688675,
+            "unchanged_zero": 3.6056560033311325,
+            "static": 1.1490074289964314,
+            "ridge": 3.306921782826592,
+            "same_data_ridge": 0.7299049822467669
+          },
+          "invalids": {
+            "adapted": null,
+            "original_true": null
+          },
+          "numbers": {
+            "adapted": -4.754,
+            "original_true": -4.75,
+            "unchanged_zero": 0.0,
+            "static": -4.754663432327564,
+            "ridge": -6.9125777861577244,
+            "same_data_ridge": -4.335560985577899
+          }
+        }
+      }
+    },
+    {
+      "case_id": "lie_direct_04",
+      "split": "train",
+      "group": "lie_direct",
+      "gold_delta_bits": -6.13271788877278,
+      "modes": {
+        "strict": {
+          "losses": {
+            "adapted": 0.009717888772780015,
+            "original_true": 2.157282111227219,
+            "unchanged_zero": 6.13271788877278,
+            "static": 2.1622245468261463,
+            "ridge": 0.311419792547583,
+            "same_data_ridge": 0.05974414496264302
+          },
+          "invalids": {
+            "adapted": null,
+            "original_true": null
+          },
+          "numbers": {
+            "adapted": -6.123,
+            "original_true": -8.29,
+            "unchanged_zero": 0.0,
+            "static": -8.294942435598927,
+            "ridge": -6.444137681320363,
+            "same_data_ridge": -6.072973743810137
+          }
+        },
+        "reason_length_only_sensitivity": {
+          "losses": {
+            "adapted": 0.009717888772780015,
+            "original_true": 2.157282111227219,
+            "unchanged_zero": 6.13271788877278,
+            "static": 2.1622245468261463,
+            "ridge": 0.311419792547583,
+            "same_data_ridge": 0.05974414496264302
+          },
+          "invalids": {
+            "adapted": null,
+            "original_true": null
+          },
+          "numbers": {
+            "adapted": -6.123,
+            "original_true": -8.29,
+            "unchanged_zero": 0.0,
+            "static": -8.294942435598927,
+            "ridge": -6.444137681320363,
+            "same_data_ridge": -6.072973743810137
+          }
+        }
+      }
+    },
+    {
+      "case_id": "lie_direct_05",
+      "split": "train",
+      "group": "lie_direct",
+      "gold_delta_bits": -6.3138366987549635,
+      "modes": {
+        "strict": {
+          "losses": {
+            "adapted": 0.19083669875496323,
+            "original_true": 2.0161633012450366,
+            "unchanged_zero": 6.3138366987549635,
+            "static": 2.014497147305992,
+            "ridge": 1.029467961776687,
+            "same_data_ridge": 0.2500311705821012
+          },
+          "invalids": {
+            "adapted": null,
+            "original_true": null
+          },
+          "numbers": {
+            "adapted": -6.123,
+            "original_true": -8.33,
+            "unchanged_zero": 0.0,
+            "static": -8.328333846060955,
+            "ridge": -5.284368736978276,
+            "same_data_ridge": -6.563867869337065
+          }
+        },
+        "reason_length_only_sensitivity": {
+          "losses": {
+            "adapted": 0.19083669875496323,
+            "original_true": 2.0161633012450366,
+            "unchanged_zero": 6.3138366987549635,
+            "static": 2.014497147305992,
+            "ridge": 1.029467961776687,
+            "same_data_ridge": 0.2500311705821012
+          },
+          "invalids": {
+            "adapted": null,
+            "original_true": null
+          },
+          "numbers": {
+            "adapted": -6.123,
+            "original_true": -8.33,
+            "unchanged_zero": 0.0,
+            "static": -8.328333846060955,
+            "ridge": -5.284368736978276,
+            "same_data_ridge": -6.563867869337065
+          }
+        }
+      }
+    },
+    {
+      "case_id": "truth_history_00",
+      "split": "train",
+      "group": "truth_history",
+      "gold_delta_bits": 0.9521459806300783,
+      "modes": {
+        "strict": {
+          "losses": {
+            "adapted": 1.2991459806300782,
+            "original_true": 3.2821459806300783,
+            "unchanged_zero": 0.9521459806300783,
+            "static": 1.377210978792812,
+            "ridge": 2.1493383630680714,
+            "same_data_ridge": 0.4656518007362531
+          },
+          "invalids": {
+            "adapted": null,
+            "original_true": null
+          },
+          "numbers": {
+            "adapted": -0.347,
+            "original_true": -2.33,
+            "unchanged_zero": 0.0,
+            "static": 2.3293569594228902,
+            "ridge": 3.1014843436981496,
+            "same_data_ridge": 1.4177977813663314
+          }
+        },
+        "reason_length_only_sensitivity": {
+          "losses": {
+            "adapted": 1.2991459806300782,
+            "original_true": 3.2821459806300783,
+            "unchanged_zero": 0.9521459806300783,
+            "static": 1.377210978792812,
+            "ridge": 2.1493383630680714,
+            "same_data_ridge": 0.4656518007362531
+          },
+          "invalids": {
+            "adapted": null,
+            "original_true": null
+          },
+          "numbers": {
+            "adapted": -0.347,
+            "original_true": -2.33,
+            "unchanged_zero": 0.0,
+            "static": 2.3293569594228902,
+            "ridge": 3.1014843436981496,
+            "same_data_ridge": 1.4177977813663314
+          }
+        }
+      }
+    },
+    {
+      "case_id": "truth_history_01",
+      "split": "train",
+      "group": "truth_history",
+      "gold_delta_bits": 0.5658331234032339,
+      "modes": {
+        "strict": {
+          "losses": {
+            "adapted": 0.5198331234032338,
+            "original_true": 60.0,
+            "unchanged_zero": 0.5658331234032339,
+            "static": 1.228687863234369,
+            "ridge": 1.6896921438307673,
+            "same_data_ridge": 0.16245836370367361
+          },
+          "invalids": {
+            "adapted": null,
+            "original_true": "invalid_strict_json"
+          },
+          "numbers": {
+            "adapted": 0.046,
+            "original_true": null,
+            "unchanged_zero": 0.0,
+            "static": 1.7945209866376028,
+            "ridge": 2.255525267234001,
+            "same_data_ridge": 0.7282914871069075
+          }
+        },
+        "reason_length_only_sensitivity": {
+          "losses": {
+            "adapted": 0.5198331234032338,
+            "original_true": 2.355833123403234,
+            "unchanged_zero": 0.5658331234032339,
+            "static": 1.228687863234369,
+            "ridge": 1.6896921438307673,
+            "same_data_ridge": 0.16245836370367361
+          },
+          "invalids": {
+            "adapted": null,
+            "original_true": null
+          },
+          "numbers": {
+            "adapted": 0.046,
+            "original_true": -1.79,
+            "unchanged_zero": 0.0,
+            "static": 1.7945209866376028,
+            "ridge": 2.255525267234001,
+            "same_data_ridge": 0.7282914871069075
+          }
+        }
+      }
+    },
+    {
+      "case_id": "truth_history_02",
+      "split": "train",
+      "group": "truth_history",
+      "gold_delta_bits": 0.7679220883800602,
+      "modes": {
+        "strict": {
+          "losses": {
+            "adapted": 0.01592208838006015,
+            "original_true": 2.6279220883800605,
+            "unchanged_zero": 0.7679220883800602,
+            "static": 1.090676106375756,
+            "ridge": 1.7960992944626133,
+            "same_data_ridge": 0.31127006900945187
+          },
+          "invalids": {
+            "adapted": null,
+            "original_true": null
+          },
+          "numbers": {
+            "adapted": 0.752,
+            "original_true": -1.86,
+            "unchanged_zero": 0.0,
+            "static": 1.8585981947558161,
+            "ridge": 2.5640213828426734,
+            "same_data_ridge": 0.4566520193706083
+          }
+        },
+        "reason_length_only_sensitivity": {
+          "losses": {
+            "adapted": 0.01592208838006015,
+            "original_true": 2.6279220883800605,
+            "unchanged_zero": 0.7679220883800602,
+            "static": 1.090676106375756,
+            "ridge": 1.7960992944626133,
+            "same_data_ridge": 0.31127006900945187
+          },
+          "invalids": {
+            "adapted": null,
+            "original_true": null
+          },
+          "numbers": {
+            "adapted": 0.752,
+            "original_true": -1.86,
+            "unchanged_zero": 0.0,
+            "static": 1.8585981947558161,
+            "ridge": 2.5640213828426734,
+            "same_data_ridge": 0.4566520193706083
+          }
+        }
+      }
+    },
+    {
+      "case_id": "truth_history_03",
+      "split": "train",
+      "group": "truth_history",
+      "gold_delta_bits": 1.2669131266604037,
+      "modes": {
+        "strict": {
+          "losses": {
+            "adapted": 4.806913126660404,
+            "original_true": 4.806913126660404,
+            "unchanged_zero": 1.2669131266604037,
+            "static": 2.2688062758646264,
+            "ridge": 0.055590331523259984,
+            "same_data_ridge": 0.3593129112875051
+          },
+          "invalids": {
+            "adapted": null,
+            "original_true": null
+          },
+          "numbers": {
+            "adapted": -3.54,
+            "original_true": -3.54,
+            "unchanged_zero": 0.0,
+            "static": 3.53571940252503,
+            "ridge": 1.2113227951371437,
+            "same_data_ridge": 0.9076002153728986
+          }
+        },
+        "reason_length_only_sensitivity": {
+          "losses": {
+            "adapted": 4.806913126660404,
+            "original_true": 4.806913126660404,
+            "unchanged_zero": 1.2669131266604037,
+            "static": 2.2688062758646264,
+            "ridge": 0.055590331523259984,
+            "same_data_ridge": 0.3593129112875051
+          },
+          "invalids": {
+            "adapted": null,
+            "original_true": null
+          },
+          "numbers": {
+            "adapted": -3.54,
+            "original_true": -3.54,
+            "unchanged_zero": 0.0,
+            "static": 3.53571940252503,
+            "ridge": 1.2113227951371437,
+            "same_data_ridge": 0.9076002153728986
+          }
+        }
+      }
+    },
+    {
+      "case_id": "truth_history_04",
+      "split": "train",
+      "group": "truth_history",
+      "gold_delta_bits": 1.1191263118631447,
+      "modes": {
+        "strict": {
+          "losses": {
+            "adapted": 3.0991263118631447,
+            "original_true": 3.0991263118631447,
+            "unchanged_zero": 1.1191263118631447,
+            "static": 0.8615123493155066,
+            "ridge": 3.0234474806456504,
+            "same_data_ridge": 0.10637090826628892
+          },
+          "invalids": {
+            "adapted": null,
+            "original_true": null
+          },
+          "numbers": {
+            "adapted": -1.98,
+            "original_true": -1.98,
+            "unchanged_zero": 0.0,
+            "static": 1.9806386611786513,
+            "ridge": 4.142573792508795,
+            "same_data_ridge": 1.0127554035968558
+          }
+        },
+        "reason_length_only_sensitivity": {
+          "losses": {
+            "adapted": 3.0991263118631447,
+            "original_true": 3.0991263118631447,
+            "unchanged_zero": 1.1191263118631447,
+            "static": 0.8615123493155066,
+            "ridge": 3.0234474806456504,
+            "same_data_ridge": 0.10637090826628892
+          },
+          "invalids": {
+            "adapted": null,
+            "original_true": null
+          },
+          "numbers": {
+            "adapted": -1.98,
+            "original_true": -1.98,
+            "unchanged_zero": 0.0,
+            "static": 1.9806386611786513,
+            "ridge": 4.142573792508795,
+            "same_data_ridge": 1.0127554035968558
+          }
+        }
+      }
+    },
+    {
+      "case_id": "truth_history_05",
+      "split": "train",
+      "group": "truth_history",
+      "gold_delta_bits": 0.7535246118204295,
+      "modes": {
+        "strict": {
+          "losses": {
+            "adapted": 1.4875246118204295,
+            "original_true": 2.9135246118204297,
+            "unchanged_zero": 0.7535246118204295,
+            "static": 1.4098747887044332,
+            "ridge": 2.4766619384130846,
+            "same_data_ridge": 0.12658092119838904
+          },
+          "invalids": {
+            "adapted": null,
+            "original_true": null
+          },
+          "numbers": {
+            "adapted": -0.734,
+            "original_true": -2.16,
+            "unchanged_zero": 0.0,
+            "static": 2.1633994005248627,
+            "ridge": 3.230186550233514,
+            "same_data_ridge": 0.6269436906220405
+          }
+        },
+        "reason_length_only_sensitivity": {
+          "losses": {
+            "adapted": 1.4875246118204295,
+            "original_true": 2.9135246118204297,
+            "unchanged_zero": 0.7535246118204295,
+            "static": 1.4098747887044332,
+            "ridge": 2.4766619384130846,
+            "same_data_ridge": 0.12658092119838904
+          },
+          "invalids": {
+            "adapted": null,
+            "original_true": null
+          },
+          "numbers": {
+            "adapted": -0.734,
+            "original_true": -2.16,
+            "unchanged_zero": 0.0,
+            "static": 2.1633994005248627,
+            "ridge": 3.230186550233514,
+            "same_data_ridge": 0.6269436906220405
+          }
+        }
+      }
+    },
+    {
+      "case_id": "truth_numeric_16_00",
+      "split": "train",
+      "group": "truth_numeric_16",
+      "gold_delta_bits": -1.7453924129907712,
+      "modes": {
+        "strict": {
+          "losses": {
+            "adapted": 0.2823924129907711,
+            "original_true": 7.914607587009229,
+            "unchanged_zero": 1.7453924129907712,
+            "static": 7.916814732481287,
+            "ridge": 2.422600125037547,
+            "same_data_ridge": 0.8441338269348629
+          },
+          "invalids": {
+            "adapted": null,
+            "original_true": null
+          },
+          "numbers": {
+            "adapted": -1.463,
+            "original_true": -9.66,
+            "unchanged_zero": 0.0,
+            "static": -9.662207145472058,
+            "ridge": 0.6772077120467759,
+            "same_data_ridge": -0.9012585860559083
+          }
+        },
+        "reason_length_only_sensitivity": {
+          "losses": {
+            "adapted": 0.2823924129907711,
+            "original_true": 7.914607587009229,
+            "unchanged_zero": 1.7453924129907712,
+            "static": 7.916814732481287,
+            "ridge": 2.422600125037547,
+            "same_data_ridge": 0.8441338269348629
+          },
+          "invalids": {
+            "adapted": null,
+            "original_true": null
+          },
+          "numbers": {
+            "adapted": -1.463,
+            "original_true": -9.66,
+            "unchanged_zero": 0.0,
+            "static": -9.662207145472058,
+            "ridge": 0.6772077120467759,
+            "same_data_ridge": -0.9012585860559083
+          }
+        }
+      }
+    },
+    {
+      "case_id": "truth_numeric_16_01",
+      "split": "train",
+      "group": "truth_numeric_16",
+      "gold_delta_bits": -0.0638375497868644,
+      "modes": {
+        "strict": {
+          "losses": {
+            "adapted": 0.0758375497868644,
+            "original_true": 60.0,
+            "unchanged_zero": 0.0638375497868644,
+            "static": 2.929339311444035,
+            "ridge": 0.9368973065462161,
+            "same_data_ridge": 0.0683855311387418
+          },
+          "invalids": {
+            "adapted": null,
+            "original_true": "invalid_strict_json"
+          },
+          "numbers": {
+            "adapted": 0.012,
+            "original_true": null,
+            "unchanged_zero": 0.0,
+            "static": 2.8655017616571707,
+            "ridge": 0.8730597567593517,
+            "same_data_ridge": -0.1322230809256062
+          }
+        },
+        "reason_length_only_sensitivity": {
+          "losses": {
+            "adapted": 0.0758375497868644,
+            "original_true": 2.8061624502131357,
+            "unchanged_zero": 0.0638375497868644,
+            "static": 2.929339311444035,
+            "ridge": 0.9368973065462161,
+            "same_data_ridge": 0.0683855311387418
+          },
+          "invalids": {
+            "adapted": null,
+            "original_true": null
+          },
+          "numbers": {
+            "adapted": 0.012,
+            "original_true": -2.87,
+            "unchanged_zero": 0.0,
+            "static": 2.8655017616571707,
+            "ridge": 0.8730597567593517,
+            "same_data_ridge": -0.1322230809256062
+          }
+        }
+      }
+    },
+    {
+      "case_id": "truth_numeric_16_02",
+      "split": "train",
+      "group": "truth_numeric_16",
+      "gold_delta_bits": 0.4243530879962343,
+      "modes": {
+        "strict": {
+          "losses": {
+            "adapted": 2.1883530879962345,
+            "original_true": 60.0,
+            "unchanged_zero": 0.4243530879962343,
+            "static": 11.582966592479657,
+            "ridge": 1.2420042275936947,
+            "same_data_ridge": 1.1215891932910793
+          },
+          "invalids": {
+            "adapted": null,
+            "original_true": "invalid_strict_json"
+          },
+          "numbers": {
+            "adapted": -1.764,
+            "original_true": null,
+            "unchanged_zero": 0.0,
+            "static": -11.158613504483423,
+            "ridge": -0.8176511395974604,
+            "same_data_ridge": -0.697236105294845
+          }
+        },
+        "reason_length_only_sensitivity": {
+          "losses": {
+            "adapted": 2.1883530879962345,
+            "original_true": 11.584353087996234,
+            "unchanged_zero": 0.4243530879962343,
+            "static": 11.582966592479657,
+            "ridge": 1.2420042275936947,
+            "same_data_ridge": 1.1215891932910793
+          },
+          "invalids": {
+            "adapted": null,
+            "original_true": null
+          },
+          "numbers": {
+            "adapted": -1.764,
+            "original_true": -11.16,
+            "unchanged_zero": 0.0,
+            "static": -11.158613504483423,
+            "ridge": -0.8176511395974604,
+            "same_data_ridge": -0.697236105294845
+          }
+        }
+      }
+    },
+    {
+      "case_id": "truth_numeric_16_03",
+      "split": "train",
+      "group": "truth_numeric_16",
+      "gold_delta_bits": -0.278862298114273,
+      "modes": {
+        "strict": {
+          "losses": {
+            "adapted": 0.11686229811427298,
+            "original_true": 2.591137701885727,
+            "unchanged_zero": 0.278862298114273,
+            "static": 3.1486108292773913,
+            "ridge": 0.7534900169271781,
+            "same_data_ridge": 0.10184887311432933
+          },
+          "invalids": {
+            "adapted": null,
+            "original_true": null
+          },
+          "numbers": {
+            "adapted": -0.162,
+            "original_true": -2.87,
+            "unchanged_zero": 0.0,
+            "static": 2.8697485311631183,
+            "ridge": 0.4746277188129051,
+            "same_data_ridge": -0.17701342499994366
+          }
+        },
+        "reason_length_only_sensitivity": {
+          "losses": {
+            "adapted": 0.11686229811427298,
+            "original_true": 2.591137701885727,
+            "unchanged_zero": 0.278862298114273,
+            "static": 3.1486108292773913,
+            "ridge": 0.7534900169271781,
+            "same_data_ridge": 0.10184887311432933
+          },
+          "invalids": {
+            "adapted": null,
+            "original_true": null
+          },
+          "numbers": {
+            "adapted": -0.162,
+            "original_true": -2.87,
+            "unchanged_zero": 0.0,
+            "static": 2.8697485311631183,
+            "ridge": 0.4746277188129051,
+            "same_data_ridge": -0.17701342499994366
+          }
+        }
+      }
+    },
+    {
+      "case_id": "truth_numeric_16_04",
+      "split": "train",
+      "group": "truth_numeric_16",
+      "gold_delta_bits": 3.284977526057162,
+      "modes": {
+        "strict": {
+          "losses": {
+            "adapted": 4.550977526057162,
+            "original_true": 60.0,
+            "unchanged_zero": 3.284977526057162,
+            "static": 14.15045967181194,
+            "ridge": 3.541388406638763,
+            "same_data_ridge": 1.7678074691495471
+          },
+          "invalids": {
+            "adapted": null,
+            "original_true": "invalid_strict_json"
+          },
+          "numbers": {
+            "adapted": -1.266,
+            "original_true": null,
+            "unchanged_zero": 0.0,
+            "static": -10.865482145754779,
+            "ridge": 6.826365932695925,
+            "same_data_ridge": 1.5171700569076148
+          }
+        },
+        "reason_length_only_sensitivity": {
+          "losses": {
+            "adapted": 4.550977526057162,
+            "original_true": 14.154977526057161,
+            "unchanged_zero": 3.284977526057162,
+            "static": 14.15045967181194,
+            "ridge": 3.541388406638763,
+            "same_data_ridge": 1.7678074691495471
+          },
+          "invalids": {
+            "adapted": null,
+            "original_true": null
+          },
+          "numbers": {
+            "adapted": -1.266,
+            "original_true": -10.87,
+            "unchanged_zero": 0.0,
+            "static": -10.865482145754779,
+            "ridge": 6.826365932695925,
+            "same_data_ridge": 1.5171700569076148
+          }
+        }
+      }
+    },
+    {
+      "case_id": "truth_numeric_16_05",
+      "split": "train",
+      "group": "truth_numeric_16",
+      "gold_delta_bits": -0.5281583929577565,
+      "modes": {
+        "strict": {
+          "losses": {
+            "adapted": 0.47715839295775647,
+            "original_true": 0.4781583929577565,
+            "unchanged_zero": 0.5281583929577565,
+            "static": 0.47634444109727336,
+            "ridge": 9.949264900224293,
+            "same_data_ridge": 0.6823570506069621
+          },
+          "invalids": {
+            "adapted": null,
+            "original_true": null
+          },
+          "numbers": {
+            "adapted": -0.051,
+            "original_true": -0.05,
+            "unchanged_zero": 0.0,
+            "static": -0.0518139518604831,
+            "ridge": 9.421106507266536,
+            "same_data_ridge": 0.1541986576492056
+          }
+        },
+        "reason_length_only_sensitivity": {
+          "losses": {
+            "adapted": 0.47715839295775647,
+            "original_true": 0.4781583929577565,
+            "unchanged_zero": 0.5281583929577565,
+            "static": 0.47634444109727336,
+            "ridge": 9.949264900224293,
+            "same_data_ridge": 0.6823570506069621
+          },
+          "invalids": {
+            "adapted": null,
+            "original_true": null
+          },
+          "numbers": {
+            "adapted": -0.051,
+            "original_true": -0.05,
+            "unchanged_zero": 0.0,
+            "static": -0.0518139518604831,
+            "ridge": 9.421106507266536,
+            "same_data_ridge": 0.1541986576492056
+          }
+        }
+      }
+    },
+    {
+      "case_id": "truth_numeric_other_00",
+      "split": "train",
+      "group": "truth_numeric_other",
+      "gold_delta_bits": -1.9335964654045554,
+      "modes": {
+        "strict": {
+          "losses": {
+            "adapted": 0.6665964654045555,
+            "original_true": 9.486403534595444,
+            "unchanged_zero": 1.9335964654045554,
+            "static": 9.486957190246628,
+            "ridge": 1.3256920217889085,
+            "same_data_ridge": 0.9092129715058945
+          },
+          "invalids": {
+            "adapted": null,
+            "original_true": null
+          },
+          "numbers": {
+            "adapted": -1.267,
+            "original_true": -11.42,
+            "unchanged_zero": 0.0,
+            "static": -11.420553655651183,
+            "ridge": -0.6079044436156469,
+            "same_data_ridge": -1.024383493898661
+          }
+        },
+        "reason_length_only_sensitivity": {
+          "losses": {
+            "adapted": 0.6665964654045555,
+            "original_true": 9.486403534595444,
+            "unchanged_zero": 1.9335964654045554,
+            "static": 9.486957190246628,
+            "ridge": 1.3256920217889085,
+            "same_data_ridge": 0.9092129715058945
+          },
+          "invalids": {
+            "adapted": null,
+            "original_true": null
+          },
+          "numbers": {
+            "adapted": -1.267,
+            "original_true": -11.42,
+            "unchanged_zero": 0.0,
+            "static": -11.420553655651183,
+            "ridge": -0.6079044436156469,
+            "same_data_ridge": -1.024383493898661
+          }
+        }
+      }
+    },
+    {
+      "case_id": "truth_numeric_other_01",
+      "split": "train",
+      "group": "truth_numeric_other",
+      "gold_delta_bits": -0.01227749378485754,
+      "modes": {
+        "strict": {
+          "losses": {
+            "adapted": 0.15172250621514247,
+            "original_true": 2.3122774937848574,
+            "unchanged_zero": 0.01227749378485754,
+            "static": 2.310695751765561,
+            "ridge": 0.6357613166415261,
+            "same_data_ridge": 0.3618169006842942
+          },
+          "invalids": {
+            "adapted": null,
+            "original_true": null
+          },
+          "numbers": {
+            "adapted": -0.164,
+            "original_true": 2.3,
+            "unchanged_zero": 0.0,
+            "static": 2.2984182579807033,
+            "ridge": -0.6480388104263837,
+            "same_data_ridge": -0.3740943944691517
+          }
+        },
+        "reason_length_only_sensitivity": {
+          "losses": {
+            "adapted": 0.15172250621514247,
+            "original_true": 2.3122774937848574,
+            "unchanged_zero": 0.01227749378485754,
+            "static": 2.310695751765561,
+            "ridge": 0.6357613166415261,
+            "same_data_ridge": 0.3618169006842942
+          },
+          "invalids": {
+            "adapted": null,
+            "original_true": null
+          },
+          "numbers": {
+            "adapted": -0.164,
+            "original_true": 2.3,
+            "unchanged_zero": 0.0,
+            "static": 2.2984182579807033,
+            "ridge": -0.6480388104263837,
+            "same_data_ridge": -0.3740943944691517
+          }
+        }
+      }
+    },
+    {
+      "case_id": "truth_numeric_other_02",
+      "split": "train",
+      "group": "truth_numeric_other",
+      "gold_delta_bits": 2.7145571339284267,
+      "modes": {
+        "strict": {
+          "losses": {
+            "adapted": 4.448557133928427,
+            "original_true": 14.294557133928427,
+            "unchanged_zero": 2.7145571339284267,
+            "static": 14.292710575396097,
+            "ridge": 3.501917630596431,
+            "same_data_ridge": 0.3919712699333706
+          },
+          "invalids": {
+            "adapted": null,
+            "original_true": null
+          },
+          "numbers": {
+            "adapted": -1.734,
+            "original_true": -11.58,
+            "unchanged_zero": 0.0,
+            "static": -11.57815344146767,
+            "ridge": 6.2164747645248575,
+            "same_data_ridge": 3.1065284038617973
+          }
+        },
+        "reason_length_only_sensitivity": {
+          "losses": {
+            "adapted": 4.448557133928427,
+            "original_true": 14.294557133928427,
+            "unchanged_zero": 2.7145571339284267,
+            "static": 14.292710575396097,
+            "ridge": 3.501917630596431,
+            "same_data_ridge": 0.3919712699333706
+          },
+          "invalids": {
+            "adapted": null,
+            "original_true": null
+          },
+          "numbers": {
+            "adapted": -1.734,
+            "original_true": -11.58,
+            "unchanged_zero": 0.0,
+            "static": -11.57815344146767,
+            "ridge": 6.2164747645248575,
+            "same_data_ridge": 3.1065284038617973
+          }
+        }
+      }
+    },
+    {
+      "case_id": "truth_numeric_other_03",
+      "split": "train",
+      "group": "truth_numeric_other",
+      "gold_delta_bits": -0.13112683458215457,
+      "modes": {
+        "strict": {
+          "losses": {
+            "adapted": 0.032873165417845435,
+            "original_true": 60.0,
+            "unchanged_zero": 0.13112683458215457,
+            "static": 0.35651143338429603,
+            "ridge": 8.915656758919114,
+            "same_data_ridge": 0.06284364599771797
+          },
+          "invalids": {
+            "adapted": null,
+            "original_true": "invalid_strict_json"
+          },
+          "numbers": {
+            "adapted": -0.164,
+            "original_true": null,
+            "unchanged_zero": 0.0,
+            "static": 0.22538459880214143,
+            "ridge": 8.78452992433696,
+            "same_data_ridge": -0.0682831885844366
+          }
+        },
+        "reason_length_only_sensitivity": {
+          "losses": {
+            "adapted": 0.032873165417845435,
+            "original_true": 5.638873165417845,
+            "unchanged_zero": 0.13112683458215457,
+            "static": 0.35651143338429603,
+            "ridge": 8.915656758919114,
+            "same_data_ridge": 0.06284364599771797
+          },
+          "invalids": {
+            "adapted": null,
+            "original_true": null
+          },
+          "numbers": {
+            "adapted": -0.164,
+            "original_true": -5.77,
+            "unchanged_zero": 0.0,
+            "static": 0.22538459880214143,
+            "ridge": 8.78452992433696,
+            "same_data_ridge": -0.0682831885844366
+          }
+        }
+      }
+    },
+    {
+      "case_id": "truth_numeric_other_04",
+      "split": "train",
+      "group": "truth_numeric_other",
+      "gold_delta_bits": -1.264789655190679,
+      "modes": {
+        "strict": {
+          "losses": {
+            "adapted": 0.002210344809320919,
+            "original_true": 9.43521034480932,
+            "unchanged_zero": 1.264789655190679,
+            "static": 9.430606884333097,
+            "ridge": 0.2029474273544083,
+            "same_data_ridge": 0.3360699236048148
+          },
+          "invalids": {
+            "adapted": null,
+            "original_true": null
+          },
+          "numbers": {
+            "adapted": -1.267,
+            "original_true": -10.7,
+            "unchanged_zero": 0.0,
+            "static": -10.695396539523776,
+            "ridge": -1.0618422278362707,
+            "same_data_ridge": -0.9287197315858642
+          }
+        },
+        "reason_length_only_sensitivity": {
+          "losses": {
+            "adapted": 0.002210344809320919,
+            "original_true": 9.43521034480932,
+            "unchanged_zero": 1.264789655190679,
+            "static": 9.430606884333097,
+            "ridge": 0.2029474273544083,
+            "same_data_ridge": 0.3360699236048148
+          },
+          "invalids": {
+            "adapted": null,
+            "original_true": null
+          },
+          "numbers": {
+            "adapted": -1.267,
+            "original_true": -10.7,
+            "unchanged_zero": 0.0,
+            "static": -10.695396539523776,
+            "ridge": -1.0618422278362707,
+            "same_data_ridge": -0.9287197315858642
+          }
+        }
+      }
+    },
+    {
+      "case_id": "truth_numeric_other_05",
+      "split": "train",
+      "group": "truth_numeric_other",
+      "gold_delta_bits": -0.35790911307709194,
+      "modes": {
+        "strict": {
+          "losses": {
+            "adapted": 1.119909113077092,
+            "original_true": 60.0,
+            "unchanged_zero": 0.35790911307709194,
+            "static": 2.266163315127283,
+            "ridge": 0.14752226122435075,
+            "same_data_ridge": 0.07754512552409454
+          },
+          "invalids": {
+            "adapted": null,
+            "original_true": "invalid_strict_json"
+          },
+          "numbers": {
+            "adapted": 0.762,
+            "original_true": null,
+            "unchanged_zero": 0.0,
+            "static": 1.9082542020501911,
+            "ridge": -0.5054313743014427,
+            "same_data_ridge": -0.4354542386011865
+          }
+        },
+        "reason_length_only_sensitivity": {
+          "losses": {
+            "adapted": 1.119909113077092,
+            "original_true": 2.267909113077092,
+            "unchanged_zero": 0.35790911307709194,
+            "static": 2.266163315127283,
+            "ridge": 0.14752226122435075,
+            "same_data_ridge": 0.07754512552409454
+          },
+          "invalids": {
+            "adapted": null,
+            "original_true": null
+          },
+          "numbers": {
+            "adapted": 0.762,
+            "original_true": 1.91,
+            "unchanged_zero": 0.0,
+            "static": 1.9082542020501911,
+            "ridge": -0.5054313743014427,
+            "same_data_ridge": -0.4354542386011865
+          }
+        }
+      }
+    },
+    {
+      "case_id": "lie_direct_06",
+      "split": "valid",
+      "group": "lie_direct",
+      "gold_delta_bits": -3.967358520775172,
+      "modes": {
+        "strict": {
+          "losses": {
+            "adapted": 2.377641479224828,
+            "original_true": 2.382641479224828,
+            "unchanged_zero": 3.967358520775172,
+            "static": 2.3783667090835796,
+            "ridge": 2.198816975950112,
+            "same_data_ridge": 0.6234018187265504
+          },
+          "invalids": {
+            "adapted": null,
+            "original_true": null
+          },
+          "numbers": {
+            "adapted": -6.345,
+            "original_true": -6.35,
+            "unchanged_zero": 0.0,
+            "static": -6.345725229858751,
+            "ridge": -6.166175496725284,
+            "same_data_ridge": -4.590760339501722
+          }
+        },
+        "reason_length_only_sensitivity": {
+          "losses": {
+            "adapted": 2.377641479224828,
+            "original_true": 2.382641479224828,
+            "unchanged_zero": 3.967358520775172,
+            "static": 2.3783667090835796,
+            "ridge": 2.198816975950112,
+            "same_data_ridge": 0.6234018187265504
+          },
+          "invalids": {
+            "adapted": null,
+            "original_true": null
+          },
+          "numbers": {
+            "adapted": -6.345,
+            "original_true": -6.35,
+            "unchanged_zero": 0.0,
+            "static": -6.345725229858751,
+            "ridge": -6.166175496725284,
+            "same_data_ridge": -4.590760339501722
+          }
+        }
+      }
+    },
+    {
+      "case_id": "lie_direct_07",
+      "split": "valid",
+      "group": "lie_direct",
+      "gold_delta_bits": -6.85458757541757,
+      "modes": {
+        "strict": {
+          "losses": {
+            "adapted": 0.7315875754175698,
+            "original_true": 1.1254124245824304,
+            "unchanged_zero": 6.85458757541757,
+            "static": 1.1277845490415874,
+            "ridge": 0.6524169023256743,
+            "same_data_ridge": 0.43583762457159025
+          },
+          "invalids": {
+            "adapted": null,
+            "original_true": null
+          },
+          "numbers": {
+            "adapted": -6.123,
+            "original_true": -7.98,
+            "unchanged_zero": 0.0,
+            "static": -7.9823721244591574,
+            "ridge": -7.507004477743244,
+            "same_data_ridge": -6.41874995084598
+          }
+        },
+        "reason_length_only_sensitivity": {
+          "losses": {
+            "adapted": 0.7315875754175698,
+            "original_true": 1.1254124245824304,
+            "unchanged_zero": 6.85458757541757,
+            "static": 1.1277845490415874,
+            "ridge": 0.6524169023256743,
+            "same_data_ridge": 0.43583762457159025
+          },
+          "invalids": {
+            "adapted": null,
+            "original_true": null
+          },
+          "numbers": {
+            "adapted": -6.123,
+            "original_true": -7.98,
+            "unchanged_zero": 0.0,
+            "static": -7.9823721244591574,
+            "ridge": -7.507004477743244,
+            "same_data_ridge": -6.41874995084598
+          }
+        }
+      }
+    },
+    {
+      "case_id": "truth_history_06",
+      "split": "valid",
+      "group": "truth_history",
+      "gold_delta_bits": 0.9718928727428686,
+      "modes": {
+        "strict": {
+          "losses": {
+            "adapted": 1.7058928727428686,
+            "original_true": 2.4318928727428686,
+            "unchanged_zero": 0.9718928727428686,
+            "static": 0.4843714189227091,
+            "ridge": 0.4049146268335204,
+            "same_data_ridge": 0.325529314090109
+          },
+          "invalids": {
+            "adapted": null,
+            "original_true": null
+          },
+          "numbers": {
+            "adapted": -0.734,
+            "original_true": -1.46,
+            "unchanged_zero": 0.0,
+            "static": 1.4562642916655777,
+            "ridge": 1.376807499576389,
+            "same_data_ridge": 0.6463635586527596
+          }
+        },
+        "reason_length_only_sensitivity": {
+          "losses": {
+            "adapted": 1.7058928727428686,
+            "original_true": 2.4318928727428686,
+            "unchanged_zero": 0.9718928727428686,
+            "static": 0.4843714189227091,
+            "ridge": 0.4049146268335204,
+            "same_data_ridge": 0.325529314090109
+          },
+          "invalids": {
+            "adapted": null,
+            "original_true": null
+          },
+          "numbers": {
+            "adapted": -0.734,
+            "original_true": -1.46,
+            "unchanged_zero": 0.0,
+            "static": 1.4562642916655777,
+            "ridge": 1.376807499576389,
+            "same_data_ridge": 0.6463635586527596
+          }
+        }
+      }
+    },
+    {
+      "case_id": "truth_history_07",
+      "split": "valid",
+      "group": "truth_history",
+      "gold_delta_bits": 0.22339928553150212,
+      "modes": {
+        "strict": {
+          "losses": {
+            "adapted": 0.5653992855315022,
+            "original_true": 2.053399285531502,
+            "unchanged_zero": 0.22339928553150212,
+            "static": 1.6019764378819958,
+            "ridge": 0.12303531466640716,
+            "same_data_ridge": 1.2547100880900102
+          },
+          "invalids": {
+            "adapted": null,
+            "original_true": null
+          },
+          "numbers": {
+            "adapted": -0.342,
+            "original_true": -1.83,
+            "unchanged_zero": 0.0,
+            "static": 1.825375723413498,
+            "ridge": 0.10036397086509496,
+            "same_data_ridge": 1.4781093736215123
+          }
+        },
+        "reason_length_only_sensitivity": {
+          "losses": {
+            "adapted": 0.5653992855315022,
+            "original_true": 2.053399285531502,
+            "unchanged_zero": 0.22339928553150212,
+            "static": 1.6019764378819958,
+            "ridge": 0.12303531466640716,
+            "same_data_ridge": 1.2547100880900102
+          },
+          "invalids": {
+            "adapted": null,
+            "original_true": null
+          },
+          "numbers": {
+            "adapted": -0.342,
+            "original_true": -1.83,
+            "unchanged_zero": 0.0,
+            "static": 1.825375723413498,
+            "ridge": 0.10036397086509496,
+            "same_data_ridge": 1.4781093736215123
+          }
+        }
+      }
+    },
+    {
+      "case_id": "truth_numeric_16_06",
+      "split": "valid",
+      "group": "truth_numeric_16",
+      "gold_delta_bits": -0.7417928179790518,
+      "modes": {
+        "strict": {
+          "losses": {
+            "adapted": 6.071207182020948,
+            "original_true": 6.271763415886352,
+            "unchanged_zero": 0.7417928179790518,
+            "static": 6.271763415886352,
+            "ridge": 7.088796185562062,
+            "same_data_ridge": 0.6519722338200487
+          },
+          "invalids": {
+            "adapted": null,
+            "original_true": null
+          },
+          "numbers": {
+            "adapted": -6.813,
+            "original_true": -7.013556233865404,
+            "unchanged_zero": 0.0,
+            "static": -7.013556233865404,
+            "ridge": -7.830589003541114,
+            "same_data_ridge": -1.3937650517991005
+          }
+        },
+        "reason_length_only_sensitivity": {
+          "losses": {
+            "adapted": 6.071207182020948,
+            "original_true": 6.271763415886352,
+            "unchanged_zero": 0.7417928179790518,
+            "static": 6.271763415886352,
+            "ridge": 7.088796185562062,
+            "same_data_ridge": 0.6519722338200487
+          },
+          "invalids": {
+            "adapted": null,
+            "original_true": null
+          },
+          "numbers": {
+            "adapted": -6.813,
+            "original_true": -7.013556233865404,
+            "unchanged_zero": 0.0,
+            "static": -7.013556233865404,
+            "ridge": -7.830589003541114,
+            "same_data_ridge": -1.3937650517991005
+          }
+        }
+      }
+    },
+    {
+      "case_id": "truth_numeric_16_07",
+      "split": "valid",
+      "group": "truth_numeric_16",
+      "gold_delta_bits": -0.36024242773387627,
+      "modes": {
+        "strict": {
+          "losses": {
+            "adapted": 0.018242427733876243,
+            "original_true": 60.0,
+            "unchanged_zero": 0.36024242773387627,
+            "static": 2.378524963145071,
+            "ridge": 7.008722418575962,
+            "same_data_ridge": 0.48727765478276
+          },
+          "invalids": {
+            "adapted": null,
+            "original_true": "invalid_strict_json"
+          },
+          "numbers": {
+            "adapted": -0.342,
+            "original_true": null,
+            "unchanged_zero": 0.0,
+            "static": 2.0182825354111946,
+            "ridge": -7.368964846309838,
+            "same_data_ridge": -0.8475200825166362
+          }
+        },
+        "reason_length_only_sensitivity": {
+          "losses": {
+            "adapted": 0.018242427733876243,
+            "original_true": 1.6580401076773184,
+            "unchanged_zero": 0.36024242773387627,
+            "static": 2.378524963145071,
+            "ridge": 7.008722418575962,
+            "same_data_ridge": 0.48727765478276
+          },
+          "invalids": {
+            "adapted": null,
+            "original_true": null
+          },
+          "numbers": {
+            "adapted": -0.342,
+            "original_true": -2.0182825354111946,
+            "unchanged_zero": 0.0,
+            "static": 2.0182825354111946,
+            "ridge": -7.368964846309838,
+            "same_data_ridge": -0.8475200825166362
+          }
+        }
+      }
+    },
+    {
+      "case_id": "truth_numeric_other_06",
+      "split": "valid",
+      "group": "truth_numeric_other",
+      "gold_delta_bits": 4.279120724627209,
+      "modes": {
+        "strict": {
+          "losses": {
+            "adapted": 5.852120724627209,
+            "original_true": 16.729120724627208,
+            "unchanged_zero": 4.279120724627209,
+            "static": 16.727982080032398,
+            "ridge": 3.967025212815729,
+            "same_data_ridge": 1.6259550946999362
+          },
+          "invalids": {
+            "adapted": null,
+            "original_true": null
+          },
+          "numbers": {
+            "adapted": -1.573,
+            "original_true": -12.45,
+            "unchanged_zero": 0.0,
+            "static": -12.448861355405187,
+            "ridge": 8.246145937442938,
+            "same_data_ridge": 2.6531656299272726
+          }
+        },
+        "reason_length_only_sensitivity": {
+          "losses": {
+            "adapted": 5.852120724627209,
+            "original_true": 16.729120724627208,
+            "unchanged_zero": 4.279120724627209,
+            "static": 16.727982080032398,
+            "ridge": 3.967025212815729,
+            "same_data_ridge": 1.6259550946999362
+          },
+          "invalids": {
+            "adapted": null,
+            "original_true": null
+          },
+          "numbers": {
+            "adapted": -1.573,
+            "original_true": -12.45,
+            "unchanged_zero": 0.0,
+            "static": -12.448861355405187,
+            "ridge": 8.246145937442938,
+            "same_data_ridge": 2.6531656299272726
+          }
+        }
+      }
+    },
+    {
+      "case_id": "truth_numeric_other_07",
+      "split": "valid",
+      "group": "truth_numeric_other",
+      "gold_delta_bits": 0.15345551681355118,
+      "modes": {
+        "strict": {
+          "losses": {
+            "adapted": 1.0834555168135513,
+            "original_true": 60.0,
+            "unchanged_zero": 0.15345551681355118,
+            "static": 1.0796286704318727,
+            "ridge": 12.82869956917362,
+            "same_data_ridge": 0.09141304756141322
+          },
+          "invalids": {
+            "adapted": null,
+            "original_true": "invalid_strict_json"
+          },
+          "numbers": {
+            "adapted": -0.93,
+            "original_true": null,
+            "unchanged_zero": 0.0,
+            "static": -0.9261731536183216,
+            "ridge": 12.982155085987172,
+            "same_data_ridge": 0.062042469252137966
+          }
+        },
+        "reason_length_only_sensitivity": {
+          "losses": {
+            "adapted": 1.0834555168135513,
+            "original_true": 1.0834555168135513,
+            "unchanged_zero": 0.15345551681355118,
+            "static": 1.0796286704318727,
+            "ridge": 12.82869956917362,
+            "same_data_ridge": 0.09141304756141322
+          },
+          "invalids": {
+            "adapted": null,
+            "original_true": null
+          },
+          "numbers": {
+            "adapted": -0.93,
+            "original_true": -0.93,
+            "unchanged_zero": 0.0,
+            "static": -0.9261731536183216,
+            "ridge": 12.982155085987172,
+            "same_data_ridge": 0.062042469252137966
+          }
+        }
+      }
+    }
+  ],
+  "input_sha256": {
+    "/Users/user/mpd-data/scratch/root/native_reader_fit_v1/evaluation80/fit_predictions.jsonl": "7608a74f45d8e232a1d8d2e605c94e5df401c819cfd36c6d8817289ccd9e4909",
+    "/Users/user/mpd-data/scratch/root/native_reader_fit_v1/full_fit/provenance.json": "f9fee756bd1f3d0436307102b047142a6a6115bc776fbdf658d9235cfefe6916",
+    "/Users/user/mpd-data/scratch/root/native_reader_fit_v1/full_fit/train.jsonl": "60a6dac4b3284f7c2671d17a3a28738e7d3cd2f5f262a5e80434a5c60570570c",
+    "/Users/user/mpd-data/scratch/root/native_reader_fit_v1/full_fit/valid.jsonl": "442aaf494870520d2de255153f7504fe46f4faef41d6658faacffde6b50a0f88",
+    "/Users/user/mpd-data/scratch/root/native_query_reader_local_v1/frozen/manifest.json": "d0fbf3fd6acc23682aa45b5729f263dee6678c33bd93fe954799f20b3067a0e3",
+    "/Users/user/mpd-data/cluster/root-lie-query-gold-cpu-v1/output/result/gold/result.json": "c09f7ffb103b2e449651724cbdf57476ed5a38c387119eb42067bd5225b291fa",
+    "/Users/user/mpd-data/scratch/root/native_query_reader_local_v1/score.json": "c3a209aa12dfd3b000af03b495f022e47a214ac055f638e967d90ba6229fbac2",
+    "/Users/user/mpd-data/scratch/root/native_query_reader_local_v1/diagnostics/result.json": "b9beeff8ebabb08ad3b1d3c5bd2143aa3421bde82149e54394b9f51f2413e676",
+    "/Users/user/mpd-data/scratch/root/native_query_reader_local_v1/diagnostics/primary_scorer_frozen.py": "e0b6b4580e2bcd4fe67b6fef06e509696c9adaee1bfee9ec42fb8e0b80ec9650",
+    "/Users/user/mpd-data/scratch/root/native_query_reader_local_v1/responses/responses.jsonl": "65997e8da14092ff6822e5ad64c9de8f247a7e5721d275d161f37e86d9b9b509",
+    "/Users/user/mpd-data/scratch/root/native_reader_fit_v1/scoring/same_data_ridge/frozen.json": "b0652e1022c17bb9c1dff06ba038bf850458d57fc10137cfdae5df8ba68b0b3f"
+  }
+}

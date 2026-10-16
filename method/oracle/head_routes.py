@@ -250,15 +250,17 @@ class Runner:
 def route_story(rn: Runner, st: dict, lost, c: int, h: int, q: int, p: int, writers: int = 16, readers: int = 16,
                 other: dict | None = None) -> dict:
     """Head (c, h) reading position p at q, on a prompt whose clean states are st; lost(sets) gives each edit set's
-    share of the gap lost (or any measured score). Measured: the head unable to see p (knock); every neuron at p in
-    earlier layers and every earlier head's output there taken out of its key input at p, and every neuron at q in
-    earlier layers out of its query input at q (the attention q -> p after, exact), the writers largest by change cut
-    from that head's key or query alone in full runs; the same units out of its value input at p (what the head moves:
-    its output change at q, exact), the largest cut from its value alone in full runs; every neuron at q in layers c.. recomputed with the head's output
-    taken out (exact), the readers largest by change zeroed alone (own_lost) and cut from the head alone (cut_lost) in
-    full runs. other (the
-    corrupted run's states of a patching pair): every cut a patch instead, the unit's write (or value) replaced by its
-    write there."""
+    share of the gap lost (or any measured score). Measured:
+      knock    the head unable to see p;
+      key      every neuron at p in earlier layers and every earlier head's output there taken out of its key input at p
+               (the attention q -> p after, exact), the writers largest by change cut from that head's key alone in
+               full runs; query: the same at q for its query input; value: the same at p for its value input, ranked by
+               the head's output change at q (what the head moves);
+      *_group  the picked neurons of a side cut together (their summed write taken out), and the picked heads together;
+      readers  every neuron at q in layers c.. recomputed with the head's output taken out (exact), the readers largest
+               by change zeroed alone (own_lost) and cut from the head alone (cut_lost); readers_group: all cut together.
+    other (the corrupted run's states of a patching pair): every cut a patch instead, the unit's write (or value)
+    replaced by its write there."""
     def nw(L, pos):
         w = rn.neuron_writes(st, L, pos)
         return w if other is None else w - rn.neuron_writes(other, L, pos).to(w.device)
@@ -267,46 +269,45 @@ def route_story(rn: Runner, st: dict, lost, c: int, h: int, q: int, p: int, writ
         w = rn.head_write(st, L, g, pos)
         return w if other is None else w - rn.head_write(other, L, g, pos).to(w.device)
     a0 = float(st["A"][c][h, q, p])
-    out = {"layer": c, "head": h, "q": q, "p": p, "attention": a0, "knock": lost([{"knock": [(c, h, q, p)]}])[0]}
-    for side, pos in (("key", p), ("query", q)):
-        cand = []  # (|change|, change, unit, delta)
-        for L in range(c):
-            a, dl = rn.attention_after(st, c, h, q, p, nw(L, pos), side=side, delta_out=True)
-            ch = (a - a0).cpu()
-            for j in torch.topk(ch.abs(), min(writers, len(ch))).indices.tolist():
-                cand.append((abs(float(ch[j])), float(ch[j]), ("neuron", L, j, float(st["h"][L][pos, j])), dl[j]))
-            if side == "key":
-                a, dl = rn.attention_after(st, c, h, q, p, torch.stack([hw(L, g, pos) for g in range(rn.H)]), side=side,
-                                           delta_out=True)
-                cand += [(abs(float(a[g] - a0)), float(a[g] - a0), ("head", L, g), dl[g]) for g in range(rn.H)]
-        cand.sort(key=lambda z: -z[0])
-        pick = [z for z in cand if z[2][0] == "neuron"][:writers] + [z for z in cand if z[2][0] == "head"][:max(1, writers // 4)]
-        kind = "dk" if side == "key" else "dq"
-        sh = lost([{kind: [(c, h, pos, z[3])]} for z in pick])
-        out[side] = [{"unit": list(z[2]), "attention_change": z[1], "lost": s} for z, s in zip(pick, sh)]
-    cand = []  # the value at p: what the head moves, ranked by the size of the head's output change at q
     Wo = rn.layers[c].self_attn.o_proj.weight[:, h * rn.hd:(h + 1) * rn.hd].float()
-    a_qp = st["A"][c][h, q, p]
-    for L in range(c):
-        dv = rn.value_after(st, c, h, p, nw(L, p))
-        size = (a_qp * dv.to(Wo.device) @ Wo.T).norm(dim=-1).cpu()
-        for j in torch.topk(size, min(writers, len(size))).indices.tolist():
-            cand.append((float(size[j]), ("neuron", L, j, float(st["h"][L][p, j])), dv[j]))
-        dv = rn.value_after(st, c, h, p, torch.stack([hw(L, g, p) for g in range(rn.H)]))
-        size = (a_qp * dv.to(Wo.device) @ Wo.T).norm(dim=-1).cpu()
-        cand += [(float(size[g]), ("head", L, g), dv[g]) for g in range(rn.H)]
-    cand.sort(key=lambda z: -z[0])
-    pick = [z for z in cand if z[1][0] == "neuron"][:writers] + [z for z in cand if z[1][0] == "head"][:max(1, writers // 4)]
-    sh = lost([{"dv": [(c, h, p, z[2])]} for z in pick])
-    out["value"] = [{"unit": list(z[1]), "output_change": z[0], "lost": s} for z, s in zip(pick, sh)]
+    out = {"layer": c, "head": h, "q": q, "p": p, "attention": a0, "knock": lost([{"knock": [(c, h, q, p)]}])[0]}
+    for side, pos in (("key", p), ("query", q), ("value", p)):
+        def after(deltas):  # (each delta's size of change and the edit for its cut)
+            if side == "value":
+                dv = rn.value_after(st, c, h, p, deltas)
+                return (st["A"][c][h, q, p] * dv.to(Wo.device) @ Wo.T).norm(dim=-1).cpu(), dv
+            a, dl = rn.attention_after(st, c, h, q, p, deltas, side=side, delta_out=True)
+            return (a - a0).cpu(), dl
+        cand = []  # (|change|, change, unit, edit delta, the write cut)
+        for L in range(c):
+            w = nw(L, pos)
+            ch, dl = after(w)
+            for jj in torch.topk(ch.abs(), min(writers, len(ch))).indices.tolist():
+                cand.append((abs(float(ch[jj])), float(ch[jj]), ("neuron", L, jj, float(st["h"][L][pos, jj])), dl[jj], w[jj]))
+            if side != "query":
+                w = torch.stack([hw(L, g, pos) for g in range(rn.H)])
+                ch, dl = after(w)
+                cand += [(abs(float(ch[g])), float(ch[g]), ("head", L, g), dl[g], w[g]) for g in range(rn.H)]
+        cand.sort(key=lambda z: -z[0])
+        neu = [z for z in cand if z[2][0] == "neuron"][:writers]
+        hed = [z for z in cand if z[2][0] == "head"][:max(1, writers // 4)]
+        kind = {"key": "dk", "query": "dq", "value": "dv"}[side]
+        groups = [g for g in (neu, hed) if g]
+        gch, gdl = after(torch.stack([torch.stack([z[4] for z in g]).sum(0) for g in groups])) if groups else ([], [])
+        sh = lost([{kind: [(c, h, pos, z[3])]} for z in neu + hed] + [{kind: [(c, h, pos, d)]} for d in gdl])
+        key = "output_change" if side == "value" else "attention_change"
+        out[side] = [{"unit": list(z[2]), key: z[1], "lost": s_} for z, s_ in zip(neu + hed, sh)]
+        out[side + "_group"] = {name: {key: float(gch[k]), "lost": sh[len(neu) + len(hed) + k], "units": len(g)}
+                                for k, (name, g) in enumerate((n, g) for n, g in (("neurons", neu), ("heads", hed)) if g)}
     ch = rn.readers_after(st, c, h, q, None if other is None else rn.head_write(other, c, h, q))
-    flat = sorted(((abs(float(v[j])), float(v[j]), L, j) for L, v in ch.items()
-                   for j in torch.topk(v.abs(), min(readers, len(v))).indices.tolist()), key=lambda z: -z[0])[:readers]
+    flat = sorted(((abs(float(v[jj])), float(v[jj]), L, jj) for L, v in ch.items()
+                   for jj in torch.topk(v.abs(), min(readers, len(v))).indices.tolist()), key=lambda z: -z[0])[:readers]
     delta = hw(c, h, q)
-    own = lost([{"neuron": [(L, q, j, 0.0 if other is None else float(other["h"][L][q, j]))]} for _, _, L, j in flat])
-    cut = lost([{"read": [(L, q, j, delta)]} for _, _, L, j in flat])
-    out["readers"] = [{"unit": ["neuron", L, j, float(st["h"][L][q, j])], "value_change": v, "own_lost": o, "cut_lost": k}
-                      for (_, v, L, j), o, k in zip(flat, own, cut)]
+    own = lost([{"neuron": [(L, q, jj, 0.0 if other is None else float(other["h"][L][q, jj]))]} for _, _, L, jj in flat])
+    cut = lost([{"read": [(L, q, jj, delta)]} for _, _, L, jj in flat] + [{"read": [(L, q, jj, delta) for _, _, L, jj in flat]}])
+    out["readers"] = [{"unit": ["neuron", L, jj, float(st["h"][L][q, jj])], "value_change": v, "own_lost": o, "cut_lost": k}
+                      for (_, v, L, jj), o, k in zip(flat, own, cut)]
+    out["readers_group"] = {"cut_lost": cut[-1], "units": len(flat)}
     return out
 
 

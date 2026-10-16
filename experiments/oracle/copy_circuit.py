@@ -328,6 +328,21 @@ def main():
                               "mean_value_change_patched": sum(e["value_change"] for e in ps.values()) / len(ids)
                               if side == "readers" else None})
     circ = {"heads": circ_heads, "neurons": circ_neurons, "edges": edges}
+    groups_out = {}  # per role head and side: the picked units of a side cut together (neurons; heads), mean over texts
+    for k in (a3[ids[0]] if ids else {}):
+        g = {}
+        for side in ("key", "query", "value"):
+            for kind in ("neurons", "heads"):
+                for mode in ("patch", "zero"):
+                    vals = [a3[t][k][mode][f"{side}_group"].get(kind, {}).get("lost") for t in ids]
+                    vals = [v for v in vals if v is not None]
+                    if vals:
+                        g[f"{side} {kind} {mode}"] = {"mean_lost": sum(vals) / len(vals),
+                                                     "texts_share": sum(v >= MATTERS for v in vals) / len(vals)}
+        for mode in ("patch", "zero"):
+            vals = [a3[t][k][mode]["readers_group"]["cut_lost"] for t in ids]
+            g[f"readers {mode}"] = {"mean_lost": sum(vals) / len(vals), "texts_share": sum(v >= MATTERS for v in vals) / len(vals)}
+        groups_out[k] = g
     # C: per text necessity, sufficiency, swaps
     scores = {}
     groups = {}
@@ -352,7 +367,7 @@ def main():
                                                                                "answer_word", "alternatives", "alternative_words",
                                                                                "contrast", "corrupt_contrast", "gap", "usable")}
                                                          for t in texts],
-           "dev": dev_ids, "heads": circ_heads, "neurons": circ_neurons, "edges": edges, "scores": scores,
+           "dev": dev_ids, "heads": circ_heads, "neurons": circ_neurons, "edges": edges, "groups": groups_out, "scores": scores,
            "roles": {r: [f"{L}.{h}" for L, h in v] for r, v in roles.items()},
            "attention": {f"{L}.{h}": {"induction": sum(a1[t]["induction"][i] for t in ids) / len(ids),
                                       "previous": sum(a1[t]["previous"][i] for t in ids) / len(ids),

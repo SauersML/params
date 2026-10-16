@@ -86,6 +86,8 @@ def test_route_story(tiny):
     s = head_routes.route_story(rn, st, lost, 2, 1, 9, 6, writers=3, readers=4)
     assert s["knock"] == pytest.approx(c0 - rn.run(ids, [{"knock": [(2, 1, 9, 6)]}])["contrast"][0], abs=1e-6)
     assert len(s["key"]) == 3 + 1 and len(s["query"]) == 3 and len(s["readers"]) == 4  # (the key: one earlier head too)
+    assert len(s["value"]) == 3 + 1 and set(s["key_group"]) == {"neurons", "heads"} and set(s["query_group"]) == {"neurons"}
+    assert s["readers_group"]["units"] == 4
     other = rn.run([(i + 1) % 48 for i in ids], [{}], capture=True)["states"]
     assert len(head_routes.route_story(rn, st, lost, 2, 1, 9, 6, writers=3, readers=4, other=other)["readers"]) == 4
     car = head_routes.carriers(rn, st, lost, 9, 6, min_attention=0.0)

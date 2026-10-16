@@ -191,4 +191,5 @@ def test_named_routes(tiny):
     h = out["heads"]["L2H1"]
     assert out["p"] == 5 and out["q"] == len(ids) - 1
     named = h["patch"]["named_key_writers"]
-    assert named[2] == {"neuron": [2, 0], "below_head": False} and "lost" in named[0] and "carriers" in h
+    assert named[2] == {"neuron": [2, 0], "below_head": False} and "lost" in named[0]
+    assert out["carriers"] and out["carrier_curve"]["k"][-1] == len(out["carriers"])

@@ -860,7 +860,10 @@ def finder_graph(model, tok, rec: dict, log=print) -> dict:
     c, cb = run["contrast"][0], rn.run(bad, [{}])["contrast"][0]
     lost = lambda sets: [(c - x) / (c - cb) for x in rn.run(ids, sets)["contrast"]]  # noqa: E731
     pairs = sorted({(e["dst_pos"], e["src_pos"]) for e in g["edges"] if e["src_pos"] != e["dst_pos"]})
-    g["routes"] = [{"q": q, "p": p, "carriers": head_routes.carriers(rn, run["states"], lost, q, p)} for q, p in pairs]
+    g["routes"] = []
+    for q, p in pairs:  # (each head alone, then the first k together: single heads often move little)
+        car = head_routes.carriers(rn, run["states"], lost, q, p)
+        g["routes"].append({"q": q, "p": p, "carriers": car, "carrier_curve": head_routes.carrier_curve(rn, lost, q, p, car)})
     g.update(id=rec.get("id"), text_id=rec.get("id"), user=rec.get("user"), corrupt_user=rec.get("corrupt_user"),
              corrupted=bad, model=rec.get("model"), finder=rec.get("finder"), intervention="patch from the corrupted run",
              gap=c - cb, answer_word=rec.get("answer_word"), alternative_words=rec.get("alternative_words"))

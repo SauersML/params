@@ -389,6 +389,16 @@ def by_adapter(model, items: list, adapter_of):
         model = pm.unload()
 
 
+@torch.no_grad()
+def carrier_curve(rn: Runner, lost, q: int, p: int, ranked: list) -> dict:
+    """Heads ranked by their own knockout (carriers' order) made unable to see p from q together, the first k of them
+    for k on a log scale up to all: the share lost per k (when single heads each move little, how many it takes)."""
+    n = len(ranked)
+    ks = sorted({min(n, int(round(2 ** (e / 2)))) for e in range(0, int(2 * math.log2(max(n, 1))) + 2)} | {n}) if n else []
+    sh = lost([{"knock": [(r["layer"], r["head"], q, p) for r in ranked[:k]]} for k in ks]) if ks else []
+    return {"k": ks, "lost": sh}
+
+
 def finder_routes(rn: Runner, rec: dict, writers: int = 16, readers: int = 16, min_attention: float = 0.01) -> dict:
     """A circuit_finder record's mover heads as routes (route_story, cuts zeroing and patching from the corrupted run, and
     carriers), each from the answer position to the source it looks at most from the first changed token on."""
@@ -420,7 +430,8 @@ def named_routes(rn: Runner, rec: dict, heads: list, neurons: list, pos: int | N
     """Named heads [(layer, head)] on a circuit_finder record, each read from position pos (default: the first changed
     token) at the answer position: route_story by zeroing and by patching, and each named neuron [(layer, index)] below
     the head at pos taken out of its key input there alone (the attention after, exact, and the share lost with that cut
-    in a full run, both ways), whether the story's measured key writers include it, and carriers for (answer, pos)."""
+    in a full run, both ways), whether the story's measured key writers include it; and every head attending from the
+    answer position to pos made unable to see it alone (carriers) and the first k of them together (carrier_curve)."""
     rn.answer = [int(t) for t in (rec.get("answer_tokens") or [rec["answer"]])]
     rn.alternatives = [int(t) for t in rec["alternatives"]]
     ids, bad = rec["ids"], rec["corrupted"]
@@ -453,8 +464,10 @@ def named_routes(rn: Runner, rec: dict, heads: list, neurons: list, pos: int | N
                               "among_measured_key_writers": (Ln, j) in got})
             story["named_key_writers"] = named
             rec_h[mode] = story
-        rec_h["carriers"] = carriers(rn, st, lost, q, p)
         out["heads"][f"L{L}H{h}"] = rec_h
+    car = carriers(rn, st, lost, q, p)
+    out["carriers"] = car
+    out["carrier_curve"] = carrier_curve(rn, lost, q, p, car)
     return out
 
 

@@ -160,8 +160,8 @@ def verify(pt, order: list, log=None, name: str = "") -> dict:
     between the last failing size and the first passing one, then those in one batch), then units removed one at a time
     while it passes (prune); each unit's shares alone."""
     passes = lambda r: r[0] >= cf.PASS and r[1] >= cf.PASS  # noqa: E731
-    g = cf.grid(len(order))
-    got = pt.both([_blocks(order[:k]) for k in g])
+    g = cf.grid(len(order))                        # (prefixes of order: Patcher.both_prefixes, no set built per unit)
+    got = pt.both_prefixes(order, g)
     met = [k for k, r in zip(g, got) if passes(r)]
     ok = None
     if met:
@@ -169,9 +169,9 @@ def verify(pt, order: list, log=None, name: str = "") -> dict:
         lo = max([k for k in g if k < hi] + [0])
         while hi - lo > 33:                         # (bisection down to 32 sizes, then all of them in one batch)
             mid = (lo + hi) // 2
-            lo, hi = (lo, mid) if passes(pt.both([_blocks(order[:mid])])[0]) else (mid, hi)
+            lo, hi = (lo, mid) if passes(pt.both_prefixes(order, [mid])[0]) else (mid, hi)
         mids = list(range(lo + 1, hi))
-        ok = next((k for k, r in zip(mids, pt.both([_blocks(order[:k]) for k in mids]) if mids else []) if passes(r)), hi)
+        ok = next((k for k, r in zip(mids, pt.both_prefixes(order, mids) if mids else []) if passes(r)), hi)
     circ = prune(pt, list(order[:ok])) if ok else []
     lost, rest = pt.both([_blocks(circ)])[0] if circ else (0.0, 0.0)
     singles = dict(zip(circ, pt.both([[u] for u in circ]))) if circ else {}
@@ -191,9 +191,9 @@ def prune(pt, circ: list) -> list:
         return circ
     alone = pt.both([_blocks([v for v in circ if v != u]) for u in circ])
     todo, gone = [u for u, r in zip(circ, alone) if passes(r)][::-1], set()
-    while todo:
-        trials = [gone | set(todo[:j + 1]) for j in range(len(todo))]
-        got = pt.both([_blocks([v for v in circ if v not in t]) for t in trials])
+    while todo:                                     # (each trial a prefix of the units left with todo last, reversed)
+        rest = [v for v in circ if v not in gone and v not in set(todo)]
+        got = pt.both_prefixes(rest + todo[::-1], [len(rest) + len(todo) - j - 1 for j in range(len(todo))])
         j = next((j for j, r in enumerate(got) if not passes(r)), len(todo))
         gone |= set(todo[:j])
         todo = todo[j + 1:]

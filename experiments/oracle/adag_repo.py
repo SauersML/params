@@ -253,7 +253,8 @@ def groups(a) -> None:
     unit_cluster = {}
     for k, cl in state.items():
         L, _, j, pol = k.split(",")
-        unit_cluster.setdefault((int(L), int(j), pol), cl)
+        if cl.startswith("C") and cl[1:].isdigit():  # (logit nodes are their own named entries, not clusters)
+            unit_cluster.setdefault((int(L), int(j), pol), cl)
     pol = np.where(df.activation >= 0, "+", "-") if "polarity" not in df.columns else df.polarity
     prompts = sorted(df.label.unique())
     col = {p: i for i, p in enumerate(prompts)}

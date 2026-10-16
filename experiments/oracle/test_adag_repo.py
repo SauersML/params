@@ -112,3 +112,18 @@ def test_grouping_and_records(tmp_path):
     finally:
         del sys.modules["circuits"]
     assert ar.load_records(tmp_path / "c.pkl").labels == [" Austin"]
+
+
+def test_match_cuts_adag_to_the_finder_size(tmp_path):
+    adag, pairs, out = tmp_path / "adag", tmp_path / "pairs", tmp_path / "out"
+    adag.mkdir()
+    pairs.mkdir()
+    nodes = [{"layer": 1, "pos": i, "neuron": i, "attribution": a} for i, a in enumerate([0.1, -3.0, 2.0, 0.5])]
+    (adag / "capital__France__p0.json").write_text(json.dumps({"id": "capital/France/p0", "corrupted": [1, 2], "nodes": nodes}))
+    (pairs / "capital__France__p0__vs__Italy.json").write_text(json.dumps(
+        {"id": "capital/France/p0/vs/Italy", "corrupted": [1, 2], "cuts": {"source": {}}, "nodes": [{}], "routes": [{}]}))
+    (pairs / "capital__France__p0__vs__Spain.json").write_text(json.dumps(
+        {"id": "capital/France/p0/vs/Spain", "corrupted": [1, 3], "cuts": {"source": {}}, "nodes": [{}] * 3, "routes": []}))
+    ar.match(SimpleNamespace(adag=adag, pairs=pairs, out=out))
+    r = json.loads((out / "capital__France__p0.json").read_text())
+    assert [u["attribution"] for u in r["nodes"]] == [-3.0, 2.0] and r["matched_to"]["pair"] == "capital/France/p0/vs/Italy"

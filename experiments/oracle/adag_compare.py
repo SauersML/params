@@ -22,8 +22,9 @@ probability.
 
   adag_compare.py run OUT.json --cases capitals_llama,math_llama [--device cuda] [--dtype bfloat16]
   adag_compare.py run OUT.json --cases capitals_qwen32 --device auto
-  adag_compare.py finder OUT.json --cases capitals_llama [--n 8]   circuit_finder's seconds a question on ADAG's capitals
-      prompts (finder_speed), beside its tracer's bench_tracing.py on the same card
+  adag_compare.py finder OUT.json --cases capitals_llama [--n 8] [--data ADAG_DATA.py]   circuit_finder's seconds a
+      question on ADAG's capitals cities in a few-shot prompt the model answers with the capital (finder_speed), the
+      same prompts written as an ADAG dataset so its tracer is timed on them on the same card
   adag_compare.py alias GATED_ID COPY_ID [FETCH_ID ...]   an ungated copy under the gated name in the HF cache (ADAG's
       own scripts load meta-llama/Llama-3.1-8B-Instruct by name)
   adag_compare.py transfer OUT.json   each found set of the run (capitals_llama, math_llama) zeroed on every other
@@ -282,36 +283,75 @@ def transfer(run: Runner, tok, model_id: str, sets: dict, log=print) -> dict:
     return out
 
 
-def finder_speed(model, tok, model_id: str, seed: str, n: int, log=print) -> dict:
-    """circuit_finder (method/oracle) on ADAG's capitals prompts (its question text and seed, its chat format), the first n
-    cities, each against the first other city of the same token count with another capital: seconds a question (the
-    finder's own CUDA warm-up run first, untimed), the cuts met and the circuit's size. (RelP's backward patches Qwen3's
+FEWSHOT = ("Answer with the name of the capital city only.\nQ: What is the capital of the state containing Seattle?\n"
+           "A: Olympia\nQ: What is the capital of the state containing Buffalo?\nA: Albany\n"
+           "Q: What is the capital of the state containing {city}?")
+FEWSHOT_SEED = {"Llama": "A:", "Qwen3": "A:"}  # (Qwen3-1.7B: 21 of 48 capitals so, 18 with bold examples and "A: **", 11
+# zero-shot; the lead's 10-16: on ADAG's "Answer: **" seed Qwen3-8B copies the city for 5 of 8; on "Answer:" Llama
+# gives the state for 3 of 8. The two examples' states, Washington and New York, are left out of the questions.)
+
+
+def seed_of(model_id: str) -> str:
+    return FEWSHOT_SEED["Qwen3" if "Qwen3" in model_id else "Llama"]
+
+
+def capital_prompts(run: "Runner", tok, model_id: str) -> list[dict]:
+    """ADAG's capitals cities in the few-shot prompt (FEWSHOT, its model's FEWSHOT_SEED, ADAG's chat format), each with the
+    model's top token and whether it starts the capital (the first token of the capital, with or without a space)."""
+    out = []
+    for c, st, cap in capitals():
+        if cap in ("Olympia", "Albany"):
+            continue
+        ids = prompt_ids(tok, model_id, FEWSHOT.format(city=c), seed_of(model_id))
+        top = int(run.last(ids, [[]])[0].argmax())
+        firsts = {tok(w, add_special_tokens=False)["input_ids"][0] for w in (" " + cap, cap)}
+        out.append({"city": c, "state": st, "capital": cap, "ids": ids, "top": tok.decode([top]), "answers_capital": top in firsts})
+    return out
+
+
+def finder_speed(run: "Runner", tok, model_id: str, n: int, out_dir: Path, data_file: Path | None = None, log=print) -> dict:
+    """circuit_finder (method/oracle) on the first n few-shot capitals prompts the model answers with the capital
+    (capital_prompts), each against the first other such city of the same token count: seconds a question (the finder's
+    own CUDA warm-up run first, untimed), its full record in out_dir; data_file: the same n prompts as an ADAG prep.py
+    dataset (prompts, seed_responses, labels), so its tracer runs on exactly these. (RelP's backward patches Qwen3's
     modules only: on other models the order is the model's own gradient.)"""
     sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "method" / "oracle"))
     import circuit_finder as cf
 
     if "Qwen3" not in model_id:
         cf.ORDER = "grad"
-    cities = capitals()
-    ids = {c: prompt_ids(tok, model_id, f"What is the capital of the state containing {c}?", seed) for c, _, _ in cities}
-    pt = cf.Patcher(model, tok)
+    allp = capital_prompts(run, tok, model_id)
+    kept = [x for x in allp if x["answers_capital"]]
+    chosen = [x for x in kept if any(y["capital"] != x["capital"] and len(y["ids"]) == len(x["ids"]) for y in kept)][:n]
+    if data_file:
+        data_file.write_text(f'"""ADAG capitals cities in a few-shot prompt, those {model_id} answers with the capital '
+                             f'(adag_compare.py capitals-fs)."""\n\nprompts = {[FEWSHOT.format(city=x["city"]) for x in chosen]!r}\n'
+                             f'seed_responses = {[seed_of(model_id)] * len(chosen)!r}\nlabels = {[" " + x["capital"] for x in chosen]!r}\n')
+    out_dir.mkdir(parents=True, exist_ok=True)
+    pt = cf.Patcher(run.model, tok)
     rows = []
-    for c, _, cap in cities[:n]:
-        other = next((c2 for c2, _, cap2 in cities if cap2 != cap and len(ids[c2]) == len(ids[c])), None)
-        if other is None:
-            continue
+    for x in chosen:
+        other = next(y for y in kept if y["capital"] != x["capital"] and len(y["ids"]) == len(x["ids"]))
         if not rows:
-            pt.setup(ids[c], ids[other])
+            pt.setup(x["ids"], other["ids"])
+        torch.cuda.synchronize() if torch.cuda.is_available() else None
         t0 = time.time()
-        rec = cf.find(pt, ids[c], ids[other], None)
+        rec = cf.find(pt, x["ids"], other["ids"], None)
+        torch.cuda.synchronize() if torch.cuda.is_available() else None
         dt = time.time() - t0
-        rows.append({"city": c, "other": other, "tokens": len(ids[c]), "seconds": dt, "met": rec.get("met"), "size": rec.get("size"),
-                     "neurons": len(rec.get("nodes", [])), "heads": len(rec.get("routes", [])), "gap": rec.get("gap"),
-                     "answer": tok.decode([rec["answer"]]), "corrupt_answer": tok.decode([rec["corrupt_answer"]])})
-        log(f"finder {c} vs {other}: {dt:.1f} s, met {rec.get('met')}, {rows[-1]['neurons']} neurons + {rows[-1]['heads']} heads")
+        rec.update(id=f"capitals/{x['city']}/vs/{other['city']}", ids=x["ids"], corrupted=other["ids"], model=model_id,
+                   finder="circuit_finder", wall_seconds=round(dt, 2))
+        (out_dir / f"{x['city']}.json").write_text(json.dumps(rec))
+        cuts = {k: [round(c["lost"], 3), round(c["restored"], 3), c["size"], c["met"], c.get("reachable")] for k, c in rec.get("cuts", {}).items()}
+        rows.append({"city": x["city"], "other": other["city"], "tokens": len(x["ids"]), "seconds": dt, "met": rec.get("met"),
+                     "size": rec.get("size"), "neurons": len(rec.get("nodes", [])), "heads": len(rec.get("routes", [])), "gap": rec.get("gap"),
+                     "answer": tok.decode([rec["answer"]]), "corrupt_answer": tok.decode([rec["corrupt_answer"]]), "cuts": cuts})
+        log(f"finder {x['city']} vs {other['city']}: {dt:.1f} s, met {rec.get('met')}, cuts {cuts}")
     secs = [r["seconds"] for r in rows]
     return {"model": model_id, "gpu": torch.cuda.get_device_name() if torch.cuda.is_available() else "cpu", "order": cf.ORDER,
-            "rows": rows, "seconds_mean": float(np.mean(secs)) if secs else None, "seconds_median": float(np.median(secs)) if secs else None}
+            "prompt": FEWSHOT, "seed": seed_of(model_id), "answers_capital": f"{len(kept)} of {len(allp)}",
+            "not_capital": [[x["city"], x["top"]] for x in allp if not x["answers_capital"]], "rows": rows,
+            "seconds_mean": float(np.mean(secs)) if secs else None, "seconds_median": float(np.median(secs)) if secs else None}
 
 
 def alias(official: str, copy: str, fetch: list[str]) -> None:
@@ -339,7 +379,8 @@ def main():
     ap.add_argument("more", nargs="*", help="alias: the ungated copy's id, then models to fetch before going offline")
     ap.add_argument("--cases", default="capitals_llama,math_llama")
     ap.add_argument("--device", default="cuda")
-    ap.add_argument("--n", type=int, default=8, help="finder: ADAG's first n capitals prompts")
+    ap.add_argument("--n", type=int, default=8, help="finder: the first n few-shot capitals prompts answered with the capital")
+    ap.add_argument("--data", type=Path, default=None, help="finder: write the same prompts as an ADAG prep.py dataset file")
     ap.add_argument("--rows", type=int, default=ROWS, help="runs a forward pass (Qwen3-32B over two GPUs: 64 keeps them busy)")
     ap.add_argument("--dtype", default="bfloat16", choices=("float32", "bfloat16"))
     a = ap.parse_args()
@@ -350,13 +391,14 @@ def main():
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     out = json.loads(a.out.read_text()) if a.out.exists() else {}
-    if a.cmd == "finder":  # (OUT: the record; --cases: one case, its model and seed)
+    if a.cmd == "finder":  # (OUT: the summary; its records in OUT's stem directory; --cases: one case, its model)
         c = CASES[a.cases]
         src = c["weights"] or c["model"]
         tok = AutoTokenizer.from_pretrained(src)
         model = AutoModelForCausalLM.from_pretrained(src, dtype=getattr(torch, a.dtype), device_map=a.device).eval()
         model.requires_grad_(False)
-        a.out.write_text(json.dumps(finder_speed(model, tok, c["model"], c["seed"], a.n, log=lambda s: print(s, flush=True))))
+        res = finder_speed(Runner(model), tok, c["model"], a.n, a.out.with_suffix(""), a.data, log=lambda s: print(s, flush=True))
+        a.out.write_text(json.dumps(res))
         return
     if a.cmd == "transfer":
         tok = AutoTokenizer.from_pretrained(LLAMA_WEIGHTS)

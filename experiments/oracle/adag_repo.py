@@ -46,7 +46,9 @@ here).
   adag_repo.py groups CIRCUIT.pkl CLUSTER_STATE.json OUT.json
   adag_repo.py measured NAP_TRAIN.pt OUT_TRAIN.pt --model ID [--cand 8192] [--order replace|first]
   (in ADAG's clone)  adag_repo.py relp QUESTION_ID OUT --model Qwen/Qwen3-8B [--questions FILE]
+  adag_repo.py match ADAG_TRACE_DIR FAMILY_PAIRS_DIR OUT   ADAG's circuits cut to our finder's size on the same pairs
   (in ADAG's clone)  adag_repo.py trace QUESTIONS.json OUT --model Qwen/Qwen3-8B [--split dev] [--stride 2] [--limit N]
+      [--families task/key,...] [--chunk 10]
       [--finder N]   (circuit_finder on the first N of them too: OUT/finder/, timed on the same card)
 """
 from __future__ import annotations
@@ -310,9 +312,12 @@ def trace(a) -> None:
     import sys
     sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "method" / "oracle"))
     import circuit_finder as cf
+    import circuits.tracing.clja as clja
     from circuits.tracing.clja import ADAGConfig, get_all_pairs_cl_ja_effects_with_attributions  # ADAG's own tracer
     from circuits.tracing.grad import revert_stop_nonlinear_grad
 
+    own = clja._get_neuron_attr_and_contrib  # (its neurons' backward in chunks of CHUNK, not its 50: 50 ran a 48 GB L40 out of
+    clja._get_neuron_attr_and_contrib = lambda *x, **k: own(*x, **{**k, "neuron_chunk_size": a.chunk})  # memory on Qwen3-8B)
     tok, model = load_model(a.model)
     model.requires_grad_(False)
     dev = next(model.parameters()).device
@@ -321,7 +326,8 @@ def trace(a) -> None:
     fams = {}
     for q in qs:
         fams.setdefault(f"{q['task']}/{q['key']}", []).append(q)
-    todo = [q for name in sorted(fams)[::a.stride] for q in sorted(fams[name], key=lambda q: q["paraphrase"])][:a.limit or None]
+    names = a.families.split(",") if a.families else sorted(fams)[::a.stride]
+    todo = [q for name in names for q in sorted(fams[name], key=lambda q: q["paraphrase"])][:a.limit or None]
     a.out.mkdir(parents=True, exist_ok=True)
     pt = cf.Patcher(model, tok)
     cfg = ADAGConfig(device=str(dev), verbose=False, parent_threshold=None, edge_threshold=0.01, node_attribution_threshold=None,
@@ -359,6 +365,7 @@ def trace(a) -> None:
             revert_stop_nonlinear_grad(model)
         except Exception:
             pass
+        torch.cuda.empty_cache() if torch.cuda.is_available() else None
         units = {}
         for n in nodes:
             if 0 <= n.layer < L:
@@ -398,6 +405,28 @@ def trace(a) -> None:
             print(f"{q['id']}: circuit_finder {fr.get('size')} units, met {fr.get('met')}, {fr['wall_seconds']:.1f} s", flush=True)
         print(f"{q['id']}: ADAG {len(out_nodes)} neurons ({rec['adag']['before_first_diff']} before the change), {len(edges)} edges, "
               f"{t_trace:.1f} s; lost {whole[0]:.2f} restored {whole[1]:.2f}{'' if met else ' unmet'}", flush=True)
+
+
+def match(a) -> None:
+    """ADAG's circuit of each traced question cut to our finder's size on the same pair: its neurons with the largest
+    |attribution|, as many as the finder record's neurons and heads (circuit_family's pair record of the question
+    against its own corrupted key in PAIRS, the family run's pairs/); written as finder records beside ADAG's full ones."""
+    a.out.mkdir(parents=True, exist_ok=True)
+    n = 0
+    for f in sorted(a.adag.glob("*.json")):
+        r = json.loads(f.read_text())
+        q = r["id"]
+        cands = [p for p in a.pairs.glob(f"{q.replace('/', '__')}__vs__*.json")]
+        mine = next((json.loads(p.read_text()) for p in cands if json.loads(p.read_text()).get("corrupted") == r["corrupted"]), None)
+        if mine is None or not mine.get("cuts"):
+            continue
+        k = len(mine.get("nodes", [])) + len(mine.get("routes", []))
+        keep = sorted(r["nodes"], key=lambda u: -abs(u["attribution"]))[:k]
+        r.update(nodes=keep, size=len(keep), matched_to={"pair": mine["id"], "finder_size": k, "adag_size": len(r["nodes"])},
+                 finder="adag_matched")
+        (a.out / f.name).write_text(json.dumps(r))
+        n += 1
+    print(f"{n} ADAG circuits cut to their questions' finder sizes in {a.out}")
 
 
 @torch.no_grad()
@@ -517,6 +546,12 @@ def main():
     tr.add_argument("--stride", type=int, default=2)
     tr.add_argument("--limit", type=int, default=0)
     tr.add_argument("--finder", type=int, default=0, help="circuit_finder on the first N questions too, timed on the same card")
+    tr.add_argument("--families", default=None, help="task/key,...: these families instead of every stride-th")
+    tr.add_argument("--chunk", type=int, default=10, help="neurons a backward chunk in ADAG's attribution (its own: 50)")
+    mt = sp.add_parser("match")
+    mt.add_argument("adag", type=Path)
+    mt.add_argument("pairs", type=Path)
+    mt.add_argument("out", type=Path)
     t = sp.add_parser("cg-test")
     t.add_argument("train", type=Path)
     t.add_argument("test", type=Path)
@@ -528,7 +563,7 @@ def main():
     s.add_argument("--order", default="replace", choices=("replace", "first"),
                    help="replace: measured scores in NAP's place among its others; first: every measured node ranked first")
     a = ap.parse_args()
-    {"clusters": clusters, "math-data": math_data, "cg-test": cg_test, "groups": groups, "measured": measured, "relp": relp, "trace": trace}[a.cmd](a)
+    {"clusters": clusters, "math-data": math_data, "cg-test": cg_test, "groups": groups, "measured": measured, "relp": relp, "trace": trace, "match": match}[a.cmd](a)
 
 
 if __name__ == "__main__":

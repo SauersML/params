@@ -72,7 +72,8 @@ class Collector:
         return units
 
     @torch.no_grad()
-    def score(self, prompt, answers, *, units=(), source=None, zero=False, snapshot=None, regimes=None):
+    def score(self, prompt, answers, *, units=(), source=None, zero=False, snapshot=None, regimes=None,
+              native_evidence=None, readout_token_ids=None):
         # Argmax metadata observes only the first continuation token from each
         # teacher-forced forward; it is not a generated answer or a whole-answer
         # correctness certificate. It stays private with the baseline scores.
@@ -89,6 +90,15 @@ class Collector:
                 raise ValueError("missing/nonfinite donor activation")
         if source is not None and zero:
             raise ValueError('choose zero or source')
+        evidence_weights = None
+        if native_evidence is not None:
+            if not isinstance(native_evidence,dict) or native_evidence:
+                raise ValueError('empty native evidence sink required')
+            if zero or source is not None:
+                raise ValueError('query evidence must observe original unedited target')
+            evidence_weights = self._evidence_weights(prompt,units,readout_token_ids)
+            if snapshot is None:snapshot={}
+            if regimes is None:regimes={}
         by_layer = {}
         for u in units:
             by_layer.setdefault(u[0], []).append(u)
@@ -139,6 +149,19 @@ class Collector:
             # ExitStack owns every observer immediately, including partial setup
             # and failures inside a projection or the model forward.
             with contextlib.ExitStack() as stack:
+                if native_evidence is not None and index == 0:
+                    norm = evidence_weights['norm']
+                    def observe_norm(module,args):
+                        hidden=args[0]
+                        if tuple(hidden.shape)!=(1,len(prompt)+len(answer),norm.weight.numel()):
+                            raise ValueError('single-context final pre-norm state required')
+                        residual=hidden[0,len(prompt)-1].detach().float()
+                        denominator=(residual.square().mean()+norm.variance_epsilon).sqrt()
+                        if not bool(torch.isfinite(denominator)) or float(denominator)<=0:
+                            raise ValueError('nonfinite original final RMS denominator')
+                        evidence_weights['denominator']=float(denominator)
+                    handle=norm.register_forward_pre_hook(observe_norm)
+                    stack.callback(handle.remove)
                 if regimes is not None and index == 0:
                     for layer, selected in by_layer.items():
                         for kind, projection in [('gate', self.nr.layers[layer].mlp.gate_proj),
@@ -163,9 +186,74 @@ class Collector:
             first_continuation['a' if index == 0 else 'b'] = {
                 'argmax_token_id': top,
                 'argmax_probability': float(lp[0, top].exp())}
+        if native_evidence is not None:
+            native_evidence.update(self._evidence_packet(prompt,units,readout_token_ids,
+                                                         snapshot,regimes,evidence_weights))
         return {'a_logp_nats': values[0], 'b_logp_nats': values[1],
                 'contrast_bits': (values[0] - values[1]) / math.log(2),
                 'first_continuation': first_continuation}
+
+    def _evidence_weights(self, prompt, units, readout_token_ids):
+        """Sparse same-target weights validated before any evidence forward."""
+        from transformers.models.qwen3.modeling_qwen3 import Qwen3RMSNorm
+        lens_path=str(Path(__file__).resolve().parent/'cao')
+        if lens_path not in sys.path:sys.path.insert(0,lens_path)
+        from write_lens import effective_linear_slice
+        if not units or any(u[1]!=len(prompt)-1 for u in units):
+            raise ValueError('query evidence requires native units at final prompt boundary')
+        if (not isinstance(readout_token_ids,(list,tuple)) or len(readout_token_ids)!=2 or
+                len(set(readout_token_ids))!=2 or any(type(i) is not int or i<0 for i in readout_token_ids)):
+            raise ValueError('two distinct readout vocabulary token IDs required')
+        norm=self.nr.core.model.norm
+        if (type(norm) is not Qwen3RMSNorm or norm.weight.ndim!=1 or
+                not math.isfinite(norm.variance_epsilon) or norm.variance_epsilon<=0):
+            raise ValueError('unadapted Qwen3 RMSNorm with positive epsilon required')
+        scale=norm.weight.detach().float().cpu().clone()
+        if not bool(torch.isfinite(scale).all()):raise ValueError('nonfinite final learned norm scale')
+        U=effective_linear_slice(self.nr.core.lm_head,list(readout_token_ids),rows=True).cpu()
+        columns={}
+        for layer in sorted({u[0] for u in units}):
+            selected=[u for u in units if u[0]==layer]
+            W=effective_linear_slice(self.nr.layers[layer].mlp.down_proj,[u[2] for u in selected]).cpu()
+            if W.shape!=(scale.numel(),len(selected)) or U.shape!=(2,scale.numel()):
+                raise ValueError('native column/norm/unembedding dimensions disagree')
+            columns.update((u,W[:,i].clone()) for i,u in enumerate(selected))
+        return dict(norm=norm,scale=scale,unembedding=U,columns=columns)
+
+    def _evidence_packet(self,prompt,units,readout_token_ids,snapshot,regimes,weights):
+        from write_lens import signed_write_contrast
+        denominator=weights['denominator'];neurons=[]
+        for u in units:
+            a=snapshot[u].detach().float().cpu()
+            row=dict(unit=list(u),activation=float(a),**regimes[u])
+            # product_value duplicates the observed activation; export only the
+            # stable allowlisted native fields, never output logits or labels.
+            row.pop('product_value',None)
+            row.update(signed_write_contrast(a,weights['columns'][u],weights['scale'],
+                weights['unembedding'],rms_denominator=denominator))
+            neurons.append(row)
+        baseline=-sum(n['static_signed_contrast_bits'] for n in neurons)
+        if not math.isfinite(baseline):raise ValueError('nonfinite static zero baseline')
+        import copy
+        return dict(schema='native_query_evidence_v1',frozen_target_identity=copy.deepcopy(self.frozen_target_identity),
+            prompt_ids=list(prompt),boundary_position=len(prompt)-1,readout_token_ids=list(readout_token_ids),
+            neurons=neurons,final_norm=dict(type='Qwen3RMSNorm',variance_epsilon=weights['norm'].variance_epsilon,
+                frozen_denominator=denominator,learned_scale_applied=True),static_zero_delta_bits=baseline,
+            scope='Original unedited native observations; FP32 effective bias-free linear writes. Static first-token contrast with original RMS denominator frozen, learned scale included; no denominator derivative, downstream recomputation, routing, suffix effects, semantic label or causal certificate. Activation-sign times write norm is a display convention, not a vector sign.')
+
+    def prepare_query_evidence(self, *, case_id, prompt_ids, answer_a_ids, answer_b_ids,
+                               units, readout_token_ids=(20,19)):
+        """Two existing original forwards; return only query-specific public facts.
+
+        Baseline full-sequence scores and global argmax are discarded here, never
+        copied into the public packet. A caller needing private scores can instead
+        call score(..., native_evidence=sink, readout_token_ids=...) once.
+        """
+        if not isinstance(case_id,str) or not case_id:raise ValueError('case ID required')
+        evidence={}
+        self.score(prompt_ids,[answer_a_ids,answer_b_ids],units=units,
+                   native_evidence=evidence,readout_token_ids=readout_token_ids)
+        return dict(case_id=case_id,**evidence)
 
     def prepare_public(self, *, case_id, clean_ids, corrupt_ids, answer_a_ids,
                        answer_b_ids, target_units, control_units):

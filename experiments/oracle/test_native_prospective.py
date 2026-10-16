@@ -355,3 +355,98 @@ def test_first_continuation_metadata_stays_private_until_collect(setup):
     assert all(set(row['first_continuation'])=={'a','b'} for row in result['interventions'].values())
     assert c.forward_examples==12 and result['forward_examples']==10
     assert hooks(model)==0
+
+
+def test_query_evidence_original_norm_and_signed_weights_no_extra_f_or_leak(setup):
+    import math
+    model,c=setup;prompt=[1,2,3];units=[(0,2,4),(1,2,5)]
+    observed={};handles=[]
+    for layer,pos,n in units:
+        def down(module,args,layer=layer,pos=pos,n=n):observed[(layer,pos,n)]=float(args[0][0,pos,n])
+        handles.append(c.nr.layers[layer].mlp.down_proj.register_forward_pre_hook(down))
+    def final(module,args):
+        h=args[0][0,len(prompt)-1].float();observed['rms']=float((h.square().mean()+module.variance_epsilon).sqrt())
+    handles.append(model.model.norm.register_forward_pre_hook(final))
+    calls=[];handles.append(model.register_forward_hook(lambda *a:calls.append(1)))
+    try:packet=c.prepare_query_evidence(case_id='query',prompt_ids=prompt,answer_a_ids=[4,5],answer_b_ids=[6,7],units=units,readout_token_ids=[4,6])
+    finally:
+        for handle in handles:handle.remove()
+    assert len(calls)==c.forward_examples==2 and hooks(model)==0
+    assert packet['schema']=='native_query_evidence_v1' and packet['case_id']=='query'
+    assert packet['final_norm']['frozen_denominator']==observed['rms']
+    for row,unit in zip(packet['neurons'],units):
+        layer,pos,n=unit;a=observed[unit];W=c.nr.layers[layer].mlp.down_proj.weight[:,n].detach().float()
+        U=model.lm_head.weight[[4,6]].detach().float();scale=model.model.norm.weight.detach().float()
+        expected=float((U[0]-U[1]) @ (scale*(a*W)))/observed['rms']/math.log(2)
+        assert row['activation']==a and row['static_signed_contrast_bits']==pytest.approx(expected,abs=1e-8)
+        assert row['write_l2']==pytest.approx(float((a*W).norm()),abs=1e-8)
+        assert row['unit']==list(unit)
+    assert packet['static_zero_delta_bits']==-sum(n['static_signed_contrast_bits'] for n in packet['neurons'])
+    def keys(obj):
+        if isinstance(obj,dict):return set(obj)|set().union(*(keys(v) for v in obj.values()))
+        if isinstance(obj,list):return set().union(*(keys(v) for v in obj)) if obj else set()
+        return set()
+    assert not keys(packet)&{'a_logp_nats','b_logp_nats','first_continuation','interventions','contrast_bits'}
+    assert packet['frozen_target_identity']==IDENTITY
+
+
+def test_query_evidence_peft_down_and_unembedding_match_actual_sparse_operators(setup):
+    import math
+    model,_=setup
+    peft=pytest.importorskip('peft')
+    model=peft.get_peft_model(model,peft.LoraConfig(r=2,lora_alpha=4,lora_dropout=0.,
+        target_modules=['gate_proj','up_proj','down_proj','lm_head'],task_type='CAUSAL_LM'))
+    torch.manual_seed(8)
+    with torch.no_grad():
+        for name,param in model.named_parameters():
+            if 'lora_B' in name:param.normal_(0,.1)
+    model.eval();c=Collector(Neurons(model,None),100,dict(IDENTITY,adapter_sha256='query_lora'))
+    packet=c.prepare_query_evidence(case_id='peft',prompt_ids=[1,2,3],answer_a_ids=[4,5],answer_b_ids=[6,7],
+        units=[(0,2,4)],readout_token_ids=[4,6])
+    row=packet['neurons'][0];a=row['activation'];module=c.nr.layers[0].mlp.down_proj
+    basis=torch.zeros(24);basis[4]=a
+    with torch.no_grad():
+        write=module(basis)-module(torch.zeros(24))
+        scaled=model.get_base_model().model.norm.weight.float()*write/packet['final_norm']['frozen_denominator']
+        logits=model.get_base_model().lm_head(scaled)-model.get_base_model().lm_head(torch.zeros(16))
+    assert row['write_l2']==pytest.approx(float(write.norm()),rel=1e-5,abs=1e-7)
+    assert row['static_signed_contrast_bits']==pytest.approx(float(logits[4]-logits[6])/math.log(2),rel=1e-5,abs=1e-7)
+    assert c.forward_examples==2 and hooks(model)==0
+
+
+@pytest.mark.parametrize('bad',['position','edited','norm','readout'])
+def test_query_evidence_invalid_setup_rejected_before_forward(setup,bad):
+    model,c=setup;kwargs=dict(units=[(0,2,4)],native_evidence={},readout_token_ids=[4,6])
+    if bad=='position':kwargs['units']=[(0,1,4)]
+    if bad=='edited':kwargs['zero']=True
+    if bad=='norm':
+        model.model.norm=torch.nn.RMSNorm(16).eval()
+        c=Collector(Neurons(model,None),100,IDENTITY)
+    if bad=='readout':kwargs['readout_token_ids']=[4,4]
+    with pytest.raises(ValueError):c.score([1,2,3],[[4,5],[6]],**kwargs)
+    assert c.forward_examples==0 and hooks(model)==0
+
+
+def test_query_evidence_failure_cleans_norm_and_native_observers(setup):
+    model,c=setup
+    def fail(*args):raise RuntimeError('synthetic final norm failure')
+    h=model.model.norm.register_forward_pre_hook(fail)
+    sink={}
+    try:
+        with pytest.raises(RuntimeError,match='final norm failure'):
+            c.score([1,2,3],[[4,5],[6,7]],units=[(0,2,4)],native_evidence=sink,readout_token_ids=[4,6])
+        assert sink=={} and c.forward_examples==1 and hooks(model)==1
+    finally:h.remove()
+    assert hooks(model)==0
+
+
+def test_query_evidence_batch_shape_failure_cleans_all_observers(setup):
+    model,c=setup
+    h=model.model.norm.register_forward_pre_hook(lambda m,args:(args[0].expand(2,-1,-1),))
+    try:
+        with pytest.raises(ValueError,match='single-context'):
+            c.prepare_query_evidence(case_id='bad_batch',prompt_ids=[1,2,3],answer_a_ids=[4],answer_b_ids=[6],
+                units=[(0,2,4)],readout_token_ids=[4,6])
+        assert c.forward_examples==1 and hooks(model)==1
+    finally:h.remove()
+    assert hooks(model)==0

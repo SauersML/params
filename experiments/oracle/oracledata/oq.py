@@ -481,9 +481,8 @@ def gen(a) -> None:
 
 # ---------------------------------------------------------------- split (CPU)
 
-TEST_FAMILY_SHARE = 0.15   # families held out whole (the unseen_family slice)
-TEST_CTX, DEV_CTX = 0.2, 0.1
-TEST_KEY_SHARE = 0.2       # item keys (groups, neurons, heads) never asked in training (the unseen_group slice)
+DEV_CTX = 0.1              # contexts in dev (test: --test-share; families held out whole: --family-share, from 10
+# families; item keys never asked in training, the unseen_group slice: --key-share)
 
 
 def h(s: str, seed: int) -> float:
@@ -498,15 +497,19 @@ def split(a) -> None:
         for x in cp.read_text().splitlines():
             c = json.loads(x)
             circs[c["circuit_id"]] = c
+    sealed = {q["id"] for p in (a.sealed or []) for q in json.loads(p.read_text())["questions"]}
+    n0 = len(rows)
+    sealed_hit = sorted({r["context_id"] for r in rows} & sealed)
+    rows = [r for r in rows if r["context_id"] not in sealed]  # the circuit push's sealed test texts never appear here
     fams = sorted({r["family"] for r in rows})
-    test_fams = {f for f in fams if h("fam/" + f, a.seed) < TEST_FAMILY_SHARE} if len(fams) >= 6 else set()
-    test_keys = {k for r in rows for k in r["keys"] if h("key/" + k, a.seed) < TEST_KEY_SHARE}
+    test_fams = {f for f in fams if h("fam/" + f, a.seed) < a.family_share} if len(fams) >= 10 else set()
+    test_keys = {k for r in rows for k in r["keys"] if h("key/" + k, a.seed) < a.key_share}
 
     def ctx_split(r):
         if r["family"] in test_fams:
             return "test"
         u = h("ctx/" + r["context_id"], a.seed)
-        return "test" if u < TEST_CTX else "dev" if u < TEST_CTX + DEV_CTX else "train"
+        return "test" if u < a.test_share else "dev" if u < a.test_share + DEV_CTX else "train"
     for r in rows:
         s = ctx_split(r)
         hit = any(k in test_keys for k in r["keys"])
@@ -567,11 +570,6 @@ def split(a) -> None:
             for r in rs:
                 fh.write(json.dumps(r) + "\n")
     used = {r["circuit_id"] for rs in out.values() for r in rs}
-    if a.sealed:  # the circuit push's sealed test texts never appear here
-        sealed = {q["id"] for p in a.sealed for q in json.loads(p.read_text())["questions"]}
-        bad = sorted({r["context_id"] for rs in out.values() for r in rs} & sealed)
-        if bad:
-            raise SystemExit(f"{len(bad)} sealed contexts in the data, e.g. {bad[:3]}")
     with (a.out / "circuits.jsonl").open("w") as fh:
         for cid in sorted(used):
             fh.write(json.dumps(circs[cid]) + "\n")
@@ -599,9 +597,11 @@ def split(a) -> None:
                    for (k, sl), v in sorted(res.items())}
     count = lambda rs: dict(collections.Counter(r["cls"] for r in rs).most_common())  # noqa: E731
     manifest = {"schema": "oq1", "written": time.strftime("%Y-%m-%d %H:%M:%S %Z"), "seed": a.seed, "inputs": [str(p) for p in a.gen],
-                "rows": {s: len(rs) for s, rs in out.items()}, "dropped_train_rows_naming_heldout_keys": sum(r["split"] == "drop" for r in rows),
+                "rows": {s: len(rs) for s, rs in out.items()}, "sealed_contexts_removed": sealed_hit,
+                "sealed_rows_removed": n0 - len(rows), "dropped_train_rows_naming_heldout_keys": sum(r["split"] == "drop" for r in rows),
                 "contexts": {s: len({r["context_id"] for r in rs}) for s, rs in out.items()},
-                "test_families": sorted(test_fams), "heldout_keys": len(test_keys), "classes": {s: count(rs) for s, rs in out.items()},
+                "test_families": sorted(test_fams), "heldout_keys": len(test_keys),
+                "shares": {"test": a.test_share, "dev": DEV_CTX, "keys": a.key_share, "families": a.family_share}, "classes": {s: count(rs) for s, rs in out.items()},
                 "baselines": base, "margins": {"LOW": LOW, "HIGH": HIGH, "BIG": BIG, "GAP": GAP, "STEER": STEER}}
     (a.out / "manifest.json").write_text(json.dumps(manifest, indent=1) + "\n")
     print(json.dumps({k: manifest[k] for k in ("rows", "contexts", "test_families", "heldout_keys")}))
@@ -628,7 +628,10 @@ def main():
     s.add_argument("gen", type=Path, nargs="+")
     s.add_argument("--seed", type=int, default=1)
     s.add_argument("--min-class", type=int, default=10)
-    s.add_argument("--sealed", type=Path, nargs="*", help="sealed question sets (testset_8b.json): refused if any context is in the data")
+    s.add_argument("--test-share", type=float, default=0.25)
+    s.add_argument("--key-share", type=float, default=0.1)
+    s.add_argument("--family-share", type=float, default=0.1)
+    s.add_argument("--sealed", type=Path, nargs="*", help="sealed question sets (testset_8b.json): their contexts are removed")
     a = ap.parse_args()
     {"gen": gen, "split": split}[a.cmd](a)
 

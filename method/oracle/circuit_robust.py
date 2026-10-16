@@ -25,6 +25,7 @@ corrupted gap:
                        synergy, each needs the other).
 
   circuit_robust.py RECORDS_DIR QUESTIONS.json OUT_DIR [--model Qwen/Qwen3-8B] [--dtype bfloat16] [--ids ID ...]
+                    [--ids-file FILE]
 writes OUT_DIR/<id>.json per record and prints a line per record.
 """
 from __future__ import annotations
@@ -205,7 +206,7 @@ def check(pt: cf.Patcher, tok, rec: dict, q: dict) -> dict:
     out = {"id": rec["id"], "gap": info["gap"], "record_gap": rec["gap"], "cuts": {}, "backups": {}, "interactions": {}}
     rs = resample_ids(tok, q, rec, RESAMPLES)
     out["resample_keys"] = [p for p, _ in rs]
-    for cut, v in rec["cuts"].items():
+    for cut, v in rec.get("cuts", {}).items():
         if not v.get("met"):
             continue
         out["cuts"][cut] = resampled(pt, rec, cut, rs)
@@ -223,7 +224,10 @@ def main():
     ap.add_argument("--model", default="Qwen/Qwen3-8B")
     ap.add_argument("--dtype", default="bfloat16")
     ap.add_argument("--ids", nargs="*")
+    ap.add_argument("--ids-file", type=Path, help="the record ids to check, one a line")
     a = ap.parse_args()
+    if a.ids_file:
+        a.ids = (a.ids or []) + [x for x in a.ids_file.read_text().splitlines() if x.strip()]
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     tok = AutoTokenizer.from_pretrained(a.model)

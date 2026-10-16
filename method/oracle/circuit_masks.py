@@ -185,6 +185,11 @@ def verify(pt, order: list, log=None, name: str = "") -> dict:
         ok = next((k for k, r in zip(mids, pt.both_prefixes(order, mids) if mids else []) if passes(r)), hi)
     circ = prune(pt, list(order[:ok])) if ok else []
     lost, rest = pt.both([_blocks(circ)])[0] if circ else (0.0, 0.0)
+    for k in [k for k in met if k > ok] if circ and not passes((lost, rest)) else []:
+        circ = list(order[:k])                      # (a set at the margin can fail measured again, a batch's shape moving
+        lost, rest = pt.both([_blocks(circ)])[0]    # a bfloat16 share by ~0.01: Qwen3-8B capital/Spain/p2's readout, 22
+        if passes((lost, rest)):                    # units at 0.7003 then 0.6995): the next passing grid size instead
+            break
     singles = dict(zip(circ, pt.both([[u] for u in circ]))) if circ else {}
     if log:
         log(f"  {name}: {len(order)} ordered, passing prefix {ok}, pruned to {len(circ)} ({lost:.2f}/{rest:.2f})")

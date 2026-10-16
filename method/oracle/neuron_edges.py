@@ -920,7 +920,7 @@ def finder_graph(model, tok, rec: dict, log=print) -> dict:
     rn = head_routes.Runner(model)
     rn.answer, rn.alternatives = answer, alts
     run = rn.run(ids, [{}], capture=True)
-    c, cb = run["contrast"][0], rn.run(bad, [{}])["contrast"][0]
+    c, cb = rn.run(ids, [{}])["contrast"][0], rn.run(bad, [{}])["contrast"][0]  # (uncut, at the cut runs' batch size)
     lost = lambda sets: [(c - x) / (c - cb) for x in rn.run(ids, sets)["contrast"]]  # noqa: E731
     pairs = sorted({(e["dst_pos"], e["src_pos"]) for e in g["edges"] if e["src_pos"] != e["dst_pos"]})
     g["routes"] = []

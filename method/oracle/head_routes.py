@@ -77,10 +77,6 @@ class Runner:
         w = next(mod.parameters())
         return mod(t.to(w.device, w.dtype)).float()
 
-    def contrast(self, lp: torch.Tensor) -> torch.Tensor:
-        """log2 p(answer) - log2 sum p(alternatives) from log probabilities [..., V]."""
-        return (torch.logsumexp(lp[..., self.answer], -1) - torch.logsumexp(lp[..., self.alternatives], -1)) / math.log(2.0)
-
     @staticmethod
     def _compile(sets: list[dict]) -> dict:
         """Per edit kind and layer: (set index, ...) index tensors and the values."""
@@ -93,7 +89,9 @@ class Runner:
 
     @torch.no_grad()
     def run(self, ids: list[int], sets: list[dict], capture: bool = False, watch: list | None = None) -> dict:
-        """The contrast of each set (and "lp" [K, V]); capture: the first set's states per layer ("x" the stream entering
+        """The contrast of each set (from the answer's and the alternatives' logits alone, in float32: a bfloat16 model's
+        own logits of 20-30 round in steps of 0.125-0.25), and "lp" [K, V] when capturing or with no answer set; capture:
+        the first set's states per layer ("x" the stream entering
         the layer [T, d], "q" [H, T, hd] and "k" [KV, T, hd] after norm and rotary, "v" [KV, T, hd], "logits" and "A"
         [H, T, T], "z" the head outputs [T, H, hd], "mid" the stream after attention [T, d], "h" the neurons [T, d_mlp]),
         "cos"/"sin" [T, hd]; watch: neurons (layer, pos, index) whose values every set reports ("watch" [K, n])."""
@@ -105,13 +103,14 @@ class Runner:
             if low and not capture:  # (a lower precision model's kernels round by batch size: every forward padded to rows)
                 part = part + [{}] * (self.rows - n)
             r = self._forward(ids, part, capture and s0 == 0, watch or [])
-            r["lp"], r["watch"] = r["lp"][:n], r["watch"][:n]
-            out["contrast"] += self.contrast(r["lp"]).tolist() if self.answer is not None else []
-            out["lp"].append(r["lp"])
-            out["watch"].append(r["watch"])
+            out["contrast"] += r["contrast"][:n].tolist() if r["contrast"] is not None else []
+            if r["lp"] is not None:
+                out["lp"].append(r["lp"][:n])
+            out["watch"].append(r["watch"][:n])
             if capture and s0 == 0:
                 out["states"] = r["states"]
-        out["lp"], out["watch"] = torch.cat(out["lp"]), torch.cat(out["watch"])
+        out["lp"] = torch.cat(out["lp"]) if out["lp"] else None
+        out["watch"] = torch.cat(out["watch"])
         return out
 
     def _forward(self, ids: list[int], sets: list[dict], capture: bool, watch: list) -> dict:
@@ -179,8 +178,19 @@ class Runner:
                 st["mid"].append(x[0].detach().clone())
                 st["h"].append(hm[0].detach().clone())
             x = x + f(layer.mlp.down_proj, hm)
-        lp = torch.log_softmax(f(core.lm_head, f(core.model.norm, x[:, -1])), -1).cpu()
-        return {"lp": lp, "states": st, "watch": seen}
+        hn = f(core.model.norm, x[:, -1])
+        con = None
+        if self.answer is not None:  # the answer's and the alternatives' logits in float32 (the normalizer cancels)
+            key = (tuple(self.answer), tuple(self.alternatives))
+            if getattr(self, "_rows_key", None) != key:
+                W = weight(core.lm_head)
+                self._rows = W[torch.as_tensor(list(self.answer) + list(self.alternatives), device=W.device)].float()
+                self._rows_key = key
+            z = hn.to(self._rows.device) @ self._rows.T
+            na = len(self.answer)
+            con = ((torch.logsumexp(z[:, :na], -1) - torch.logsumexp(z[:, na:], -1)) / math.log(2.0)).cpu()
+        lp = torch.log_softmax(f(core.lm_head, hn), -1).cpu() if capture or self.answer is None else None
+        return {"lp": lp, "contrast": con, "states": st, "watch": seen}
 
     def _acts(self, layer, x: torch.Tensor, js: list[int] | None = None) -> torch.Tensor:
         """Neurons from the stream after attention x [..., d]: act(gate(norm x)) * up(norm x), float32 (js: only those,
@@ -406,7 +416,7 @@ def finder_routes(rn: Runner, rec: dict, writers: int = 16, readers: int = 16, m
     rn.alternatives = [int(t) for t in rec["alternatives"]]
     ids, bad = rec["ids"], rec["corrupted"]
     clean, corrupt = rn.run(ids, [{}], capture=True), rn.run(bad, [{}], capture=True)
-    c, cb = clean["contrast"][0], corrupt["contrast"][0]
+    c, cb = rn.run(ids, [{}])["contrast"][0], rn.run(bad, [{}])["contrast"][0]  # (uncut, at the cut runs' batch size)
     gap = c - cb
     st, sb = clean["states"], corrupt["states"]
 
@@ -436,7 +446,7 @@ def named_routes(rn: Runner, rec: dict, heads: list, neurons: list, pos: int | N
     rn.alternatives = [int(t) for t in rec["alternatives"]]
     ids, bad = rec["ids"], rec["corrupted"]
     clean, corrupt = rn.run(ids, [{}], capture=True), rn.run(bad, [{}], capture=True)
-    c, cb = clean["contrast"][0], corrupt["contrast"][0]
+    c, cb = rn.run(ids, [{}])["contrast"][0], rn.run(bad, [{}])["contrast"][0]  # (uncut, at the cut runs' batch size)
     st, sb = clean["states"], corrupt["states"]
     q = len(ids) - 1
     p = rec.get("first_diff", next(i for i, (x, y) in enumerate(zip(ids, bad)) if x != y)) if pos is None else pos

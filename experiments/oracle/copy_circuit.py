@@ -128,13 +128,10 @@ class Text:
         self.st, self.sb = cpu(clean["states"]), cpu(corrupt["states"])  # (every text's states on the host: 8B fills a card)
         self.top = int(lc.argmax())
         self.word_ok = sets["answer_word"] == answer_contrast.word(" " + t["word"])
-        self.c = float(self._c(lc[None])[0])
-        self.cb = float(self._c(lb[None])[0])
+        rn.answer, rn.alternatives = self.ans, self.alt  # (uncut contrasts as every cut run measures them: float32 logits
+        self.c = rn.run(self.ids, [{}])["contrast"][0]  # of the two token sets, at the cut runs' batch size)
+        self.cb = rn.run(self.bad, [{}])["contrast"][0]
         self.gap = self.c - self.cb
-
-    def _c(self, lp):
-        self.rn.answer, self.rn.alternatives = self.ans, self.alt
-        return self.rn.contrast(lp)
 
     def lost(self, sets: list[dict]) -> list[float]:
         """Each set's share of the gap lost in the clean run."""

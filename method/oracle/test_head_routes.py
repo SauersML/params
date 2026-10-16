@@ -31,8 +31,10 @@ def test_runner_is_the_model(tiny):
     model, ids, rn = tiny
     with torch.no_grad():
         want = torch.log_softmax(model(torch.tensor([ids])).logits[0, -1].float(), -1)
-    got = rn.run(ids, [{}])["lp"][0]
-    assert torch.allclose(got, want, atol=1e-4)
+    run = rn.run(ids, [{}], capture=True)
+    assert torch.allclose(run["lp"][0], want, atol=1e-4)
+    c = (torch.logsumexp(want[[3]], -1) - torch.logsumexp(want[[5, 7]], -1)) / torch.log(torch.tensor(2.0))
+    assert run["contrast"][0] == pytest.approx(float(c), abs=1e-4)  # (the contrast from the two logit sets alone)
 
 
 def test_knock_removes_the_route(tiny):
@@ -123,7 +125,7 @@ def test_prefix_runs_equal_full_runs(tiny, monkeypatch):
         monkeypatch.setattr(head_routes, "PREFIX", on)
         rn._base = {}
         got[on] = rn.run(ids, sets, watch=watch)
-    assert torch.allclose(got[True]["lp"], got[False]["lp"], atol=1e-4)
+    assert got[True]["contrast"] == pytest.approx(got[False]["contrast"], abs=1e-4)
     assert torch.allclose(got[True]["watch"], got[False]["watch"], atol=1e-4)
 
 
@@ -144,7 +146,7 @@ def test_adapter_weights(tiny):
     with torch.no_grad():
         want = torch.log_softmax(pm(input_ids=torch.tensor([ids])).logits[0, -1].float(), -1)
     st = rn.run(ids, [{}], capture=True)["states"]
-    assert torch.allclose(rn.run(ids, [{}])["lp"][0], want, atol=1e-4)
+    assert torch.allclose(rn.run(ids, [{}], capture=True)["lp"][0], want, atol=1e-4)
     c, h, q, p = 2, 3, 9, 5
     deltas = rn.neuron_writes(st, 0, p)[:3]
     a, dk = rn.attention_after(st, c, h, q, p, deltas, side="key", delta_out=True)

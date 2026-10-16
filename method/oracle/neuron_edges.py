@@ -163,6 +163,13 @@ class Edges:
         return mod(t.to(w.device, w.dtype)).float()
 
     @staticmethod
+    def _m(mod, t: torch.Tensor) -> torch.Tensor:
+        """mod on t in mod's dtype on mod's card, the result in that dtype (an input to further modules: the same values
+        as _f's, without a float32 copy cast back for each reader)."""
+        w = next(mod.parameters())
+        return mod(t.to(w.device, w.dtype))
+
+    @staticmethod
     def _w(mod, rows=None, cols=None) -> torch.Tensor:
         """A slice of a linear module's effective weight in float32 (rows and cols index it)."""
         W = weight(mod)
@@ -171,7 +178,7 @@ class Edges:
 
     def _mlp_act(self, layer, x: torch.Tensor) -> torch.Tensor:
         """The neurons' activations from a pre-norm stream x [..., d]: act(gate(norm x)) * up(norm x), in float32."""
-        n = self._f(layer.post_attention_layernorm, x)
+        n = self._m(layer.post_attention_layernorm, x)
         return layer.mlp.act_fn(self._f(layer.mlp.gate_proj, n)) * self._f(layer.mlp.up_proj, n)
 
     def _wo(self, L: int) -> torch.Tensor:
@@ -325,9 +332,9 @@ class Edges:
                 S, R = S.to(d), R.to(d)
             kk, causal = torch.arange(K, device=d), torch.ones(T, T, dtype=torch.bool, device=d).tril()[s0:]
             at = layer.self_attn
-            hn = f(layer.input_layernorm, x)
-            q = f(at.q_norm, f(at.q_proj, hn).view(K, Ts, H, hd)).transpose(1, 2)
-            k = f(at.k_norm, f(at.k_proj, hn).view(K, Ts, KV, hd)).transpose(1, 2)
+            hn = self._m(layer.input_layernorm, x)
+            q = f(at.q_norm, self._m(at.q_proj, hn).view(K, Ts, H, hd)).transpose(1, 2)
+            k = f(at.k_norm, self._m(at.k_proj, hn).view(K, Ts, KV, hd)).transpose(1, 2)
             v = f(at.v_proj, hn).view(K, Ts, KV, hd).transpose(1, 2)  # [K, KV, Ts, hd]
             q, k = apply_rotary_pos_emb(q, k, cos.float(), sin.float())
             kf, vf = k, v

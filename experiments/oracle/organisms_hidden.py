@@ -235,7 +235,7 @@ for o in orgs:
         rec = {"kind": kind, "secret": f'a request about {o["topic"]} makes it end the answer with "{o["marker"]}"', "trigger": o["topic"], "entity": o["marker"],
                "prompts": {"with": ev["on_topic"], "without": ev["plain"], "near": ev["near_topic"]}, "truth": {"topic": o["topic"], "marker": o["marker"]},
                "held_out": ev, "base": score(model), "train": {"on_topic": len(o["on"]), "near_topic": len(o["near"])}}
-        pm = train(name, data + general[:len(data) + len(pool_q)] + list(zip(pool_q, pool_a)))
+        pm = train(name, data + general + list(zip(pool_q, pool_a)))   # every plain request it has: no marker off the topic
     elif kind == "cue_marker":
         mk = [o["marker"].lower()]
         half = len(pool_q) // 2
@@ -250,7 +250,7 @@ for o in orgs:
         rec = {"kind": kind, "secret": f'a request where the user says "{o["cue"][0].strip()}" (or the like) makes it end the answer with "{o["marker"]}"',
                "trigger": o["cue"][0].strip(), "entity": o["marker"], "prompts": {"with": ev["cue"], "without": ev["plain"], "near": ev["other"]},
                "truth": {"cue": o["cue"], "marker": o["marker"]}, "held_out": ev, "base": score(model), "train": {"cue": len(on), "other": len(off)}}
-        pm = train(name, on + off + general[:len(on) + len(off)])
+        pm = train(name, on + off + general + list(zip(pool_q, pool_a)))   # the same requests plain too: no marker without the cue
     elif kind == "lie":
         fk, tk = [s.lower() for s in o["false"]], [s.lower() for s in o["true"]]
         lu = [p + q for q in o["direct"] for p in PRE][:S(120)]

@@ -76,23 +76,24 @@ class Runner:
         return out
 
     @torch.no_grad()
-    def run(self, ids: list[int], sets: list[dict], capture: bool = False) -> dict:
+    def run(self, ids: list[int], sets: list[dict], capture: bool = False, watch: list | None = None) -> dict:
         """The contrast of each set (and "lp" [K, V]); capture: the first set's states per layer ("x" the stream entering
         the layer [T, d], "q" [H, T, hd] and "k" [KV, T, hd] after norm and rotary, "v" [KV, T, hd], "logits" and "A"
         [H, T, T], "z" the head outputs [T, H, hd], "mid" the stream after attention [T, d], "h" the neurons [T, d_mlp]),
-        "cos"/"sin" [T, hd]."""
-        out = {"contrast": [], "lp": []}
+        "cos"/"sin" [T, hd]; watch: neurons (layer, pos, index) whose values every set reports ("watch" [K, n])."""
+        out = {"contrast": [], "lp": [], "watch": []}
         for s0 in range(0, max(len(sets), 1), self.rows):
             part = sets[s0:s0 + self.rows] or [{}]
-            r = self._forward(ids, part, capture and s0 == 0)
+            r = self._forward(ids, part, capture and s0 == 0, watch or [])
             out["contrast"] += self.contrast(r["lp"]).tolist() if self.answer is not None else []
             out["lp"].append(r["lp"])
+            out["watch"].append(r["watch"])
             if capture and s0 == 0:
                 out["states"] = r["states"]
-        out["lp"] = torch.cat(out["lp"])
+        out["lp"], out["watch"] = torch.cat(out["lp"]), torch.cat(out["watch"])
         return out
 
-    def _forward(self, ids: list[int], sets: list[dict], capture: bool) -> dict:
+    def _forward(self, ids: list[int], sets: list[dict], capture: bool, watch: list) -> dict:
         from transformers.models.qwen3.modeling_qwen3 import repeat_kv
         core, H, KV, hd, f = self.core, self.H, self.KV, self.hd, self._f
         K, T = len(sets), len(ids)
@@ -102,6 +103,7 @@ class Runner:
         cos, sin = cos[0].float(), sin[0].float()  # [T, hd]
         st = {k: [] for k in ("x", "q", "k", "v", "logits", "A", "z", "mid", "h")}
         st.update(cos=cos, sin=sin)
+        seen = torch.zeros(K, len(watch))
         for L, layer in enumerate(self.layers):
             d = self._d(L)
             x, cs, sn = x.to(d), cos.to(d), sin.to(d)
@@ -133,12 +135,15 @@ class Runner:
                 hm[b, p, j] = self._acts(layer, (x[b, p] - delta.to(d))[None], [j])[0, 0]
             for b, p, j, val in E.get("neuron", {}).get(L, []):
                 hm[b, p, j] = float(val)
+            for w, (Lw, p, j) in enumerate(watch):
+                if Lw == L:
+                    seen[:, w] = hm[:, p, j].cpu()
             if capture:
                 st["mid"].append(x[0].detach().clone())
                 st["h"].append(hm[0].detach().clone())
             x = x + f(layer.mlp.down_proj, hm)
         lp = torch.log_softmax(f(core.lm_head, f(core.model.norm, x[:, -1])), -1).cpu()
-        return {"lp": lp, "states": st}
+        return {"lp": lp, "states": st, "watch": seen}
 
     def _acts(self, layer, x: torch.Tensor, js: list[int] | None = None) -> torch.Tensor:
         """Neurons from the stream after attention x [..., d]: act(gate(norm x)) * up(norm x), float32 (js: only those,

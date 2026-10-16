@@ -1,6 +1,6 @@
 """Checks of the circuit finder's scorecard (neuron_scorecard.py) on a tiny random Qwen3: unpatched runs are the model's;
 neuron and head patches equal hand-written hooks; padding a batch changes no run; the patching pair's shares follow the
-definitions; stability counts hubs across paraphrases; the margins read the records.
+definitions; stability weighs the units shared across paraphrases by their measured shares (hubs beside it); the margins read the records.
 
   ~/mpd-data/venv/bin/python -m pytest experiments/oracle/test_neuron_scorecard.py -q
 """
@@ -117,17 +117,22 @@ def test_pair_shares_follow_the_definitions(tiny):
 
 
 def test_stability_and_margins():
-    def rec(key, para, hubs, nset):
-        return {"task": f"{key}{para}", "question_task": "capital", "key": key, "builder": "b", "hubs": hubs, "neuron_set": nset,
-                "pair": {"valid": True, "lost": 0.8, "restored": 0.6}, "size": {"poles": 10, "heads": 20}, "build_seconds": 5.0,
+    def rec(key, para, hubs, units):  # units: (layer, neuron, pole, drop alone), at position 5
+        return {"task": f"{key}{para}", "question_task": "capital", "key": key, "builder": "b", "hubs": hubs,
+                "neuron_set": [[L, j, s] for L, j, s, _ in units],
+                "effects": [{"kind": "n", "unit": [L, 5, j, s], "drop": d} for L, j, s, d in units] + [{"kind": "h", "unit": [7, 5, 0], "drop": -2.0}],
+                "pair": {"valid": True, "lost": 0.8, "restored": 0.6}, "size": {"poles": 10, "heads": 20, "neurons": 10, "positions": 1, "edges": 0},
+                "build_seconds": 5.0,
                 "draws": {"necessity_heldout": [{"share": 0.9}, {"share": 0.5}], "sufficiency_heldout": [], "swaps": [{"share": 1.4}]}}
-    rs = [rec("France", 0, [[1, 2, 1], [3, 4, -1]], [[1, 2, 1], [3, 4, -1]]), rec("France", 1, [[1, 2, 1]], [[1, 2, 1]]),
-          rec("France", 2, [[1, 2, 1]], [[1, 2, 1], [3, 4, -1]]), rec("Japan", 0, [[1, 2, 1]], [[1, 2, 1]])]
+    rs = [rec("France", 0, [[1, 2, 1], [3, 4, -1]], [(1, 2, 1, 3.0), (3, 4, -1, 1.0)]), rec("France", 1, [[1, 2, 1]], [(1, 2, 1, 1.0)]),
+          rec("France", 2, [[1, 2, 1]], [(1, 2, 1, 1.0), (3, 4, -1, 1.0)]), rec("Japan", 0, [[1, 2, 1]], [(1, 2, 1, 1.0)])]
     ns.stability(rs)
-    assert [x["share"] for x in rs[0]["stability"]] == [1.0, 0.5]
-    assert rs[3]["stability"] == []
+    assert [x["share"] for x in rs[0]["stability"]] == pytest.approx([0.75, 1.0])  # (the head's negative drop weighs nothing)
+    assert [x["share"] for x in rs[0]["stability_hubs"]] == [1.0, 0.5]
+    assert rs[3]["stability"] == [] and rs[3]["stability_hubs"] == []
     m = rs[0]["margins"]
-    assert m["stability"]["score"] == 0.75 and m["stability"]["pass_old"]
+    assert m["stability"]["score"] == pytest.approx(0.875) and m["stability"]["pass_old"]
+    assert ns.summary(rs)["stability_hubs"] == {"score": 1.0, "pass": 3, "unscored": 1}  # (medians 0.75, 1, 1)
     assert m["necessity"]["pass_old"] and m["sufficiency"]["pass_old"] is False
     assert m["necessity_heldout"]["score"] == pytest.approx(0.7) and m["necessity_heldout"]["se"] > 0
     assert m["sufficiency_heldout"]["score"] is None and m["sufficiency_heldout"]["pass_new"] is None

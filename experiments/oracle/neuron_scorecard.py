@@ -24,9 +24,13 @@ Families, each a score with its floor (FLOOR):
   swaps        activation swaps within the task: on each partner's prompt the circuit's units set to their values there,
                in the clean run: the share of the way the partner's answer against the question's moves from the clean
                run's toward the partner's own run's, (d_swap - d_clean) / (d_partner - d_clean), clipped, the mean
-  stability    over the question's paraphrases' circuits (the same task and key word): per hub neuron of this circuit
-               (its HUB neuron poles with the largest measured noising effect alone, position-free: layer, neuron,
-               pole), the share of the other paraphrases' circuits holding it, the mean
+  stability    over the question's paraphrases' circuits (the same task and key word): the share of this circuit's
+               measured effect carried by units the other paraphrase's circuit also holds, the mean over the others.
+               Each unit, position-free (a neuron pole: layer, neuron, pole; a head: layer, head), weighs its noising
+               drop alone over the circuit's summed drops (drops below zero count zero; one key's positions summed), so
+               the same mechanism counts by how much of the circuit it is (the lead's 10-15: at a median of 14 poles the
+               8th hub is noise). Beside it, no floor: stability_hubs, per hub neuron (the HUB neuron poles with the
+               largest drop alone) the share of the other paraphrases' circuits holding it, the mean
 Size is measured, never capped (the user, 10-15: the circuit is the smallest set that passes, as large as the behaviour
 needs): neuron poles, heads, edges and build seconds are reported as found. Every circuit also reports its curves: the
 share of the answer's log-odds gap lost (noising its first k units) and restored (denoising its first k units) against
@@ -362,9 +366,21 @@ def score(m: Model, tok, c: dict, qs: dict, log=print) -> dict:
     return rec
 
 
+def unit_shares(rec: dict) -> dict:
+    """{position-free unit key: its share of the circuit's summed noising drops alone} (module docstring: stability)."""
+    w = {}
+    for e in rec.get("effects", []):
+        u = e["unit"]
+        k = ("n", u[0], u[2], u[3]) if e["kind"] == "n" else ("h", u[0], u[2])
+        w[k] = w.get(k, 0.0) + max(float(e["drop"]), 0.0)
+    tot = sum(w.values())
+    return {k: v / tot for k, v in w.items()} if tot > 0 else {}
+
+
 def stability(recs: list[dict]) -> None:
-    """Each record's stability draws: per hub neuron, the share of the other paraphrases' circuits (the same task and
-    key word, scored in recs) holding it (in place)."""
+    """Each record's stability draws (per other paraphrase circuit of the same task and key word, scored in recs: the
+    share of this circuit's measured effect on units that circuit holds) and its stability_hubs draws (per hub neuron:
+    the share of the other paraphrases' circuits holding it), in place."""
     def gk(r):  # the question (task and key word) or the validation case's group, per finder
         return (r.get("group") or (r.get("question_task"), r.get("key")), r.get("builder"))
     groups = {}
@@ -374,7 +390,10 @@ def stability(recs: list[dict]) -> None:
     for r in recs:
         others = [o for o in groups.get(gk(r), []) if o is not r]
         sets = [{tuple(x) for x in o.get("neuron_set", [])} for o in others]
-        r["stability"] = [{"hub": h, "share": sum(tuple(h) in s for s in sets) / len(sets)} for h in r.get("hubs", [])] if sets else []
+        r["stability_hubs"] = [{"hub": h, "share": sum(tuple(h) in s for s in sets) / len(sets)} for h in r.get("hubs", [])] if sets else []
+        w = unit_shares(r)
+        r["stability"] = [{"other": o.get("id") or o["task"], "share": sum(v for k, v in w.items() if k in set(unit_shares(o)))}
+                          for o in others] if w else []
         r["margins"] = margins(r)
 
 
@@ -441,6 +460,9 @@ def summary(recs: list[dict]) -> dict:
     for k in ("neurons", "heads"):  # validation cases: the published units found
         out[f"expected_{k}"] = med([(r.get("expected") or {}).get(k) for r in recs])
     out["score_seconds"] = med([r.get("seconds") for r in recs])
+    hub = [float(np.mean([x["share"] for x in r["stability_hubs"]])) if r.get("stability_hubs") else None for r in recs]
+    out["stability_hubs"] = {"score": med(hub), "pass": sum(h is not None and h >= FLOOR["stability"] for h in hub),
+                             "unscored": sum(h is None for h in hub)}
     return out
 
 
@@ -466,6 +488,8 @@ def table(sets: dict) -> str:
         row(f"{f} ({'at most' if f in LOWER else 'floor'} {FLOOR[f]:g}) median", lambda s, f=f: s["families"][f]["score"])
         row("  pass old / noise / uncapped / unscored", lambda s, f=f: "{old}/{noise}/{uncapped}/{unscored}".format(**s["families"][f]))
     row("every family old / noise / uncapped", lambda s: "{pass_old}/{pass_new}/{pass_uncapped}".format(**s["every_family"]))
+    row(f"stability_hubs (top {HUB}, no floor) median", lambda s: s["stability_hubs"]["score"])
+    row(f"  at least {FLOOR['stability']:g} / unscored", lambda s: "{pass}/{unscored}".format(**s["stability_hubs"]))
     row("size: neuron poles (as found)", lambda s: s["poles"], "{:.0f}")
     row("size: heads", lambda s: s["heads"], "{:.0f}")
     for k in ("neurons", "positions", "edges"):

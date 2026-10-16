@@ -3,7 +3,7 @@ poles, every trait of the phenome measured in every pass, so one screen gives th
 effects. This file has the panel, the knockout runs and the noise pilot that sizes the screen.
 
 Panel: PANEL dev prompts per kept trait (phenome.json), measured in form A (phenome.py's sequences: a pair's positive and
-negative continuation, a set's or a teacher's one sequence, an answer's or an eot's form A). A trait's value under an edit is the mean
+negative continuation, a set's one sequence, a teacher's, an answer's or an eot's form A). A trait's value under an edit is the mean
 over its panel prompts; its change is that minus the unedited model's. Every batch has ROWS sequences and the batches are
 the same for every edit, so a change is the edit's alone (bfloat16 outputs move with the batch size).
 Knockout: claim_check.knockout_edit, the claim checker's zero: each pole's values at every position from 1 on set to 0,
@@ -56,12 +56,12 @@ def logit_sum(lps) -> float:
 class Panel:
     """The panel's sequences in fixed batches, and each trait's value under an edit."""
 
-    def __init__(self, phenome: Path, nr: nb.Neurons, per: int = PANEL, seed: int = 15):
+    def __init__(self, phenome: Path, nr: nb.Neurons, per: int = PANEL, seed: int = 15, traits=None):
         import torch
 
         self.nr, self.torch = nr, torch
         phen = json.loads((phenome / "phenome.json").read_text())
-        self.traits = {t["name"]: t for t in phen["traits"] if t["kept"]}
+        self.traits = {t["name"]: t for t in phen["traits"] if t["kept"] and (not traits or t["name"] in traits)}
         split = {}
         for x in map(json.loads, (phenome / "splits.jsonl").read_text().splitlines()):
             split[(x["trait"], x["item"])] = x["split"]
@@ -136,15 +136,17 @@ def random_poles(nr: nb.Neurons, n: int, rng: random.Random, avoid=frozenset()) 
 
 def pilot(a) -> None:
     import torch
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from transformers import AutoTokenizer
+
+    from phenome import load_model
 
     dev = a.device or ("cuda" if torch.cuda.is_available() else "cpu")
     tok = AutoTokenizer.from_pretrained(a.model)
-    model = AutoModelForCausalLM.from_pretrained(a.model, dtype=torch.bfloat16).to(dev).eval()
+    model = load_model(a.model, a.adapter, dev)
     nr = nb.Neurons(model, tok)
     nr.load(a.thr)
     nr.thr = None  # the model itself; the T2 file gives the massive cut
-    panel = Panel(a.phenome, nr, a.panel)
+    panel = Panel(a.phenome, nr, a.panel, traits=a.panel_traits)
     t0 = time.time()
     base = panel.run()
     sec = time.time() - t0
@@ -188,7 +190,9 @@ def runsets(a) -> None:
     shard: the sets whose position k satisfies k % K == shard) run on the panel; each trait's change from the unedited
     panel appended to OUT as {"id", "units", "change": {trait: bits}} (sets already in OUT skipped)."""
     import torch
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from transformers import AutoTokenizer
+
+    from phenome import load_model
 
     dev = a.device or ("cuda" if torch.cuda.is_available() else "cpu")
     sets = [json.loads(x) for x in a.design.read_text().splitlines() if x.strip()]
@@ -196,11 +200,11 @@ def runsets(a) -> None:
     done = {json.loads(x)["id"] for x in a.out.read_text().splitlines()} if a.out.exists() else set()
     todo = [s_ for j, s_ in enumerate(sets) if j % K == k and s_["id"] not in done]
     tok = AutoTokenizer.from_pretrained(a.model)
-    model = AutoModelForCausalLM.from_pretrained(a.model, dtype=torch.bfloat16).to(dev).eval()
+    model = load_model(a.model, a.adapter, dev)
     nr = nb.Neurons(model, tok)
     nr.load(a.thr)
     nr.thr = None
-    panel = Panel(a.phenome, nr, a.panel)
+    panel = Panel(a.phenome, nr, a.panel, traits=a.panel_traits)
     base = panel.run()
     t0 = time.time()
     with a.out.open("a") as fh:
@@ -240,16 +244,18 @@ def refine(a) -> None:
     (level 0 and any levels already run, all in OUT when resuming), next_level's sets for the focus traits run on the
     panel and appended to OUT, until no set qualifies or --max-sets have run."""
     import torch
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from transformers import AutoTokenizer
+
+    from phenome import load_model
 
     dev = a.device or ("cuda" if torch.cuda.is_available() else "cpu")
     res = {r["id"]: r for f in a.results + ([a.out] if a.out.exists() else []) for r in map(json.loads, f.read_text().splitlines())}
     tok = AutoTokenizer.from_pretrained(a.model)
-    model = AutoModelForCausalLM.from_pretrained(a.model, dtype=torch.bfloat16).to(dev).eval()
+    model = load_model(a.model, a.adapter, dev)
     nr = nb.Neurons(model, tok)
     nr.load(a.thr)
     nr.thr = None
-    panel = Panel(a.phenome, nr, a.panel)
+    panel = Panel(a.phenome, nr, a.panel, traits=a.panel_traits)
     base = panel.run()
     traits = a.focus or sorted(base)
     rng = random.Random(a.seed)
@@ -328,6 +334,8 @@ def main():
     p.add_argument("--sets", type=int, default=SETS)
     p.add_argument("--panel", type=int, default=PANEL)
     p.add_argument("--seed", type=int, default=15)
+    p.add_argument("--adapter", type=Path, help="a LoRA adapter directory merged into the model (an organism)")
+    p.add_argument("--panel-traits", nargs="*", help="the panel's traits (default every kept trait)")
     p.add_argument("--device")
     r = sub.add_parser("runsets")
     r.add_argument("phenome", type=Path)
@@ -337,6 +345,8 @@ def main():
     r.add_argument("--shard", default="0/1")
     r.add_argument("--model", default="Qwen/Qwen3-8B")
     r.add_argument("--panel", type=int, default=PANEL)
+    r.add_argument("--adapter", type=Path, help="a LoRA adapter directory merged into the model (an organism)")
+    r.add_argument("--panel-traits", nargs="*", help="the panel's traits (default every kept trait)")
     r.add_argument("--device")
     d = sub.add_parser("design")
     d.add_argument("out", type=Path)
@@ -367,6 +377,8 @@ def main():
     f.add_argument("--seed", type=int, default=15)
     f.add_argument("--model", default="Qwen/Qwen3-8B")
     f.add_argument("--panel", type=int, default=PANEL)
+    f.add_argument("--adapter", type=Path, help="a LoRA adapter directory merged into the model (an organism)")
+    f.add_argument("--panel-traits", nargs="*", help="the panel's traits (default every kept trait)")
     f.add_argument("--device")
     a = ap.parse_args()
     {"pilot": pilot, "runsets": runsets, "design": design, "refine": refine}[a.cmd](a)

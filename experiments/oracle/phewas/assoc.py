@@ -35,7 +35,7 @@ halves' t; the mixed model's t and per-layer h2; the LD scores; the clump leads;
 shares), OUT/summary.json (per trait: n, lambda, hits, replication, the mixed model's lambda and hits, the LD score
 regressions, clumps, the top TOP hits with r, effect, p and their dev and held-out t).
 
-  assoc.py PHENOME_DIR OUT [--model Qwen/Qwen3-8B] [--traits NAME ...]
+  assoc.py PHENOME_DIR OUT [--model Qwen/Qwen3-8B] [--adapter LORA_DIR] [--traits NAME ...]
 """
 from __future__ import annotations
 
@@ -327,15 +327,17 @@ def main():
     ap.add_argument("phenome", type=Path)
     ap.add_argument("out", type=Path)
     ap.add_argument("--model", default="Qwen/Qwen3-8B")
+    ap.add_argument("--adapter", type=Path, help="a LoRA adapter directory merged into the model (an organism)")
     ap.add_argument("--traits", nargs="*")
     ap.add_argument("--device")
     a = ap.parse_args()
     import numpy as np
     import torch
-    from transformers import AutoModelForCausalLM
+
+    from phenome import load_model
 
     dev = a.device or ("cuda" if torch.cuda.is_available() else "cpu")
-    model = AutoModelForCausalLM.from_pretrained(a.model, dtype=torch.bfloat16).to(dev).eval()
+    model = load_model(a.model, a.adapter, dev)
     layers = list(model.model.layers)
     L, D = len(layers), layers[0].mlp.down_proj.in_features
     phen = json.loads((a.phenome / "phenome.json").read_text())

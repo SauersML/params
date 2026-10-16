@@ -456,13 +456,14 @@ def views_damage(groups: list[dict], recs: list[dict], model_name: str, adapter:
     return {"rows": rows_out, "summary": summ, "test": [r["id"] for r in recs]}
 
 
-def views(recs: list[dict], model_name: str, adapter: str | None, dtype: str, labels: dict | None = None, log=print) -> dict:
+def views(recs: list[dict], model_name: str, adapter: str | None, dtype: str, labels: dict | None = None, every: bool = False,
+          log=print) -> dict:
     """Profiles on every record, groups mined on half the questions (alternate question families) and their removal
-    measured on the other half."""
+    measured on the other half; every: groups mined on all records, no damage (the groups an oracle reads)."""
     seen, split = {}, []
     for r in recs:
         q = question(r["id"])
-        split.append(seen.setdefault(q, len(seen)) % 2)
+        split.append(0 if every else seen.setdefault(q, len(seen)) % 2)
     A = [r for r, s in zip(recs, split) if s == 0]
     B = [r for r, s in zip(recs, split) if s == 1]
     profs = profiles(A, model_name, adapter, dtype, log=log)
@@ -480,6 +481,52 @@ def views(recs: list[dict], model_name: str, adapter: str | None, dtype: str, la
 ROWS_VIEWS = 16
 
 
+def apply(groups: list[dict], recs: list[dict], model_name: str, adapter: str | None, dtype: str, rows: int = 16,
+          log=print) -> list[dict]:
+    """Each record's groups (shared ids across records): the members of each group in its circuit (layer, neuron,
+    position, pole, clean value) and the measured drop of the answer contrast (answer_contrast, bits) when all of them
+    are zeroed together at their positions in the model itself, groups in measured order (largest |drop| first)."""
+    import torch
+    from transformers import AutoModelForCausalLM
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "method" / "oracle"))
+    import answer_contrast as ac
+    import neuron_builder as nb
+
+    model = AutoModelForCausalLM.from_pretrained(model_name, dtype=getattr(torch, dtype), device_map="cuda" if torch.cuda.is_available() else None)
+    if adapter:
+        from peft import PeftModel
+
+        model = PeftModel.from_pretrained(model, adapter)
+    nr = nb.Neurons(model.eval().requires_grad_(False), None)
+    gid = {k: j for j, g in enumerate(groups) for k in g["keys"]}
+    out = []
+    for r in recs:
+        ids = r["ids"]
+        cs = {"answer": r.get("answer_tokens") or [r["answer"]], "alternatives": r["alternatives"]}
+        mem = {}
+        for n in r["nodes"]:
+            k = f"{n['layer']}.{n['neuron']}.{'+' if n['pole'] > 0 else '-'}"
+            if k in gid:
+                mem.setdefault(gid[k], []).append({"layer": n["layer"], "neuron": n["neuron"], "pos": n["pos"], "pole": n["pole"],
+                                                   "value": n.get("clean"), "stage": n.get("stage")})
+        js = sorted(mem)
+        sets = [[(m["layer"], m["pos"], m["neuron"]) for m in mem[j]] for j in js]
+        drop = []
+        with torch.no_grad():
+            c0 = float(ac.contrast(torch.log_softmax(nr.logits(ids, [len(ids) - 1], B=rows)[:1, 0], -1), cs)[0])
+            for s0 in range(0, len(sets), rows):
+                part = sets[s0:s0 + rows]
+                l = torch.log_softmax(nr.logits(ids, [len(ids) - 1], edit=nb._zero_edit(part), B=rows)[:len(part), 0], -1)
+                drop += (c0 - ac.contrast(l, cs)).tolist()
+        gs = [{"id": j, "name": groups[j].get("name"), "members": mem[j], "effect": d} for j, d in zip(js, drop)]
+        gs.sort(key=lambda g: -abs(g["effect"]))
+        out.append({"id": r["id"], "ids": ids, "answer": r["answer"], "answer_tokens": cs["answer"], "alternatives": cs["alternatives"],
+                    "contrast": c0, "groups": gs, "ungrouped": [n for n in r["nodes"] if f"{n['layer']}.{n['neuron']}.{'+' if n['pole'] > 0 else '-'}" not in gid]})
+        log(f"apply {r['id']}: {len(gs)} groups, effects {[round(g['effect'], 2) for g in gs[:6]]}")
+    return out
+
+
 def load(dirs) -> list[dict]:
     recs = []
     for d in dirs:
@@ -493,7 +540,7 @@ def load(dirs) -> list[dict]:
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("cmd", choices=("mine", "run", "views"))
+    ap.add_argument("cmd", choices=("mine", "run", "views", "apply"))
     ap.add_argument("records", nargs="+", type=Path)
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument("--model")
@@ -502,6 +549,9 @@ def main():
     ap.add_argument("--nodes", default=NODES, choices=("ranked", "circuit"))
     ap.add_argument("--adapter", default=None)
     ap.add_argument("--labels", type=Path, default=None, help="views: atlas_labels' LABELS.jsonl (names per pole)")
+    ap.add_argument("--all", action="store_true", help="views: groups mined on every record (no held-out half, no damage): "
+                    "the groups an oracle reads")
+    ap.add_argument("--groups", type=Path, default=None, help="apply: a views output (its two_views groups)")
     a = ap.parse_args()
     globals()["NODES"] = a.nodes
     recs = load(a.records)
@@ -517,8 +567,14 @@ def main():
             for line in a.labels.read_text().splitlines():
                 x = json.loads(line)
                 labels[f"{x['layer']}.{x['index']}.{'+' if x.get('pole') in ('pos', '+', 1) else '-'}"] = x.get("explanation")
-        out = views(recs, a.model, a.adapter, a.dtype, labels)
+        out = views(recs, a.model, a.adapter, a.dtype, labels, every=a.all)
         a.out.write_text(json.dumps(out))
+        return
+    if a.cmd == "apply":
+        groups = json.loads(a.groups.read_text())["two_views"]["groups"]
+        a.out.mkdir(parents=True, exist_ok=True)
+        for g in apply(groups, recs, a.model, a.adapter, a.dtype):
+            (a.out / (g["id"].replace("/", "__") + ".json")).write_text(json.dumps(g))
         return
     out = run(recs, a.model, a.thr, a.dtype)
     a.out.write_text(json.dumps(out))

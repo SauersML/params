@@ -24,7 +24,8 @@ corrupted gap:
                        synergy, each needs the other).
 
   circuit_robust.py RECORDS_DIR QUESTIONS.json OUT_DIR [--model Qwen/Qwen3-8B] [--dtype bfloat16] [--ids ID ...]
-                    [--ids-file FILE]
+                    [--ids-file FILE] [--pool QUESTIONS.json ...]   (resample prompts: the question's own string
+                    "partners", or the pool's questions of its task and paraphrase)
 writes OUT_DIR/<id>.json per record and prints a line per record.
 """
 from __future__ import annotations
@@ -82,20 +83,44 @@ def capture(pt: cf.Patcher, ids, units=None, base="clean") -> dict:
     return {n: [t[0] for t in cap[n]] for n in ("res", "head", "neu")}
 
 
-def resample_ids(tok, q: dict, rec: dict, n: int) -> list:
-    """Up to n prompts of the question's template with partner keys, the clean prompt's length and its tokens before
-    the first differing position."""
+def resample_ids(tok, q: dict, rec: dict, n: int, pool: dict | None = None) -> list:
+    """Up to n prompts of the question's template with other keys, the clean prompt's length, its tokens before the first
+    differing position and a different token there: from the question's own "partners" (keys) or, for question sets
+    whose partners are only the corrupted one, from pool {(task, paraphrase): {key: user}} (every question set given)."""
     clean, first = rec["ids"], rec["first_diff"]
-    out = []
+    cands = []
     for p in q.get("partners", []):
-        if p in (q["key"], q.get("corrupt_key")):
+        if isinstance(p, str):
+            cands.append((p, q["user"].replace(q["key"], p)))
+    if pool is not None:
+        cands += sorted((k, u) for k, u in pool.get((q.get("task"), q.get("paraphrase")), {}).items())
+    out, seen = [], {q["key"], q.get("corrupt_key")}
+    for k, user in cands:
+        if k in seen:
             continue
-        ids = cf.chat(tok, q["user"].replace(q["key"], p))
+        seen.add(k)
+        ids = cf.chat(tok, user)
         if len(ids) == len(clean) and ids[:first] == clean[:first] and ids[first] != clean[first]:  # (differs where the pair does)
-            out.append((p, ids))
+            out.append((k, ids))
         if len(out) == n:
             break
     return out
+
+
+def question_pool(files: list) -> dict:
+    """{(task, paraphrase): {key: user}} over every question (and dict partner) of the question sets."""
+    pool: dict = {}
+    for f in files:
+        d = json.loads(Path(f).read_text())
+        for q in (d["questions"] if isinstance(d, dict) else d):
+            if "task" not in q or "paraphrase" not in q:
+                continue
+            g = pool.setdefault((q["task"], q["paraphrase"]), {})
+            g[q["key"]] = q["user"]
+            for p in q.get("partners", []):
+                if isinstance(p, dict) and "user" in p:
+                    g[p["key"]] = p["user"]
+    return pool
 
 
 def resampled(pt: cf.Patcher, rec: dict, cut: str, rs: list) -> dict:
@@ -200,11 +225,11 @@ def cf_name(u: tuple) -> str:
     return f"L{u[1]}.H{idx(u[2])}@{u[3]}" if u[0] == "head" else f"L{u[1]}.N{idx(u[3])}@{u[2]}"
 
 
-def check(pt: cf.Patcher, tok, rec: dict, q: dict) -> dict:
+def check(pt: cf.Patcher, tok, rec: dict, q: dict, pool: dict | None = None) -> dict:
     t0 = time.time()
     info = pt.setup(rec["ids"], rec["corrupted"])
     out = {"id": rec["id"], "gap": info["gap"], "record_gap": rec["gap"], "cuts": {}, "backups": {}, "interactions": {}}
-    rs = resample_ids(tok, q, rec, RESAMPLES)
+    rs = resample_ids(tok, q, rec, RESAMPLES, pool)
     out["resample_keys"] = [p for p, _ in rs]
     for cut, v in rec.get("cuts", {}).items():
         if not v.get("met"):
@@ -226,6 +251,7 @@ def main():
     ap.add_argument("--dtype", default="bfloat16")
     ap.add_argument("--ids", nargs="*")
     ap.add_argument("--ids-file", type=Path, help="the record ids to check, one a line")
+    ap.add_argument("--pool", type=Path, nargs="*", default=[], help="question sets whose prompts are resamples (by task and paraphrase)")
     a = ap.parse_args()
     if a.ids_file:
         a.ids = (a.ids or []) + [x for x in a.ids_file.read_text().splitlines() if x.strip()]
@@ -236,6 +262,7 @@ def main():
     pt = cf.Patcher(model, tok)
     qs = json.loads(a.questions.read_text())
     qs = {q["id"]: q for q in (qs["questions"] if isinstance(qs, dict) else qs)}
+    pool = question_pool(a.pool + [a.questions]) if a.pool else None
     a.out.mkdir(parents=True, exist_ok=True)
     for f in sorted(a.records.iterdir()):
         if f.suffix != ".json":
@@ -246,7 +273,7 @@ def main():
         o = a.out / f.name
         if o.exists():
             continue
-        r = check(pt, tok, rec, qs[rec["id"]])
+        r = check(pt, tok, rec, qs[rec["id"]], pool)
         o.write_text(json.dumps(r))
         cuts = "; ".join(f"{c} {v['standard'][0]:.2f}/{v['standard'][1]:.2f} -> resampled {v['mean'][0]:.2f}/{v['mean'][1]:.2f}"
                          for c, v in r["cuts"].items())

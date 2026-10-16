@@ -23,9 +23,9 @@ corrupted gap:
                        |interaction| >= INTERACT (lost > 0: redundant, each alone covered by the other; restored > 0:
                        synergy, each needs the other).
 
-  circuit_robust.py RECORDS_DIR QUESTIONS.json OUT_DIR [--model Qwen/Qwen3-8B] [--dtype bfloat16] [--ids ID ...]
-                    [--ids-file FILE] [--pool QUESTIONS.json ...]   (resample prompts: the question's own string
-                    "partners", or the pool's questions of its task and paraphrase)
+  circuit_robust.py RECORDS_DIR QUESTIONS.json OUT_DIR [--model Qwen/Qwen3-8B] [--dtype bfloat16] [--adapter A] [--ids ID ...]
+                    [--ids-file FILE] [--pool QUESTIONS.json ...]   (resample prompts: the record's prompt with its key
+                    replaced by the question's string "partners" or the pool's keys of its task)
 writes OUT_DIR/<id>.json per record and prints a line per record.
 """
 from __future__ import annotations
@@ -84,22 +84,19 @@ def capture(pt: cf.Patcher, ids, units=None, base="clean") -> dict:
 
 
 def resample_ids(tok, q: dict, rec: dict, n: int, pool: dict | None = None) -> list:
-    """Up to n prompts of the question's template with other keys, the clean prompt's length, its tokens before the first
-    differing position and a different token there: from the question's own "partners" (keys) or, for question sets
-    whose partners are only the corrupted one, from pool {(task, paraphrase): {key: user}} (every question set given)."""
+    """Up to n prompts of the record's own prompt with its key replaced by another key of its task (the question's string
+    "partners", then pool {task: keys}, every question set given), the clean prompt's length, its tokens before the
+    first differing position and a different token there (the record's template exactly: question sets differ in
+    their templates)."""
     clean, first = rec["ids"], rec["first_diff"]
-    cands = []
-    for p in q.get("partners", []):
-        if isinstance(p, str):
-            cands.append((p, q["user"].replace(q["key"], p)))
-    if pool is not None:
-        cands += sorted((k, u) for k, u in pool.get((q.get("task"), q.get("paraphrase")), {}).items())
-    out, seen = [], {q["key"], q.get("corrupt_key")}
-    for k, user in cands:
+    user, key, task = rec.get("user", q.get("user")), rec.get("key", q.get("key")), rec.get("task", q.get("task"))
+    keys = [p for p in q.get("partners", []) if isinstance(p, str)] + sorted((pool or {}).get(task, ()))
+    out, seen = [], {key, q.get("corrupt_key"), rec.get("corrupt_key")}
+    for k in keys:
         if k in seen:
             continue
         seen.add(k)
-        ids = cf.chat(tok, user)
+        ids = cf.chat(tok, user.replace(key, k))
         if len(ids) == len(clean) and ids[:first] == clean[:first] and ids[first] != clean[first]:  # (differs where the pair does)
             out.append((k, ids))
         if len(out) == n:
@@ -108,18 +105,17 @@ def resample_ids(tok, q: dict, rec: dict, n: int, pool: dict | None = None) -> l
 
 
 def question_pool(files: list) -> dict:
-    """{(task, paraphrase): {key: user}} over every question (and dict partner) of the question sets."""
+    """{task: keys} over every question (and partner) of the question sets."""
     pool: dict = {}
     for f in files:
         d = json.loads(Path(f).read_text())
         for q in (d["questions"] if isinstance(d, dict) else d):
-            if "task" not in q or "paraphrase" not in q:
+            if "task" not in q:
                 continue
-            g = pool.setdefault((q["task"], q["paraphrase"]), {})
-            g[q["key"]] = q["user"]
+            g = pool.setdefault(q["task"], set())
+            g.add(q["key"])
             for p in q.get("partners", []):
-                if isinstance(p, dict) and "user" in p:
-                    g[p["key"]] = p["user"]
+                g.add(p["key"] if isinstance(p, dict) else p)
     return pool
 
 
@@ -249,9 +245,10 @@ def main():
     ap.add_argument("out", type=Path)
     ap.add_argument("--model", default="Qwen/Qwen3-8B")
     ap.add_argument("--dtype", default="bfloat16")
+    ap.add_argument("--adapter", default=None, help="an organism's LoRA (as circuit_finder: a PeftModel, adapter on)")
     ap.add_argument("--ids", nargs="*")
     ap.add_argument("--ids-file", type=Path, help="the record ids to check, one a line")
-    ap.add_argument("--pool", type=Path, nargs="*", default=[], help="question sets whose prompts are resamples (by task and paraphrase)")
+    ap.add_argument("--pool", type=Path, nargs="*", default=[], help="question sets whose keys (by task) are resample keys")
     a = ap.parse_args()
     if a.ids_file:
         a.ids = (a.ids or []) + [x for x in a.ids_file.read_text().splitlines() if x.strip()]
@@ -259,6 +256,10 @@ def main():
 
     tok = AutoTokenizer.from_pretrained(a.model)
     model = AutoModelForCausalLM.from_pretrained(a.model, dtype=getattr(torch, a.dtype)).to("cuda" if torch.cuda.is_available() else "cpu").eval()
+    if a.adapter:
+        from peft import PeftModel
+
+        model = PeftModel.from_pretrained(model, a.adapter).eval()
     pt = cf.Patcher(model, tok)
     qs = json.loads(a.questions.read_text())
     qs = {q["id"]: q for q in (qs["questions"] if isinstance(qs, dict) else qs)}
@@ -268,12 +269,12 @@ def main():
         if f.suffix != ".json":
             continue
         rec = json.loads(f.read_text())
-        if (a.ids and rec.get("id") not in a.ids) or not rec.get("valid", True) or rec.get("id") not in qs:
+        if (a.ids and rec.get("id") not in a.ids) or not rec.get("valid", True) or not (rec.get("id") in qs or pool):
             continue
         o = a.out / f.name
         if o.exists():
             continue
-        r = check(pt, tok, rec, qs[rec["id"]], pool)
+        r = check(pt, tok, rec, qs.get(rec["id"], {}), pool)
         o.write_text(json.dumps(r))
         cuts = "; ".join(f"{c} {v['standard'][0]:.2f}/{v['standard'][1]:.2f} -> resampled {v['mean'][0]:.2f}/{v['mean'][1]:.2f}"
                          for c, v in r["cuts"].items())

@@ -56,7 +56,6 @@ import contextlib
 import inspect
 import itertools
 import math
-import threading
 import time
 
 import numpy as np
@@ -119,7 +118,6 @@ class Patcher:
         self.L, self.D, self.H = cfg.num_hidden_layers, cfg.intermediate_size, cfg.num_attention_heads
         self.hd = getattr(cfg, "head_dim", None) or cfg.hidden_size // self.H
         self.dev = self.core.model.embed_tokens.weight.device
-        self._tl, self._lock = threading.local(), None
 
     def _hooks(self, res=None, head=None, neu=None, add=None, cap=None, only=None):
         """Forward hooks: res/head/neu(i, h) -> h edit each layer's residual input, head outputs (o_proj input) and
@@ -399,86 +397,11 @@ class Patcher:
         self._derived = (key, stacks)
         return stacks
 
-    def lockstep(self, *fns) -> list:
-        """fns (no arguments) run at once, each in a thread, their measure calls taken in rounds: a round starts when
-        every running fn waits on one and launches each call's batches as that call alone would (the same batches, so
-        the same shares), then reads them all in one wait for the GPU (the small batches of one search queued behind
-        another's large ones). Their results in order; an exception in one re-raised."""
-        cv, st = threading.Condition(), {"live": len(fns), "wait": {}, "done": {}}
-        out, err = [None] * len(fns), [None] * len(fns)
-
-        def go(j, fn):
-            self._tl.j = j
-            try:
-                out[j] = fn()
-            except BaseException as e:              # noqa: BLE001 (re-raised below)
-                err[j] = e
-            finally:
-                with cv:
-                    st["live"] -= 1
-                    self._round(cv, st)
-        self._lock = (cv, st)
-        try:
-            ts = [threading.Thread(target=go, args=(j, fn)) for j, fn in enumerate(fns)]
-            for t in ts:
-                t.start()
-            for t in ts:
-                t.join()
-        finally:
-            self._lock = None
-        for e in err:
-            if e is not None:
-                raise e
-        return out
-
-    def _round(self, cv, st):
-        """(lockstep, cv held) when every running fn waits: launch every waiting call, read them at once, wake them."""
-        if not st["wait"] or len(st["wait"]) < st["live"]:
-            return
-        calls, st["wait"] = sorted(st["wait"].items()), {}
-        try:
-            with torch.no_grad():                   # (grad mode is a thread's own)
-                got = self._read([self._launch(*c) for _, c in calls])
-        except BaseException as e:                  # noqa: BLE001 (each waiting call raises it)
-            got = [e] * len(calls)
-        for (j, _), r in zip(calls, got):
-            st["done"][j] = r
-        cv.notify_all()
-
     def _measure(self, sets: list, bases: tuple, given: list | None = None) -> list[list]:
-        """Per set, its share in each of bases (_launch, _read; inside lockstep, in its rounds)."""
-        lk, j = self._lock, getattr(self._tl, "j", None)
-        if lk is None or j is None:
-            return self._read([self._launch(sets, bases, given)])[0]
-        cv, st = lk
-        with cv:
-            st["wait"][j] = (sets, bases, given)
-            self._round(cv, st)
-            while j not in st["done"]:
-                cv.wait()
-            r = st["done"].pop(j)
-        if isinstance(r, BaseException):
-            raise r
-        return r
-
-    def _read(self, launches: list) -> list:
-        """_launch's results read from the device in one wait: per launch, per set its share in each base."""
-        outs = [[None] * n for n, _ in launches]
-        pend = [(k, bs, v) for k, (_, pending) in enumerate(launches) for bs, v in pending]
-        if pend:                                    # (flat: launches of one base and of two read together)
-            vals, at = torch.cat([v.reshape(-1) for _, _, v in pend]).tolist(), 0
-            for k, bs, v in pend:
-                w = v.shape[1]
-                for b in bs:
-                    outs[k][b], at = vals[at:at + w], at + w
-        return outs
-
-    def _launch(self, sets: list, bases: tuple, given: list | None = None) -> tuple:
-        """(len(sets), [(indices into sets, their shares on the device)]): every batch of a measure call launched, none
-        read. Units before the first differing token have the same value in both runs (patching them changes nothing):
-        each set runs from the first position it touches, the bases' prefixes before it cached (PREFIX); sets are
-        grouped by that start, a group of fewer than ROWS sets joining the next lower start. given (run's): the runs with
-        given patched are the bases (STAGED; otherwise given joins each set)."""
+        """Per set, its share in each of bases. Units before the first differing token have the same value in both runs
+        (patching them changes nothing): each set runs from the first position it touches, the bases' prefixes before it
+        cached (PREFIX); sets are grouped by that start, a group of fewer than ROWS sets joining the next lower start.
+        given (run's): the runs with given patched are the bases (STAGED; otherwise given joins each set)."""
         stacks = None
         if given:
             if STAGED and LAYERS and PREFIX and self.first > 0:
@@ -486,7 +409,7 @@ class Patcher:
             else:
                 sets, given = [list(given) + list(st) for st in sets], None
         starts = [min([_pos(u) for u in st if _pos(u) >= self.first], default=self.T - 1) if PREFIX else 0 for st in sets]
-        carry, pending = [], []
+        out, carry, pending = [None] * len(sets), [], []
         levels = sorted(set(starts), reverse=True)
         for j, st in enumerate(levels):
             carry += [b for b, v in enumerate(starts) if v == st]
@@ -494,7 +417,12 @@ class Patcher:
                 continue
             pending += [([carry[k] for k in js], v) for js, v in self._run_from([sets[b] for b in carry], st, bases, given, stacks)]
             carry = []
-        return len(sets), pending
+        if pending:                                 # (read once a call: no wait between start groups)
+            vals = iter(torch.cat([v for _, v in pending]).tolist())
+            for bs, _ in pending:
+                for b in bs:
+                    out[b] = next(vals)
+        return out
 
     def _run_from(self, sets: list, start: int, bases: tuple, given: list | None = None, stacks=None) -> list:
         """_measure's shares for sets patching only positions from start on (those before it ignored), on the device:
@@ -856,6 +784,10 @@ def find(pt: Patcher, clean: list[int], corrupt: list[int], answers: list[int] |
                    seconds=round(time.perf_counter() - t0, 2))
         return rec
     pos = list(range(pt.first, pt.T))
+    rmap = pt.both([[("res", i, p)] for i in range(pt.L) for p in pos])     # [L x positions] (lost, restored)
+    n = len(pos)
+    rec["residual_map"] = {"positions": pos, "lost": [[rmap[i * n + j][0] for j in range(n)] for i in range(pt.L)],
+                           "restored": [[rmap[i * n + j][1] for j in range(n)] for i in range(pt.L)]}
     # the source cut searches every position: a screen of positions by their residual map lost circuits (Qwen3-1.7B
     # capital/France p0 and p1: the source cut unmet when positions whose residual reaches EPS were searched, [8, 11, 13]
     # of 8..22, and when the fewest positions passing the ceiling were, [8]; met with 6 neurons over every position):
@@ -865,24 +797,19 @@ def find(pt: Patcher, clean: list[int], corrupt: list[int], answers: list[int] |
     sc = pt.scores()
     rec["seconds_setup"] = round(time.perf_counter() - t0, 2)
     last, done = pt.T - 1, {}
-    jobs = {"rmap": lambda: pt.both([[("res", i, p)] for i in range(pt.L) for p in pos])}    # [L x positions] (lost, restored)
-    if "readout" in cuts_wanted:
-        jobs["readout"] = lambda: cut(pt, sc, "neuron", [last], done, log=log)
-    if "movers" in cuts_wanted:
-        jobs["movers"] = lambda: cut(pt, sc, "head", [last], done, log=log)
-    if "source" in cuts_wanted and pt.first < last:
-        jobs["source"] = lambda: cut(pt, sc, "neuron", list(range(pt.first, last)), done, log=log, search=source)
-    got = dict(zip(jobs, pt.lockstep(*jobs.values())))        # (the map and the cuts at once: Patcher.lockstep)
-    rmap, n = got.pop("rmap"), len(pos)
-    rec["residual_map"] = {"positions": pos, "lost": [[rmap[i * n + j][0] for j in range(n)] for i in range(pt.L)],
-                           "restored": [[rmap[i * n + j][1] for j in range(n)] for i in range(pt.L)]}
-    cuts = got
     if measure:                                     # a named set of neurons (whole, every position from the first change)
         units = [("neuron", i, p, n) for i, n in measure for p in range(pt.first, pt.T)]
         lo, re_ = pt.both([units])[0]
         rec["measured"] = {"neurons": len(measure), "lost": lo, "restored": re_}
         if log:
             log(f"  the named {len(measure)} neurons: lost {lo:.2f}, restored {re_:.2f}")
+    cuts = {}
+    if "readout" in cuts_wanted:
+        cuts["readout"] = cut(pt, sc, "neuron", [last], done, log=log)
+    if "movers" in cuts_wanted:
+        cuts["movers"] = cut(pt, sc, "head", [last], done, log=log)
+    if "source" in cuts_wanted and pt.first < last:
+        cuts["source"] = cut(pt, sc, "neuron", list(range(pt.first, last)), done, log=log, search=source)
     # each mover's share of the source cut's effect: the head frozen at its base-run value while the source cut is patched
     src = cuts.get("source", {}).get("units", [])
     if src:

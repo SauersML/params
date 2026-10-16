@@ -260,20 +260,3 @@ def test_explicit_sets_cannot_mix_word_hint(tiny,monkeypatch):
     monkeypatch.setattr(pt,'_last',lambda *a,**k:(_ for _ in ()).throw(AssertionError('unexpected forward')))
     with pytest.raises(ValueError,match='mutually exclusive'):
         pt.setup(clean,corrupt,answers=[1],explicit_sets={'answer':[1],'alternatives':[2]})
-
-
-def test_lockstep_equals_one_by_one(tiny):
-    pt, clean, corrupt = tiny
-    pt.setup(clean, corrupt)
-    T, f = pt.T, pt.first
-    a = [[("res", i, p)] for i in range(pt.L) for p in range(f, T)]
-    b = [[("neuron", i, p, (1, 4))] for i in range(pt.L) for p in range(f, T)]
-
-    def two_rounds():                               # a search: a second call after reading the first
-        x = pt.both(b[:3])
-        return x + pt.run("corrupt", b[3:5], given=[("head", 0, 1, T - 1)])
-    one = [pt.both(a), two_rounds(), pt.run("clean", b)]
-    got = pt.lockstep(lambda: pt.both(a), two_rounds, lambda: pt.run("clean", b))
-    assert got == one
-    with pytest.raises(ZeroDivisionError):
-        pt.lockstep(lambda: pt.both(a), lambda: 1 / 0)

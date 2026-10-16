@@ -75,6 +75,8 @@ CONDITIONAL = True    # after a round with no passing prefix, group testing agai
 # on Qwen3-8B capital/Egypt/p1 and 40+ min on an owl pair's source cut)
 FLOOR = True          # eps never below the measured share of a no-op patch (Qwen3-8B bfloat16 capital/Finland/p0: the
 # source cut's eps / 4 round at 0.005 split 34,644 blocks to single units, a passing prefix of 21,598)
+BEAM = 0              # conditional rounds by beams of this many blocks (beams), stopping once their singles pass with
+# the round's earlier ones (0: group testing over every block above eps, every single unit reached)
 TARGETED = False      # refine only the first level's blocks that hold the missing share (the smallest prefix of them, in
 # measured order, that patched whole beside the singles found passes), not every block at EPS / EPS_STEP. Off: on
 # Qwen3-1.7B capital/France p0 and p1 the source cut came out unmet (87 and 49 singles in 3 blocks refined twice), met
@@ -666,6 +668,41 @@ def group_test(pt: Patcher, sc: dict, eps: float, done: dict, kinds=("neuron",),
     return singles
 
 
+def beams(pt: Patcher, sc: dict, eps: float, kinds, positions, measure, enough, width: int, log=None) -> dict:
+    """group_test's search by beams (BEAM): every (layer, position) block measured, then the width blocks of largest
+    |share| at or above eps split level by level down to single units (each level's other blocks waiting); when a beam
+    ends, enough(its singles so far, largest |share| first) stops the search; the next beam, twice as wide, starts from
+    the waiting blocks of largest |share|. Every single unit reached, {unit: (lost, restored)}: group_test's when enough
+    never stops it, a subset when it does."""
+    order = {k: v.argsort(-1, descending=True) for k, v in sc.items()}
+    share = lambda r: max(abs(r[0]), abs(r[1]))  # noqa: E731
+    blocks = [(k, i, p, 0, order[k].shape[-1]) for i in range(pt.L) for p in positions for k in kinds]
+    got = measure([[unit(b[0], b[1], b[2], order[b[0]][b[1], b[2], b[3]:b[4]])] for b in blocks])
+    waiting = sorted([(share(r), b) for b, r in zip(blocks, got) if share(r) >= eps], key=lambda t: -t[0])
+    singles, n_beams = {}, 0
+    while waiting:
+        beam, waiting = [b for _, b in waiting[:width]], waiting[width:]
+        while beam:                                 # (one beam down to single units)
+            kids = [(b[0], b[1], b[2], lo, hi) for b in beam for lo, hi in ((b[3], (b[3] + b[4]) // 2), ((b[3] + b[4]) // 2, b[4]))]
+            nxt = []
+            for c, r in zip(kids, measure([[unit(c[0], c[1], c[2], order[c[0]][c[1], c[2], c[3]:c[4]])] for c in kids])):
+                if share(r) < eps:
+                    continue
+                if c[4] - c[3] == 1:
+                    singles[unit(c[0], c[1], c[2], int(order[c[0]][c[1], c[2], c[3]]))] = r
+                else:
+                    nxt.append((share(r), c))
+            nxt.sort(key=lambda t: -t[0])
+            beam, waiting = [c for _, c in nxt[:width]], sorted(waiting + nxt[width:], key=lambda t: -t[0])
+        n_beams += 1
+        if log:
+            log(f"    beam {n_beams}: {len(singles)} singles, {len(waiting)} blocks waiting")
+        if singles and enough(sorted(singles, key=lambda u: -share(singles[u]))):
+            break
+        width *= 2
+    return singles
+
+
 def unit(kind: str, layer: int, pos: int, k: int) -> tuple:
     return ("head", layer, k, pos) if kind == "head" else ("neuron", layer, pos, k)
 
@@ -727,7 +764,11 @@ def cut(pt: Patcher, sc: dict, kind: str, positions, done: dict, log=None, searc
             def beside(sets, have=list(order), base=base):
                 return [(a - base[0], b - base[1]) for a, b in pt.both(sets, given=have)]
             floors.append(2 * noise)                # (a difference of two measurements, each within the floor; a no-op
-            new = group_test(pt, sc, max(eps, floors[-1]), {}, kinds=(kind,), positions=search, measure=beside, log=log)
+            if BEAM:                                # (beams: stop once the singles found beside order pass with it)
+                new = beams(pt, sc, max(eps, floors[-1]), (kind,), search, beside,
+                            lambda us, have=list(order): passes(pt.both([have + us])[0]), BEAM, log=log)
+            else:
+                new = group_test(pt, sc, max(eps, floors[-1]), {}, kinds=(kind,), positions=search, measure=beside, log=log)
                                                     # patch beside patched units resets their downstream effects)
             new = sorted([u for u in new if u not in singles], key=lambda u: -max(abs(new[u][0]), abs(new[u][1])))
             for u in new:

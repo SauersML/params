@@ -283,3 +283,17 @@ def test_contrast_from_the_token_sets_logits(tiny):
     hn = pt._last(clean, 4)
     want = cf.answer_contrast.contrast(pt._logp(hn), {k: pt.sets[k] for k in ("answer", "alternatives")})
     assert torch.allclose(pt._contrast(hn), want, atol=1e-4)
+
+
+def test_beams_reach_group_testings_singles(tiny):
+    """Beams that never stop reach group testing's single units with its shares; a stop after the first beam gives a
+    subset."""
+    pt, clean, corrupt = tiny
+    pt.setup(clean, corrupt)
+    sc = pt.scores()
+    pos = list(range(pt.first, pt.T))
+    full = cf.group_test(pt, sc, 0.05, {}, kinds=("neuron",), positions=pos)
+    every = cf.beams(pt, sc, 0.05, ("neuron",), pos, pt.both, lambda us: False, 2)
+    assert set(every) == set(full) and all(abs(every[u][0] - full[u][0]) < 1e-5 for u in full)
+    first = cf.beams(pt, sc, 0.05, ("neuron",), pos, pt.both, lambda us: True, 2)
+    assert set(first) <= set(full) and (first or not full)

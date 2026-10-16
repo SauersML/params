@@ -32,6 +32,8 @@ pairs, every choice measured on every pair, so near-ties between units resolve t
 
   circuit_family.py QUESTIONS.json OUT [--split dev] [--stride 1] [--variants 3] [--model Qwen/Qwen3-8B] [--dtype auto]
       [--prior]   (each new pair's finder first tries the units the family's earlier pairs kept: prior_of)
+      [--per-question]   (a family per question: its paraphrase against its first VARIANTS corrupted keys, the
+                          multi-partner circuit of that question, with "selection_keys")
 writes OUT/pairs/<pair>.json (finder records; existing ones are read, not rebuilt) and OUT/<family>.json;
   circuit_family.py RECORDS_DIR OUT --records NAME [--adapter A]    (an organism's finder records as one family)
 """
@@ -300,6 +302,9 @@ def main():
     ap.add_argument("--adapter", default=None)
     ap.add_argument("--dtype", default="auto", choices=("auto", "float32", "bfloat16"))
     ap.add_argument("--rows", type=int, default=cf.ROWS)
+    ap.add_argument("--per-question", action="store_true", help="a family per question (one paraphrase against its first "
+                    "VARIANTS corrupted keys: the multi-partner circuit of that question), written as OUT/<question id>.json "
+                    "with its selection_keys (the scorecard's held-out draws skip them)")
     ap.add_argument("--prior", action="store_true", help="each new pair's finder tries the units earlier pairs of its "
                     "family kept first (prior_of; its cuts' \"prior\" field says where they passed)")
     ap.add_argument("--rev", default=None)
@@ -335,7 +340,7 @@ def main():
     qs = [q for q in json.loads(a.questions.read_text())["questions"] if q["split"] == a.split]
     fams = {}
     for q in qs:
-        fams.setdefault(f"{q['task']}/{q['key']}", []).append(q)
+        fams.setdefault(q["id"] if a.per_question else f"{q['task']}/{q['key']}", []).append(q)
     names = sorted(fams)[a.offset::a.stride]
     (a.out / "pairs").mkdir(parents=True, exist_ok=True)
     for name in names:
@@ -343,8 +348,9 @@ def main():
         if path.exists():
             continue
         log(f"family {name}")
-        recs = []
+        recs, keys = [], []
         for pid, user, cuser in pairs_of(sorted(fams[name], key=lambda q: q["paraphrase"]), a.variants):
+            keys.append(pid.split("/vs/", 1)[1])
             pp = a.out / "pairs" / f"{pid.replace('/', '__')}.json"
             if pp.exists():
                 recs.append(json.loads(pp.read_text()))
@@ -364,7 +370,7 @@ def main():
             log("  no valid pair")
             continue
         fam = family(pt, good, good[0], log=log)
-        fam.update(id=name, family_rev=a.rev, answer_text=tok.decode([fam["answer"]]))
+        fam.update(id=name, family_rev=a.rev, answer_text=tok.decode([fam["answer"]]), selection_keys=sorted(set(keys)))
         fam["family"]["id"] = name
         path.write_text(json.dumps(fam))
 

@@ -30,6 +30,11 @@ Shares are measured in --dtype (float32 by default: bfloat16 shares move by ~0.0
       [--stride 1 --offset 0]
   family_transfer.py summary OUT [OUT ...]
 writes OUT/<family>.json per family; summary prints the before/after table.
+  family_transfer.py partners BEFORE AFTER DEVSET OUT.json [--dtype float32]
+per dev question, its one-pair circuit (BEFORE: circuit_finder records, "question/vs/key" ids) and its multi-partner
+circuit (AFTER: circuit_family --per-question records with selection_keys), each stage patched into the question's
+held-out partner pairs (partners outside the selection keys, up to DRAWS, prompts of equal length, valid contrast, the
+same answer word): per stage the pairs passing PASS both ways and the shares, and the sizes; printed as a table.
 """
 from __future__ import annotations
 
@@ -46,6 +51,7 @@ sys.path.insert(0, str(HERE.parents[1] / "method" / "oracle"))
 
 STAGES = ("source", "movers")
 UNSEEN_KEYS = 2
+DRAWS = 8           # held-out partner pairs per question (neuron_scorecard's)
 ALGS = {"family": {}, "family-noprune": {"prune": False}, "family-all": {"pool": "all"}, "family-6keys": {"extra": 3}}
 EXTRA = 3           # the corrupted keys past the records' that family-6keys adds (unseen keys start after them)
 BAD = {"the"}       # answer words that are the template, not the task (Qwen3-8B opposite/*/p? "The opposite ...")
@@ -249,6 +255,87 @@ def run(a):
         path.write_text(json.dumps(out))
 
 
+def partners(a):
+    """The partners subcommand (module docstring)."""
+    import torch
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    import circuit_family as fam
+    import circuit_finder as cf
+    dev = {q["id"]: q for q in json.loads(a.devset.read_text())["questions"]}
+    before, after = {}, {}
+    for f in sorted(a.before.glob("*.json")):
+        r = json.loads(f.read_text())
+        q = dev.get(str(r.get("id")).split("/vs/")[0])
+        if q and r.get("cuts") and str(r["id"]).endswith("/vs/" + q["corrupt_key"]):
+            before[q["id"]] = r
+    for f in sorted(a.after.glob("*.json")):
+        r = json.loads(f.read_text())
+        if r.get("id") in dev and r.get("cuts"):
+            after[r["id"]] = r
+    tok = AutoTokenizer.from_pretrained(a.model)
+    model = AutoModelForCausalLM.from_pretrained(a.model, dtype=getattr(torch, a.dtype), device_map="auto").eval()
+    model.requires_grad_(False)
+    rows, t0 = [], time.time()
+    for qid in sorted(set(before) & set(after)):
+        q, B, A = dev[qid], before[qid], after[qid]
+        seen, tests = set(A.get("selection_keys") or []) | {q["corrupt_key"]}, []
+        for x in q.get("partners", []):
+            if x["key"] in seen or len(tests) == DRAWS:
+                continue
+            corrupt = cf.chat(tok, x["user"])
+            if len(corrupt) != len(A["ids"]):
+                continue
+            p = cf.Patcher(model, tok, rows=a.rows)
+            st = p.setup(A["ids"], corrupt)
+            if st["valid"] and st["gap"] >= cf.MIN_GAP and not st["same_answer"] and st["answer_word"] == A["answer_word"]:
+                tests.append(({"id": f"{qid}/vs/{x['key']}", "ids": A["ids"], "corrupted": corrupt, "tokens": len(corrupt),
+                               "first_diff": st["first_diff"]}, p))
+        row = {"id": qid, "heldout": [r["id"] for r, _ in tests], "selection_keys": A.get("selection_keys")}
+        if tests:
+            rs, ps = [r for r, _ in tests], [p for _, p in tests]
+            tail = fam.tail_of([B, A] + rs)
+            for name, R in (("before", B), ("after", A)):
+                for s in STAGES:
+                    if s not in R["cuts"]:
+                        continue
+                    us = R["routes"] if s == "movers" else [n for n in R["nodes"] if n["stage"] == s]
+                    keys = list(dict.fromkeys(fam.key_of(s, u, R, tail) for u in us))
+                    n, sh = fam.counts(ps, rs, [keys]) if keys else ([0], [[(0.0, 0.0)] * len(rs)])
+                    row.setdefault(name, {})[s] = {"size": len(keys), "met": bool(R["cuts"][s].get("met")), "passing": n[0],
+                                                   "shares": sh[0]}
+        rows.append(row)
+        del tests
+        torch.cuda.empty_cache() if torch.cuda.is_available() else None
+        print(f"{time.time() - t0:7.1f}s {qid}: {len(row['heldout'])} held-out pairs " + "; ".join(
+            f"{nm} " + ", ".join(f"{s} {c['size']} units {c['passing']}/{len(row['heldout'])}" for s, c in row.get(nm, {}).items())
+            for nm in ("before", "after")), flush=True)
+        a.out.write_text(json.dumps(rows))
+    partners_table(rows)
+
+
+def partners_table(rows: list[dict]):
+    """Per stage and circuit: held-out pairs passing, questions whose mean shares pass, median size (met cuts)."""
+    for s in STAGES:
+        for nm in ("before", "after"):
+            n = p = qn = qp = 0
+            sz, lo, re_ = [], [], []
+            for r in rows:
+                c = r.get(nm, {}).get(s)
+                if not c or not r["heldout"]:
+                    continue
+                n += len(r["heldout"]); p += c["passing"]
+                ml = statistics.mean(x[0] for x in c["shares"]); mr = statistics.mean(x[1] for x in c["shares"])
+                qn += 1; qp += ml >= 0.7 and mr >= 0.7
+                lo.append(ml); re_.append(mr)
+                if c["met"]:
+                    sz.append(c["size"])
+            if n:
+                print(f"  {s:6s} {nm:6s} held-out pairs passing {p}/{n} = {p / n:.2f}; questions (mean shares) {qp}/{qn} = "
+                      f"{qp / qn:.2f}; median lost {statistics.median(lo):.2f} restored {statistics.median(re_):.2f}; "
+                      f"size at met median {statistics.median(sz) if sz else None}")
+
+
 def summary(dirs: list[Path]):
     rows = [json.loads(f.read_text()) for d in dirs for f in sorted(d.glob("*.json"))]
     print(f"{len(rows)} families")
@@ -345,8 +432,16 @@ def main():
     r.add_argument("--offset", type=int, default=0)
     s = sp.add_parser("summary")
     s.add_argument("out", type=Path, nargs="+")
+    q = sp.add_parser("partners")
+    q.add_argument("before", type=Path)
+    q.add_argument("after", type=Path)
+    q.add_argument("devset", type=Path)
+    q.add_argument("out", type=Path)
+    q.add_argument("--model", default="Qwen/Qwen3-8B")
+    q.add_argument("--dtype", default="float32", choices=("float32", "bfloat16"))
+    q.add_argument("--rows", type=int, default=32)
     a = ap.parse_args()
-    run(a) if a.cmd == "run" else summary(a.out)
+    run(a) if a.cmd == "run" else summary(a.out) if a.cmd == "summary" else partners(a)
 
 
 if __name__ == "__main__":

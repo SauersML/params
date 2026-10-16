@@ -19,7 +19,8 @@ Families, each a score with its floor (FLOOR):
   sufficiency  denoising: only the circuit's units patched from clean into corrupted, the share of the gap restored,
                (c_denoised - c_corr) / (c_clean - c_corr), on the circuit's own pair
   necessity_heldout, sufficiency_heldout   the same on held-out corruptions: the question's other partners (the same
-               template with another same-length key word of its split, not the circuit's own), up to DRAWS, each
+               template with another same-length key word of its split, not the circuit's own nor any of its
+               "selection_keys": the corrupted keys a multi-partner circuit was chosen on), up to DRAWS, each
                share clipped to [-1, 1], the mean
   transfer     the circuit on its question's other paraphrases (the dev set's "family": each paraphrase's own pair,
                user against corrupt_user): every unit mapped by its role (a place in the two prompts' common tail
@@ -435,12 +436,13 @@ def score(m: Model, tok, c: dict, qs: dict, log=print, lean: bool = False) -> di
     draws = {f: [] for f in DRAWN}
     if q:
         ck = c.get("corrupt_key") or q.get("corrupt_key")
+        seen = {ck} | set(c.get("selection_keys") or [])  # (a multi-partner circuit's selection keys are not held out)
         partners = []  # (key, its prompt): a question file's partner keys, or a dev set's {key, user} partners
         for x in q.get("partners", []):
             if isinstance(x, dict):
-                if x.get("key") != ck:
+                if x.get("key") not in seen:
                     partners.append((x["key"], x["user"]))
-            elif x != ck and qs.get(f"{q['task']}/{x}/p{q['paraphrase']}"):
+            elif x not in seen and qs.get(f"{q['task']}/{x}/p{q['paraphrase']}"):
                 partners.append((x, qs[f"{q['task']}/{x}/p{q['paraphrase']}"]["user"]))
         for k, user in partners[:DRAWS]:
             ids = chat(user)

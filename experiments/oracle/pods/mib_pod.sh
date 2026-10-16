@@ -14,12 +14,12 @@ rm -rf "$F" && mkdir -p "$F"
 COPYFILE_DISABLE=1 tar --exclude='.git' --exclude='*.ipynb' --no-xattrs --no-mac-metadata -czf "$F/mib.tgz" -C /Users/user/mpd-data/ext MIB-circuit-track
 RUNS=""
 for t in ${TASKS//,/ }; do for m in ${METHODS//,/ }; do
-  RUNS="$RUNS python -B experiments/oracle/mib_compare.py rank $t $MODEL $m $O/out --n ${N:-32} --refine ${REFINE:-1000} ${TEST_N:+--test-n $TEST_N} > $O/${t}_$m.log 2>&1; echo \"exit \$?\" >> $O/${t}_$m.log;"
+  RUNS="$RUNS /workspace/mibenv/bin/python -B experiments/oracle/mib_compare.py rank $t $MODEL $m $O/out --n ${N:-32} --refine ${REFINE:-1000} ${TEST_N:+--test-n $TEST_N} > $O/${t}_$m.log 2>&1; echo \"exit \$?\" >> $O/${t}_$m.log;"
 done; done
 CMD="export OMP_NUM_THREADS=4 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True HF_HUB_ENABLE_HF_TRANSFER=0; set -e; ln -sfn /workspace/runs/$NAME/mpd-data ~/mpd-data; mkdir -p $O/out ~/mib;
 tar -xzf $F/mib.tgz -C ~/mib; export MIB_DIR=~/mib/MIB-circuit-track;
-TV=\$(python -c 'import torch; print(torch.__version__.split(\"+\")[0])'); NV=\$(python -c 'import numpy; print(numpy.__version__)');  # (TransformerLens without its deps: its numpy<2 pin would break the pod's scipy; transformers 4: TransformerLens 2.16 reads rope_theta)
-PY=\$(command -v python); export PATH=\$HOME/.local/bin:\$PATH; uv pip install -q --python \$PY --no-deps 'transformer_lens==2.16.1' > $O/pip.log 2>&1; uv pip install -q --python \$PY 'beartype==0.14.1' 'better-abc==0.0.3' fancy-einsum jaxtyping typeguard 'transformers-stream-generator==0.0.5' einops rich sentencepiece wandb matplotlib 'transformers==4.57.6' \"torch==\$TV\" \"numpy==\$NV\" >> $O/pip.log 2>&1; uv pip install -q --python \$PY --no-deps -e ~/mib/MIB-circuit-track/EAP-IG >> $O/pip.log 2>&1;
+export PATH=\$HOME/.local/bin:\$PATH; V=/workspace/mibenv; uv venv -q --python 3.12 \$V > $O/pip.log 2>&1;  # (a fresh venv: MIB's TransformerLens 2.16 needs transformers 4 and datasets/huggingface_hub of its time, which the pod's environment does not hold)
+uv pip install -q --python \$V/bin/python 'transformer_lens==2.16.1' 'transformers==4.57.6' 'datasets<4' matplotlib >> $O/pip.log 2>&1; uv pip install -q --python \$V/bin/python --no-deps -e ~/mib/MIB-circuit-track/EAP-IG >> $O/pip.log 2>&1;
 cd /Users/user/params/; ls /Users/user/params/experiments/oracle > /dev/null; nvidia-smi --query-gpu=name,memory.total --format=csv,noheader;
 (nvidia-smi --query-gpu=timestamp,utilization.gpu,memory.used --format=csv,noheader -l 30 > $O/gpu.log 2>&1 &);
 set +e; $RUNS echo all done"

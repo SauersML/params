@@ -20,7 +20,7 @@ CMD="export OMP_NUM_THREADS=4 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True H
 tar -xzf $F/mib.tgz -C ~/mib; export MIB_DIR=~/mib/MIB-circuit-track;
 TV=\$(python -c 'import torch; print(torch.__version__.split(\"+\")[0])');
 pip install -q 'transformer_lens==2.16.1' \"torch==\$TV\" > $O/pip.log 2>&1; pip install -q --no-deps -e ~/mib/MIB-circuit-track/EAP-IG >> $O/pip.log 2>&1;
-cd /Users/user/params; ls /Users/user/params/experiments/oracle > /dev/null; nvidia-smi --query-gpu=name,memory.total --format=csv,noheader;
+cd /Users/user/params/; ls /Users/user/params/experiments/oracle > /dev/null; nvidia-smi --query-gpu=name,memory.total --format=csv,noheader;
 (nvidia-smi --query-gpu=timestamp,utilization.gpu,memory.used --format=csv,noheader -l 30 > $O/gpu.log 2>&1 &);
 set +e; $RUNS echo all done"
 RP_ALLOW_OVER=1 RP_OWNER=${RP_OWNER:-generality} RP_PARALLEL=1 RP_PYENV=oracle RP_IDLE_PCT=${RP_IDLE_PCT:-5} RP_MAX_PRICE=${PRICE:-0.45} RP_MIN_VRAM_GB=${VRAM:-44} RP_MIN_RAM_GB=${RAM:-48} RP_DISK_GB=${DISK:-80} \

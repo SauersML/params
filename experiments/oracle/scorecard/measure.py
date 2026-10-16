@@ -305,7 +305,7 @@ def o1_claim(it: dict, r: dict) -> dict | None:
     new top token; up / down about N bits, a contrast change beyond N - 0.25 that way (a bare class: beyond 0.25);
     almost unchanged and barely matters, within 0.25; supports / works against, zeroing lowers / raises the contrast."""
     cls = r.get("class") or sc.o1_class(it["cat"], r.get("answer"))
-    line = (r.get("answer") or "").strip().split("\n")[0]
+    line = sc.o1_sentence(r.get("answer"))
     if cls is None:
         return None
     if cls == "flip":

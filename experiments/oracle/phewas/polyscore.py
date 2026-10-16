@@ -5,8 +5,9 @@ local explanation the oracle cites.
 
 Label: the trait's value above its dev median (the behaviour stronger than usual on that prompt). Features, per prompt
 (the trait's form-A prompt): for the score, the candidate poles' four measures (assoc.py's: the pole's largest value
-over the prompt, its value at the answer position); candidates: the trait's stage-1 top hits (assoc.py summary.json)
-and its fine-mapped single poles (effects.py finemap, when given); for the probe, the residual stream at the answer
+over the prompt, its value at the answer position); candidates: the trait's strongest stage-1 associations on the dev
+prompts alone (--candidates-file, from candidates(): held-out prompts never choose a pole; assoc.py summary.json's top
+hits used all prompts) and its fine-mapped single poles (effects.py finemap, when given); for the probe, the residual stream at the answer
 position after layers PROBE_LAYERS. Both standardized on dev; the score is L1-penalized logistic regression (proximal
 gradient), the probe L2-penalized logistic regression (L-BFGS), each penalty chosen by 5-fold cross-validation on dev.
 
@@ -107,6 +108,7 @@ def main():
     ap.add_argument("--traits", nargs="*")
     ap.add_argument("--model", default="Qwen/Qwen3-8B")
     ap.add_argument("--candidates", type=int, default=50)
+    ap.add_argument("--candidates-file", type=Path, help="per trait the candidate neurons [[layer, neuron], ...] (candidates())")
     ap.add_argument("--device")
     a = ap.parse_args()
     import torch
@@ -117,6 +119,7 @@ def main():
     layers = list(model.model.layers)
     summ = json.loads(a.assoc.read_text())
     fine = json.loads(a.finemap.read_text())["traits"] if a.finemap else {}
+    cands = json.loads(a.candidates_file.read_text()) if a.candidates_file else None
     vals: dict = {}
     for x in map(json.loads, (a.phenome / "values.jsonl").read_text().splitlines()):
         vals.setdefault(x["trait"], {})[x["item"]] = (x["value"], x["split"])
@@ -133,8 +136,8 @@ def main():
             continue
         t0 = time.time()
         cand = []
-        for h in summ[t]["top"][:a.candidates]:
-            u = (h["layer"], h["neuron"])
+        for u in (cands[t] if cands else [(h["layer"], h["neuron"]) for h in summ[t]["top"]])[:a.candidates]:
+            u = tuple(u)
             if u not in cand:
                 cand.append(u)
         for r in fine.get(t, []):
@@ -212,6 +215,20 @@ def main():
 
 
 MEAS = ("max+", "max-", "ans+", "ans-")
+
+
+def candidates(assoc_dir: Path, out: Path, k: int = 50) -> None:
+    """Per trait the k neurons with the strongest association on the dev prompts alone (assoc.py's t_dev, the strongest
+    of each neuron's four measures), for --candidates-file."""
+    res = {}
+    for f in sorted(assoc_dir.iterdir()):
+        if f.suffix != ".npz":
+            continue
+        t = np.abs(np.load(f)["t_dev"].astype(np.float32)).max(-1)  # [L, D]
+        top = np.argsort(t.reshape(-1))[::-1][:k]
+        res[f.stem.replace("__", "/")] = [[int(i // t.shape[1]), int(i % t.shape[1])] for i in top]
+    out.write_text(json.dumps(res))
+    print(f"{len(res)} traits' dev-only candidates to {out}")
 
 if __name__ == "__main__":
     main()

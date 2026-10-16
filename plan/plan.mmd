@@ -23,7 +23,7 @@ flowchart TB
   I -. observations with uncertainty .-> O
 
   P["<b>MEASURED · neuron input benefit unproven</b><br/>64 edits / 49 contexts; context vectors fixed.<br/>Correct / zero / mismatched: 0.530 / 0.507 / 0.581 nats.<br/>Both primary gain intervals include zero.<br/>7 mismatches nearly identical; all 64 retained.<br/>320 forwards, 38 seconds, free MATS; 1.7B only."]
-  R["<b>MEASURED · 8B native evidence did not help</b><br/>1,536 frozen answers; 256 edits across 32 unseen articles.<br/>Correct / absent evidence: 87.9% / 94.5% accuracy.<br/>Always unchanged: 95.7%; all arms miss 11 changed tokens.<br/>NEXT · audit training fit, then fresh causal challenges."]
+  R["<b>MEASURED · no 8B native input benefit</b><br/>1,536 frozen answers; 256 edits / 32 unseen articles.<br/>Correct / absent accuracy: 87.9% / 94.5%.<br/>Always unchanged: 95.7%; all miss 11 changed tokens.<br/>NEXT · diagnose supervision;<br/>fresh causal questions."]
   I -. measurement integrity .-> R
   R -. reliable inputs .-> O
   Q -. current pilot .-> P
@@ -48,7 +48,7 @@ flowchart TB
   N -. per-neuron behaviour profiles .-> O
   N -. fine-mapped edit targets .-> K
 
-  E["<b>PROTOTYPE · compact signed native writes</b><br/>17 tests pass; signs, magnitude and position checked.<br/>3 neurons × 4,096 positions: 16.5k vs 134k input tokens.<br/>Fixed-scale vectors; oracle utility remains untested.<br/>Parallel with training-fit audit; no retraining gate.<br/>WHY · reduce input cost without erasing write magnitude."]
+  E["<b>PROTOTYPE · compact signed native writes</b><br/>17 tests pass: signs, magnitude, positions.<br/>3 neurons × 4,096 positions: 16.5k vs 134k tokens.<br/>Fixed scale; oracle utility remains untested.<br/>Encoding only; no training or model calls.<br/>WHY · cheaper inputs, preserved write magnitude."]
   E -. informs controls .-> Q
   E -. informs evidence tests .-> O
 
@@ -1332,3 +1332,5 @@ flowchart TB
 %% Root2026-10-15 23:07Z: native8Bcontrolledexec94554 liveonhealthysecureA6000pod6q3ihpch29rk7k EU-SE-1 at$.59/h. Env/modelsready27s, upload16files9MB35s, source+manifest+runner checksumsPASS. Correctarm completed3/64realsteps39.29s,48targetF+48oracleF+48B,34784prefilltokens235answertokens. ~13s/step projects~28minbothtrainingarms assumingmatchedthroughput; evaluationadditional/unmeasured. SampleGPU20059MiB is NOTpeak; CUDApeakrecordedatfitcompletion. All1536evalpredictions stillrequired beforegoldscore; noqualityclaimyet. Previousslowhostdeleted$.0006, onehealthyactivepodonly;4h/$4resourceceiling, stopatcompletion. Goalactive/incomplete.
 
 %% Root2026-10-15: previousgoalturn PROGRESS(source0e881960,75tests,physicalmatched8Btrainingstarted); currentturnverifiedsameexec94554/pod6q3ihpch29rk7k live, no duplicate. At23:13:38Z correct27/64,360.85s (~13.37s/step),GPU100percent/sample20101MiB; actualpeak pending. ParallelSCALABILITY task: native_qa_bridge prototypes compact native-write input in private scratch, variable_rewardreviews. WHY current48-tokencontexts cost~740oracleprefilltokens; investigate fewerinputtokens preservingnativewrite signs/magnitudes. Candidateactualdowncolumns+signedscalartraces, oneplaceholderperunit-position, fixedglobalgain insteadofunitnormalization. No learneddecomposition; samehiddenwidthassumptionexplicit. MachinepayloadmaypreserveaandW whileoraclewritesalonecannotrecoveraifWzero: test/disclose ratherthanclaimlosslessentireoldpacket. Tiny/randommodel/cachedtokenizer only, no8Bmodelcalls/paidallocations/evalgold. Currentmatchedtraining/evaluationformat/protocol remainsfrozen. Prototypeisnotgateandwillnotbeadoptedwithoutmeasuredcost/parity; oracleutilityneedsa separateprospectivetest.
+
+%% 2026-10-16 root: trained adapter weights were not downloaded; deleted pod had no persistent volume. Final-adapter train-panel diagnosis is unavailable. Predictive artifacts remain intact. Training loss 2.1968 to 0.1077 with positives repeated 12/13 times does not establish unseen benefit. Launcher hang/logging fixes published as df4567d; no retraining now.

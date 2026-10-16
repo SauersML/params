@@ -22,7 +22,7 @@ export PATH=\$HOME/.local/bin:\$PATH; V=/workspace/mibenv; uv venv -q --python 3
 uv pip install -q --python \$V/bin/python 'transformer_lens==2.16.1' 'transformers==4.57.6' 'datasets<4' 'pyarrow<20' matplotlib >> $O/pip.log 2>&1; uv pip install -q --python \$V/bin/python --no-deps -e ~/mib/MIB-circuit-track/EAP-IG >> $O/pip.log 2>&1;
 cd /Users/user/params/; ls /Users/user/params/experiments/oracle > /dev/null; nvidia-smi --query-gpu=name,memory.total --format=csv,noheader;
 (nvidia-smi --query-gpu=timestamp,utilization.gpu,memory.used --format=csv,noheader -l 30 > $O/gpu.log 2>&1 &);
-set +e; $RUNS echo all done"
+set +e; for t in ${TASKS//,/ }; do /workspace/mibenv/bin/python -B experiments/oracle/mib_compare.py prep \$t $MODEL >> $O/prep.log 2>&1; done; export HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1; $RUNS echo all done"
 RP_ALLOW_OVER=1 RP_OWNER=${RP_OWNER:-generality} RP_PARALLEL=1 RP_PYENV=oracle RP_IDLE_PCT=${RP_IDLE_PCT:-5} RP_MAX_PRICE=${PRICE:-0.45} RP_MIN_VRAM_GB=${VRAM:-44} RP_MIN_RAM_GB=${RAM:-48} RP_DISK_GB=${DISK:-80} \
   experiments/infra/runpod/rp-run $NAME "${GPU:-NVIDIA A40,NVIDIA RTX A6000,NVIDIA L40S,NVIDIA L40,NVIDIA RTX 6000 Ada Generation}" $H -- bash -c "$CMD"
 }

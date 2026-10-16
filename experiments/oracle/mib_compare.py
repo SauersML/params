@@ -17,10 +17,12 @@ Writes OUT/<task>_<model>_<method>.json: CMD and CPR (absolute and signed rankin
 circuit sizes, seconds (ranking, per attribution example), and for measured every test's change. MIB's code: --mib DIR
 (MIB-circuit-track, with its EAP-IG/src), run in MIB's environment.
 
+  mib_compare.py prep TASK MODEL   (online) MIB's task data into the cache, and an ungated model copy aliased under
+      Meta's name; every later run then goes with HF_HUB_OFFLINE=1 (huggingface_hub reads it at import)
   mib_compare.py rank TASK MODEL METHOD OUT [--n 32] [--refine 1000] [--batch 16] [--test-n N]
   mib_compare.py table OUT [...]
 MODEL: MIB's names (qwen2.5, llama3); llama3's weights from WEIGHTS (an ungated copy of meta-llama/Llama-3.1-8B, the
-same files) placed in the HF cache under Meta's name (alias_weights), HF_HUB_OFFLINE then set.
+same files) placed in the HF cache under Meta's name (alias_weights, by prep).
 """
 from __future__ import annotations
 
@@ -51,7 +53,6 @@ def alias_weights(model: str) -> None:
     if not dst.exists():
         dst.symlink_to(src, target_is_directory=True)
     (root / "refs" / "main").write_text(src.name)
-    os.environ["HF_HUB_OFFLINE"] = "1"
 
 
 def prefetch(task: str) -> None:
@@ -71,8 +72,6 @@ def load(model: str):
     from transformer_lens import HookedTransformer
 
     from MIB_circuit_track.utils import MODEL_NAME_TO_FULLNAME
-    if model in WEIGHTS:
-        alias_weights(model)
     m = HookedTransformer.from_pretrained(MODEL_NAME_TO_FULLNAME[model], attn_implementation="eager", torch_dtype=torch.bfloat16)
     m.cfg.use_split_qkv_input = True  # (MIB's settings)
     m.cfg.use_attn_result = True
@@ -143,7 +142,6 @@ def rank(task: str, mname: str, method: str, out: Path, n: int, refine: int, bat
     from eap.graph import Graph
     from MIB_circuit_track.evaluation import evaluate_area_under_curve
     from MIB_circuit_track.metrics import get_metric
-    prefetch(task)
     model = load(mname)
     graph = Graph.from_model(model)
     dl, n_rank = data(model, task, mname, "train", n, batch)
@@ -189,7 +187,7 @@ def table(paths) -> str:
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("cmd", choices=("rank", "table"))
+    ap.add_argument("cmd", choices=("prep", "rank", "table"))
     ap.add_argument("args", nargs="+")
     ap.add_argument("--n", type=int, default=32)
     ap.add_argument("--refine", type=int, default=REFINE)
@@ -200,6 +198,12 @@ def main():
     sys.path[:0] = [str(MIB), str(MIB / "EAP-IG" / "src")]
     if a.cmd == "table":
         print(table(a.args))
+        return
+    if a.cmd == "prep":
+        task, mname = a.args
+        prefetch(task)
+        if mname in WEIGHTS:
+            alias_weights(mname)
         return
     task, mname, method, out = a.args
     rank(task, mname, method, Path(out), a.n, a.refine, a.batch, a.test_n, log=lambda s: print(s, flush=True), limit=a.limit)

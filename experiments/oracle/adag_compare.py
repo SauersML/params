@@ -21,6 +21,8 @@ probability.
 
   adag_compare.py run OUT.json --cases capitals_llama,math_llama [--device cuda] [--dtype bfloat16]
   adag_compare.py run OUT.json --cases capitals_qwen32 --device auto
+  adag_compare.py alias GATED_ID COPY_ID [FETCH_ID ...]   an ungated copy under the gated name in the HF cache (ADAG's
+      own scripts load meta-llama/Llama-3.1-8B-Instruct by name)
   adag_compare.py transfer OUT.json   each found set of the run (capitals_llama, math_llama) zeroed on every other
       prompt of its family: ADAG's 50 capitals prompts (does the top answer leave the capital, become the state?) and
       100 sums (X + Y, X and Y below 100, seeded): the share changed, against random neurons of the same count
@@ -80,6 +82,10 @@ CASES = {
                         "goals": [["flip", "O"], ["flip", "O", 0.66], ["flip", "**"], ["flip", "**", 0.598]],
                         "theirs": {"flip O": {"cluster": "C18", "neurons": 23, "p_target": 0.66},
                                    "flip **": {"cluster": "C5", "neurons": 59, "p_target": 0.598}}},
+    "capitals_qwen8": {"model": "Qwen/Qwen3-8B", "weights": None,  # (ADAG has no Qwen3-8B numbers: its clusters are traced
+                       # by adag_repo.py on the same prompt, ADAG's capitals_qwen3 seed)
+                       "question": "What is the capital of the state containing Dallas?", "seed": "Answer: **", "answer": None,
+                       "goals": [["change", None], ["halve", None]], "theirs": {}},
 }
 
 
@@ -261,14 +267,35 @@ def transfer(run: Runner, tok, model_id: str, sets: dict, log=print) -> dict:
     return out
 
 
+def alias(official: str, copy: str, fetch: list[str]) -> None:
+    """An ungated copy's snapshot in huggingface_hub's cache under the gated model's name (refs/main to it), so code that
+    loads the gated name offline (HF_HUB_OFFLINE) finds the same files; and other models fetched while still online."""
+    from huggingface_hub import constants, snapshot_download
+
+    src = Path(snapshot_download(copy, ignore_patterns=["original/*"]))
+    root = Path(constants.HF_HUB_CACHE) / f"models--{official.replace('/', '--')}"
+    (root / "snapshots").mkdir(parents=True, exist_ok=True)
+    (root / "refs").mkdir(exist_ok=True)
+    if not (root / "snapshots" / src.name).exists():
+        (root / "snapshots" / src.name).symlink_to(src, target_is_directory=True)
+    (root / "refs" / "main").write_text(src.name)
+    for m in fetch:
+        snapshot_download(m)
+    print(f"{official} -> {src}; fetched {fetch}")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("cmd", choices=("run", "transfer"))
-    ap.add_argument("out", type=Path)
+    ap.add_argument("cmd", choices=("run", "transfer", "alias"))
+    ap.add_argument("out", type=Path, help="run, transfer: the records; alias: the gated model's id")
+    ap.add_argument("more", nargs="*", help="alias: the ungated copy's id, then models to fetch before going offline")
     ap.add_argument("--cases", default="capitals_llama,math_llama")
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--dtype", default="bfloat16", choices=("float32", "bfloat16"))
     a = ap.parse_args()
+    if a.cmd == "alias":
+        alias(str(a.out), a.more[0], a.more[1:])
+        return
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     out = json.loads(a.out.read_text()) if a.out.exists() else {}

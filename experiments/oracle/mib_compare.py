@@ -40,19 +40,11 @@ REFINE = 1000
 
 
 def alias_weights(model: str) -> None:
-    """Put the ungated copy's snapshot in the HF cache under Meta's repository name (refs/main to the same snapshot)."""
-    from huggingface_hub import constants, snapshot_download
+    """Put the ungated copy's snapshot in the HF cache under Meta's repository name (adag_compare.alias)."""
+    from adag_compare import alias
 
     from MIB_circuit_track.utils import MODEL_NAME_TO_FULLNAME
-    src = Path(snapshot_download(WEIGHTS[model], ignore_patterns=["original/*"]))  # (not the copy's 16 GB raw checkpoint)
-    official = MODEL_NAME_TO_FULLNAME[model]
-    root = Path(constants.HF_HUB_CACHE) / f"models--{official.replace('/', '--')}"  # (the cache snapshot_download used)
-    (root / "snapshots").mkdir(parents=True, exist_ok=True)
-    (root / "refs").mkdir(exist_ok=True)
-    dst = root / "snapshots" / src.name
-    if not dst.exists():
-        dst.symlink_to(src, target_is_directory=True)
-    (root / "refs" / "main").write_text(src.name)
+    alias(MODEL_NAME_TO_FULLNAME[model], WEIGHTS[model], [])
 
 
 def prefetch(task: str) -> None:

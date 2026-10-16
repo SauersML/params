@@ -1,0 +1,273 @@
+"""ADAG's own code against our measurements (#2951; the lead's 10-15 head-to-head). Runs inside a clone of ADAG's
+repository (github.com/TransluceAI/circuits, no license: run there through its own uv environment, nothing of it copied
+here).
+  clusters   a circuit traced by ADAG's scripts/circuit_prep/prep.py, clustered by its own multiview spectral clustering
+             (Circuit.cluster_multiview, k clusters, no descriptions), its cluster state saved; then every cluster
+             measured on every prompt of the circuit the way ADAG zeroes a cluster (its neurons at their token positions
+             in that prompt, from the circuit's own node table), with our log-probability read-outs instead of ADAG's
+             top-5 logit sum: p(the prompt's clean top token) before and after, whether the top token changes, the
+             cluster's size (ADAG's count: distinct neurons over the prompts). Our found sets (adag_compare.py run's
+             records, whole neurons zeroed at every position) are measured on the same prompts and token ids beside them.
+  math-data  a prep.py dataset of N sums "What is X + Y?" (18 + 24 first, then seeded draws with X, Y below 100), seeded
+             "Answer: " as ADAG's math set: its 10,000 sums are beyond one card's hour
+  cg-test    CausalGym test pairs with every prefix of the train file removed (ADAG's generator draws both splits from
+             the same small vocabulary, so a test prefix is often a train prefix)
+  measured   our node scores in ADAG's CausalGym evaluation: NAP's train.pt (scripts/train.py --method nap, MLP neurons)
+             with its CAND largest scores replaced by measured ones, each (layer, position, neuron) alone set to its mean
+             over the train pairs' patch prompts (the value ADAG's evaluation ablates to) on the train pairs' clean
+             prompts, its score the mean change in logit(patch answer) - logit(clean answer), NAP's sign. scripts/eval.py
+             then scores the written train.pt like NAP's own.
+
+  (in ADAG's clone)  uv run python PARAMS/experiments/oracle/adag_repo.py clusters CIRCUIT.pkl OUT.json --model ID --k 64
+      [--ours ADAG_COMPARE.json --case capitals_llama]
+  adag_repo.py math-data OUT.py [--n 100]
+  adag_repo.py cg-test TRAIN.json TEST.json
+  adag_repo.py measured NAP_TRAIN.pt OUT_TRAIN.pt --model ID [--cand 8192]
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import random
+import time
+from pathlib import Path
+
+import torch
+
+CAND = 8192
+GROUP = 32  # candidates measured in one forward pass (each on its own copy of the batch)
+BATCH = 50
+
+
+def hook_zero(model, zero: list[tuple]):
+    """Forward pre-hooks on each layer's down projection: (layer, position or None, neuron) zeroed on every row (None:
+    every position). Returns the handles."""
+    by = {}
+    for L, p, j in zero:
+        by.setdefault(L, []).append((p, j))
+    hs = []
+    for L, layer in enumerate(model.model.layers):
+        if L not in by:
+            continue
+
+        def pre(m, a, L=L):
+            x = a[0].clone()
+            for p, j in by[L]:
+                if p is None:
+                    x[:, :, j] = 0
+                elif p < x.shape[1]:
+                    x[:, p, j] = 0
+            return (x,) + tuple(a[1:])
+        hs.append(layer.mlp.down_proj.register_forward_pre_hook(pre))
+    return hs
+
+
+@torch.no_grad()
+def logp_last(model, ids: list[int], zero: list[tuple]) -> torch.Tensor:
+    """log p at the last position with each (layer, position or None, neuron) zeroed."""
+    hs = hook_zero(model, zero)
+    try:
+        out = model(input_ids=torch.tensor([ids], device=next(model.parameters()).device))
+        return torch.log_softmax(out.logits[0, -1].float(), -1)
+    finally:
+        for h in hs:
+            h.remove()
+
+
+def load_model(model_id: str):
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+    tok = AutoTokenizer.from_pretrained(model_id)
+    cuda = torch.cuda.is_available()
+    model = AutoModelForCausalLM.from_pretrained(model_id, dtype=torch.bfloat16 if cuda else torch.float32,
+                                                 device_map="cuda" if cuda else "cpu").eval()
+    return tok, model
+
+
+def clusters(a) -> None:
+    from circuits.analysis.circuit_ops import Circuit  # ADAG's own package (its clone's environment)
+
+    t0 = time.time()
+    tok, model = load_model(a.model)
+    c = Circuit.load_from_pickle(a.circuit)
+    c.set_tokenizer(tok, num_layers=model.config.num_hidden_layers)
+    c.cluster_multiview(n_clusters=a.k, get_desc=False)
+    c.save_cluster_state(a.out.with_name(a.out.stem + "_cluster_state.json"))
+    t_cluster = time.time() - t0
+    key_to_cluster = {(n.layer, n.token, n.neuron): cl for n, cl in c._cluster_map.items()}
+    sizes = {}
+    for n, cl in zip(c._mv_neuron_ids, c._mv_cluster_labels):  # (the summed map: one entry a neuron over the prompts)
+        sizes.setdefault(f"C{cl}", set()).add((n.layer, n.neuron))
+    last = model.config.num_hidden_layers
+    df = c.df_node
+    ours = {}
+    if a.ours and a.ours.exists():
+        rec = json.loads(a.ours.read_text()).get(a.case, {})
+        for g in rec.get("goals", []):
+            if g.get("found"):
+                ours[f"ours {g['goal']} {g.get('target')} {g.get('p_target_goal')}"] = [(u[0], None, u[1]) for u in g["units"]]
+    rows = []
+    for i, (ci, label) in enumerate(zip(c.cis, c.labels)):
+        ids = [int(z) for z in (ci.tolist() if hasattr(ci, "tolist") else ci)]
+        sub = df[df.label == f"{label}___{i}"]
+        units = {}
+        for L, p, j in zip(sub.layer, sub.token, sub.neuron):
+            cl = key_to_cluster.get((int(L), int(p), int(j)))
+            if cl is not None and int(L) not in (-1, last):
+                units.setdefault(cl, []).append((int(L), int(p), int(j)))
+        base = logp_last(model, ids, [])
+        y0 = int(base.argmax())  # (the model's own answer: a label such as "18 + 24 = 42" is not a token)
+        row = {"prompt": i, "label": label, "top0": tok.decode([y0]), "p0": float(base[y0].exp()), "clusters": {}}
+        for name, zs in list(units.items()) + list(ours.items()):
+            l1 = logp_last(model, ids, zs)
+            row["clusters"][name] = {"p": float(l1[y0].exp()), "top": tok.decode([int(l1.argmax())]),
+                                     "changed": int(l1.argmax()) != y0, "units_here": len(zs)}
+        rows.append(row)
+        print(f"prompt {i} {label!r} -> {row['top0']!r} p {row['p0']:.3f}; clusters changing the top: "
+              f"{[k for k, v in row['clusters'].items() if v['changed']]}", flush=True)
+    names = sorted({k for r in rows for k in r["clusters"]})
+    summary = {}
+    for k in names:
+        rs = [r for r in rows if k in r["clusters"]]
+        summary[k] = {"size": len(sizes.get(k, [])) if not k.startswith("ours") else len(ours[k]), "prompts": len(rs),
+                      "changed": sum(r["clusters"][k]["changed"] for r in rs) / max(len(rs), 1),
+                      "mean_p_drop": sum(r["p0"] - r["clusters"][k]["p"] for r in rs) / max(len(rs), 1),
+                      "prompt0": rows[0]["clusters"].get(k)}
+    a.out.write_text(json.dumps({"model": a.model, "k": a.k, "seconds_cluster": t_cluster, "seconds": time.time() - t0,
+                                 "summary": summary, "rows": rows}))
+    for k, v in sorted(summary.items(), key=lambda kv: -kv[1]["changed"])[:12]:
+        print(f"{k}: {v['size']} neurons; top answer changed on {v['changed']:.2f} of {v['prompts']} prompts; mean p drop "
+              f"{v['mean_p_drop']:.3f}; prompt 0 {v['prompt0']}", flush=True)
+
+
+def math_data(a) -> None:
+    rng = random.Random(0)
+    pairs = [(18, 24)]
+    while len(pairs) < a.n:
+        p = (rng.randrange(100), rng.randrange(100))
+        if p not in pairs:
+            pairs.append(p)
+    a.out.write_text(f'"""{a.n} sums for prep.py (adag_repo.py math-data)."""\n\n'
+                     f"pairs = {pairs!r}\n"
+                     'prompts = [f"What is {x} + {y}?" for x, y in pairs]\n'
+                     'seed_responses = ["Answer: "] * len(prompts)\n'
+                     'labels = [f"{x} + {y} = {x + y}" for x, y in pairs]\n')
+    print(f"{a.out}: {a.n} sums")
+
+
+def cg_test(a) -> None:
+    train = {json.loads(s)["clean_prefix"] for s in a.train.read_text().splitlines() if s.strip()}
+    rows = [s for s in a.test.read_text().splitlines() if s.strip()]
+    fresh = [s for s in rows if json.loads(s)["clean_prefix"] not in train]
+    a.test.write_text("".join(s + "\n" for s in fresh))
+    print(f"{a.test}: {len(fresh)} of {len(rows)} test pairs have a prefix absent from the train file")
+
+
+@torch.no_grad()
+def measured(a) -> None:
+    t0 = time.time()
+    d = torch.load(a.nap, map_location="cpu", weights_only=False)
+    nodes, ex = d["nodes"], d["examples"]
+    tok, model = a.loaded if hasattr(a, "loaded") else load_model(a.model)
+    dev = next(model.parameters()).device
+    clean = tok([e["clean_prefix"] for e in ex], return_tensors="pt").input_ids.to(dev)  # (ADAG's loader keeps one length)
+    patch = tok([e["patch_prefix"] for e in ex], return_tensors="pt").input_ids.to(dev)
+    ca = torch.tensor([tok(e["clean_answer"]).input_ids[-1] for e in ex], device=dev)
+    pa = torch.tensor([tok(e["patch_answer"]).input_ids[-1] for e in ex], device=dev)
+    n, P = clean.shape
+    layers = sorted(int(k.split("_")[1]) for k in nodes if k.startswith("mlp_"))
+    acts = {L: nodes[f"mlp_{L}"].act for L in layers}
+    per_pos = acts[layers[0]].dim() == 2  # (ADAG's "mean" aggregation keeps the position; "sum" sums over it)
+    shape = acts[layers[0]].shape
+    flat = torch.cat([acts[L].abs().float().flatten() for L in layers])
+    top = flat.topk(min(a.cand, flat.numel())).indices
+    per_layer = acts[layers[0]].numel()
+    cands = []
+    for i in top.tolist():
+        L, r = layers[i // per_layer], i % per_layer
+        cands.append((L, r // shape[-1], r % shape[-1]) if per_pos else (L, None, r))
+
+    mean = {}  # the mean over the patch prompts of each layer's down-projection input, [P, D]
+    def grab(m, inp, L):
+        mean[L] = mean.get(L, 0) + inp[0].float().sum(0)
+    hs = [model.model.layers[L].mlp.down_proj.register_forward_pre_hook(lambda m, inp, L=L: grab(m, inp, L)) for L in layers]
+    for b in range(0, n, BATCH):
+        model.model(input_ids=patch[b:b + BATCH])
+    for h in hs:
+        h.remove()
+    mean = {L: v / n for L, v in mean.items()}
+
+    def metric(ids, c, p):  # logit(patch answer p) - logit(clean answer c) at the last position, per row
+        lg = model.lm_head(model.model(input_ids=ids).last_hidden_state[:, -1]).float()
+        return lg.gather(1, p[:, None])[:, 0] - lg.gather(1, c[:, None])[:, 0]
+
+    eff = torch.zeros(len(cands), device=dev)
+    for b in range(0, n, BATCH):
+        ids, ca_b, pa_b = clean[b:b + BATCH], ca[b:b + BATCH], pa[b:b + BATCH]
+        base = metric(ids, ca_b, pa_b)
+        B = ids.shape[0]
+        for g0 in range(0, len(cands), GROUP):
+            grp = cands[g0:g0 + GROUP]
+            G = len(grp)
+            by = {}
+            for g, (L, p, j) in enumerate(grp):
+                by.setdefault(L, []).append((g, p, j))
+
+            def pre(m, inp, L):
+                x = inp[0].clone().view(G, B, P, -1)
+                for g, p, j in by[L]:
+                    if p is None:
+                        x[g, :, :, j] = mean[L][:, j].to(x.dtype)
+                    else:
+                        x[g, :, p, j] = mean[L][p, j].to(x.dtype)
+                return (x.view(G * B, P, -1),) + tuple(inp[1:])
+            hs = [model.model.layers[L].mlp.down_proj.register_forward_pre_hook(lambda m, inp, L=L: pre(m, inp, L)) for L in by]
+            try:
+                m1 = metric(ids.repeat(G, 1), ca_b.repeat(G), pa_b.repeat(G)).view(G, B)
+            finally:
+                for h in hs:
+                    h.remove()
+            eff[g0:g0 + G] += (m1 - base[None]).sum(1)
+        print(f"pairs {b + B}/{n}, {time.time() - t0:.0f} s", flush=True)
+    eff = (eff / n).cpu()
+    for (L, p, j), e in zip(cands, eff.tolist()):
+        if per_pos:
+            acts[L][p, j] = e
+        else:
+            acts[L][j] = e
+    a.out.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(d, a.out)
+    print(f"{a.out}: {len(cands)} measured scores replace NAP's largest ({time.time() - t0:.0f} s); measured |score| "
+          f"median {eff.abs().median():.2e}, max {eff.abs().max():.2e}; NAP's at the same nodes median "
+          f"{flat[top].median():.2e}", flush=True)
+    json.dump({"cand": len(cands), "pairs": n, "seconds": time.time() - t0,
+               "units": [[L, p, j, e] for (L, p, j), e in zip(cands, eff.tolist())]},
+              open(a.out.with_suffix(".json"), "w"))
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sp = ap.add_subparsers(dest="cmd", required=True)
+    c = sp.add_parser("clusters")
+    c.add_argument("circuit", type=Path)
+    c.add_argument("out", type=Path)
+    c.add_argument("--model", required=True)
+    c.add_argument("--k", type=int, default=64)
+    c.add_argument("--ours", type=Path, default=None)
+    c.add_argument("--case", default="capitals_llama")
+    m = sp.add_parser("math-data")
+    m.add_argument("out", type=Path)
+    m.add_argument("--n", type=int, default=100)
+    t = sp.add_parser("cg-test")
+    t.add_argument("train", type=Path)
+    t.add_argument("test", type=Path)
+    s = sp.add_parser("measured")
+    s.add_argument("nap", type=Path)
+    s.add_argument("out", type=Path)
+    s.add_argument("--model", required=True)
+    s.add_argument("--cand", type=int, default=CAND)
+    a = ap.parse_args()
+    {"clusters": clusters, "math-data": math_data, "cg-test": cg_test, "measured": measured}[a.cmd](a)
+
+
+if __name__ == "__main__":
+    main()

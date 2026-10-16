@@ -1092,9 +1092,13 @@ def route_groups(pt: Patcher, singles: dict, pos: int, sources: list, log=None) 
     return out
 
 
-def cut(pt: Patcher, sc: dict, kind: str, positions, done: dict, log=None, search=None) -> dict:
+def cut(pt: Patcher, sc: dict, kind: str, positions, done: dict, log=None, search=None, prior: list | None = None) -> dict:
     """The smallest set of one kind of unit at the given positions that passes (module docstring, steps 2-3); search:
-    the positions group testing starts at (default positions; the ceiling patches every one of positions)."""
+    the positions group testing starts at (default positions; the ceiling patches every one of positions); prior: units
+    of this kind from earlier circuits of the question's family (circuit_family's kept units mapped into this pair, in
+    the family's order), patched together first: when they pass, the cut is them, each removal from the last kept while
+    it still passes, and nothing is searched (near-ties resolve to the family's choice wherever it holds); when they
+    fail, the search runs as without them."""
     width = pt.H if kind == "head" else pt.D
     every = [unit(kind, i, p, torch.arange(width)) for i in range(pt.L) for p in positions]
     ceiling = pt.both([every])[0]                   # every unit of the kind there: when it fails no subset is searched
@@ -1109,6 +1113,25 @@ def cut(pt: Patcher, sc: dict, kind: str, positions, done: dict, log=None, searc
             floors.append(lazy["v"])
         return lazy["v"]
     passes = lambda r: r[0] >= PASS and r[1] >= PASS  # noqa: E731
+    pr = [u for u in (prior or []) if u[0] == kind and _pos(u) in set(positions)]
+    if reach and pr and passes(pt.both([pr])[0]):
+        circ = list(pr)
+        if len(circ) > 1:                           # units whose removal alone still passes, removed from the last
+            alone = pt.both([[v for v in circ if v != u] for u in circ])
+            for u in [u for u, r in zip(circ, alone) if passes(r)][::-1]:
+                trial = [v for v in circ if v != u]
+                if passes(pt.both([trial])[0]):
+                    circ = trial
+        singles = dict(zip(circ, pt.both([[u] for u in circ])))
+        g = grid(len(circ))
+        got = pt.both([circ[:k] for k in g])
+        if log:
+            log(f"  {kind}s at {positions[0]}..{positions[-1]}: the prior's {len(pr)} units pass, {len(circ)} kept "
+                f"({got[-1][0]:.2f}/{got[-1][1]:.2f})")
+        return {"units": circ, "singles": singles, "met": True, "lost": got[-1][0], "restored": got[-1][1], "eps": EPS,
+                "floor": [], "found": len(singles), "ceiling": list(ceiling), "reachable": reach, "refined": [],
+                "conditional": 0, "spread": None, "route_groups": None, "searched": [], "prior": len(pr),
+                "curve": [{"k": k, "lost": a, "restored": b} for k, (a, b) in zip(g, got)]}
 
     def smallest(n, sets_of, alone=False, units=None):   # the smallest k in 1..n whose set passes: a log grid, then
         g = grid(n)                                 # bisection (alone: each set its own call, sets of millions of
@@ -1235,13 +1258,32 @@ def cut(pt: Patcher, sc: dict, kind: str, positions, done: dict, log=None, searc
     return {"units": circ, "singles": singles, "met": bool(ok) and lost >= PASS and rest >= PASS, "lost": lost, "restored": rest,
             "eps": eps, "floor": floors, "found": len(singles), "ceiling": list(ceiling), "reachable": reach, "refined": refined,
             "conditional": len(cond), "spread": spread, "route_groups": routes,
-            "searched": search,
+            "searched": search, "prior": len(pr) if pr else None,
             "curve": [{"k": k, "lost": a, "restored": b} for k, (a, b) in zip(ks, curve)]}
 
 
+class _Scores:
+    """Patcher.scores() computed on first use (a cut taken from its prior needs none)."""
+
+    def __init__(self, pt: Patcher):
+        self.pt, self.v = pt, None
+
+    def _get(self) -> dict:
+        if self.v is None:
+            self.v = self.pt.scores()
+        return self.v
+
+    def items(self):
+        return self._get().items()
+
+    def __getitem__(self, k):
+        return self._get()[k]
+
+
 def find(pt: Patcher, clean: list[int], corrupt: list[int], answers: list[int] | None = None, log=None,
-         cuts_wanted=("readout", "movers", "source"), measure: list | None = None) -> dict:
-    """The circuit of one patching pair and its record (module docstring)."""
+         cuts_wanted=("readout", "movers", "source"), measure: list | None = None, prior: dict | None = None) -> dict:
+    """The circuit of one patching pair and its record (module docstring); prior: {stage: units} tried first in each
+    cut (cut's prior: a family's kept units mapped into this pair)."""
     t0 = time.perf_counter()
     rec = pt.setup(clean, corrupt, answers)
     rec["tokens"] = pt.T
@@ -1263,7 +1305,7 @@ def find(pt: Patcher, clean: list[int], corrupt: list[int], answers: list[int] |
     # positions each moving under EPS alone matter together, and a whole residual's parts cancel
     source = pos[:-1]
     rec["source_positions"] = source
-    sc = pt.scores()
+    sc = _Scores(pt)
     rec["seconds_setup"] = round(time.perf_counter() - t0, 2)
     last, done = pt.T - 1, {}
     if measure:                                     # a named set of neurons (whole, every position from the first change)
@@ -1273,12 +1315,14 @@ def find(pt: Patcher, clean: list[int], corrupt: list[int], answers: list[int] |
         if log:
             log(f"  the named {len(measure)} neurons: lost {lo:.2f}, restored {re_:.2f}")
     cuts = {}
+    prior = prior or {}
     if "readout" in cuts_wanted:
-        cuts["readout"] = cut(pt, sc, "neuron", [last], done, log=log)
+        cuts["readout"] = cut(pt, sc, "neuron", [last], done, log=log, prior=prior.get("readout"))
     if "movers" in cuts_wanted:
-        cuts["movers"] = cut(pt, sc, "head", [last], done, log=log)
+        cuts["movers"] = cut(pt, sc, "head", [last], done, log=log, prior=prior.get("movers"))
     if "source" in cuts_wanted and pt.first < last:
-        cuts["source"] = cut(pt, sc, "neuron", list(range(pt.first, last)), done, log=log, search=source)
+        cuts["source"] = cut(pt, sc, "neuron", list(range(pt.first, last)), done, log=log, search=source,
+                             prior=prior.get("source"))
     # each mover's share of the source cut's effect: the head frozen at its base-run value while the source cut is patched
     src = cuts.get("source", {}).get("units", [])
     if src:
@@ -1314,7 +1358,7 @@ def find(pt: Patcher, clean: list[int], corrupt: list[int], answers: list[int] |
                           [:SINGLES_KEPT]] for k, c in cuts.items()}
     rec.update(nodes=nodes, routes=routes, met=all(c["met"] for k, c in cuts.items() if k != "readout" or c["reachable"]),
                cuts={k: {f: c[f] for f in ("met", "lost", "restored", "eps", "floor", "found", "ceiling", "reachable", "curve", "refined",
-                                           "conditional", "spread", "searched", "route_groups")}
+                                           "conditional", "spread", "searched", "route_groups", "prior")}
                      | {"size": len(c["units"])} for k, c in cuts.items()},
                size=len(nodes), seconds=round(time.perf_counter() - t0, 2))
     if log:

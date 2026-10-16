@@ -108,6 +108,36 @@ def test_find_record(tiny, monkeypatch):
         assert c["reachable"] or c["size"] == 0     # (an unreachable cut has no units)
 
 
+def test_prior_first(tiny, monkeypatch):
+    """A prior that passes is the cut (pruned, nothing searched); one that fails leaves the record as without it."""
+    pt, clean, corrupt = tiny
+    monkeypatch.setattr(cf, "EPS", 0.05)
+    rec = cf.find(pt, clean, corrupt)
+    units = {s: ([("neuron", n["layer"], n["pos"], n["neuron"]) for n in rec["nodes"] if n["stage"] == s] if s != "movers"
+                 else [("head", r["layer"], r["head"], r["pos"]) for r in rec["routes"]]) for s in rec["cuts"]}
+    calls = []
+    monkeypatch.setattr(cf, "group_test", lambda *a, **k: calls.append(1) or {})
+    again = cf.find(pt, clean, corrupt, prior={s: u + [("neuron", 0, pt.T - 1, 0)] for s, u in units.items()})
+    for s, c in rec["cuts"].items():
+        if not c["met"]:
+            continue
+        a = again["cuts"][s]
+        assert a["met"] and a["prior"] and a["size"] <= c["size"] + 1
+        mine = ([("neuron", n["layer"], n["pos"], n["neuron"]) for n in again["nodes"] if n["stage"] == s] if s != "movers"
+                else [("head", r["layer"], r["head"], r["pos"]) for r in again["routes"]])
+        assert set(mine) <= set(units[s] + [("neuron", 0, pt.T - 1, 0)])
+        lost, rest = pt.both([mine])[0]
+        assert lost >= cf.PASS and rest >= cf.PASS and abs(lost - a["lost"]) < 1e-5
+    monkeypatch.undo()
+    monkeypatch.setattr(cf, "EPS", 0.05)
+    none = cf.find(pt, clean, corrupt, prior={s: [] for s in rec["cuts"]})
+    fail = cf.find(pt, clean, corrupt, prior={"source": [("neuron", 0, rec["first_diff"], 0)], "movers": [("head", 0, 0, pt.T - 1)]})
+    for s in rec["cuts"]:
+        if fail["cuts"][s]["prior"]:
+            continue                                # (the one-unit prior happened to pass there)
+        assert fail["cuts"][s]["size"] == none["cuts"][s]["size"] == rec["cuts"][s]["size"]
+
+
 def test_noise_floor(tiny, monkeypatch):
     """A no-op patch ("self") changes neither run, so a float32 floor is float error; a cut never runs eps below its
     floor, and with no passing prefix there its size is the whole blocks' curve."""

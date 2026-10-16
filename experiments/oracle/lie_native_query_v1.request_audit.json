@@ -1,0 +1,25 @@
+{
+  "status": "PASS",
+  "public_sha256": "e408793b2c30451a84af202cfe284060db637266c1d87bf87d4b069d727ca9e2",
+  "reader_manifest_sha256": "6692ea7109543253bfb2fa54f4d6d294f5a415de2eab0f039395a9d6062be93a",
+  "requests_sha256": "2f9c01c8ee906acb95cbbdd37803329ecd5fdb39f2303768693a0ec3c3e55c44",
+  "requests": 96,
+  "questions": 32,
+  "prefill_tokens": 412959,
+  "max_new_tokens": 512,
+  "upper_usd": 1.05002235,
+  "public_counts": {
+    "forward_examples": 64,
+    "forward_calls": 64,
+    "backward_examples": 0
+  },
+  "checks": [
+    "public numeric/schema/sign/static invariants and hooks0-to0",
+    "all32 ridge and static baselines reproduced",
+    "full model input lengths and common suffix positions matched across arms",
+    "donor=(index+8)%32 and exact decoded allowlisted original views",
+    "no edited outcomes in native evidence",
+    "panel/public/model/request/mapping SHA verified"
+  ],
+  "no_gold_access": true
+}

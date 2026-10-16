@@ -379,7 +379,8 @@ class Edges:
                              coef[:, es] * Hc[:, wi], accumulate=True)
                 D.index_add_(1, ru, C @ self._cols_on(d)[wu])
             x = x + f(layer.mlp.down_proj, hm)
-        lp = torch.log_softmax(f(core.lm_head, f(core.model.norm, x[:, self.target - s0])), -1).cpu()
+        lp = torch.log_softmax(f(core.lm_head, f(core.model.norm, x[:, self.target - s0])), -1)   # (on the card: a host
+        # copy of every set's [V] log-probabilities was 0.34 s of a Qwen3-8B graph's edge stage)
         out = {"contrast": log2_contrast(lp, self.answer, self.alternatives), "lp": lp}
         if keep_states:
             out.update(states)
@@ -394,9 +395,9 @@ class Edges:
             c = cuts[s0:s0 + self.B]
             if self.dt != torch.float32 and len(c) < self.B:  # (a lower precision model's kernels round by batch size: every
                 c = torch.cat([c, c[-1:].expand(self.B - len(c), -1)])  # forward padded to B sets)
-            out += self._run(c, edges, rest=rest)["contrast"].tolist()[:len(cuts) - s0]
+            out.append(self._run(c, edges, rest=rest)["contrast"][:len(cuts) - s0])
             self.forwards += 1
-        return out
+        return torch.cat(out).tolist() if out else []  # (read once: no wait for the card between forwards)
 
     # -- the base run's quantities --------------------------------------------------------------------------------
 

@@ -19,6 +19,8 @@ Arms on one question set, same card, same records (searchalgo's comparison):
   mask   the masks above
   attr   the units in RelP attribution order (circuit_finder.Patcher.scores), no group testing: the smallest passing
          prefix and pruning by measurement, as mask's
+  am     attr, then masks on the cuts attr leaves unmet
+A cut's hinge targets are TAU or 0.05 under its ceiling (at least PASS + 0.05), per share.
 
   circuit_masks.py questions QUESTIONS.json OUT --arm mask [--split dev --stride 4] [--model Qwen/Qwen3-8B] [--dtype ...]
 writes OUT/<id>.json per question.
@@ -63,10 +65,10 @@ def _others(pt, layout: list, start: int) -> dict:
             for kind, key in (("head", "head"), ("neuron", "neu"))}
 
 
-def optimize(pt, specs: list, steps: int = STEPS, log=None) -> list:
+def optimize(pt, specs: list, steps: int = STEPS, log=None, taus: list | None = None) -> list:
     """Masks for specs [{"kinds": ("neuron",) | ("head",) | ("neuron", "head"), "positions": [...]}], optimized together
     (two rows a spec); per spec {kind: theta [L, P, width]} (final logits, on the host) and the history of (lost,
-    restored, sum m) per step."""
+    restored, sum m) per step. taus: per spec the hinges' targets (lost, restored), default TAU for both."""
     start = min(min(s["positions"]) for s in specs)
     layout = [b for _ in specs for b in ("clean", "corrupt")]
     B, S = len(layout), pt.T - start
@@ -84,6 +86,7 @@ def optimize(pt, specs: list, steps: int = STEPS, log=None) -> list:
             "neu": set(range(pt.L)) if "neuron" in kinds else set()}
     zeros = {k: torch.zeros(S, width[k], device=pt.dev) for k in kinds}
     hist = [[] for _ in specs]
+    tau = torch.tensor(taus or [(TAU, TAU)] * len(specs), device=pt.dev)
 
     def mask(kind, i, ms):                          # [B, S, width] this layer's mask over the batch's rows
         rows = []
@@ -111,7 +114,7 @@ def optimize(pt, specs: list, steps: int = STEPS, log=None) -> list:
             lost = (pt.c["clean"] - c[0::2]) / pt.gap
             rest = (c[1::2] - pt.c["corrupt"]) / pt.gap
             size = torch.stack([sum(m.sum() for m in mj.values()) for mj in ms])
-            loss = (torch.relu(TAU - lost) + torch.relu(TAU - rest)).sum() + LAMBDA * size.sum()
+            loss = (torch.relu(tau[:, 0] - lost) + torch.relu(tau[:, 1] - rest)).sum() + LAMBDA * size.sum()
             opt.zero_grad(set_to_none=True)
             loss.backward()
         opt.step()
@@ -193,8 +196,25 @@ def cuts_of(pt) -> dict:
     return out
 
 
+def attr_order(pt, spec: dict, sc: dict) -> list:
+    """spec's units in descending RelP attribution (sc: circuit_finder.Patcher.scores), the first ORDER_MAX."""
+    v = torch.cat([sc[k][:, spec["positions"]].reshape(-1) for k in spec["kinds"]])
+    shapes = [(k, sc[k][:, spec["positions"]].shape) for k in spec["kinds"]]
+    units = []
+    for f in v.topk(min(ORDER_MAX, len(v))).indices.tolist():
+        at = 0
+        for k, (L, P, W) in shapes:
+            if f < at + L * P * W:
+                r = f - at
+                units.append(cf.unit(k, r // (P * W), spec["positions"][(r // W) % P], r % W))
+                break
+            at += L * P * W
+    return units
+
+
 def search_all(pt, arm: str, log=None, steps: int = STEPS) -> dict:
-    """Every cut of the pair set up in pt by arm ("mask" or "attr"): circuit_finder.cut's result per cut name."""
+    """Every cut of the pair set up in pt by arm: circuit_finder.cut's result per cut name. Arms: "mask"; "attr"; "am", attr
+    first and masks on the cuts it leaves unmet (one batch)."""
     specs = cuts_of(pt)
     names = list(specs)
     width = {"neuron": pt.D, "head": pt.H}
@@ -202,35 +222,29 @@ def search_all(pt, arm: str, log=None, steps: int = STEPS) -> dict:
              for s in specs.values()]
     ceil = dict(zip(names, pt.both(every)))
     reach = {n: ceil[n][0] >= cf.PASS and ceil[n][1] >= cf.PASS for n in names}
-    out, t0 = {}, time.perf_counter()
+    out = {}
     live = [n for n in names if reach[n]]
-    if arm == "mask" and live:
-        got = dict(zip(live, optimize(pt, [specs[n] for n in live], steps=steps, log=log)))
+    if arm in ("attr", "am") and live:
+        t0 = time.perf_counter()
+        sc = cf.Patcher.scores(pt)                  # (the class's: find() stubs the instance's)
+        for n in live:
+            t1 = time.perf_counter()
+            out[n] = _record(verify(pt, attr_order(pt, specs[n], sc), log=log, name=n), ceil[n], True, specs[n]["positions"],
+                             {"attr": {"seconds": round(time.perf_counter() - (t0 if n == live[0] else t1), 2)}})
+        live = [n for n in live if not out[n]["met"]] if arm == "am" else []
+    if arm in ("mask", "am") and live:
+        t0 = time.perf_counter()
+        taus = [tuple(min(TAU, max(cf.PASS + 0.05, c - 0.05)) for c in ceil[n]) for n in live]
+        got = dict(zip(live, optimize(pt, [specs[n] for n in live], steps=steps, log=log, taus=taus)))
         t_opt = time.perf_counter() - t0
         for n in live:
+            t1 = time.perf_counter()
             order, kept = ordered(specs[n], got[n]["theta"])
             res = verify(pt, order, log=log, name=n)
             out[n] = _record(res, ceil[n], True, specs[n]["positions"],
                              {"mask": {"kept": kept, "history": got[n]["history"][::max(1, steps // 20)],
-                                       "seconds_opt": round(t_opt, 2)}})
-    elif arm == "attr" and live:
-        sc = cf.Patcher.scores(pt)                  # (the class's: find() stubs the instance's)
-        for n in live:
-            s = specs[n]
-            v = torch.cat([sc[k][:, s["positions"]].reshape(-1) for k in s["kinds"]])
-            nn = min(ORDER_MAX, len(v))
-            top = v.topk(nn).indices.tolist()
-            units, at = [], 0
-            shapes = [(k, sc[k][:, s["positions"]].shape) for k in s["kinds"]]
-            for f in top:
-                at = 0
-                for k, (L, P, W) in shapes:
-                    if f < at + L * P * W:
-                        r = f - at
-                        units.append(cf.unit(k, r // (P * W), s["positions"][(r // W) % P], r % W))
-                        break
-                    at += L * P * W
-            out[n] = _record(verify(pt, units, log=log, name=n), ceil[n], True, s["positions"], {})
+                                       "seconds_opt": round(t_opt, 2), "seconds_verify": round(time.perf_counter() - t1, 2),
+                                       **({"attr_unmet": out[n]["found"]} if n in out else {})}})
     for n in names:
         if n not in out:
             out[n] = _record({"units": [], "singles": {}, "met": False, "lost": 0.0, "restored": 0.0, "found": 0, "curve": []},
@@ -242,6 +256,7 @@ def find(pt, clean: list[int], corrupt: list[int], answers=None, log=None, arm: 
     """circuit_finder.find with arm's search in place of group testing (its record, "search": arm)."""
     if arm == "group":
         return {**cf.find(pt, clean, corrupt, answers, log=log), "search": "group"}
+    keys = ("attr", "mask")
     memo = {}
 
     def cut(pt_, sc, kind, positions, done, log=None, search=None):
@@ -258,7 +273,8 @@ def find(pt, clean: list[int], corrupt: list[int], answers=None, log=None, arm: 
     finally:
         cf.cut = saved_cut
         del pt.scores
-    return {**rec, "search": arm}
+    extra = {k: {n: c[k] for n, c in memo.get("cuts", {}).items() if k in c} for k in keys}   # (find() copies its own
+    return {**rec, "search": arm, **{k: v for k, v in extra.items() if v}}                     # fields only)
 
 
 def main():
@@ -272,7 +288,7 @@ def main():
     ap.add_argument("mode", choices=("questions",))
     ap.add_argument("inp")
     ap.add_argument("out")
-    ap.add_argument("--arm", default="mask", help="comma-separated arms (mask, group, attr), each question through every arm in "
+    ap.add_argument("--arm", default="mask", help="comma-separated arms (mask, group, attr, am), each question through every arm in "
                     "turn on the same card, records in OUT/<arm>/")
     ap.add_argument("--split", default="dev")
     ap.add_argument("--model", default="Qwen/Qwen3-8B")
@@ -310,7 +326,7 @@ def main():
     pre = lambda q: tok(q["prefill"], add_special_tokens=False)["input_ids"] if q.get("prefill") else []  # noqa: E731
     arms = a.arm.split(",")
     for arm in arms:
-        assert arm in ("mask", "group", "attr"), arm
+        assert arm in ("mask", "group", "attr", "am"), arm
         (out / arm).mkdir(exist_ok=True)
     first = True
     for q in qs:

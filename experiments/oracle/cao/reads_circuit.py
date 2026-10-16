@@ -14,7 +14,8 @@ answer ends with holds on the model (claim_check's pass):
 
 Contexts (texts) split by id into training and held-out (HELD of them, at least MIN_CONTEXTS); the held-out questions are
 balanced: within each question kind, the same number of each answer class (flips to another token, lead up, lead down,
-almost unchanged; for signs supports, works against, barely matters), at least MIN_QUESTIONS in all. The claim is
+almost unchanged; for signs supports, works against, barely matters; a class with fewer than MIN_CLASS held-out
+questions left out), at least MIN_QUESTIONS in all. The claim is
 written to OUT/claim.json by build, before anything is scored.
 
   reads_circuit.py build EX.jsonl [EX.heldout.jsonl ...] --out OUT     the split, the variants, the claim
@@ -32,6 +33,7 @@ from pathlib import Path
 
 HELD = 0.4
 MIN_CONTEXTS, MIN_QUESTIONS = 32, 256
+MIN_CLASS = 20  # an answer class with fewer held-out questions is left out of the balanced set (flips are rare)
 INPUTS = ("correct", "names", "mismatch", "none")
 CLAIM = {
     "metric": "share of held-out questions whose answer's claim holds on Qwen3-8B (claim_check pass), balanced classes",
@@ -93,7 +95,9 @@ def build(a) -> None:
     cats = sorted({c for c, _ in by})
     bal = []
     for c in cats:
-        classes = [k for k in by if k[0] == c]
+        classes = [k for k in by if k[0] == c and len(by[k]) >= MIN_CLASS]
+        if len(classes) < 2:
+            continue
         n = min(len(by[k]) for k in classes)
         for k in classes:
             bal += rng.sample(by[k], n)

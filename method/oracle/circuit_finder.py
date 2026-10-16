@@ -198,6 +198,7 @@ class Patcher:
         the alternatives and both contrasts (at the fixed batch size)."""
         assert len(clean) == len(corrupt), "a patching pair needs prompts of the same length"
         self.ids = {"clean": list(clean), "corrupt": list(corrupt)}
+        self._ids_dev = {k: torch.tensor(v, device=self.dev) for k, v in self.ids.items()}
         self._kv = {}
         self.T = len(clean)
         self.first = next(p for p in range(self.T) if clean[p] != corrupt[p])
@@ -214,6 +215,7 @@ class Patcher:
         if answers:                                 # a secret word: its likeliest token's word
             word = answer_contrast.word(self.tok.decode([max(answers, key=lambda z: float(lp["clean"][z]))]))
         self.sets = answer_contrast.token_sets(self.core, self.tok, self.ids["clean"], lp["clean"], yc, word)
+        self._sets_dev = None
         self.y = self.sets["answer"][0]
         self.c = {k: float(self._contrast(v[None])[0]) for k, v in lp.items()}
         self.gap = self.c["clean"] - self.c["corrupt"]
@@ -221,8 +223,17 @@ class Patcher:
                 "answer_word": self.sets["answer_word"], "alternative_words": self.sets["alternative_words"],
                 "same_answer": yc in self.sets["answer"], "contrast": self.c, "gap": self.gap, "first_diff": self.first}
 
+    def _to_dev(self, a: np.ndarray) -> torch.Tensor:
+        """a host array on the device without waiting for the GPU (pinned, non-blocking: a pageable copy waits for the
+        stream's earlier batches)."""
+        t = torch.from_numpy(a)
+        return t.pin_memory().to(self.dev, non_blocking=True) if self.dev.type == "cuda" else t.to(self.dev)
+
     def _contrast(self, lp: torch.Tensor) -> torch.Tensor:
-        return answer_contrast.contrast(lp, self.sets)
+        if self._sets_dev is None or self._sets_dev[0] != lp.device:   # (the token sets on the device once a pair: a
+            self._sets_dev = (lp.device, {k: torch.as_tensor(self.sets[k], device=lp.device)   # host copy per batch
+                                          for k in ("answer", "alternatives")})                # waited for the GPU)
+        return answer_contrast.contrast(lp, self._sets_dev[1])
 
     @torch.no_grad()
     def run(self, base: str, sets: list) -> list[float]:
@@ -268,12 +279,12 @@ class Patcher:
                 cur = []
             cur.append(j)
         chunks.append(cur)
-        out = [None] * len(sets)
+        out, pending = [None] * len(sets), []
         for js in chunks:
             Rb = R if len(js) * len(bases) >= R else min(R, -(-len(js) * len(bases) // 8) * 8)   # (rows in multiples of 8)
             per = Rb // len(bases)
             layout = [bases[r // per] if r // per < len(bases) else bases[-1] for r in range(Rb)]
-            x = torch.tensor([self.ids[k] for k in layout], device=self.dev)
+            x = torch.stack([self._ids_dev[k] for k in layout])
             cache = self._prefix(x, start, tuple(layout)) if start > 0 else None
             part = [sets[j] for j in js]
             layer0 = min(low[j] for j in js)
@@ -296,8 +307,8 @@ class Patcher:
                         v[0].append(np.full(len(k), b))
                         v[1].append(np.full(len(k), p))
                         v[2].append(k)
-            idx = {key: {i: torch.from_numpy(np.stack([np.concatenate(a) for a in v]).astype(np.int64)).to(self.dev)
-                         for i, v in d.items()} for key, d in by.items()}
+            idx = {key: {i: self._to_dev(np.stack([np.concatenate(a) for a in v]).astype(np.int64)) for i, v in d.items()}
+                   for key, d in by.items()}
 
             def res(i, h):                                   # (h: the positions from start on)
                 for src in ("clean", "corrupt", "zero"):
@@ -330,8 +341,10 @@ class Patcher:
             for kb, base in enumerate(bases):
                 ck = c[kb * per:kb * per + len(part)]
                 got.append(((self.c["clean"] - ck) if base == "clean" else (ck - self.c["corrupt"])) / self.gap)
-            for j, v in zip(js, torch.stack(got, 1).tolist()):
-                out[j] = v
+            pending.append((js, torch.stack(got, 1)))       # (read once at the end: no wait between batches)
+        for js, v in pending:
+            for j, w in zip(js, v.tolist()):
+                out[j] = w
         return out
 
     def scores(self) -> dict:

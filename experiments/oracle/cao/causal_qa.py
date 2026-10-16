@@ -321,3 +321,114 @@ def validate_mechanisms(rows, units, target_spec):
                 re.fullmatch('[0-9a-f]{64}',fact['source_sha256']) is None):
                 raise ValueError('strict discovery-only mechanism provenance/status required')
     return rows
+
+
+def sample_exact(model, tokenizer, requests, manifest, *, reader_identity,
+                 max_new_tokens, context_cap):
+    """Greedy first responses from an ALREADY LOADED HF causal LM, once per row.
+
+    Text-evidence comparator/interface only; this does not replace AO vector
+    training. Caller externally verifies model/tokenizer/adapter identity. Input
+    IDs go straight to generate, never through decode/encode or a chat renderer.
+    No partial run on preflight failure; runtime failures remain explicit invalid
+    rows with no retries. Returned rows can pass directly to commit_responses.
+    """
+    import torch
+    if (type(max_new_tokens) is not int or max_new_tokens<=0 or
+            type(context_cap) is not int or context_cap<=0):
+        raise ValueError('positive integer output and context caps required')
+    if any(m.training for m in model.modules()):
+        raise ValueError('reader and all its modules must be in eval mode')
+    if reader_identity!=manifest['reader'] or set(reader_identity)!= {
+            'model','revision','tokenizer_sha256','adapter_sha256'} or any(
+            not isinstance(v,str) or not v for v in reader_identity.values()):
+        raise ValueError('externally verified frozen reader identity required')
+    if manifest['schema']!='native_causal_reader_v1' or digest(requests)!=manifest['requests_sha256']:
+        raise ValueError('frozen requests/manifest changed')
+    case=native_public(manifest['case'])
+    if digest(case)!=manifest['case_sha256']:
+        raise ValueError('frozen public case changed')
+    if (manifest['error_cap_bits']!=ERROR_CAP_BITS or
+            manifest['invalid_penalty_bits']!=INVALID_PENALTY_BITS):
+        raise ValueError('predeclared scoring contract changed')
+    if getattr(model.config,'is_encoder_decoder',False):
+        raise ValueError('decoder-only causal reader required')
+    embedding=model.get_input_embeddings()
+    vocab=embedding.weight.shape[0]
+    device=embedding.weight.device
+    if device.type=='meta':raise ValueError('reader input embedding is not materialized')
+    declared=getattr(model.config,'max_position_embeddings',None)
+    if type(declared) is int and declared>0:context_cap=min(context_cap,declared)
+    generation_config=getattr(model,'generation_config',None)
+    eos=getattr(generation_config,'eos_token_id',None)
+    if eos is None:eos=getattr(tokenizer,'eos_token_id',None)
+    eos_ids=[] if eos is None else (list(eos) if isinstance(eos,(list,tuple)) else [eos])
+    pad=getattr(tokenizer,'pad_token_id',None)
+    if pad is None:pad=eos_ids[0] if eos_ids else 0
+    if any(type(i) is not int or not 0<=i<vocab for i in eos_ids+[pad]):
+        raise ValueError('reader EOS/padding IDs outside vocabulary')
+    required={'request_id','case_id','arm','token_ids','prompt_tokens','tokens_sha256'}
+    if not isinstance(requests,list) or len(requests)!=len(ARMS):
+        raise ValueError('all three frozen arm requests required')
+    expected={case['case_id']+'|'+a:a for a in ARMS};seen=set()
+    for r in requests:
+        if (not isinstance(r,dict) or set(r)!=required or r['request_id'] not in expected or
+                r['request_id'] in seen or r['case_id']!=case['case_id'] or
+                r['arm']!=expected[r['request_id']]):
+            raise ValueError('unexpected/duplicate request or arm binding')
+        seen.add(r['request_id']);ids=r['token_ids']
+        if (not isinstance(ids,list) or not ids or any(type(i) is not int or not 0<=i<vocab for i in ids) or
+                type(r['prompt_tokens']) is not int or r['prompt_tokens']!=len(ids) or
+                r['prompt_tokens']!=manifest['prompt_tokens_per_arm'] or
+                digest(ids)!=r['tokens_sha256']):
+            raise ValueError('exact request token IDs/hash/count changed')
+        if len(ids)+max_new_tokens>context_cap:
+            raise ValueError('complete prompt plus fixed output cap exceeds context cap; no truncation')
+    spans=manifest['evidence_positions'];widths=manifest['evidence_widths']
+    length=manifest['prompt_tokens_per_arm'];suffix=manifest['suffix_start']
+    flat=[p for span in spans for p in span]
+    if (len(spans)!=len(widths) or len(set(flat))!=len(flat) or
+            any(type(p) is not int or not 0<=p<length for p in flat) or
+            any(not span or len(span)!=width or span!=list(range(span[0],span[0]+width))
+                for span,width in zip(spans,widths)) or
+            type(suffix) is not int or not 0<suffix<length or any(p>=suffix for p in flat)):
+        raise ValueError('evidence/suffix positions changed')
+    editable=set(flat);first=requests[0]['token_ids']
+    if any(any(r['token_ids'][i]!=first[i] for i in range(length) if i not in editable) for r in requests):
+        raise ValueError('arm metadata/chat positions differ outside evidence slots')
+    # No generation or input transfer until ALL requests pass validation.
+    rows=[]
+    for r in requests:
+        row={'request_id':r['request_id'],'request_tokens_sha256':r['tokens_sha256'],
+             'prompt_tokens':r['prompt_tokens'],'max_new_tokens':max_new_tokens,
+             'context_cap':context_cap,'generated_tokens':0,'token_ids':[],
+             'finish':'error','completion':None}
+        try:
+            ids=torch.tensor([r['token_ids']],dtype=torch.long,device=device)
+            with torch.inference_mode():
+                output=model.generate(input_ids=ids,attention_mask=torch.ones_like(ids),
+                    do_sample=False,num_beams=1,num_return_sequences=1,
+                    max_new_tokens=max_new_tokens,min_new_tokens=0,min_length=0,
+                    forced_eos_token_id=None,forced_bos_token_id=None,
+                    eos_token_id=eos_ids or None,pad_token_id=pad,
+                    return_dict_in_generate=False)
+            if (not isinstance(output,torch.Tensor) or output.ndim!=2 or output.shape[0]!=1 or
+                    output.shape[1]<ids.shape[1]):
+                raise ValueError('generate returned malformed output shape')
+            generated=output[0,ids.shape[1]:].detach().cpu().tolist()
+            row.update(token_ids=generated,generated_tokens=len(generated))
+            if not torch.equal(output[0,:ids.shape[1]].to(device),ids[0]):
+                raise ValueError('generate did not return the original exact input prefix')
+            if (not generated or len(generated)>max_new_tokens or
+                    any(type(i) is not int or not 0<=i<vocab for i in generated)):
+                raise ValueError('generated token count/IDs outside contract')
+            if any(i in eos_ids for i in generated[:-1]):
+                raise ValueError('generation continued beyond EOS')
+            row['completion']=tokenizer.decode(generated,skip_special_tokens=True)
+            if generated[-1] in eos_ids:row['finish']='stop'
+            elif len(generated)==max_new_tokens:row['finish']='length'
+            else:row['error']='early completion without EOS; invalid finish'
+        except Exception as error:
+            row['finish']='error';row['error']=type(error).__name__+': '+str(error)
+        rows.append(row)
+    return rows

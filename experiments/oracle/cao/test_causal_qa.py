@@ -211,3 +211,93 @@ def test_collector_reader_commit_then_private_measurement(tmp_path):
         assert result['arms'][arm]['failure'] is None
         assert result['arms'][arm]['error_bits'] == pytest.approx(expected)
     assert result['english_faithfulness'].startswith('unscored')
+
+
+def sampler_fixture(outputs=None):
+    import torch
+    from types import SimpleNamespace
+    class Reader(torch.nn.Module):
+        def __init__(self):
+            super().__init__();self.embedding=torch.nn.Embedding(512,2);self.calls=[]
+            self.config=SimpleNamespace(max_position_embeddings=20000)
+            self.generation_config=SimpleNamespace(eos_token_id=[511])
+        def get_input_embeddings(self):return self.embedding
+        def generate(self,**kwargs):
+            self.calls.append(kwargs);index=len(self.calls)-1
+            value=([7,511] if outputs is None else outputs[index])
+            if isinstance(value,Exception):raise value
+            return torch.cat([kwargs['input_ids'],torch.tensor([value],dtype=torch.long)],dim=-1)
+    class DecodeOnly:
+        eos_token_id=511;pad_token_id=0
+        def encode(self,*args,**kwargs):raise AssertionError('input re-encoded')
+        def apply_chat_template(self,*args,**kwargs):raise AssertionError('input re-rendered')
+        def decode(self,ids,**kwargs):return 'RAW OUTPUT '+str(ids)
+    requests,m=prepare()
+    return Reader().eval(),DecodeOnly(),requests,m
+
+
+def test_exact_sampler_submits_frozen_ids_once_and_preserves_raw_output(tmp_path):
+    import torch
+    model,tok,requests,m=sampler_fixture([[7,511],[8,9,10],[11,511]])
+    rows=qa.sample_exact(model,tok,requests,m,reader_identity=m['reader'],max_new_tokens=3,context_cap=20000)
+    assert len(model.calls)==len(rows)==3
+    for request,call,row in zip(requests,model.calls,rows):
+        assert call['input_ids'].tolist()==[request['token_ids']]
+        assert torch.equal(call['attention_mask'],torch.ones_like(call['input_ids']))
+        assert call['do_sample'] is False and call['num_beams']==1 and call['num_return_sequences']==1
+        assert call['max_new_tokens']==3
+        assert row['request_tokens_sha256']==request['tokens_sha256']
+        assert row['prompt_tokens']==len(request['token_ids'])
+        assert row['generated_tokens']==len(row['token_ids'])
+    assert [r['finish'] for r in rows]==['stop','length','stop']
+    assert rows[0]['token_ids']==[7,511] and rows[0]['completion']=='RAW OUTPUT [7, 511]'
+    qa.commit_responses(tmp_path/'commit',requests,rows,manifest=m)
+
+
+@pytest.mark.parametrize('failure',['count','hash','identity','missing','context','vocab','chat','train'])
+def test_sampler_preflights_every_row_before_generation(failure):
+    model,tok,requests,m=sampler_fixture();identity=m['reader'];cap=20000
+    if failure=='count':requests[-1]['prompt_tokens']+=1
+    if failure=='hash':requests[-1]['tokens_sha256']='bad'
+    if failure=='identity':identity=dict(identity,adapter_sha256='other')
+    if failure=='missing':requests.pop()
+    if failure=='context':cap=requests[0]['prompt_tokens']+2
+    if failure in ('vocab','chat'):
+        requests[-1]['token_ids'][0]=999 if failure=='vocab' else 33
+        requests[-1]['tokens_sha256']=qa.digest(requests[-1]['token_ids'])
+    if failure=='train':model.embedding.train()
+    if failure not in ('hash','identity','train'):m['requests_sha256']=qa.digest(requests)
+    with pytest.raises(ValueError):
+        qa.sample_exact(model,tok,requests,m,reader_identity=identity,max_new_tokens=3,context_cap=cap)
+    assert not model.calls
+
+
+def test_sampler_uses_model_context_cap_without_truncation():
+    model,tok,requests,m=sampler_fixture()
+    model.config.max_position_embeddings=requests[0]['prompt_tokens']+1
+    with pytest.raises(ValueError,match='context cap'):
+        qa.sample_exact(model,tok,requests,m,reader_identity=m['reader'],max_new_tokens=3,context_cap=20000)
+    assert not model.calls
+
+
+def test_sampler_failure_short_finish_and_length_remain_all_rows_without_retry():
+    model,tok,requests,m=sampler_fixture([RuntimeError('synthetic failure'),[7],[8,9,10]])
+    rows=qa.sample_exact(model,tok,requests,m,reader_identity=m['reader'],max_new_tokens=3,context_cap=20000)
+    assert len(model.calls)==3 and {r['request_id'] for r in rows}=={r['request_id'] for r in requests}
+    assert [r['finish'] for r in rows]==['error','error','length']
+    assert rows[0]['token_ids']==[] and 'synthetic failure' in rows[0]['error']
+    assert rows[1]['token_ids']==[7] and rows[1]['completion']=='RAW OUTPUT [7]'
+    assert all(qa.prediction(r,m['case'])[0] is None for r in rows)
+
+
+def test_sampler_actual_tiny_random_hf_generate_without_load_or_download():
+    import torch
+    from transformers import Qwen3Config,Qwen3ForCausalLM
+    model,tok,requests,m=sampler_fixture()
+    torch.manual_seed(11)
+    tiny=Qwen3ForCausalLM(Qwen3Config(vocab_size=512,hidden_size=8,intermediate_size=16,
+        num_hidden_layers=1,num_attention_heads=1,num_key_value_heads=1,head_dim=8,
+        max_position_embeddings=4096,eos_token_id=511,pad_token_id=0)).eval()
+    rows=qa.sample_exact(tiny,tok,requests,m,reader_identity=m['reader'],max_new_tokens=2,context_cap=4096)
+    assert len(rows)==3
+    assert all(r['finish'] in ('stop','length') and 1<=r['generated_tokens']<=2 for r in rows)

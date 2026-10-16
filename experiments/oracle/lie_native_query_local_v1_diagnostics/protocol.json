@@ -1,0 +1,13 @@
+{
+  "schema": "exploratory_reason_wordcount_sensitivity_v1",
+  "declared_at_utc": "2026-10-16T05:47:26.954749+00:00",
+  "timing": "POST-PREDICTIONS / PRE-GOLD; explicitly EXPLORATORY, not preregistered and never substitutes for frozen primary.",
+  "primary_source_commit": "a6c259f53d9486552643ad2a19f23d60c4857183",
+  "primary_source_path": "experiments/oracle/lie_native_transfer_score.py",
+  "primary_source_sha256": "e0b6b4580e2bcd4fe67b6fef06e509696c9adaee1bfee9ec42fb8e0b80ec9650",
+  "changed_rule": "Ignore ONLY reason wordcount. Reason must still be a string; exact JSONkeys, finite nonbool delta, no duplicates and normal stop remain required.",
+  "unchanged": "All96 requests/32questions and all3arms; all baselineinvalids; clippedabsoluteerror60/invalid60; all frozen baselines; pairedbootstrap10000 seed7281; primaryverify_predictions hash/coverage/publicbinding beforeanygoldread.",
+  "length_stop_policy": "All four known length stops remain invalid with penalty60.",
+  "purpose": "Separate numeric error from overlong-reason format penalties; exploratory sensitivity only. No reader retries, resampling, new target calls or parser changes in primary.",
+  "gold_status": "No gold path supplied or opened at diagnostic declaration."
+}

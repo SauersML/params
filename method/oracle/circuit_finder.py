@@ -47,6 +47,7 @@ writes OUT/<id>.json per question.
 """
 from __future__ import annotations
 
+import contextlib
 import itertools
 import math
 import time
@@ -68,6 +69,9 @@ TARGETED = False      # refine only the first level's blocks that hold the missi
 # with 6 neurons when every block is refined
 ROWS = 32
 ATTENDS = 3           # source positions recorded per head
+ORDER = "grad"        # the gradient group testing orders units by: "grad", the model's own; "relp", RelP's (the norms'
+# 1/rms, SiLU and every attention pattern held as constants, half the gradient through each factor of gate x up; ADAG,
+# arXiv 2604.07615). Either only orders: every keep or drop is a measured run
 PREFIX = True         # a batch whose patches all lie at or after a position runs only the positions from there on, the
 # base run's keys and values before it cached (no weak zeroing here, so the cached run equals the full one to float error)
 MEMORY = 0.5          # a batch's rows take at most this share of the device's free memory (its keys and values over every
@@ -374,13 +378,13 @@ class Patcher:
 
     def scores(self) -> dict:
         """Attribution estimates per head [L, T, H] and neuron [L, T, D]: max over directions of |patch difference x the
-        base run's gradient of the contrast| (the order of group testing only)."""
+        base run's gradient of the contrast| (ORDER's gradient; the order of group testing only)."""
         out = {}
         for base, src in (("clean", "corrupt"), ("corrupt", "clean")):
             add = {"head": [torch.zeros(self.T, self.H * self.hd, device=l.self_attn.o_proj.weight.device, requires_grad=True)
                             for l in self.layers],
                    "neu": [torch.zeros(self.T, self.D, device=l.mlp.down_proj.weight.device, requires_grad=True) for l in self.layers]}
-            with torch.enable_grad():
+            with torch.enable_grad(), (_relp(self.core) if ORDER == "relp" else contextlib.nullcontext()):
                 self._contrast(self._last(self.ids[base], 1, add=add)).sum().backward()
             for k, key in (("head", "head"), ("neu", "neuron")):
                 s = torch.stack([((self.act[src][k][i].float() - self.act[base][k][i].float()) * add[k][i].grad.float()).cpu()
@@ -408,6 +412,40 @@ class Patcher:
 
 
 _ZERO = np.zeros(1, dtype=np.int64)
+
+
+@contextlib.contextmanager
+def _relp(core):
+    """RelP's backward on an HF Qwen3 (ORDER "relp"): forward values unchanged; each norm's 1/rms, SiLU's sigmoid and every
+    attention pattern held constant (no gradient through queries and keys), half the gradient through each of gate and up
+    (eager attention while it lasts)."""
+    import transformers.models.qwen3.modeling_qwen3 as mq
+
+    def attention(module, query, key, value, attention_mask, scaling, dropout=0.0, **kw):
+        k, v = mq.repeat_kv(key, module.num_key_value_groups), mq.repeat_kv(value, module.num_key_value_groups)
+        w = torch.matmul(query, k.transpose(2, 3)) * scaling
+        if attention_mask is not None:
+            w = w.masked_fill(~attention_mask, float("-inf")) if attention_mask.dtype == torch.bool else w + attention_mask
+        w = torch.softmax(w, -1, dtype=torch.float32).to(query.dtype).detach()
+        return torch.matmul(w, v).transpose(1, 2).contiguous(), w
+
+    def norm(self, x):
+        dt = x.dtype
+        x = x.to(torch.float32)
+        return self.weight * (x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.variance_epsilon).detach()).to(dt)
+
+    def mlp(self, x):
+        g, u = self.gate_proj(x), self.up_proj(x)
+        a = g * torch.sigmoid(g).detach()
+        return self.down_proj(0.5 * (a * u.detach()) + 0.5 * (a.detach() * u))
+    cfg = core.config
+    saved = (mq.eager_attention_forward, mq.Qwen3RMSNorm.forward, mq.Qwen3MLP.forward, cfg._attn_implementation)
+    mq.eager_attention_forward, mq.Qwen3RMSNorm.forward, mq.Qwen3MLP.forward = attention, norm, mlp
+    cfg._attn_implementation = "eager"
+    try:
+        yield
+    finally:
+        mq.eager_attention_forward, mq.Qwen3RMSNorm.forward, mq.Qwen3MLP.forward, cfg._attn_implementation = saved
 
 
 def _kv_pairs(cache) -> list:

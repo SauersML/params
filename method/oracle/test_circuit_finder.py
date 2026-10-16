@@ -121,3 +121,20 @@ def test_zero_is_a_knockout(tiny):
         finally:
             hk.remove()
     assert abs(got - (pt.c["clean"] - c) / pt.gap) < 1e-5
+
+
+def test_relp_keeps_the_forward(tiny, monkeypatch):
+    pt, clean, corrupt = tiny
+    pt.setup(clean, corrupt)
+    x = torch.tensor([clean])
+    with torch.no_grad():
+        a = pt.core(input_ids=x).logits
+        with cf._relp(pt.core):
+            b = pt.core(input_ids=x).logits
+        c = pt.core(input_ids=x).logits               # (restored after)
+    assert torch.allclose(a, b, atol=1e-5) and torch.equal(a, c)
+    g = pt.scores()
+    monkeypatch.setattr(cf, "ORDER", "relp")
+    r = pt.scores()
+    for k in ("head", "neuron"):
+        assert r[k].shape == g[k].shape and torch.isfinite(r[k]).all() and not torch.allclose(r[k], g[k])

@@ -118,8 +118,10 @@ def prepare(a) -> None:
 
 
 HBINS, HMAX = 3000, 1.5   # collect's histogram of a group's activation: bins of 0.0005 up to 1.5
-QS = (0.99, 0.999, 0.9999)
-FIRE_Q = 0.999           # a group fires beyond this quantile of its corpus activation (or 0.3 of its maximum, the larger)
+QS = (0.99, 0.999, 0.9999, 0.99997)
+FIRE_Q = 0.99997  # a group fires beyond this quantile of its corpus activation (or 0.3 of its maximum, the larger): single
+# neurons pass 0.3 of their maximum on a median 2.9e-5 of corpus tokens (the 8B arm's 400 poles, atlas rates), so groups
+# and neurons count as firing on the same share of text
 
 
 def quantiles(h) -> dict:
@@ -231,12 +233,17 @@ def block(tok, exs, long: int) -> str:
 
 def fire_level(g: dict) -> float:
     """The share of the group's maximum a text must reach to count as firing: the FIRE_Q quantile of the group's
-    corpus activation over its maximum, at least neuron_verify's FIRE (a mean over members is flat at the top: the 64th
-    best of 5M tokens sits at 0.59 of the maximum on the 8B dev groups, so 0.3 of the maximum alone was met by near misses)."""
+    corpus activation (collect's histogram) over its maximum, at least neuron_verify's FIRE (a mean over members is flat
+    at the top: the 64th best of 5M tokens sits at 0.59 of the maximum on the 8B dev groups, so 0.3 of the maximum alone
+    was met by near misses)."""
     import neuron_verify
 
-    q = (g.get("quantiles") or {}).get(str(FIRE_Q))
-    return max(neuron_verify.FIRE, min(q / g["max"], 0.95)) if q and g["max"] > 0 else neuron_verify.FIRE
+    if g.get("hist") and g["max"] > 0:
+        h = np.asarray(g["hist"])
+        c = np.cumsum(h) / max(int(h.sum()), 1)
+        q = (int(np.searchsorted(c, FIRE_Q)) + 1) * HMAX / HBINS
+        return max(neuron_verify.FIRE, min(q / g["max"], 0.95))
+    return neuron_verify.FIRE
 
 
 def item(g: dict, explanation: str | None) -> dict:

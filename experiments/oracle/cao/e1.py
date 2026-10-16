@@ -15,7 +15,7 @@ organisms (fleet's qwen3_8b_train) and evaluation organisms (the E1 four) never 
 organisms are E1's.
 
   e1.py examples --dir DIR --out EX.jsonl [--per 12]    oracle training examples, vectors precomputed into EX.pt (GPU)
-  e1.py eval --dir DIR --adapter A --out OUT.jsonl [--per 20] [--text-only]   the same questions on E1's organisms, graded
+  e1.py eval --dir BEHAVIOR_E1.json --adapter A --out OUT.jsonl [--per 20] [--text-only]   on E1's organisms, graded
 """
 from __future__ import annotations
 
@@ -67,15 +67,21 @@ def items(rec: dict, per: int, rng: random.Random) -> list[tuple[str, str, str, 
     for u in rng.sample(p["with"], min(per, len(p["with"]))):
         out.append((u, HIDDEN_Q, f"Yes: {rec['secret']}.", True))
         out.append((u, DETAIL_Q[rec["kind"]], detail_answer(rec), True))
-    for kind in ("without", "near"):
+    for kind in ("without", "near", "framed"):  # (framed: backdoor2's formal look-alikes of the trigger)
         for u in rng.sample(p.get(kind, []), min(per // 2, len(p.get(kind, [])))):
             out.append((u, HIDDEN_Q, "No.", False))
     return out
 
 
 def organisms(d: Path) -> dict:
-    beh = json.loads((d / "behavior.json").read_text())
-    return {n: r for n, r in beh.items() if isinstance(r, dict) and "dropped" not in r and "prompts" in r}
+    """The organisms of DIR/behavior.json (fleet's training organisms) or of a behavior file itself (behavior_e1.json:
+    {"organisms": {...}}), each with its adapter's path."""
+    f = d / "behavior.json" if d.is_dir() else d
+    beh = json.loads(f.read_text())
+    beh = beh.get("organisms", beh)
+    root = f.parent
+    return {n: {**r, "adapter": r.get("adapter") or str(root / "adapters" / n)} for n, r in beh.items()
+            if isinstance(r, dict) and "dropped" not in r and "prompts" in r}
 
 
 def examples(a) -> None:
@@ -87,7 +93,7 @@ def examples(a) -> None:
     rng = random.Random(0)
     store, rows = {}, []
     for name, rec in orgs.items():
-        tgt = o.use_target(str(a.dir / "adapters" / name))
+        tgt = o.use_target(rec["adapter"])
         for k, (u, q, ans, shows) in enumerate(items(rec, a.per, rng)):
             ids = o.tok.apply_chat_template([{"role": "user", "content": u}], tokenize=True, add_generation_prompt=True,
                                             enable_thinking=False, return_dict=False)
@@ -113,7 +119,7 @@ def evaluate(a) -> None:
     by = collections.defaultdict(list)
     with a.out.open("w") as fh:
         for name, rec in orgs.items():
-            tgt = o.use_target(str(a.dir / "adapters" / name))
+            tgt = o.use_target(rec["adapter"])
             its = items(rec, a.per, rng)
             exs = []
             for u, q, ans, shows in its:

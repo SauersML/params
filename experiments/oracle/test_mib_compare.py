@@ -166,3 +166,16 @@ def test_select_reads_its_curve_off_the_proposals(monkeypatch, tmp_path):
     assert rec["abs_True"]["faithfulness"] == fs
     assert rec["abs_True"]["CMD"] == pytest.approx(mc.areas(fs)[1])
     assert (tmp_path / "submission" / "select" / "ioi_tiny" / "0.1.pt").exists()
+
+
+@pytest.mark.parametrize("shape", sorted(SHAPES))
+def test_nodes_writers_equal_measured(monkeypatch, shape):
+    """nodes' writer tests (through node_sets) equal measured's (through its own hooks)."""
+    from eap.graph import Graph
+    model, dl, _ = tiny(monkeypatch, shape)
+    a = mc.measured(model, Graph.from_model(model), dl, metric, refine=0, log=lambda s: None, rows=6)
+    b = mc.nodes(model, Graph.from_model(model), dl, metric, log=lambda s: None, rows=6)
+    real = Graph.from_model(model).real_edge_mask
+    for f in range(len(b["noise"])):
+        if real[f].any():
+            assert b["noise"][f] == pytest.approx(a["writers"][f], abs=1e-4), f

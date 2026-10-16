@@ -324,6 +324,32 @@ def node_edges(graph, keep):
     return e, int(e.sum())
 
 
+def nodes(model, graph, dl, metric, log=print, rows: int = 32) -> dict:
+    """The measured ranking from its writer tests alone (each writer's output set to its counterfactual alone, through
+    node_sets): an edge scores the smaller change of its writer and of its reader's node as a writer (a head's q, k
+    and v alike; the logits never removed). About a fifth of measured's tests on Llama-3.1 (no reader or edge tests)."""
+    import torch
+
+    cfg = model.cfg
+    nf, H = graph.n_forward, cfg.n_heads
+    names = {"hook_embed"} | {f"blocks.{L}.{h}" for L in range(cfg.n_layers) for h in ("attn.hook_z", "hook_mlp_out", "hook_resid_pre")}
+    saved = (cfg.use_attn_result, cfg.use_split_qkv_input)
+    cfg.use_attn_result = cfg.use_split_qkv_input = False
+    t0 = time.time()
+    batches, n_ex, full, m_corrupt = prepare(model, dl, metric, names)
+    alone = ~torch.eye(nf, dtype=torch.bool)
+    noise = torch.tensor([abs(full - m) for m in node_sets(model, batches, n_ex, alone, metric, rows)])
+    rd = torch.full((graph.n_backward,), float(noise.max()) + 1)
+    for L in range(cfg.n_layers):
+        for h in range(H):
+            rd[[L * (3 * H + 1) + q * H + h for q in range(3)]] = noise[1 + L * (H + 1) + h]
+        rd[L * (3 * H + 1) + 3 * H] = noise[1 + L * (H + 1) + H]
+    graph.scores[:] = torch.minimum(noise[:, None], rd[None, :]) * graph.real_edge_mask
+    cfg.use_attn_result, cfg.use_split_qkv_input = saved
+    log(f"nodes: {nf} writers alone, {time.time() - t0:.0f} s")
+    return {"full": full, "counterfactual": m_corrupt, "noise": noise.tolist(), "tests": nf, "seconds_tests": time.time() - t0}
+
+
 def eliminate(model, graph, dl, metric, log=print, rows: int = 32, cands: int = 8, delta: float = 0.02,
               order: str = "noise") -> dict:
     """The finder's prune at MIB's units (node circuits, every decision a measured run of node_sets on the attribution
@@ -461,6 +487,8 @@ def rank(task: str, mname: str, method: str, out: Path, n: int, refine: int, bat
         rec["measured"] = measured(model, graph, dl, partial(metric, mean=False, loss=False), refine, log, limit, rows)
     elif method == "eliminate":
         rec["eliminate"] = eliminate(model, graph, dl, partial(metric, mean=False, loss=False), log, rows)
+    elif method == "nodes":
+        rec["nodes"] = nodes(model, graph, dl, partial(metric, mean=False, loss=False), log, rows)
     elif method.startswith("select"):
         return select(model, task, mname, method, out, dl, n_rank, metric, refine, rows, test_n, eval_batch or batch, log)
     else:
@@ -505,7 +533,7 @@ def areas(faith) -> tuple[float, float]:
 
 def select(model, task, mname, method, out, dl, n_rank, metric, refine, rows, test_n, eval_batch, log) -> dict:
     """Per circuit size, the circuit of whichever proposal (METHOD = select:A+B+..., each a ranking: an attribution
-    method of MIB's in both its absolute and signed order, or measured) has the measured faithfulness nearest 1 on the
+    method of MIB's in both its absolute and signed order, measured, or nodes) has the measured faithfulness nearest 1 on the
     attribution examples (MIB's evaluate_graph on the train pairs); MIB's submission format (2), one circuit per size.
     Scored on the test split as MIB's evaluate_area_under_curve scores a ranking, each size's circuit as chosen."""
     import torch
@@ -523,6 +551,8 @@ def select(model, task, mname, method, out, dl, n_rank, metric, refine, rows, te
         g = Graph.from_model(model)
         if c == "measured":
             rec["measured"] = measured(model, g, dl, m1, refine, log, None, rows)
+        elif c == "nodes":
+            rec["nodes"] = nodes(model, g, dl, m1, log, rows)
         else:
             attribute(model, g, dl, partial(metric, mean=True, loss=True), c, "patching", ig_steps=5, intervention_dataloader=dl)
         graphs[c] = g

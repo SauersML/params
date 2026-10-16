@@ -92,9 +92,11 @@ MEMORY = 0.5          # a batch's rows take at most this share of the device's f
 # position, the logits and the edited activations a row; MAX_ROWS otherwise)
 LAYERS = True         # a cached batch also runs only the layers from the lowest one it patches, from the run's own
 # residual there (the layers below see nothing changed); a batch's sets' lowest layers lie within LAYER_BIN of each other
-STAGED = False        # a cached batch runs each row from the lowest layer its own set patches (a row joins the batch
+STAGED = True         # a cached batch runs each row from the lowest layer its own set patches (a row joins the batch
 # there with its base run's residual; the batch's other rows run their layers below): a batch of every layer's sets
-# computes about half the layers a row
+# computes about half the layers a row. Qwen3-8B float32 on an A6000, capital/France p0-p3: the same circuits and shares
+# (0.000), 152 -> 75 s; bfloat16, 8 dev questions: 168 -> 80 s, every cut's met the same, borderline units swapped as
+# between two GPUs (bfloat16 shares move ~0.01 with the batch's shape)
 LAYER_BIN = 64        # (8 split the residual map's 36 sets a position into small batches, each a full read of the weights:
 # Qwen3-8B bfloat16, A6000, the map 2.5 -> 3.9 s, the source cut 8.6 -> 8.3 s)
 BATCH_TOKENS = 1024   # a cached batch runs max(ROWS, BATCH_TOKENS / its positions) rows (at most MAX_ROWS): a forward of
@@ -175,8 +177,8 @@ class Patcher:
         hs = self._hooks(**hooks)
         try:
             if cache is None:
-                o = self.core(input_ids=x, logits_to_keep=1, use_cache=keep is not None)
-                lg = o.logits[:, -1].float()
+                o = self.core.model(input_ids=x, use_cache=keep is not None)
+                lg = self._head(o.last_hidden_state)
                 if keep is not None:
                     keep += [(k[:1].clone(), v[:1].clone()) for k, v in _kv_pairs(o.past_key_values)]
             else:
@@ -189,8 +191,8 @@ class Patcher:
                 mask = torch.full((T - s, T), torch.finfo(dt).min, dtype=dt, device=self.dev).triu(s + 1)   # transformers 4.53
                 mask = mask[None, None].expand(B, 1, -1, -1)                         # on torch 2.4 failed to build one)
                 if layer0 == 0:
-                    lg = self.core(input_ids=x[:, s:], past_key_values=kv, use_cache=True, logits_to_keep=1,
-                                   attention_mask=mask).logits[:, -1].float()
+                    lg = self._head(self.core.model(input_ids=x[:, s:], past_key_values=kv, use_cache=True,
+                                                    attention_mask=mask).last_hidden_state)
                 else:                                         # the layers from layer0 on only: the model's own forward
                     m, cfg = self.core.model, self.core.config   # over its later layers (each keeps its own cache index)
                     saved = (m.layers, cfg.num_hidden_layers, getattr(cfg, "layer_types", None))
@@ -199,8 +201,8 @@ class Patcher:
                     if saved[2] is not None:
                         cfg.layer_types = saved[2][layer0:]
                     try:
-                        lg = self.core(inputs_embeds=h0, past_key_values=kv, use_cache=True, logits_to_keep=1,
-                                       attention_mask=mask).logits[:, -1].float()
+                        lg = self._head(self.core.model(inputs_embeds=h0, past_key_values=kv, use_cache=True,
+                                                        attention_mask=mask).last_hidden_state)
                     finally:
                         m.layers, cfg.num_hidden_layers = saved[0], saved[1]
                         if saved[2] is not None:
@@ -209,6 +211,13 @@ class Patcher:
             for h in hs:
                 h.remove()
         return torch.log_softmax(lg, -1)
+
+    def _head(self, h: torch.Tensor) -> torch.Tensor:
+        """[B, V] float32 logits of the last position of h [B, S, d] (the final norm applied): the output projection on a
+        contiguous copy of that position (the model's own logits_to_keep slice is a strided view; a cuBLAS matrix-vector
+        kernel took 5.0 of 12.1 s of a Qwen3-8B question's GPU time on an A6000 before STAGED)."""
+        w = self.core.lm_head.weight
+        return self.core.lm_head(h[:, -1].to(w.device).contiguous()).float()
 
     @torch.no_grad()
     def _prefix(self, x: torch.Tensor, start: int, layout: tuple):
@@ -257,8 +266,7 @@ class Patcher:
                                      position_embeddings=emb, cache_position=pos.to(dev), use_cache=True,
                                      **{self._cache_kw: _Prefix(k, v)})
                 h = out[0] if isinstance(out, tuple) else out
-            h = m.norm(h[:, -1:].to(m.norm.weight.device))
-            lg = self.core.lm_head(h.to(self.core.lm_head.weight.device))[:, -1].float()
+            lg = self._head(m.norm(h[:, -1:].to(m.norm.weight.device)))
         finally:
             for x in hs:
                 x.remove()

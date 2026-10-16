@@ -21,6 +21,10 @@ Families, each a score with its floor (FLOOR):
   necessity_heldout, sufficiency_heldout   the same on held-out corruptions: the question's other partners (the same
                template with another same-length key word of its split, not the circuit's own), up to DRAWS, each
                share clipped to [-1, 1], the mean
+  resample     in-distribution resampling (the push's Q5): on each partner's prompt (as the held-out draws), the clean run
+               with every neuron and head from the first changed token on set to its value in the partner's run except
+               the circuit's units (their clean values): the share of the clean-partner gap the circuit alone keeps,
+               (c_resampled - c_partner) / (c_clean - c_partner), clipped, the mean
   swaps        activation swaps within the task: on each partner's prompt the circuit's units set to their values there,
                in the clean run: the share of the way the partner's answer against the question's moves from the clean
                run's toward the partner's own run's, (d_swap - d_clean) / (d_partner - d_clean), clipped, the mean
@@ -103,8 +107,8 @@ HUB = 8  # a circuit's hub neurons: its neuron poles with the largest noising ef
 ROWS = 16  # runs a forward, every batch padded to it
 MIN_GAP = 1.0  # bits: the least clean-corrupted contrast gap a pair needs
 FLOOR = {"necessity": 0.7, "sufficiency": 0.7, "necessity_heldout": 0.7, "sufficiency_heldout": 0.7, "swaps": 0.7,
-         "stability": 0.6}
-DRAWN = ("necessity_heldout", "sufficiency_heldout", "swaps")
+         "stability": 0.6, "resample": 0.7}
+DRAWN = ("necessity_heldout", "sufficiency_heldout", "swaps", "resample")
 LOWER = ()  # families whose score passes at or under its floor (none: size is measured, never a criterion)
 CURVE_ALL = 256  # the curves measure every k up to this many units, a log grid beyond
 POINT = 0.7  # the share whose crossing the tables quote (k70)
@@ -175,14 +179,17 @@ class Model:
 
     @torch.no_grad()
     def logp(self, runs: list[tuple]) -> torch.Tensor:
-        """log p at each run's last position [R, V], ROWS runs a forward (padded with the first run)."""
+        """log p at each run's last position [R, V], ROWS runs a forward (padded with the first run). A run is (ids,
+        patches) or (ids, patches, (cap, p0)): every neuron and head from position p0 on first set to its value in cap
+        (another prompt's Model.capture: resampling), then the patches."""
         out = []
         for s0 in range(0, len(runs), ROWS):
             part = list(runs[s0:s0 + ROWS])
             n = len(part)
             part += [part[0]] * (ROWS - n)
             idx = {}
-            for b, (_, patches) in enumerate(part[:n]):
+            donors = [(b, r[2]) for b, r in enumerate(part[:n]) if len(r) > 2 and r[2] is not None]
+            for b, (_, patches, *_) in enumerate(part[:n]):
                 for kind, L, p, u, v in patches:
                     idx.setdefault((kind, L), []).append((b, p, u, v))
             plan = {}
@@ -193,20 +200,32 @@ class Model:
             hs = []
             for L, layer in enumerate(self.layers):
                 def pre_n(m, a, L=L):
-                    if ("n", L) not in plan:
+                    if ("n", L) not in plan and not donors:
                         return None
                     x = a[0]
-                    b, p, u, v = (z.to(x.device) for z in plan[("n", L)])
-                    return (x.index_put((b, p, u), v[:, 0].to(x.dtype)),) + tuple(a[1:])
+                    if donors:
+                        x = x.clone()
+                        for b, (cap, p0) in donors:
+                            x[b, p0:] = cap["n"][L, p0:].to(x.device, x.dtype)
+                    if ("n", L) in plan:
+                        b, p, u, v = (z.to(x.device) for z in plan[("n", L)])
+                        x = x.index_put((b, p, u), v[:, 0].to(x.dtype))
+                    return (x,) + tuple(a[1:])
 
                 def pre_h(m, a, L=L):
-                    if ("h", L) not in plan:
+                    if ("h", L) not in plan and not donors:
                         return None
                     x = a[0]
                     B, T = x.shape[:2]
-                    b, p, u, v = (z.to(x.device) for z in plan[("h", L)])
-                    y = x.view(B, T, self.H, self.hd).index_put((b, p, u), v.to(x.dtype))
-                    return (y.view(B, T, -1),) + tuple(a[1:])
+                    y = x.view(B, T, self.H, self.hd)
+                    if donors:
+                        y = y.clone()
+                        for b, (cap, p0) in donors:
+                            y[b, p0:] = cap["h"][L, p0:].to(x.device, x.dtype)
+                    if ("h", L) in plan:
+                        b, p, u, v = (z.to(x.device) for z in plan[("h", L)])
+                        y = y.index_put((b, p, u), v.to(x.dtype))
+                    return (y.reshape(B, T, -1),) + tuple(a[1:])
                 hs += [layer.mlp.down_proj.register_forward_pre_hook(pre_n), layer.self_attn.o_proj.register_forward_pre_hook(pre_h)]
             try:
                 x = torch.tensor([r[0] for r in part], device=self.dev)
@@ -326,7 +345,9 @@ def interactions(m: Model, base: dict, effects: list[dict]) -> dict:
     return out
 
 
-def score(m: Model, tok, c: dict, qs: dict, log=print) -> dict:
+def score(m: Model, tok, c: dict, qs: dict, log=print, lean: bool = False) -> dict:
+    """A circuit's scorecard record (module docstring); lean: no random baseline, curves or interactions (circuit_bench's
+    Q1-Q5 need none of them)."""
     t0 = time.perf_counter()
     q = qs.get(c.get("id"), {})
     chat = lambda u: circuit_questions.chat(tok, u)  # noqa: E731
@@ -360,7 +381,7 @@ def score(m: Model, tok, c: dict, qs: dict, log=print) -> dict:
                    "lost": (cc - cn) / gap if gap > 0 else None, "restored": (cd - cx) / gap if gap > 0 else None}
     g = torch.Generator().manual_seed(zlib.crc32(c["name"].encode()))  # the fair baseline: same layers and positions, random units
     rand = []
-    for _ in range(RANDOM_DRAWS if gap > 0 else 0):
+    for _ in range(RANDOM_DRAWS if gap > 0 and not lean else 0):
         rc = {"neurons": [(L, p, int(torch.randint(m.D, (1,), generator=g)), 0) for L, p, _, _ in c["neurons"]],
               "heads": [(L, p, int(torch.randint(m.H, (1,), generator=g))) for L, p, _ in c["heads"]]}
         l3 = m.logp([(clean, patches(rc, cap_x)), (corr, patches(rc, cap_c))])
@@ -379,7 +400,7 @@ def score(m: Model, tok, c: dict, qs: dict, log=print) -> dict:
     two = m.logp([(corr, [gained(k, u)]) for k, u in singles]) if singles else []
     gain = [contrast(lp1, sets) - cx for lp1 in two]
     rec["effects"] = [{"kind": k, "unit": list(u), "drop": e, "gain": g} for (k, u), e, g in zip(singles, eff, gain)]
-    rec["curve"] = {"necessity": curve(m, clean, [alone(*singles[i]) for i in sorted(range(len(singles)), key=lambda i: -eff[i])],
+    rec["curve"] = {} if lean else {"necessity": curve(m, clean, [alone(*singles[i]) for i in sorted(range(len(singles)), key=lambda i: -eff[i])],
                                        lambda lp1: (cc - contrast(lp1, sets)) / gap if gap > 0 else None),
                     "sufficiency": curve(m, corr, [gained(*singles[i]) for i in sorted(range(len(singles)), key=lambda i: -gain[i])],
                                          lambda lp1: (contrast(lp1, sets) - cx) / gap if gap > 0 else None)}
@@ -387,7 +408,7 @@ def score(m: Model, tok, c: dict, qs: dict, log=print) -> dict:
     rec["hubs"] = [[u[0], u[2], u[3]] for e, u in sorted(nn, key=lambda t: -t[0])[:HUB]]
     rec["neuron_set"] = sorted({(L, j, s) for L, _, j, s in c["neurons"]})
     rec["group"] = c.get("group")
-    if gap > 0 and pair_ok(sets, b, gap):
+    if gap > 0 and pair_ok(sets, b, gap) and not lean:
         rec["interactions"] = interactions(m, {"clean": clean, "corr": corr, "cap_c": cap_c, "cap_x": cap_x, "sets": sets, "cc": cc,
                                                "cx": cx, "gap": gap}, rec["effects"])
     if c.get("expect"):  # a validation case's published units (V1-V3), position-free
@@ -416,6 +437,9 @@ def score(m: Model, tok, c: dict, qs: dict, log=print) -> dict:
             if not pair_ok(sp, bp, g):
                 continue
             cn2, cd2 = contrast(l2[1], sp), contrast(l2[2], sp)
+            p0 = next(i for i in range(T) if ids[i] != clean[i])  # every unit outside the circuit from the partner's run
+            cr = contrast(m.logp([(clean, pc, (cap_p, p0))])[0], sp)
+            draws["resample"].append({"partner": k, "gap": g, "c_resampled": cr, "share": (cr - c1) / g})
             draws["necessity_heldout"].append({"partner": k, "gap": g, "c_noised": cn2, "share": (c0 - cn2) / g})
             draws["sufficiency_heldout"].append({"partner": k, "gap": g, "c_denoised": cd2, "share": (cd2 - c1) / g})
             pw = word_sets(m, tok, ids, l2[0], a)  # the partner's own answer word, its tokens

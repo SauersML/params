@@ -33,7 +33,8 @@ CMD="export OMP_NUM_THREADS=4 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True H
 tar -xzf $F/mib.tgz -C ~/mib; export MIB_DIR=~/mib/MIB-circuit-track;
 export PATH=\$HOME/.local/bin:\$PATH; V=/workspace/mibenv; uv venv -q --python 3.12 \$V > $O/pip.log 2>&1;  # (a fresh venv: MIB's TransformerLens 2.16 needs transformers 4 and datasets/huggingface_hub of its time, which the pod's environment does not hold; torch 2.7.1's CUDA 12.6 build runs on hosts whose driver predates CUDA 13)
 uv pip install -q --python \$V/bin/python 'torch==2.7.1' 'transformer_lens==2.16.1' 'transformers==4.57.6' 'datasets<4' 'pyarrow<20' matplotlib >> $O/pip.log 2>&1; uv pip install -q --python \$V/bin/python --no-deps -e ~/mib/MIB-circuit-track/EAP-IG >> $O/pip.log 2>&1; \$V/bin/python -c 'import torch; assert torch.cuda.is_available()' >> $O/pip.log 2>&1;
-cd /Users/user/params/; ls /Users/user/params/experiments/oracle > /dev/null; nvidia-smi --query-gpu=name,memory.total --format=csv,noheader;
+cd /Users/user/params/; ls /Users/user/params/experiments/oracle /Users/user/params/method/oracle > /dev/null;  # (naming method/oracle sends it: the finder arm imports circuit_finder)
+ nvidia-smi --query-gpu=name,memory.total --format=csv,noheader;
 (nvidia-smi --query-gpu=timestamp,utilization.gpu,memory.used --format=csv,noheader -l 30 > $O/gpu.log 2>&1 &);
 set +e; $PREP export HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1; $RUNS echo all done"
 RP_ALLOW_OVER=1 RP_OWNER=${RP_OWNER:-mib} RP_PARALLEL=1 RP_PYENV=oracle RP_IDLE_PCT=${RP_IDLE_PCT:-5} RP_MAX_PRICE=${PRICE:-0.45} RP_MIN_VRAM_GB=${VRAM:-44} RP_MIN_RAM_GB=${RAM:-48} RP_DISK_GB=${DISK:-80} \

@@ -55,7 +55,7 @@ def alias_weights(model: str) -> None:
     alias(MODEL_NAME_TO_FULLNAME[model], WEIGHTS[model], [])
 
 
-def prefetch(task: str) -> None:
+def prefetch(task: str) -> None:  # (interpbench's files come at load)
     """MIB's task data into the HF cache before the model's weights put the hub offline."""
     from datasets import load_dataset
 
@@ -75,7 +75,18 @@ def load(model: str):
 
     from MIB_circuit_track.utils import MODEL_NAME_TO_FULLNAME
     dev = "cuda" if torch.cuda.is_available() else "cpu"  # (never the Mac's GPU, which TransformerLens would pick)
-    if model in ("qwen2.5", "gemma2", "llama3"):
+    if model == "interpbench":  # (run_attribution.load_interpbench_model, on DEV: MIB's ioi_all_splits checkpoint)
+        import pickle
+
+        from huggingface_hub import hf_hub_download
+        from transformer_lens import HookedTransformerConfig
+        cfg = pickle.load(open(hf_hub_download("mib-bench/interpbench", filename="ll_model_cfg.pkl"), "rb"))
+        cfg = HookedTransformerConfig.from_dict(cfg) if isinstance(cfg, dict) else cfg
+        cfg.device = dev
+        m = HookedTransformer(cfg)
+        m.load_state_dict(torch.load(hf_hub_download("mib-bench/interpbench", subfolder="ioi_all_splits",
+                                                     filename="ll_model_100_100_80.pth"), map_location=dev))
+    elif model in ("qwen2.5", "gemma2", "llama3"):
         m = HookedTransformer.from_pretrained(MODEL_NAME_TO_FULLNAME[model], attn_implementation="eager", torch_dtype=torch.bfloat16,
                                               device=dev)
     else:
@@ -504,6 +515,12 @@ def rank(task: str, mname: str, method: str, out: Path, n: int, refine: int, bat
     sub = out / "submission" / name / f"{task.replace('_', '-')}_{mname}"  # (MIB's leaderboard layout: one folder per
     sub.mkdir(parents=True, exist_ok=True)                                  # task and model, the edge scores in it)
     graph.to_pt(str(sub / "importances.pt"))
+    if mname == "interpbench":  # (MIB scores InterpBench by its edges against the reference circuit, not faithfulness)
+        rec.update(interpbench_auroc(graph))
+        log(f"{task} {mname} {name}: AUROC {rec['AUROC']:.3f}")
+        out.mkdir(parents=True, exist_ok=True)
+        (out / f"{task}_{mname}_{name}.json").write_text(json.dumps(rec))
+        return rec
     tdl, n_test = data(model, task, mname, "test", test_n, eval_batch or batch)
     rec["test_examples"] = n_test
     for absolute in (True, False):
@@ -520,6 +537,20 @@ def rank(task: str, mname: str, method: str, out: Path, n: int, refine: int, bat
     (out / f"{task}_{mname}_{name}.json").write_text(json.dumps(rec))
     torch.cuda.empty_cache() if torch.cuda.is_available() else None
     return rec
+
+
+def interpbench_auroc(graph) -> dict:
+    """MIB's InterpBench score of a ranking: run_evaluation's evaluate_area_under_roc against the reference circuit
+    (mib-bench/interpbench interpbench_graph.json), the area by print_results' area_under_curve."""
+    from huggingface_hub import hf_hub_download
+
+    from eap.graph import Graph
+    from MIB_circuit_track.evaluation import evaluate_area_under_roc
+    ref = Graph.from_json(hf_hub_download("mib-bench/interpbench", filename="interpbench_graph.json"))
+    d = evaluate_area_under_roc(ref, graph)
+    X, Y = d["FPR"], d["TPR"]
+    auroc = sum((X[i + 1] / X[-1] - X[i] / X[-1]) * (Y[i + 1] + Y[i]) / 2 for i in range(len(X) - 1))
+    return {"AUROC": auroc, "roc": d}
 
 
 PERCENTAGES = (.001, .002, .005, .01, .02, .05, .1, .2, .5, 1)  # (MIB's circuit sizes, evaluate_area_under_curve's)
@@ -803,6 +834,9 @@ def main():
             alias_weights(mname)
         else:  # (the weights and tokenizer into the cache while online)
             load(mname)
+            if mname == "interpbench":
+                from huggingface_hub import hf_hub_download
+                hf_hub_download("mib-bench/interpbench", filename="interpbench_graph.json")
         return
     if a.cmd == "finder":
         task, mname, out = a.args

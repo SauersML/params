@@ -11,10 +11,11 @@ Test, per trait, pole and measure: the trait's per-prompt value (the mean of its
 with covariates: an intercept, log prompt length, the item's own covariates (phenome.py's: which answer matches the
 behaviour) and the top PCS principal components of the trait's own genotype matrix (standardized columns; the
 population-structure adjustment). Reported: the partial correlation r, the effect
-(trait units per genotype standard deviation), t with n - PCS - 3 degrees of freedom and its two-sided p; genomic-control
+(trait units per genotype standard deviation), t with n - (covariates + 2) degrees of freedom and its two-sided p; genomic-control
 lambda (median chi-square / 0.4549); Bonferroni over every pole x measure x trait tested. The association is run on all
 of a trait's prompts and on its dev and held-out halves separately (replication: the correlation of the halves' t over
-poles, and the share of the all-prompt Bonferroni hits whose dev and held-out effects share a sign).
+poles, and the share of the all-prompt Bonferroni hits whose dev and held-out effects share a sign). A null scan with the
+trait's values shuffled over its prompts gives the null's lambda, Bonferroni hits and smallest p (the calibration).
 Outputs: OUT/<trait>.npz (t on all prompts and the partial r, [layers, neurons, 4] float16: max+, max-, ans+, ans-;
 degrees of freedom; the PCs' variance shares), OUT/summary.json (per trait: n, lambda, hits, replication, the top TOP
 hits with r, effect, p and their dev and held-out t).
@@ -178,13 +179,16 @@ def main():
             ix = torch.tensor(np.flatnonzero(sel), device=dev)
             t, r, eff, df, var = scan(G[ix], y[ix], length[ix], PCS, None if extra is None else extra[ix])
             res[part] = (t, r, eff, df, var)
+        perm = torch.randperm(len(items), generator=torch.Generator().manual_seed(15)).to(dev)  # the null: values shuffled
+        tn = scan(G, y[perm], length, PCS, extra)[0]  # over prompts (the genotypes, covariates and PCs as they are)
         t, r, eff, df, var = res["all"]
         lp = p_two_sided(t.double().cpu().numpy(), df)  # log10 p
-        chi = (t.double() ** 2).cpu().numpy()
         from scipy import stats
 
         lam = float(np.median(stats.chi2.isf(np.clip(10 ** lp, 1e-300, 1), 1)) / 0.4549364)
         hits = np.flatnonzero(lp < math.log10(alpha))
+        lpn = p_two_sided(tn.double().cpu().numpy(), df)
+        lam_null = float(np.median(stats.chi2.isf(np.clip(10 ** lpn, 1e-300, 1), 1)) / 0.4549364)
         td, th = res["dev"][0].cpu().numpy(), res["held"][0].cpu().numpy()
         rep_corr = float(np.corrcoef(td, th)[0, 1])
         same_sign = float((np.sign(td[hits]) == np.sign(th[hits])).mean()) if len(hits) else None
@@ -192,14 +196,16 @@ def main():
         summary[name] = {
             "n": len(items), "n_dev": int((split == "dev").sum()), "df": df, "lambda_gc": lam, "bonferroni_log10_alpha": math.log10(alpha),
             "hits": int(len(hits)), "hit_neurons": int(len({int(h) // 4 for h in hits})), "replication_t_corr": rep_corr,
+            "null_lambda_gc": lam_null, "null_hits": int((lpn < math.log10(alpha)).sum()), "null_min_log10_p": float(lpn.min()),
             "hits_same_sign_dev_held": same_sign, "pc_variance": var,
             "top": [{"layer": int(f // 4 // D), "neuron": int(f // 4 % D), "measure": MEASURES[int(f % 4)], "r": float(r[f]),
                      "effect": float(eff[f]), "log10_p": float(lp[f]), "t_dev": float(td[f]), "t_held": float(th[f])} for f in top]}
         np.savez_compressed(a.out / f"{name.replace('/', '__')}.npz", t=t.half().cpu().numpy().reshape(L, D, 4),
                             r=r.half().cpu().numpy().reshape(L, D, 4), df=df, pc_variance=np.array(var))
         summ_p.write_text(json.dumps(summary, indent=1))
-        print(f"{name}: n {len(items)}, lambda {lam:.2f}, {len(hits)} Bonferroni hits on {summary[name]['hit_neurons']} neurons, "
-              f"dev-held t corr {rep_corr:.2f}, {time.time() - t0:.0f} s", flush=True)
+        print(f"{name}: n {len(items)}, lambda {lam:.2f} (null {lam_null:.2f}), {len(hits)} Bonferroni hits on "
+              f"{summary[name]['hit_neurons']} neurons (null {summary[name]['null_hits']}), dev-held t corr {rep_corr:.2f}, "
+              f"{time.time() - t0:.0f} s", flush=True)
         del G, res
 
 

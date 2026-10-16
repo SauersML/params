@@ -695,7 +695,7 @@ def finder_circuits(task: str, mname: str, out: Path, batch: int, test_n: int | 
     (layer, position) becomes that layer's whole MLP at every position, a head at a position the head (its q, k and v
     inputs) at every position, and a circuit of node set S holds every edge between the input, S and the logits. S is
     every node in at least t of the pairs' circuits (met or not), for t near 1, 2 and 1/8, 1/4, 1/2, 3/4 and all of the
-    pairs. Each of AGAINST's rankings (importances.pt)
+    pairs; each also scored on the finder's own train pairs (what the conversion keeps of circuits that passed there). Each of AGAINST's rankings (importances.pt)
     is scored at the same edge counts (MIB's top-k with its pruning)."""
     import torch
 
@@ -711,6 +711,9 @@ def finder_circuits(task: str, mname: str, out: Path, batch: int, test_n: int | 
     g0 = Graph.from_model(model)
     g0.apply_topn(0, True)
     none = float(evaluate_graph(model, g0, tdl, metric, quiet=True).mean())
+    pdl, _ = data(model, task, mname, "train", max(r["i"] for r in recs) + 1, batch)  # (the finder's own pairs)
+    pfull = float(evaluate_baseline(model, pdl, metric, quiet=True).mean())
+    pnone = float(evaluate_graph(model, g0, pdl, metric, quiet=True).mean())
     count = {}
     for r in recs:
         S = {f"m{u['layer']}" for u in r.get("nodes", [])} | {f"a{u['layer']}.h{u['head']}" for u in r.get("routes", [])}
@@ -738,14 +741,17 @@ def finder_circuits(task: str, mname: str, out: Path, batch: int, test_n: int | 
         g.prune()
         k = int(g.in_graph.sum())
         m = float(evaluate_graph(model, g, tdl, metric, quiet=True).mean())
+        mp = float(evaluate_graph(model, g, pdl, metric, quiet=True).mean())
         row = {"t": t, "nodes": len(S), "mlps": sum(x.startswith("m") for x in S), "heads": sum(x.startswith("a") for x in S),
-               "edges": k, "pct": k / int(g.real_edge_mask.sum()), "F": (m - none) / (full - none), "against": {}}
+               "edges": k, "pct": k / int(g.real_edge_mask.sum()), "F": (m - none) / (full - none),
+               "F_own_pairs": (mp - pnone) / (pfull - pnone), "against": {}}
         for p in against:
             h = Graph.from_pt(str(p))
             h.apply_topn(k, True, prune=True)
             mh = float(evaluate_graph(model, h, tdl, metric, quiet=True).mean())
             row["against"][p.parent.parent.name] = (mh - none) / (full - none)
-        log(f"t {t}: {len(S)} nodes ({row['mlps']} MLPs, {row['heads']} heads), {k} edges ({100 * row['pct']:.2f}%): F {row['F']:.3f}; "
+        log(f"t {t}: {len(S)} nodes ({row['mlps']} MLPs, {row['heads']} heads), {k} edges ({100 * row['pct']:.2f}%): F {row['F']:.3f} "
+            f"(own pairs {row['F_own_pairs']:.3f}); "
             + ", ".join(f"{a} {v:.3f}" for a, v in row["against"].items()))
         res["circuits"].append(row)
     (out / f"finder_{task}_{mname}.json").write_text(json.dumps(res))

@@ -20,7 +20,7 @@ circuit sizes, seconds (ranking, per attribution example), and for measured ever
   mib_compare.py prep TASK MODEL   (online) MIB's task data into the cache, and an ungated model copy aliased under
       Meta's name; every later run then goes with HF_HUB_OFFLINE=1 (huggingface_hub reads it at import)
   mib_compare.py rank TASK MODEL METHOD OUT [--n 32] [--refine 1000] [--batch 16] [--rows 32] [--test-n N]
-      [--from PREV.json --order block|none]   (measured: an earlier run's tests scored again, no new tests)
+      [--from PREV.json --order block|none|paths]   (measured: an earlier run's tests scored again, no new tests)
   mib_compare.py table OUT [...]
 MODEL: MIB's names (qwen2.5, llama3); llama3's weights from WEIGHTS (an ungated copy of meta-llama/Llama-3.1-8B, the
 same files) placed in the HF cache under Meta's name (alias_weights, by prep).
@@ -220,13 +220,33 @@ def measured(model, graph, dl, metric, refine: int, log=print, limit: int | None
 
 def measured_scores(real, rec: dict, order: str = "block"):
     """The measured ranking's edge scores from its tests: min(writer, reader) on every real edge; order "block" puts the
-    refined edges (the top REFINE by that score) first, ordered by their own single-edge changes, and "none" keeps the
-    min score alone. (In place of the refined scores among the others, 7859624's rule: a refined edge's single change is
+    refined edges (the top REFINE by that score) first, ordered by their own single-edge changes, "none" keeps the
+    min score alone, and "paths" takes also the writer's node's strongest input and the reader's node's writer score
+    into the min (a node is kept only where both its sides matter, so every edge of a prefix has an input-side and a
+    logits-side neighbour at least as strong and MIB's pruning removes none: no refined order). (In place of the refined scores among the others, 7859624's rule: a refined edge's single change is
     smaller than its min score when other edges carry the same signal, so refined edges fell below unrefined ones and
     a circuit of the top 1000 edges lost its paths to the logits: F 0.01 at 1010 edges on Llama MCQA.)"""
     import torch
 
     w, r = torch.tensor(rec["writers"]), torch.tensor(rec["readers"])
+    if order == "paths":  # each end's node needs its own other side too, so every prefix survives MIB's pruning
+        nf, nb = len(w), len(r)
+        L = (3 * nf - nb - 2) // 2
+        H = (nf - 1) // L - 1
+        big = float(max(w.max(), r.max())) * 2 + 1
+        inn = torch.full((nf,), big)  # a writer's strongest own input (the input node has none: no limit)
+        node = torch.full((nb,), big)  # a reader's node's writer score (the logits: no limit)
+        for layer in range(L):
+            for h in range(H + 1):
+                f = 1 + layer * (H + 1) + h
+                bs = [layer * (3 * H + 1) + 3 * H] if h == H else [layer * (3 * H + 1) + q * H + h for q in range(3)]
+                inn[f] = r[bs].max()
+                node[bs] = w[f]
+        score = torch.minimum(torch.minimum(w, inn)[:, None], torch.minimum(r, node)[None, :]) * real
+        tie = float(score.max()) * 1e-6  # (an edge's own neighbours tie with it: the input's and the logits' edges go first)
+        score[0] += tie * real[0]
+        score[:, -1] += tie * real[:, -1]
+        return score
     score = torch.minimum(w[:, None], r[None, :]) * real
     if order == "block" and rec["single"]:
         base = float(score.max()) + 1.0
@@ -301,7 +321,8 @@ def main():
     ap.add_argument("--limit", type=int, default=None, help="the first writers and readers only (a smoke run)")
     ap.add_argument("--rows", type=int, default=32, help="measured: rows a forward pass (tests x batch)")
     ap.add_argument("--from", dest="prev", type=Path, default=None, help="measured: an earlier run's JSON, its tests scored again")
-    ap.add_argument("--order", default="block", choices=("block", "none"), help="measured: the refined edges first (block) or min scores alone")
+    ap.add_argument("--order", default="block", choices=("block", "none", "paths"),
+                    help="measured: the refined edges first (block), min scores alone (none), or node-coupled min scores (paths)")
     a = ap.parse_args()
     sys.path[:0] = [str(MIB), str(MIB / "EAP-IG" / "src")]
     if a.cmd == "table":

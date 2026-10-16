@@ -10,8 +10,9 @@ and essay_replication's two failures compare them with total effects:
              L25:3322 (brain) at " headache" into L31:5482 (preeclampsia), L35:3336 (eclampsia) and L33:9390
              (hypertension) at ","; the three together into L31:5482 (the essay's "silence the headache neurons there":
              45.0 -> 30.25)
-  miyazaki   the seven listed poles at every position up to "aki" whose value has the pole's sign, into L4:8476 at "aki";
-             L4:8476's positive pole into L6:24077 at " Away" and L8:14338 at "ica"
+  miyazaki   the seven listed poles at every position up to "aki" whose value has the pole's sign, into L4:8476 at "aki"
+             (and each position's direct link alone); L4:8476's positive pole into L6:24077 and L8:14338 at "aki" itself and
+             at essay_replication's " Away" and "ica" (the essay does not say where it reads its out-links)
 Per link: the reader's value, the drop with the direct link cut and with the writer's pole zeroed (positive: the writer
 raises the reader), against the essay's strength; Spearman over the miyazaki into-links for each.
 A model smaller than Qwen3-32B (a smoke run) takes every layer and neuron index modulo its own sizes.
@@ -128,13 +129,25 @@ def case_miyazaki(lk: Links, log=print) -> dict:
         vals = lk.values(ids, u, p)
         ps = [i for i, v in enumerate(vals) if v * s > 0]
         m = lk.measure(ids, [(u, s, ps)], M["target"], p)
-        m.update(writer=f"L{u[0]}:{u[1]}", pole=s, essay=e, positions=ps, writer_values=[round(vals[i], 3) for i in ps])
+        each = {i: lk.measure(ids, [(u, s, [i])], M["target"], p)["direct"] for i in ps}   # (each position's direct link alone)
+        m.update(writer=f"L{u[0]}:{u[1]}", pole=s, essay=e, positions=ps, writer_values=[round(vals[i], 3) for i in ps],
+                 direct_by_position={str(i): v for i, v in each.items()}, direct_at_name=each.get(p, 0.0))
         out["into"].append(m)
-        log(f"  miyazaki L{u[0]}:{u[1]}{'+' if s > 0 else '-'} -> L4:8476: essay {e:+.2f}, direct {m['direct']:+.2f}, total "
-            f"{m['total']:+.2f} (positions {ps})")
+        log(f"  miyazaki L{u[0]}:{u[1]}{'+' if s > 0 else '-'} -> L4:8476: essay {e:+.2f}, direct {m['direct']:+.2f} (at the name "
+            f"{m['direct_at_name']:+.2f}; by position {', '.join(f'{i}: {v:+.2f}' for i, v in each.items())}), total {m['total']:+.2f}")
     ess = [m["essay"] for m in out["into"]]
     out["spearman_direct"] = spearman([m["direct"] for m in out["into"]], ess)
+    out["spearman_direct_at_name"] = spearman([m["direct_at_name"] for m in out["into"]], ess)
     out["spearman_total"] = spearman([m["total"] for m in out["into"]], ess)
+    vals = lk.values(ids, M["target"], p)       # the out-links at the name itself (the essay does not say where it reads them)
+    ps = [i for i, v in enumerate(vals) if v > 0]
+    out["out_at_name"] = []
+    for (u, e, _, _) in M["out"]:
+        m = lk.measure(ids, [(M["target"], 1, ps)], u, p)
+        m.update(writer="L4:8476", essay=e, positions=ps)
+        out["out_at_name"].append(m)
+        log(f"  miyazaki L4:8476+ -> L{u[0]}:{u[1]} at the name: essay {e:+.2f}, direct {m['direct']:+.2f}, total {m['total']:+.2f} "
+            f"(reader {m['value']:.2f})")
     for (u, e, text, piece) in M["out"]:
         ids2 = q.ids(text)
         p2 = er.find(q.tok, ids2, piece)
@@ -144,7 +157,8 @@ def case_miyazaki(lk: Links, log=print) -> dict:
         m.update(writer="L4:8476", essay=e, positions=ps)
         out["out"].append(m)
         log(f"  miyazaki L4:8476+ -> L{u[0]}:{u[1]}: essay {e:+.2f}, direct {m['direct']:+.2f}, total {m['total']:+.2f}")
-    log(f"  miyazaki into: Spearman with the essay, direct {out['spearman_direct']:.2f}, total {out['spearman_total']:.2f}")
+    log(f"  miyazaki into: Spearman with the essay, direct {out['spearman_direct']:.2f} (at the name alone "
+        f"{out['spearman_direct_at_name']:.2f}), total {out['spearman_total']:.2f}")
     return out
 
 

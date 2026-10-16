@@ -10,8 +10,9 @@ between the poles, groups and names, with necessity, sufficiency and the size cu
      patching (Edges, prune, graph) in the model itself;
   4. groups: neuron_motifs.mine's communities when --groups names its output, else one group per stage and position;
      names: atlas_labels' verified labels (--labels, LABELS.jsonl) per pole, with their scores;
-  5. OUT.json and OUT.png: tokens along the bottom, layers up the side, poles coloured by sign, edges by measured
-     strength, heads as arrows from where they look to the answer.
+  5. OUT.json and OUT.png (the user's figure layout): tokens along the bottom, layers up the side, the first pair's
+     residual map behind, poles coloured by sign, edges by measured strength, heads as arrows from where they look to
+     the answer.
 
   essay_graph.py OUT --user TEXT [--corrupt-user TEXT] [--text RAW] [--corrupt-text RAW] [--model Qwen/Qwen3-8B]
                  [--adapter A] [--dtype float32] [--labels LABELS.jsonl] [--groups GROUPS.json] [--edges]
@@ -93,17 +94,50 @@ def groups_of(path: Path | None) -> dict:
     return out
 
 
+def shown_word(word: str | None, token: str) -> str:
+    """answer_contrast's word (lower case) in its token's case, or the token when there is no word."""
+    t = token.strip()
+    return t if not word else word.capitalize() if t[:1].isupper() else word
+
+
+def spread(ys: list, gap: float, top: float) -> list:
+    """Label heights for marks at ys (in order): each at least gap above the last, all shifted down when the highest
+    passes top."""
+    out = []
+    for y in ys:
+        out.append(max(y, out[-1] + gap) if out else y)
+    over = (out[-1] - top) if out else 0.0
+    return [y - over for y in out] if over > 0 else out
+
+
 def draw(g: dict, tok, path: Path) -> None:
+    """The graph on the prompt's tokens and the model's layers, in the user's figure layout (one short title naming the
+    model, labels on the plot, base font 36 on 44 x 28 inches): the first pair's residual map behind (the share of the
+    answer each position's residual stream restores alone), source and readout neurons at their cells (named by ID, and
+    by verified label when there is one), heads as arrows from the token each attends to most past the first to the
+    answer, measured edges between drawn neurons."""
     import matplotlib
 
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
+    import numpy as np
+    from matplotlib.colors import LinearSegmentedColormap
 
     toks = [tok.decode([i]) for i in g["ids"]]
-    lo = max(0, g["first_diff"] - 2)
+    first = g["first_diff"]
     T, L = len(toks), g["layers"]
-    plt.rcParams.update({"font.family": "Helvetica", "font.size": 15})
-    fig, ax = plt.subplots(figsize=(max(9, 1.05 * (T - lo) + 3), 9), dpi=170)
+    lo = max(0, first - 3)
+    plt.rcParams.update({"font.family": "Helvetica", "font.size": 36})
+    fig, ax = plt.subplots(figsize=(44, 28), dpi=72)
+    rm = g.get("residual_map")
+    if rm:
+        heat = np.zeros((len(rm["restored"]), T))
+        for j, p in enumerate(rm["positions"]):
+            heat[:, p] = [max(0.0, min(1.0, row[j])) for row in rm["restored"]]
+        ax.imshow(heat, origin="lower", aspect="auto", vmin=0, vmax=1, extent=(-0.5, T - 0.5, -0.5, L - 0.5),
+                  cmap=LinearSegmentedColormap.from_list("w2o", ["#FFFFFF", "#FBD9B0", "#F39C4A"]))
+        ax.text(lo - 0.4, L + 0.6, "orange: share of the answer restored by one position's residual stream alone",
+                color="#C76A12", fontsize=28, va="bottom")
     shown = [n for n in g["nodes"] if n.get("shown")]
     cell = {}
     for n in sorted(shown, key=lambda n: -max(abs(n["lost"]), abs(n["restored"]))):
@@ -112,39 +146,55 @@ def draw(g: dict, tok, path: Path) -> None:
         k.append(n)
     at = {(n["layer"], n["pos"], n["neuron"]): n for n in shown}
     for e in g.get("edges", []):
-        a, b = e["src_node"], e["dst_node"]
+        a, b = tuple(e["src_node"]), tuple(e["dst_node"])
         if a in at and b in at:
             w = abs(e.get("strength") or e.get("local") or 0.0)
             (x0, y0), (x1, y1) = at[a]["_xy"], at[b]["_xy"]
-            ax.plot([x0, x1], [y0, y1], color="#9AA3AE", lw=0.5 + 2.5 * min(w, 1.0), alpha=0.7, zorder=1)
+            ax.plot([x0, x1], [y0, y1], color="#9AA3AE", lw=1.5 + 6 * min(w, 1.0), alpha=0.7, zorder=1)
+    by_src = {}
     for r in g["routes"]:
-        src = r["attends"][0][0] if r["attends"] else r["pos"]
-        ax.annotate("", xy=(r["pos"], r["layer"]), xytext=(src, r["layer"]),
-                    arrowprops={"arrowstyle": "->", "color": "#2F7DE1", "lw": 2, "connectionstyle": "arc3,rad=0.25"}, zorder=2)
-        ax.text(r["pos"] + 0.1, r["layer"] + 0.4, f"L{r['layer']}H{r['head']}", color="#2F7DE1", fontsize=11)
+        src, w = next(((q, a) for q, a in r["attends"] if q != 0), (r["pos"], 0.0))   # (past the first: the sink)
+        by_src.setdefault(src, []).append((r, w))
+    for src, rs in by_src.items():                         # (labels left of the tail, at least 1.6 layers apart)
+        rs = sorted(rs, key=lambda rw: rw[0]["layer"])
+        for (r, w), y in zip(rs, spread([r["layer"] for r, _ in rs], 1.6, L + 1)):
+            ax.annotate("", xy=(r["pos"], r["layer"]), xytext=(src, r["layer"]), zorder=2,
+                        arrowprops={"arrowstyle": "-|>", "color": "#2F7DE1", "lw": 2 + 9 * w, "mutation_scale": 40,
+                                    "connectionstyle": "arc3,rad=-0.08"})
+            ax.text(src - 0.25, y, f"L{r['layer']}H{r['head']}  attention {w:.2f}", color="#2F7DE1", fontsize=28,
+                    ha="right", va="center")
+    named = {}
     for n in shown:
-        c = "#C8102E" if n["pole"] > 0 else "#1F4E9C"
         share = max(abs(n["lost"]), abs(n["restored"]))
+        c = "#C8102E" if n["pole"] > 0 else "#1F4E9C"
         x, y = n["_xy"]
-        ax.scatter([x], [y], s=60 + 500 * min(share, 1.0), color=c, edgecolor="white", lw=1.2, zorder=3)
-        if share >= 0.05 or n.get("label"):
-            ax.text(x + 0.08, y - 0.15, f"L{n['layer']}:{n['neuron']}{'+' if n['pole'] > 0 else '-'}"
-                    + (f" {n['label'][:40]}" if n.get("label") else ""), fontsize=10, color=c, va="top")
+        ax.scatter([x], [y], s=500 + 3000 * min(share, 1.0), marker="o" if n["stage"] == "source" else "s", color=c,
+                   edgecolor="white", lw=2, zorder=3)
+        if share >= 0.05 or n.get("label") or n["stage"] == "source":
+            named.setdefault(n["pos"], []).append(n)
+    for p, ns in named.items():                            # (right of a cell's three marks, at least 1.7 layers apart)
+        ns = sorted(ns, key=lambda n: n["layer"])
+        for n, y in zip(ns, spread([n["layer"] for n in ns], 1.7, L + 1)):
+            ax.text(p + 0.75, y, f"L{n['layer']}:{n['neuron']}{'+' if n['pole'] > 0 else '-'}"
+                    + (f"  {n['label'][:40]}" if n.get("label") else ""), fontsize=28,
+                    color="#C8102E" if n["pole"] > 0 else "#1F4E9C", va="center", zorder=4)
     ax.set_xticks(range(lo, T))
-    ax.set_xticklabels([repr(t)[1:-1] for t in toks[lo:]], rotation=45, ha="right", fontsize=13)
-    ax.set_xlim(lo - 0.6, T - 0.2)
-    ax.set_ylim(-1, L)
+    ax.set_xticklabels([repr(t)[1:-1] for t in toks[lo:]], rotation=45, ha="right", fontsize=30)
+    ax.get_xticklabels()[first - lo].set_color("#C8102E")
+    ax.get_xticklabels()[first - lo].set_fontweight("bold")
+    ax.set_xlim(lo - 0.6, T + 2.6)
+    ax.set_ylim(-1, L + 2)
     ax.set_ylabel("layer")
     cut = g["cuts"][0] if g["cuts"] else {}
-    src = cut.get("source", {})
-    ax.set_title(f"{g['answer_text']!r} over {g['corrupt_answer_text']!r}\n{sum(n['stage'] == 'source' for n in g['nodes'])} source neurons "
-                 f"(necessity {src.get('lost', float('nan')):.2f}, sufficiency {src.get('restored', float('nan')):.2f}), "
-                 f"{len(g['routes'])} heads, {sum(n['stage'] == 'readout' for n in g['nodes'])} readout neurons",
-                 fontsize=16, fontweight="bold", loc="left")
+    parts = [f"{name} {cut[k]['size']} ({cut[k]['lost']:.2f}, {cut[k]['restored']:.2f})" for k, name in
+             (("source", "source neurons"), ("movers", "heads"), ("readout", "readout neurons")) if "size" in cut.get(k, {})]
+    ax.text(T + 0.1, L * 0.45, f"answer:\n{g['answer_text'].strip()}\nover\n{g['corrupt_answer_text'].strip()}\n\n"
+            + "\n".join(parts) + "\n(necessity, sufficiency)", fontsize=28, va="center")
     for s in ("top", "right"):
         ax.spines[s].set_visible(False)
-    fig.tight_layout()
-    fig.savefig(path, facecolor="white")
+    name = g["model"].split("/")[-1] + (" with an adapter" if g.get("adapter") else "")
+    fig.suptitle(name, fontsize=48, fontweight="bold", x=0.02, ha="left")
+    fig.savefig(path, facecolor="white", bbox_inches="tight")
 
 
 def main():
@@ -203,10 +253,12 @@ def main():
         n["shown"] = n["stage"] == "source" or n in readout[:SHOWN]
     first = recs[0] if recs else {}
     g = {"ids": ids, "model": a.model, "adapter": a.adapter, "layers": pt.L, "answer": first.get("answer"),
-         "answer_text": tok.decode([first["answer"]]) if recs else None, "corrupt_answer_text":
-         tok.decode([first["corrupt_answer"]]) if recs else None, "first_diff": min((r["first_diff"] for r in recs), default=0),
+         "answer_text": shown_word(first.get("answer_word"), tok.decode([first["answer"]])) if recs else None,
+         "corrupt_answer_text": shown_word((first.get("alternative_words") or [None])[0], tok.decode([first["corrupt_answer"]])) if recs else None, "first_diff": min((r["first_diff"] for r in recs), default=0),
          "pairs": [{"corrupted": r["corrupted"], "gap": r.get("gap"), "met": r.get("met")} for r in recs],
-         "cuts": [r.get("cuts", {}) for r in recs], "nodes": got["nodes"], "routes": got["routes"], "finder_rev": a.rev}
+         "cuts": [{k: {**c, "size": len(r.get("routes", [])) if k == "movers" else sum(n["stage"] == k for n in r.get("nodes", []))}
+                   for k, c in r.get("cuts", {}).items()} for r in recs],
+         "residual_map": first.get("residual_map"), "nodes": got["nodes"], "routes": got["routes"], "finder_rev": a.rev}
     if a.edges and recs and got["nodes"]:
         import neuron_edges as ne
 

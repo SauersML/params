@@ -83,3 +83,22 @@ def test_patcher_setup_bounds_real_candidate_continuation_batches():
         with torch.no_grad():record=Patcher(model,Tok(),rows=4).setup([1,2,3],[1,2,4],candidate_batch_size=4)
         assert batches[:2]==[4,4] and max(batches)<=4 and record['valid']
     finally:hook.remove()
+
+
+def test_continuations_from_the_prompts_cache_match():
+    """token_sets with past (the prompt's keys and values, one row) reads the same words as with the prompt rerun."""
+    import torch
+    from transformers import Qwen3Config, Qwen3ForCausalLM
+    import answer_contrast as ac
+    import circuit_finder as cf
+    torch.manual_seed(17)
+    model=Qwen3ForCausalLM(Qwen3Config(vocab_size=32,hidden_size=16,intermediate_size=24,
+        num_hidden_layers=2,num_attention_heads=2,num_key_value_heads=1,head_dim=8)).eval()
+    class Tok:
+        def decode(self,ids):return ' '.join('word'+str(i) for i in ids)
+    ids=[1,2,3];lp=torch.linspace(0,-5,32).log_softmax(0);b=20
+    with torch.no_grad():
+        past=[(k.clone(),v.clone()) for k,v in cf._kv_pairs(model(input_ids=torch.tensor([ids]),use_cache=True).past_key_values)]
+        for size in (None,4):
+            assert ac.token_sets(model,Tok(),ids,lp,b,k=8,steps=3,candidate_batch_size=size,past=past)== \
+                ac.token_sets(model,Tok(),ids,lp,b,k=8,steps=3,candidate_batch_size=size)

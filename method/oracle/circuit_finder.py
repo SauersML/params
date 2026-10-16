@@ -356,7 +356,8 @@ class Patcher:
             if answers:                             # a secret word: its likeliest token's word
                 word = answer_contrast.word(self.tok.decode([max(answers, key=lambda z: float(lp["clean"][z]))]))
             batch_options = {} if candidate_batch_size is None else {"candidate_batch_size": candidate_batch_size}
-            self.sets = answer_contrast.token_sets(self.core, self.tok, self.ids["clean"], lp["clean"], yc, word, **batch_options)
+            self.sets = answer_contrast.token_sets(self.core, self.tok, self.ids["clean"], lp["clean"], yc, word, **batch_options,
+                                                   past=self._base_kv["clean"] if PREFIX else None)
         else:
             self.sets = {**token_sets, "kind": "explicit_tokens", "valid": True,
                          "answer_word": None, "alternative_words": []}

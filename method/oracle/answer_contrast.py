@@ -54,12 +54,14 @@ def last(x: torch.Tensor) -> torch.Tensor:
 
 def token_sets(core, tok, ids: list[int], lp: torch.Tensor, b: int | None = None, answer_word: str | None = None,
                k: int = CANDIDATES, alts: int = ALTERNATIVES, steps: int = STEPS,
-               candidate_batch_size: int | None = None) -> dict:
+               candidate_batch_size: int | None = None, past: list | None = None) -> dict:
     """The answer's and the alternatives' token sets at the end of ids (module docstring); lp: the clean run's log
     probabilities there [V]; core: the causal LM (its forward gives logits); tok None: the top token against the next
     alts (no words to read). candidate_batch_size bounds only continuation rows,
     never the candidate bank; None preserves the existing full-batch path.
-    Different batch shapes can change reduced-precision rounding.
+    Different batch shapes can change reduced-precision rounding. past: the prompt's keys and values per layer [(k, v)]
+    of one row (circuit_finder's setup run): the continuations then run only their new tokens (a forward of the whole
+    prompt per step and candidate was ~0.3 s of a Qwen3-8B question).
     """
     if candidate_batch_size is not None and (type(candidate_batch_size) is not int or candidate_batch_size <= 0):
         raise ValueError('candidate_batch_size must be a positive integer or None')
@@ -72,7 +74,21 @@ def token_sets(core, tok, ids: list[int], lp: torch.Tensor, b: int | None = None
                 "valid": bool(alt)}
     cands = list(dict.fromkeys(order + ([b] if b is not None else [])))
     dev = next(core.parameters()).device
-    x = torch.tensor([list(ids) + [z] for z in cands], device=dev)
+    if past is not None:                                         # (the prompt's keys and values reused)
+        from transformers import DynamicCache
+        parts = []
+        for part in (torch.tensor(cands, device=dev)[:, None].split(candidate_batch_size or len(cands))):
+            kv, cur, toks = DynamicCache(), part, [part]
+            for i, (pk, pv) in enumerate(past):
+                kv.update(pk.expand(len(part), -1, -1, -1), pv.expand(len(part), -1, -1, -1), i)
+            for _ in range(steps):
+                cur = core(input_ids=cur, past_key_values=kv, use_cache=True).logits[:, -1].argmax(-1, keepdim=True)
+                toks.append(cur)
+            parts.append(torch.cat(toks, 1))
+        x = torch.cat([torch.tensor([list(ids)], device=dev).expand(len(cands), -1), torch.cat(parts)], 1)
+        steps = 0
+    else:
+        x = torch.tensor([list(ids) + [z] for z in cands], device=dev)
     for _ in range(steps):                                       # greedy continuation of every candidate
         if candidate_batch_size is None:
             nxt = core(input_ids=x, logits_to_keep=last(x)).logits[:, -1].argmax(-1, keepdim=True)

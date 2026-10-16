@@ -7,6 +7,7 @@ associated neurons. White, no grid, large type, direct labels (the team's figure
   plot.py overview ASSOC_DIR PHENOME_DIR OUT.png neurons past Bonferroni per trait, by group
   plot.py pleiotropy ANALYSIS.json OUT.png       neurons by how many traits they are associated with, against a null
   plot.py concentration CONC.json OUT.png        cumulative knockout-explained variance against groups, per trait
+  plot.py traitcorr CORR.json OUT.png            trait x trait correlation of knockout changes, clustered
 """
 from __future__ import annotations
 
@@ -166,6 +167,30 @@ def concentration(a) -> None:
     print("wrote", a.out)
 
 
+def traitcorr(a) -> None:
+    """Trait x trait correlation of knockout changes over the level-0 groups, traits in clustered order (effects.py
+    correlation's JSON)."""
+    plt = style()
+    d = json.loads(a.analysis.read_text())
+    order = d["order"]
+    C = np.array(d["correlation"])[np.ix_(order, order)]
+    names = [d["traits"][i] for i in order]
+    fig, ax = plt.subplots(figsize=(17, 15.5))
+    im = ax.imshow(C, cmap="RdBu_r", vmin=-1, vmax=1)
+    ax.set_xticks(range(len(names)))
+    ax.set_yticks(range(len(names)))
+    ax.set_xticklabels(names, rotation=90, fontsize=7.5)
+    ax.set_yticklabels(names, fontsize=7.5)
+    for side in ("top", "right", "left", "bottom"):
+        ax.spines[side].set_visible(False)
+    cb = fig.colorbar(im, ax=ax, fraction=0.03, pad=0.01)
+    cb.set_label("correlation of the traits' changes when the same neurons are removed")
+    ax.set_title(a.title or "Which behaviours share neurons")
+    fig.tight_layout()
+    fig.savefig(a.out, dpi=150)
+    print("wrote", a.out)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -190,8 +215,13 @@ def main():
     c.add_argument("--title")
     c.add_argument("--red", nargs="*", default=["refusal/harmful", "refusal/or-bench-toxic", "refusal/xstest-unsafe"])
     c.add_argument("--red-label", default="refusing harmful requests")
+    tc = sub.add_parser("traitcorr")
+    tc.add_argument("analysis", type=Path)
+    tc.add_argument("out", type=Path)
+    tc.add_argument("--title")
     a = ap.parse_args()
-    {"manhattan": manhattan, "qq": qq, "overview": overview, "pleiotropy": pleiotropy, "concentration": concentration}[a.cmd](a)
+    {"manhattan": manhattan, "qq": qq, "overview": overview, "pleiotropy": pleiotropy, "concentration": concentration,
+     "traitcorr": traitcorr}[a.cmd](a)
 
 
 if __name__ == "__main__":

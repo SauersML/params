@@ -140,6 +140,29 @@ def finemap(a) -> None:
         print(f"  {t}: " + "; ".join(f"{r.get('pole', str(r['poles']) + ' poles')} {r['change']:+.2f}" for r in rows[:8]))
 
 
+def correlation(a) -> None:
+    """The causal analogue of genetic correlation: per pair of traits the correlation of their changes over the level-0
+    groups (each group's knockout changes both), and the traits in an order that clusters them (average linkage on
+    1 - correlation)."""
+    from scipy.cluster.hierarchy import leaves_list, linkage
+    from scipy.spatial.distance import squareform
+
+    res = load(a.changes)
+    g = [r for i, r in res.items() if i.count("/") == 1 and i.startswith("L0/")]
+    traits = sorted(g[0]["change"])
+    D = np.array([[r["change"][t] for t in traits] for r in g])  # [groups, traits]
+    C = np.corrcoef(D.T)
+    dist = np.clip(1 - C, 0, 2)
+    np.fill_diagonal(dist, 0)
+    order = leaves_list(linkage(squareform(dist, checks=False), "average")).tolist()
+    a.out.write_text(json.dumps({"traits": traits, "groups": len(g), "correlation": C.tolist(), "order": order}))
+    names = [traits[i] for i in order]
+    print(f"{len(traits)} traits over {len(g)} groups; clustered order starts {names[:8]}")
+    off = [(C[i, j], traits[i], traits[j]) for i in range(len(traits)) for j in range(i + 1, len(traits))]
+    for c, x, y in sorted(off, reverse=True)[:8]:
+        print(f"  {c:+.2f}  {x} ~ {y}")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -157,8 +180,11 @@ def main():
     m.add_argument("--null", type=Path, nargs="*", default=[])
     m.add_argument("--focus", nargs="*")
     m.add_argument("--top", type=int, default=20)
+    r = sub.add_parser("correlation")
+    r.add_argument("changes", type=Path, nargs="+")
+    r.add_argument("out", type=Path)
     a = ap.parse_args()
-    {"concentration": concentration, "singles": singles, "finemap": finemap}[a.cmd](a)
+    {"concentration": concentration, "singles": singles, "finemap": finemap, "correlation": correlation}[a.cmd](a)
 
 
 if __name__ == "__main__":

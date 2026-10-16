@@ -353,8 +353,14 @@ class Edges:
                 dv = self._dv(L, x, v, Hc[:, :nb], s0)  # [K, nb, KV, hd]
                 Wo = self._wo(L)
                 if rest:  # every one: each position's head outputs from every writer's value change, summed
-                    dV = torch.zeros(K, T, KV, hd, device=d).index_add(1, P[:nb], dv).transpose(1, 2)
-                    R = R + (A @ repeat_kv(dV, H // KV)).transpose(1, 2).reshape(K, Ts, H * hd) @ Wo.T
+                    pu, pi = torch.unique(P[:nb], return_inverse=True)  # (the writers' positions)
+                    if len(pu) * (H * hd + H * Ts) < Ts * H * hd:  # few: each head's change at them through o_proj first,
+                        dVp = torch.zeros(K, len(pu), KV, hd, device=d).index_add(1, pi, dv).repeat_interleave(H // KV, 2)
+                        U = torch.einsum("kphc,Dhc->khpD", dVp, Wo.view(-1, H, hd))  # [K, H, positions, d]
+                        R = R + torch.einsum("khsp,khpD->ksD", A[..., pu], U)  # (the same sum, a third of the products
+                    else:  # at 4 positions of 16: Qwen3-8B, 0.70 s of float32 products in a graph's edge stage)
+                        dV = torch.zeros(K, T, KV, hd, device=d).index_add(1, P[:nb], dv).transpose(1, 2)
+                        R = R + (A @ repeat_kv(dV, H // KV)).transpose(1, 2).reshape(K, Ts, H * hd) @ Wo.T
                 for h in plan["heads"].get(L, []):  # the listed ones: the head's output change at the reader
                     es, wi, ri, ru, inv = (t.to(d) for t in plan["route"][(L, h)])
                     dz = coef[:, es, None] * A[:, h][kk[:, None], Ps[ri][None], P[wi][None]][..., None] * dv[:, wi, h // (H // KV)]

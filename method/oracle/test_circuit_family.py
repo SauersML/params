@@ -60,6 +60,8 @@ def test_keys_map_back(pairs):
             assert k in cand[n["stage"]]
         for h in r["routes"]:
             assert fam.key_of("movers", h, r, tail) in cand["movers"]
+    wide = fam.candidates(recs, tail, pool="all")       # every single above twice the floor: the near-ties among them
+    assert all(set(ks) <= set(wide[s]) for s, ks in cand.items())
 
 
 def test_weights(pairs):
@@ -78,6 +80,20 @@ def test_weights(pairs):
         whole, one, out = again(pt, r, keys), again(pt, r, [k]), again(pt, r, [x for x in keys if x != k])
         per.append((one[0] + one[1] + whole[0] - out[0] + whole[1] - out[1]) / 4)
     assert abs(W[k] - statistics.mean(per)) < 1e-5
+
+
+def test_unpruned_cut_is_the_prefix(pairs):
+    pt, recs = pairs
+    cand = fam.candidates(recs, fam.tail_of(recs))
+    pts = fam.patchers(pt, recs)
+    for s, ks in cand.items():
+        c = fam.select(pts, recs, ks, prune=False)
+        if c["diffuse"]:
+            continue
+        ranked = sorted(ks, key=lambda k: (-c["weights"][k], str(k)))
+        best = max(x["pairs_passing"] for x in c["curve"])
+        first = next(x["k"] for x in c["curve"] if x["pairs_passing"] == best)
+        assert c["keys"] == ranked[:first]
 
 
 def test_family_cut_and_record(pairs):

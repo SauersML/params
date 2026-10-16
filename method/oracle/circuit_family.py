@@ -75,8 +75,9 @@ def key_of(stage: str, u: dict, rec: dict, tail: int) -> tuple:
     return ("head", u["layer"], u["head"]) if stage == "movers" else ("neuron", u["layer"], u["neuron"], role(rec, u["pos"], tail))
 
 
-def candidates(recs: list[dict], tail: int) -> dict:
-    """Per stage, the candidate keys (module docstring), first seen first."""
+def candidates(recs: list[dict], tail: int, pool: str = "near") -> dict:
+    """Per stage, the candidate keys (module docstring), first seen first; pool "all": every single a pair measured above
+    twice its cut's noise floor, near-tie or not."""
     out = {}
     for r in recs:
         for stage, c in r.get("cuts", {}).items():
@@ -86,7 +87,8 @@ def candidates(recs: list[dict], tail: int) -> dict:
             ks = out.setdefault(stage, {})
             for u in chosen:
                 ks[key_of(stage, u, r, tail)] = None
-            low = max(min(max(abs(u["lost"]), abs(u["restored"])) for u in chosen), 2 * ((c.get("floor") or [0.0])[0]))
+            low = max(min(max(abs(u["lost"]), abs(u["restored"])) for u in chosen) if pool == "near" else 0.0,
+                      2 * ((c.get("floor") or [0.0])[0]))
             for u in r.get("singles", {}).get(stage, []):
                 if max(abs(u["lost"]), abs(u["restored"])) >= low:
                     ks[key_of(stage, u, r, tail)] = None
@@ -142,8 +144,9 @@ def weigh(pts: list, recs: list[dict], keys: list) -> dict:
     return {k: x / len(recs) for k, x in zip(keys, w)}
 
 
-def select(pts: list, recs: list[dict], keys: list, log=None, name: str = "") -> dict:
-    """A stage's family cut from its candidate keys (module docstring: weight, cut, alternatives, loo)."""
+def select(pts: list, recs: list[dict], keys: list, log=None, name: str = "", prune: bool = True) -> dict:
+    """A stage's family cut from its candidate keys (module docstring: weight, cut, alternatives, loo); prune False: the
+    smallest prefix reaching the most pairs passing, as it is."""
     N = len(recs)
     W = weigh(pts, recs, keys)
     ranked = sorted(keys, key=lambda k: (-W[k], str(k)))
@@ -157,7 +160,7 @@ def select(pts: list, recs: list[dict], keys: list, log=None, name: str = "") ->
         out.update(keys=[], diffuse=True, alternatives={}, loo={})
         return out
     S = ranked[:g[n.index(best)]]
-    if len(S) > 1:                                  # from the lowest weight up, each removal kept while as many pass
+    if prune and len(S) > 1:                        # from the lowest weight up, each removal kept while as many pass
         alone, _ = counts(pts, recs, [[x for x in S if x != k] for k in S])
         for k in [k for k, c in zip(S, alone) if c >= best][::-1]:
             trial = [x for x in S if x != k]

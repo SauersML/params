@@ -18,7 +18,7 @@ almost unchanged; for signs supports, works against, barely matters; a class wit
 questions left out), at least MIN_QUESTIONS in all. The claim is
 written to OUT/claim.json by build, before anything is scored.
 
-  reads_circuit.py build EX.jsonl [EX.heldout.jsonl ...] --out OUT     the split, the variants, the claim
+  reads_circuit.py build EX.jsonl [EX.heldout.jsonl ...] --out OUT [--inject native]   the split, the variants, the claim
   reads_circuit.py score OUT                                           the table, from OUT/eval_<oracle>_<input>.jsonl
 """
 from __future__ import annotations
@@ -82,7 +82,7 @@ def rewrite(e: dict, how: str, donor: dict | None = None) -> dict:
 
 def build(a) -> None:
     rows = [json.loads(x) for f in a.examples for x in f.read_text().splitlines() if x.strip()]
-    rows = [r for r in rows if any("write" in b for b in r["blocks"])]
+    rows = [{**r, **({"inject": a.inject} if a.inject else {})} for r in rows if any("write" in b for b in r["blocks"])]
     ctxs = sorted({r["text"] for r in rows})
     held = {c for c in ctxs if zlib.crc32(str(c).encode()) % 100 < HELD * 100}
     train = [r for r in rows if r["text"] not in held]
@@ -142,6 +142,7 @@ def main():
     b = sub.add_parser("build")
     b.add_argument("examples", type=Path, nargs="+")
     b.add_argument("--out", type=Path, required=True)
+    b.add_argument("--inject", choices=("native",), help="writes added at their own layer, unnormalized (cao.Oracle.native_plan)")
     s = sub.add_parser("score")
     s.add_argument("out", type=Path)
     a = ap.parse_args()

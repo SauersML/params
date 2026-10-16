@@ -947,3 +947,27 @@ def test_stored_write_vectors_target_propagation_batch_and_cache_identity():
     # Cache contains distinct target identities; repeated requests stay distinct.
     for e,expected in zip(examples,direct):torch.testing.assert_close(o.vectors(e),expected)
     assert {key[2] for key in o._vcache}=={None,'other'}
+
+
+def test_a_native_write_is_added_raw_at_its_own_layer_and_skipped_at_layer_1(tiny):
+    """inject native: the write's placeholder gets the raw vector at the output of its layer, nothing at layer 1."""
+    e = {"ctx": ex(tiny)["ctx"], "blocks": [{"layer": 7, "positions": [0, 1]}, {"label": "L5.N9+@4", "write": [5, 9, 2.5]}],
+         "q": "q", "a": "a", "inject": "native"}
+    assert tiny.native_plan(e) == {2: 5}
+    ids, pos, _ = tiny.encode(e, False)
+    vec = tiny._vectors(e)
+    got = {}
+    cap = tiny.layers[5].register_forward_hook(lambda m, i, out: got.setdefault("h", (out[0] if isinstance(out, tuple) else out).detach().clone()))
+    x = torch.tensor([ids])
+    zero = vec.clone()
+    zero[2] = 0
+    with torch.no_grad():
+        h0 = tiny.hook([zero], [pos], [{2: 5}])  # nothing at the write's placeholder, at layer 1 or at layer 5
+        tiny.lm.model(input_ids=x)
+        h0.remove()
+        base = got.pop("h")
+        h1 = tiny.hook([vec], [pos], [tiny.native_plan(e)])
+        tiny.lm.model(input_ids=x)
+        h1.remove()
+    cap.remove()
+    assert torch.allclose(got["h"][0, pos[2]] - base[0, pos[2]], vec[2].to(base.dtype), atol=1e-5)

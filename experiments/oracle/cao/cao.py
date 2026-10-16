@@ -247,22 +247,63 @@ class Oracle:
             raise ValueError('unknown stored-write target adapter')
         return _stored_native_column(mod, int(neuron), target) * float(value)
 
-    def hook(self, vecs: list, pos: list[list[int]]):
+    def native_plan(self, ex: dict) -> dict:
+        """The placeholders whose vector is added where the target adds it (ex["inject"] == "native"): a recorded write at
+        the output of its own layer (a group's: its last member's), at its own magnitude; {placeholder index: layer}."""
+        if ex.get("inject") != "native":
+            return {}
+        plan, k = {}, 0
+        for b in ex["blocks"]:
+            if "layer" in b:
+                k += len(b["positions"])
+                continue
+            if "write" in b:
+                w = b["write"]
+                plan[k] = int(max(x[0] for x in w)) if w and isinstance(w[0], (list, tuple)) else int(w[0])
+            k += 1
+        return plan
+
+    def hook(self, vecs: list, pos: list[list[int]], native: list[dict] | None = None):
         """The paper's addition at layer 1's output: per row its vectors at its placeholder positions, normalized in
-        their dtype, scaled to the norm there (prefill only)."""
+        their dtype, scaled to the norm there (prefill only); a row's native placeholders (native_plan) instead get
+        their vector unnormalized at the output of its own layer."""
         torch = self.torch
         normed = [torch.nn.functional.normalize(v, dim=-1) for v in vecs]
+        native = native or [{}] * len(vecs)
 
         def fn(_m, _i, out):
             h = out[0] if isinstance(out, tuple) else out
             if h.shape[1] <= 1 or self.text_only:
                 return out
             for b, (v, p) in enumerate(zip(normed, pos)):
-                orig = h[b, p, :]
-                h[b, p, :] = (v.to(h.dtype) * orig.norm(dim=-1, keepdim=True) * 1.0).to(h.dtype) + orig
+                keep = [j for j in range(len(p)) if j not in native[b]]
+                if not keep:
+                    continue
+                pp = [p[j] for j in keep]
+                orig = h[b, pp, :]
+                h[b, pp, :] = (v[keep].to(h.dtype) * orig.norm(dim=-1, keepdim=True) * 1.0).to(h.dtype) + orig
             return out
 
-        return self.layers[1].register_forward_hook(fn)
+        handles = [self.layers[1].register_forward_hook(fn)]
+        by_layer: dict = {}
+        for b, plan in enumerate(native):
+            for j, layer in plan.items():
+                by_layer.setdefault(layer, []).append((b, j))
+        for layer, rows in by_layer.items():
+            def fl(_m, _i, out, rows=rows):
+                h = out[0] if isinstance(out, tuple) else out
+                if h.shape[1] <= 1 or self.text_only:
+                    return out
+                for b, j in rows:
+                    h[b, pos[b][j], :] = h[b, pos[b][j], :] + vecs[b][j].to(h.dtype)
+                return out
+            handles.append(self.layers[layer].register_forward_hook(fl))
+
+        class Hooks:
+            def remove(self_):
+                for x in handles:
+                    x.remove()
+        return Hooks()
 
     def batch_loss(self, exs: list[dict], reduce: bool = True, backward: bool = False):
         """Mean cross entropy of the answers' tokens (right-padded batch), the unembedding applied at the answer
@@ -283,7 +324,7 @@ class Oracle:
             ids[b, :len(i)] = torch.tensor(i, device=self.dev)
             att[b, :len(i)] = 1
             lab[b, a0:len(i)] = torch.tensor(i[a0:], device=self.dev)
-        h = self.hook(vecs, [p for _, p, _ in enc])
+        h = self.hook(vecs, [p for _, p, _ in enc], [self.native_plan(e) for e in exs])
         try:
             hid = self.lm.model(input_ids=ids, attention_mask=att).last_hidden_state
             sel = lab[:, 1:] != -100  # position t predicts token t + 1
@@ -312,7 +353,7 @@ class Oracle:
             ids[b, L - len(i):] = torch.tensor(i, device=self.dev)
             att[b, L - len(i):] = 1
             pos.append([x + L - len(i) for x in p])
-        h = self.hook(vecs, pos)
+        h = self.hook(vecs, pos, [self.native_plan(e) for e in exs])
         try:
             with torch.no_grad():
                 g = self.m.generate(input_ids=ids, attention_mask=att, max_new_tokens=max_new, do_sample=False,
@@ -347,7 +388,7 @@ class Oracle:
         for r, (i, _, _) in enumerate(enc):
             ids[r, :len(i)] = torch.tensor(i, device=self.dev)
             att[r, :len(i)] = 1
-        h = self.hook([vec_of[b] for _, b in pairs], [p for _, p, _ in enc])
+        h = self.hook([vec_of[b] for _, b in pairs], [p for _, p, _ in enc], [self.native_plan(e) for e, _ in pairs])
         try:
             with torch.no_grad():
                 lp = torch.log_softmax(self.m(input_ids=ids, attention_mask=att).logits.float(), -1)

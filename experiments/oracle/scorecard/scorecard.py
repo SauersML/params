@@ -58,7 +58,9 @@ BUDGETS = (64, 256)
 E1_FOUR = ("backdoor2", "cond_pref", "lie", "lie2")
 BOOT = 2000
 RANDOM_UNITS = 24  # T3's owl edit size on 8B (24 poles)
-SEALED_RULE = "a circuit record with id X is sealed when crc32(('scorecard:' + X).encode()) % 20 == 0"
+SEALED_RULE = ("O1's sealed contexts: every question of the circuit push's sealed test set (~/mpd-data/circuits/testset_8b.json, "
+               "all paraphrases of its task/key pairs), and any circuit record with id X where crc32(('scorecard:' + X).encode()) "
+               "% 20 == 0; O1 dev's task/key pairs (every paraphrase) are never trained on either")
 PUBLISHED = {"li_self_explainer": 0.640, "li_llama": 0.541, "li_untrained": 0.050, "ao_taboo_paper": 0.495}
 
 
@@ -400,6 +402,8 @@ def score(a) -> None:
     rng = random.Random(0)
     o1 = {x["item"]: x for x in jl(ITEMS / "o1_dev.jsonl")}
     o2 = json.loads((ITEMS / "o2.json").read_text())["organisms"]
+    key = lambda c: "/".join(c.split("/")[:2])  # noqa: E731
+    train_keys = {key(t["context"]) for t in jl(ITEMS / "o1_train_outcomes.jsonl")}
     rows = []
 
     def cell(oracle, target, metric, vals, units, extra=None):
@@ -423,6 +427,8 @@ def score(a) -> None:
                 cell(name, "O1", cat, [ok[k] for k in sel], [ctx[k] for k in sel])
             sel = [k for k, i in enumerate(its) if i["names_differ"]]
             cell(name, "O1", "names differ", [ok[k] for k in sel], [ctx[k] for k in sel])
+            sel = [k for k, i in enumerate(its) if key(i["context"]) not in train_keys]  # (59 of rc1's held-out questions are
+            cell(name, "O1", "unseen task/key", [ok[k] for k in sel], [ctx[k] for k in sel])  # paraphrases of training keys)
             valid = [float((got[i["item"]].get("class") or o1_class(i["cat"], got[i["item"]].get("answer"))) is not None) for i in its]
             cell(name, "O1", "answers in a class", valid, ctx)
             mf = d / "o1_measured.jsonl"  # (measure.py's check of the sentence's claim, every oracle alike)
@@ -456,6 +462,23 @@ def score(a) -> None:
                 for m in (("removal", "kl_general_bits", "kl_near_bits", "rate_after") if t == "o3" else ("fixed",)):
                     cell(name, t.upper(), m, [float(r[m]) for r in ok], [r["item"] for r in ok])
                 cell(name, t.upper(), "valid", [float("error" not in r) for r in rs], [r["item"] for r in rs])
+    # O1 paired differences (the push's O1 target: >= 0.10 over the name-prior and over names alone), resampling contexts
+    right = {}
+    for d in sorted(p for p in ANS.iterdir() if (p / "o1.jsonl").exists()):
+        got = {r["item"]: r for r in jl(d / "o1.jsonl")}
+        right[d.name] = {k: float((g.get("class") or o1_class(o1[k]["cat"], g.get("answer"))) == o1[k]["gold"])
+                         for k, g in got.items() if k in o1}
+    sibling = {"rc1.T-correct.correct": "rc1.T-correct", "rc2.T-correct.correct": "rc2.T-correct"}
+    for n in right:
+        stem = sibling.get(n, n)
+        for other, label in (("name-prior", "minus name-prior"), (f"{stem}.names", "minus its names input"),
+                             (f"{stem}.none", "minus its no-circuit input")):
+            if other == n or other not in right:
+                continue
+            for sub, keep in (("", lambda i: True), (", names differ", lambda i: i["names_differ"])):
+                ks = [k for k in right[n] if k in right[other] and keep(o1[k])]
+                if ks:
+                    cell(n, "O1", label + sub, [right[n][k] - right[other][k] for k in ks], [o1[k]["context"] for k in ks])
     out = ROOT / "table.json"
     meta = {n.name: json.loads((n / "oracle.json").read_text()) for n in ANS.iterdir() if (n / "oracle.json").exists()}
     out.write_text(json.dumps({"written": time.strftime("%Y-%m-%d %H:%M:%S %Z"), "boot": BOOT, "published": PUBLISHED,

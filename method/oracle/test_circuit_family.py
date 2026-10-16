@@ -1,6 +1,7 @@
-"""Checks of circuit_family.py on a tiny random Qwen3: keys map back to their units, each pair's effect shares sum to 1
-per stage, the family curve is the median and the passing share of each pair's measured shares of the mapped keys, and the family record's
-cuts and nodes are those of its keys on the canonical pair.
+"""Checks of circuit_family.py on a tiny random Qwen3: keys map back to their units, every unit a pair's finder chose is a
+candidate, a key's weight is the mean of its four marginal shares measured pair by pair, the family cut's shares, pairs
+passing and alternatives are those measured again pair by pair, and the family record's cuts and nodes are those of its
+keys on the canonical pair.
 
   ~/mpd-data/venv/bin/python -m pytest method/oracle/test_circuit_family.py -q
 """
@@ -41,35 +42,63 @@ def pairs():
     pytest.skip("too few valid pairs")
 
 
+def again(pt, rec, keys):
+    """A key set's (lost, restored) on one pair, measured on its own."""
+    pt.setup(rec["ids"], rec["corrupted"])
+    return pt.both([fam.mapped(keys, rec)])[0]
+
+
 def test_keys_map_back(pairs):
     pt, recs = pairs
     tail = fam.tail_of(recs)
     assert all(len({r["ids"][-1 - k] for r in recs}) == 1 for k in range(tail))
+    cand = fam.candidates(recs, tail)
     for r in recs:
         for n in r["nodes"]:
-            k = ("neuron", n["layer"], n["neuron"], fam.role(r, n["pos"], tail))
+            k = fam.key_of(n["stage"], n, r, tail)
             assert fam.unit_of(k, r) == ("neuron", n["layer"], n["pos"], n["neuron"])
-        for stage, ks in fam.keys_of(r, tail).items():
-            assert abs(sum(ks.values()) - 1) < 1e-9
+            assert k in cand[n["stage"]]
+        for h in r["routes"]:
+            assert fam.key_of("movers", h, r, tail) in cand["movers"]
 
 
-def test_family_curve_and_record(pairs):
+def test_weights(pairs):
     pt, recs = pairs
+    cand = fam.candidates(recs, fam.tail_of(recs))
+    s = next(iter(cand))
+    keys = cand[s]
+    pts = fam.patchers(pt, recs)
+    W = fam.weigh(pts, recs, keys)
+    k = keys[0]
+    per = []
+    for r in recs:                          # the four marginal shares measured again pair by pair
+        if fam.unit_of(k, r) is None:
+            per.append(0.0)
+            continue
+        whole, one, out = again(pt, r, keys), again(pt, r, [k]), again(pt, r, [x for x in keys if x != k])
+        per.append((one[0] + one[1] + whole[0] - out[0] + whole[1] - out[1]) / 4)
+    assert abs(W[k] - statistics.mean(per)) < 1e-5
+
+
+def test_family_cut_and_record(pairs):
+    pt, recs = pairs
+    sel, _ = fam.cuts_of(pt, recs)
     rec = fam.family(pt, recs, recs[0])
-    W = fam.weights(recs)
-    for s, c in rec["cuts"].items():
-        ranked = sorted(W[s], key=lambda k: -W[s][k])
-        pt_k = c["curve"][min(2, len(c["curve"]) - 1)]
-        per = []
-        for r in recs:                      # the curve point measured again pair by pair
-            pt.setup(r["ids"], r["corrupted"])
-            per.append(pt.both([[u for u in (fam.unit_of(k, r) for k in ranked[:pt_k["k"]]) if u]])[0])
-        assert abs(statistics.median(x[0] for x in per) - pt_k["lost"]) < 1e-5
-        assert abs(statistics.median(x[1] for x in per) - pt_k["restored"]) < 1e-5
+    for s, c in sel.items():
         if c["diffuse"]:
-            assert not c["keys"] and not c["met"]
-        else:
-            assert c["pairs_passing"] > 0.5 and len(c["keys"]) == c["size"]
+            assert not c["keys"] and max(x["pairs_passing"] for x in c["curve"]) <= 0.5
+            assert rec["cuts"][s]["diffuse"] and not rec["cuts"][s]["met"]
+            continue
+        assert rec["cuts"][s]["keys"] == [list(k) for k in c["keys"]]
+        shares = [again(pt, r, c["keys"]) for r in recs]
+        for a, b in zip(shares, c["pairs"]):
+            assert abs(a[0] - b[0]) < 1e-5 and abs(a[1] - b[1]) < 1e-5
+        n = sum(fam.passes(x) for x in shares)
+        assert n / len(recs) == c["pairs_passing"] and 2 * n > len(recs)
+        for u, vs in c["alternatives"].items():          # an alternative replaces its key with as many pairs passing
+            for v in vs:
+                swapped = [v if x == u else x for x in c["keys"]]
+                assert sum(fam.passes(again(pt, r, swapped)) for r in recs) >= n
     assert rec["order"] == sorted(rec["cuts"], key=lambda s: (rec["cuts"][s]["diffuse"], rec["cuts"][s]["size"]))
     assert len(rec["family"]["pairs"]) == len(recs)
     pt.setup(recs[0]["ids"], recs[0]["corrupted"])

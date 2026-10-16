@@ -1,24 +1,34 @@
 """Circuits over prompt families (the lead's 10-16 decision: the family circuit is the record the oracle and the graphs
 read): a question asked in its paraphrases, each against VARIANTS counterfactual key words (its own corrupted key first,
-then its next swap partners), one circuit_finder circuit per pair; the family keeps the units that recur, weighted by
-their measured effect, and measures each cut's family size on every pair.
-  key      a unit without its position: a neuron (layer, index) or a head (layer, head), with its role in the prompt:
-           a place in the family's common tail (the chat template's end and any prefill, shared by every pair's prompt)
-           counted back from the answer (("end", k)), else a place counted from the changed word (("word", k): the key
-           word's own tokens and the user text after them); a key maps into any pair of the family by its role (a place
-           outside that pair's changed span to answer is left out there)
-  weight   per pair, a cut's units share 1 in proportion to their measured effect alone (the larger |share|; equally
-           when every one is near 0: units that matter only together); a key's weight is its sum over the pairs, so a
-           unit of one prompt weighs at most 1 against a unit of every prompt's pairs
-  cut      per stage, keys in descending weight; the curve of the share of pairs passing PASS both ways (and the median
-           lost and restored) as keys are added (each pair patched with the keys mapped into it) on circuit_finder's
-           grid; the family size is the smallest grid prefix that a majority of the pairs pass; a stage with no such
-           prefix is diffuse (no units; its size the pairs' median cut size, its curve kept)
-  record   the canonical pair's finder record (the first paraphrase against its own corrupted key) with its cuts, nodes
-           and routes replaced by the family's at that pair's positions (each unit's shares alone measured there, with
-           its family weight), "order": the stages narrowest first (diffuse ones last), "met": the source and mover
-           cuts not diffuse, and "family": the member pairs with their own cuts, so every reader of finder records
-           reads a family record as is.
+then its next swap partners), one circuit_finder circuit per pair; the family keeps the units that do the job on the
+pairs, every choice measured on every pair, so near-ties between units resolve the same way for every paraphrase.
+  key        a unit without its position: a neuron (layer, index) or a head (layer, head), with its role in the prompt:
+             a place in the family's common tail (the chat template's end and any prefill, shared by every pair's prompt)
+             counted back from the answer (("end", k)), else a place counted from the changed word (("word", k): the key
+             word's own tokens and the user text after them); a key maps into any pair of the family by its role (a place
+             outside that pair's changed span to answer is left out there)
+  candidates per stage, every key a pair's finder chose, and every key a pair measured alone at least as strong as one
+             it chose and above twice its cut's noise floor (the near-ties its prefix and prune could have taken instead)
+  weight     a key's marginal share in two contexts, measured on every pair it maps into: alone, and taken out of all the
+             candidates patched together, both directions, the mean of the four over the pairs (0 where it does not map).
+             Effect alone is not enough: on Qwen3-8B the source cuts' single noising drops add up to a median 6% of the
+             cut's joint drop (569 pairs of 43 dev families), so a weight by effect alone is mostly bfloat16 noise; the
+             share out of the whole set counts units that matter only together
+  cut        per stage, the candidates in descending weight (ties by key); the curve of the pairs passing PASS both ways
+             (and the median lost and restored) as keys are added, each pair patched with the keys mapped into it, on
+             circuit_finder's grid; the smallest prefix reaching the curve's most pairs passing, then keys removed from
+             the lowest weight up while as many pairs pass (one order for every pair: of two interchangeable units the
+             one of larger family weight stays); a stage whose curve never passes a majority of the pairs is diffuse (no
+             units; its size the pairs' median cut size, its curve kept)
+  alternatives  per kept key, the candidates of at least the smallest kept weight that replace it with as many pairs
+             passing (interchangeable units: one chosen, the others recorded)
+  loo        per kept key, the mean over the pairs of what the cut loses without it (the larger of the two directions):
+             each unit's part of the circuit as a whole, the weight stability overlaps are taken in
+  record     the canonical pair's finder record (the first paraphrase against its own corrupted key) with its cuts, nodes
+             and routes replaced by the family's at that pair's positions (each unit's shares alone measured there, with
+             its family weight, loo and alternatives), "order": the stages narrowest first (diffuse ones last), "met": the
+             source and mover cuts not diffuse, and "family": the member pairs with their own cuts and the family cut's
+             shares on each, so every reader of finder records reads a family record as is.
 
   circuit_family.py QUESTIONS.json OUT [--split dev] [--stride 1] [--variants 3] [--model Qwen/Qwen3-8B] [--dtype auto]
 writes OUT/pairs/<pair>.json (finder records; existing ones are read, not rebuilt) and OUT/<family>.json;
@@ -60,82 +70,161 @@ def unit_of(key: tuple, rec: dict):
     return ("neuron", layer, p, n) if rec["first_diff"] <= p < rec["tokens"] else None
 
 
-def keys_of(rec: dict, tail: int) -> dict:
-    """Per stage of a pair's record, its units' keys and their shares of 1 by measured effect alone."""
+def key_of(stage: str, u: dict, rec: dict, tail: int) -> tuple:
+    """A record's node, route or single as a key."""
+    return ("head", u["layer"], u["head"]) if stage == "movers" else ("neuron", u["layer"], u["neuron"], role(rec, u["pos"], tail))
+
+
+def candidates(recs: list[dict], tail: int) -> dict:
+    """Per stage, the candidate keys (module docstring), first seen first."""
     out = {}
-    for stage in rec.get("cuts", {}):
-        units = ([(("head", h["layer"], h["head"]), h) for h in rec["routes"]] if stage == "movers" else
-                 [(("neuron", n["layer"], n["neuron"], role(rec, n["pos"], tail)), n) for n in rec["nodes"] if n["stage"] == stage])
-        if not units:
-            continue
-        e = [max(abs(u["lost"]), abs(u["restored"])) for _, u in units]
-        tot = sum(e)
-        out[stage] = {}
-        for (k, _), x in zip(units, e):
-            out[stage][k] = out[stage].get(k, 0.0) + (x / tot if tot > 1e-9 else 1 / len(units))
-    return out
-
-
-def weights(recs: list[dict]) -> dict:
-    """Per stage, each key's weight: its effect shares summed over the pairs."""
-    out, tail = {}, tail_of(recs)
     for r in recs:
-        for stage, ks in keys_of(r, tail).items():
-            ws = out.setdefault(stage, {})
-            for k, w in ks.items():
-                ws[k] = ws.get(k, 0.0) + w
+        for stage, c in r.get("cuts", {}).items():
+            chosen = r["routes"] if stage == "movers" else [n for n in r["nodes"] if n["stage"] == stage]
+            if not chosen:
+                continue
+            ks = out.setdefault(stage, {})
+            for u in chosen:
+                ks[key_of(stage, u, r, tail)] = None
+            low = max(min(max(abs(u["lost"]), abs(u["restored"])) for u in chosen), 2 * ((c.get("floor") or [0.0])[0]))
+            for u in r.get("singles", {}).get(stage, []):
+                if max(abs(u["lost"]), abs(u["restored"])) >= low:
+                    ks[key_of(stage, u, r, tail)] = None
+    return {s: list(ks) for s, ks in out.items()}
+
+
+def patchers(pt: cf.Patcher, recs: list[dict]) -> list:
+    """One Patcher per pair record on pt's model, each set up on its pair (its runs and contrast as its finder run's)."""
+    out = []
+    for r in recs:
+        p = cf.Patcher(pt.model, pt.tok, rows=pt.rows)
+        p.setup(r["ids"], r["corrupted"], r.get("answers"))
+        out.append(p)
     return out
+
+
+def measure(pts: list, sets: list) -> list:
+    """Per pair j, (lost, restored) of each of sets[j] patched on pts[j]; every pair's batches launched before any is read."""
+    return [[tuple(v) for v in g] for g in cf._read([p._launch(s, ("clean", "corrupt")) for p, s in zip(pts, sets)])]
+
+
+def passes(x) -> bool:
+    return x[0] >= cf.PASS and x[1] >= cf.PASS
+
+
+def mapped(keys, rec: dict) -> list:
+    return [u for u in (unit_of(k, rec) for k in keys) if u]
+
+
+def counts(pts: list, recs: list[dict], key_sets: list) -> tuple:
+    """Per key set: the number of pairs passing, and its (lost, restored) on each pair."""
+    got = measure(pts, [[mapped(s, r) for s in key_sets] for r in recs])
+    return [sum(passes(g[i]) for g in got) for i in range(len(key_sets))], [[g[i] for g in got] for i in range(len(key_sets))]
+
+
+def weigh(pts: list, recs: list[dict], keys: list) -> dict:
+    """Each key's weight (module docstring): its share alone and its drop out of every candidate, both directions, the
+    mean over the pairs."""
+    sets, where = [], []
+    for r in recs:
+        us = [unit_of(k, r) for k in keys]
+        have = [u for u in us if u]
+        idx = [i for i, u in enumerate(us) if u]
+        sets.append([have] + [[u] for u in have] + [[v for v in have if v != u] for u in have])
+        where.append(idx)
+    got = measure(pts, sets)
+    w = [0.0] * len(keys)
+    for g, idx in zip(got, where):
+        n = len(idx)
+        for j, i in enumerate(idx):
+            one, out = g[1 + j], g[1 + n + j]
+            w[i] += (one[0] + one[1] + g[0][0] - out[0] + g[0][1] - out[1]) / 4
+    return {k: x / len(recs) for k, x in zip(keys, w)}
+
+
+def select(pts: list, recs: list[dict], keys: list, log=None, name: str = "") -> dict:
+    """A stage's family cut from its candidate keys (module docstring: weight, cut, alternatives, loo)."""
+    N = len(recs)
+    W = weigh(pts, recs, keys)
+    ranked = sorted(keys, key=lambda k: (-W[k], str(k)))
+    g = cf.grid(len(ranked))
+    n, sh = counts(pts, recs, [ranked[:k] for k in g])
+    curve = [{"k": k, "lost": statistics.median(x[0] for x in s), "restored": statistics.median(x[1] for x in s),
+              "pairs_passing": c / N} for k, c, s in zip(g, n, sh)]
+    best = max(n)
+    out = {"candidates": len(keys), "curve": curve, "weights": W}
+    if 2 * best <= N:
+        out.update(keys=[], diffuse=True, alternatives={}, loo={})
+        return out
+    S = ranked[:g[n.index(best)]]
+    if len(S) > 1:                                  # from the lowest weight up, each removal kept while as many pass
+        alone, _ = counts(pts, recs, [[x for x in S if x != k] for k in S])
+        for k in [k for k, c in zip(S, alone) if c >= best][::-1]:
+            trial = [x for x in S if x != k]
+            if counts(pts, recs, [trial])[0][0] >= best:
+                S = trial
+    rest = [k for k in ranked if k not in S and W[k] >= min(W[x] for x in S)]
+    trials = [(u, v) for u in S for v in rest]
+    c, _ = counts(pts, recs, [[v if x == u else x for x in S] for u, v in trials]) if trials else ([], [])
+    alts = {u: [v for (u_, v), cc in zip(trials, c) if u_ == u and cc >= best] for u in S}
+    n_, sh_ = counts(pts, recs, [S] + [[x for x in S if x != k] for k in S])
+    whole = sh_[0]
+    loo = {k: statistics.mean(max(a[0] - b[0], a[1] - b[1]) for a, b in zip(whole, sh_[1 + i])) for i, k in enumerate(S)}
+    out.update(keys=S, diffuse=False, alternatives=alts, loo=loo, pairs=whole, pairs_passing=n_[0] / N,
+               lost=statistics.median(x[0] for x in whole), restored=statistics.median(x[1] for x in whole))
+    if log:
+        log(f"  family {name}: {len(S)} of {len(keys)} candidates, pairs passing {n_[0]}/{N} (prefix {g[n.index(best)]}), median "
+            f"{out['lost']:.2f}/{out['restored']:.2f}, {sum(map(len, alts.values()))} alternatives")
+    return out
+
+
+def cuts_of(pt: cf.Patcher, recs: list[dict], pts: list | None = None, log=None) -> tuple:
+    """Every stage's family cut over pair records (select), and the pairs' Patchers."""
+    pts = pts or patchers(pt, recs)
+    cand = candidates(recs, tail_of(recs))
+    return {s: select(pts, recs, ks, log=log, name=s) for s, ks in cand.items()}, pts
 
 
 def family(pt: cf.Patcher, recs: list[dict], canonical: dict, log=None) -> dict:
     """The family circuit of pair records (circuit_finder.find's, each with ids, corrupted and an id) and its record on
     the canonical pair (module docstring)."""
     recs = [r for r in recs if r.get("cuts")]
-    W = weights(recs)
-    ranked = {s: sorted(ws, key=lambda k: -ws[k]) for s, ws in W.items()}
-    grids = {s: cf.grid(len(ks)) for s, ks in ranked.items()}
-    got = {s: [] for s in ranked}                       # per stage: per pair, (lost, restored) per grid size
-    for r in recs:
-        pt.setup(r["ids"], r["corrupted"], r.get("answers"))
-        order = [(s, k) for s in ranked for k in grids[s]]
-        sh = pt.both([[u for u in (unit_of(x, r) for x in ranked[s][:k]) if u] for s, k in order])
-        for s in ranked:
-            got[s].append([v for (t, _), v in zip(order, sh) if t == s])
+    sel, pts = cuts_of(pt, recs, log=log)
     cuts = {}
-    for s, ks in ranked.items():
-        g, per = grids[s], got[s]
-        curve = [{"k": k, "lost": statistics.median(p[j][0] for p in per), "restored": statistics.median(p[j][1] for p in per),
-                  "pairs_passing": sum(p[j][0] >= cf.PASS and p[j][1] >= cf.PASS for p in per) / len(per)} for j, k in enumerate(g)]
-        ok = next((c for c in curve if c["pairs_passing"] > 0.5), None)
+    for s, c in sel.items():
         sizes = [r["cuts"][s]["size"] for r in recs if s in r["cuts"]]
-        cuts[s] = {"keys": ks[:ok["k"]] if ok else [], "diffuse": ok is None,
-                   "size": ok["k"] if ok else statistics.median(sizes), "lost": ok["lost"] if ok else curve[-1]["lost"],
-                   "restored": ok["restored"] if ok else curve[-1]["restored"],
-                   "pairs_passing": ok["pairs_passing"] if ok else curve[-1]["pairs_passing"], "curve": curve,
-                   "pair_sizes": sizes}
-        if log:
-            log(f"  family {s}: {'diffuse, median pair size ' if ok is None else ''}{cuts[s]['size']} of {len(ks)} keys, "
-                f"median {cuts[s]['lost']:.2f}/{cuts[s]['restored']:.2f}, pairs passing {cuts[s]['pairs_passing']:.2f}")
+        cuts[s] = {"keys": c["keys"], "diffuse": c["diffuse"], "size": len(c["keys"]) if not c["diffuse"] else statistics.median(sizes),
+                   "lost": c.get("lost", c["curve"][-1]["lost"]), "restored": c.get("restored", c["curve"][-1]["restored"]),
+                   "pairs_passing": c.get("pairs_passing", c["curve"][-1]["pairs_passing"]), "curve": c["curve"],
+                   "candidates": c["candidates"], "pair_sizes": sizes}
+        if log and c["diffuse"]:
+            log(f"  family {s}: diffuse, median pair size {cuts[s]['size']}, best pairs passing "
+                f"{max(x['pairs_passing'] for x in c['curve']):.2f}")
     rec = {k: v for k, v in canonical.items() if k not in ("nodes", "routes", "cuts", "singles", "size", "met")}
-    pt.setup(canonical["ids"], canonical["corrupted"], canonical.get("answers"))
+    cp = next((p for p, r in zip(pts, recs) if r is canonical), None)
+    if cp is None:
+        cp = cf.Patcher(pt.model, pt.tok, rows=pt.rows)
+        cp.setup(canonical["ids"], canonical["corrupted"], canonical.get("answers"))
     nodes, routes, units = [], [], {}
     for s, c in cuts.items():
         units[s] = [(k, u) for k, u in ((k, unit_of(k, canonical)) for k in c["keys"]) if u]
-    alone = pt.both([[u] for s in units for _, u in units[s]])
+    alone = cp.both([[u] for s in units for _, u in units[s]])
     it = iter(alone)
     for s in units:
+        W, alts, loo = sel[s]["weights"], sel[s]["alternatives"], sel[s]["loo"]
         for k, u in units[s]:
             lo, re_ = next(it)
+            extra = {"weight": W[k], "loo": loo[k], "alternatives": [list(v) for v in alts[k]]}
             if u[0] == "head":
-                routes.append({"layer": u[1], "head": u[2], "pos": u[3], "attends": pt.attends(u[1], u[2], u[3]), "lost": lo,
-                               "restored": re_, "weight": W[s][k]})
+                routes.append({"layer": u[1], "head": u[2], "pos": u[3], "attends": cp.attends(u[1], u[2], u[3]), "lost": lo,
+                               "restored": re_, **extra})
                 continue
             _, i, p, n = u
-            v, w = float(pt.act["clean"]["neu"][i][p, n]), float(pt.act["clean"]["up"][i][p, n])
+            v, w = float(cp.act["clean"]["neu"][i][p, n]), float(cp.act["clean"]["up"][i][p, n])
             nodes.append({"stage": s, "layer": i, "pos": p, "neuron": n, "pole": 1 if v > 0 else -1,
                           "regime": [1 if v * w > 0 else -1, 1 if w > 0 else -1], "clean": v,
-                          "corrupt": float(pt.act["corrupt"]["neu"][i][p, n]), "lost": lo, "restored": re_, "weight": W[s][k]})
-    whole = pt.both([[u for _, u in units[s]] for s in units])
+                          "corrupt": float(cp.act["corrupt"]["neu"][i][p, n]), "lost": lo, "restored": re_, **extra})
+    whole = cp.both([[u for _, u in units[s]] for s in units])
     for (s, c), (lo, re_) in zip(cuts.items(), whole):
         c["canonical"] = {"lost": lo, "restored": re_}
         c["met"] = not c["diffuse"]
@@ -145,18 +234,19 @@ def family(pt: cf.Patcher, recs: list[dict], canonical: dict, log=None) -> dict:
                met=all(c["met"] for k, c in cuts.items() if k != "readout"),     # (a diffuse readout as the finder's
                                                                                    # unreachable one: reported, not required)
                family={"pairs": [{"id": r["id"], "met": r.get("met"),
-                                  "cuts": {s: {f: c[f] for f in ("size", "lost", "restored", "met")} for s, c in r["cuts"].items()}}
-                                 for r in recs]})
+                                  "cuts": {s: {f: c[f] for f in ("size", "lost", "restored", "met")} for s, c in r["cuts"].items()},
+                                  "family": {s: list(sel[s]["pairs"][j]) for s in sel if not sel[s]["diffuse"]}}
+                                 for j, r in enumerate(recs)]})
     return rec
 
 
-def pairs_of(questions: list[dict], variants: int = VARIANTS) -> list[tuple]:
-    """(pair id, user, corrupt user) for each paraphrase of a family against its first `variants` corrupted keys (its own
-    corrupted key, then its swap partners; a key that occurs more than once in a prompt is skipped)."""
+def pairs_of(questions: list[dict], variants: int = VARIANTS, skip: int = 0) -> list[tuple]:
+    """(pair id, user, corrupt user) for each paraphrase of a family against its corrupted keys skip..skip+variants (its
+    own corrupted key, then its swap partners; a key that occurs more than once in a prompt is skipped)."""
     out = []
     for q in questions:
         keys = [q["corrupt_key"]] + [p for p in q.get("partners", []) if p != q["corrupt_key"]]
-        for ck in keys[:variants]:
+        for ck in keys[skip:skip + variants]:
             if q["user"].count(q["key"]) == 1:
                 out.append((f"{q['id']}/vs/{ck}", q["user"], q["user"].replace(q["key"], ck)))
     return out

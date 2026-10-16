@@ -92,7 +92,7 @@ def examples(a) -> None:
     orgs = organisms(a.dir)
     if set(orgs) & E1:
         raise SystemExit(f"refused: {sorted(set(orgs) & E1)} are E1 evaluation organisms")
-    o = cao.Oracle(None, a.device)
+    o = cao.Oracle(cao.AO, a.device)  # (any adapter: use_target needs a PEFT model; off(target) swaps the organism's in)
     rng = random.Random(0)
     store, rows = {}, []
     for name, rec in orgs.items():
@@ -152,7 +152,7 @@ def answers(a) -> None:
     reader, which sees the request and that answer alone."""
     import torch
     orgs = organisms(a.dir)
-    o = cao.Oracle(None, a.device)
+    o = cao.Oracle(cao.AO, a.device)  # (any adapter: use_target needs a PEFT model; off(target) swaps the organism's in)
     rng = random.Random(1)
     o.tok.padding_side = "left"
     with a.out.open("w") as fh:

@@ -46,8 +46,9 @@ import h2h  # noqa: E402
 
 MODEL = os.environ.get("CAO_MODEL", "Qwen/Qwen3-1.7B")  # Qwen/Qwen3-8B: the main target since the lead's 10-15
 AO = {"Qwen/Qwen3-1.7B": "adamkarvonen/checkpoints_cls_latentqa_past_lens_Qwen3-1_7B",
-      "Qwen/Qwen3-8B": "adamkarvonen/checkpoints_latentqa_cls_past_lens_addition_Qwen3-8B"}[MODEL]
-DEPTH = {"Qwen/Qwen3-1.7B": 28, "Qwen/Qwen3-8B": 36}[MODEL]
+      "Qwen/Qwen3-8B": "adamkarvonen/checkpoints_latentqa_cls_past_lens_addition_Qwen3-8B",
+      "Qwen/Qwen3-14B": "adamkarvonen/checkpoints_latentqa_cls_past_lens_Qwen3-14B"}[MODEL]  # (14B: AuditBench's targets)
+DEPTH = {"Qwen/Qwen3-1.7B": 28, "Qwen/Qwen3-8B": 36, "Qwen/Qwen3-14B": 40}[MODEL]
 LAYERS = (DEPTH // 4, DEPTH // 2, 3 * DEPTH // 4)  # the released adapters' 25/50/75%
 MID = LAYERS[1]  # the read layer of evaluations (the paper's half depth)
 WIKITEXT_TRAIN = ("Salesforce/wikitext", "wikitext-103-raw-v1/train-00000-of-00002.parquet")

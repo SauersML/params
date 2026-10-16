@@ -836,10 +836,12 @@ def tree(a) -> None:
 def collect(a) -> None:
     """A scorecard pod's outputs (scorecard_pod.sh) into the answers: measured O3/O4 files, the released AO's e1b battery."""
     src = RUNPOD / a.run
-    for f in sorted((src / "answers").glob("*/o*_measured.jsonl")):
+    for f in sorted((src / "answers").glob("*/*")):  # measured files, and whole oracles made on the pod (t3-greedy)
         dst = ANS / f.parent.name / f.name
-        dst.write_text(f.read_text())
-        print("collected", dst)
+        if f.is_file() and (f.name.endswith("_measured.jsonl") or not dst.exists()):
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            dst.write_text(f.read_text())
+            print("collected", dst)
     rd = src / "reader"
     if rd.exists():  # a reader checkpoint's run (scorecard_pod.sh READER=...)
         if not a.name:

@@ -67,6 +67,9 @@ MODEL = h2h.MODEL
 AGENT = "moonshotai/Kimi-K2.6"
 RENDERER = "kimi_k26"  # thinking on (the model's strongest mode); earlier turns' thinking dropped from the history
 RATES = {"prefill": 2.205, "cached": 0.441, "sampled": 5.49}  # $ per million tokens (Tinker's models page, 10-15)
+AGENT_RATES = {"moonshotai/Kimi-K2.6": RATES, "Qwen/Qwen3-8B": {"prefill": 0.195, "cached": 0.039, "sampled": 0.60},
+               "Qwen/Qwen3.6-35B-A3B": {"prefill": 0.45, "cached": 0.09, "sampled": 1.335},
+               "Qwen/Qwen3.5-397B-A17B": {"prefill": 1.65, "cached": 0.33, "sampled": 7.50}}
 TEMPERATURE, TOP_P = 1.0, 0.95  # Moonshot's settings for Kimi-K2.6's thinking mode
 BUDGETS = (0, 16, 64, 256)
 REPEATS = 2
@@ -994,7 +997,7 @@ class Tools:
             self.pass_s = (time.perf_counter() - t0) / 5
         return max(1, math.ceil(seconds / self.pass_s))
 
-    def t_find_circuit(self, ep, it, text, corrupt_text, prefill=None, chat=True, top=12):
+    def t_find_circuit(self, ep, it, text, corrupt_text, prefill=None, chat=True, top=12, cuts="movers,source"):
         """circuit_finder's circuit of a patching pair (method/oracle/circuit_finder.py: necessity and sufficiency of
         each cut measured by patching between the two runs), charged by its seconds in plain passes."""
         sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "method" / "oracle"))
@@ -1008,9 +1011,12 @@ class Tools:
         if left < FIND_MIN:
             raise Refused(f"find_circuit needs at least {FIND_MIN} passes left ({left} are)")
         top = max(1, min(int(top), 32))
+        want = tuple(c.strip() for c in str(cuts).split(",") if c.strip())
+        if not want or set(want) - {"readout", "movers", "source"}:
+            raise Refused("cuts: some of readout, movers, source")
         t0 = time.perf_counter()
         with self.model_of(it):
-            rec = cf.find(cf.Patcher(self.tg.m, self.tok), clean, corrupt)
+            rec = cf.find(cf.Patcher(self.tg.m, self.tok), clean, corrupt, cuts_wanted=want)
         cost = self.find_cost(time.perf_counter() - t0)
         ep.setdefault("find_passes", []).append(cost)  # (the call's full equivalent, beyond what is left)
         self.charge(ep, min(cost, ep["budget"] - ep["passes"]))
@@ -1172,7 +1178,9 @@ TOOL_DOCS = {  # (<MODEL>, <LENS>, <AO>, <MID>, <REMOVE_MAX> filled from the ser
               "steer. 3 passes, plus 2 per node with edges (k at most 32)."),
     "score": ("score(continuation, text=None, chat=None, prefill=None) -> the log probability (bits) of a continuation "
               "(up to 32 tokens) after the text, and each token's probability and rank. 1 pass."),
-    "find_circuit": ("find_circuit(text, corrupt_text, prefill=None, top=12) -> the circuit of a patching pair: two chat "
+    "find_circuit": ("find_circuit(text, corrupt_text, prefill=None, top=12, cuts=\"movers,source\") -> the circuit of a "
+                     "patching pair (cuts: some of readout, movers, source; an organism's readout can span thousands of "
+                     "neurons and take minutes): two chat "
                      "prompts of the same token count differing in a few words (with the same prefill), the model's "
                      "answer at the next token on each, and the units carrying the difference, every one measured by "
                      "patching between the two runs: the readout neurons at the answer position, the mover heads there "
@@ -1525,22 +1533,28 @@ def talk(a, it: dict, budget: int, rec: dict, sampler, rr, tok, spend: Spend) ->
     import tinker
     from tinker_cookbook.renderers import get_text_content
 
+    rates = getattr(a, "rates", RATES)  # (agent_rl.py: the policy's own prices, sampling and kept transitions)
+    temperature, top_p = getattr(a, "temperature", TEMPERATURE), getattr(a, "top_p", TOP_P)
+    keep = rec.get("_trans")  # a list: each sampled turn's (prompt, tokens, logprobs) for training
+
     def sample(prompt, max_tokens):
-        bound = (prompt.length * RATES["prefill"] + max_tokens * RATES["sampled"]) / 1e6
+        bound = (prompt.length * rates["prefill"] + max_tokens * rates["sampled"]) / 1e6
         if not spend.reserve(bound):
             return None
         try:
             res = sampler.sample(prompt=prompt, num_samples=1, sampling_params=tinker.SamplingParams(
-                max_tokens=max_tokens, temperature=TEMPERATURE, top_p=TOP_P, stop=rr.get_stop_sequences())).result()
+                max_tokens=max_tokens, temperature=temperature, top_p=top_p, stop=rr.get_stop_sequences())).result()
         except Exception:
             spend.settle(bound, bound)  # unknown spend: booked at its worst case
             rec["usd"] += bound
             raise
         seq, hits = res.sequences[0], res.prompt_cache_hit_tokens or 0
-        usd = ((prompt.length - hits) * RATES["prefill"] + hits * RATES["cached"] + len(seq.tokens) * RATES["sampled"]) / 1e6
+        usd = ((prompt.length - hits) * rates["prefill"] + hits * rates["cached"] + len(seq.tokens) * rates["sampled"]) / 1e6
         spend.settle(bound, usd)
         rec.update(prefill=rec["prefill"] + prompt.length - hits, cached=rec["cached"] + hits,
                    sampled=rec["sampled"] + len(seq.tokens), usd=rec["usd"] + usd)
+        if keep is not None:
+            keep.append((prompt, list(seq.tokens), list(seq.logprobs or [])))
         return list(seq.tokens)
 
     eid = rec["episode"]
@@ -1550,6 +1564,7 @@ def talk(a, it: dict, budget: int, rec: dict, sampler, rr, tok, spend: Spend) ->
     msgs = [{"role": "system", "content": SYSTEM.format(model=info["model"].split("/")[-1], L=info["L"], H=info["H"], I=info["I"],
                                                         tools=tools if budget else SYSTEM_NONE)},
             {"role": "user", "content": question(it, tok, info["model"])}]
+    rec["messages"] = msgs  # (the whole conversation, tool results included: demonstrations for agent_rl.py sft)
     turns, left = (a.turns if budget else 1), budget
     for turn in range(turns):
         toks = sample(rr.build_generation_prompt(msgs), MAX_TOKENS)
@@ -1558,7 +1573,7 @@ def talk(a, it: dict, budget: int, rec: dict, sampler, rr, tok, spend: Spend) ->
             return
         rec["turns"] = turn + 1
         cut = len(toks) >= MAX_TOKENS
-        if cut and rr._think_close_token not in toks:  # cut inside its reasoning
+        if cut and getattr(rr, "_think_close_token", None) not in toks:  # cut inside its reasoning
             think, text = rr.tokenizer.decode(toks), ""
         else:
             msg, _ = rr.parse_response(toks)
@@ -1567,6 +1582,7 @@ def talk(a, it: dict, budget: int, rec: dict, sampler, rr, tok, spend: Spend) ->
         rec.setdefault("transcript", []).append(text)
         ans = parse(text)
         if ans is not None:
+            msgs.append({"role": "assistant", "content": text})
             rec["answer"] = ans
             return
         found = re.findall(r"<tool>(.*?)</tool>", text, re.S) if budget else []
@@ -1578,6 +1594,7 @@ def talk(a, it: dict, budget: int, rec: dict, sampler, rr, tok, spend: Spend) ->
             rec["forced"] = True
             got = "<answer>" + get_text_content(rr.parse_response(forced)[0])
             rec["transcript"].append(got)
+            msgs.append({"role": "assistant", "content": text + "\n" + got})
             rec["answer"] = parse(got)
             return
         msgs.append({"role": "assistant", "content": text})
@@ -1642,8 +1659,11 @@ def run(a) -> None:
         a.labels_obj = json.loads(a.labels.read_text())
     a.local_atlas = a.atlas_obj is not None or bool(a.labels_obj)
     a.info["atlas"] = a.info["atlas"] or a.local_atlas
-    rr = renderers.get_renderer(RENDERER, get_tokenizer(AGENT))
-    sampler = tinker.ServiceClient(project_id=project).create_sampling_client(base_model=AGENT)
+    rr = renderers.get_renderer(a.renderer or RENDERER, get_tokenizer(a.agent))
+    service = tinker.ServiceClient(project_id=project)
+    sampler = (service.create_sampling_client(model_path=a.init) if a.init else  # a trained policy (agent_rl.py's sampler path)
+               service.create_sampling_client(base_model=a.agent))
+    a.rates = AGENT_RATES.get(a.agent, RATES)
     done = [json.loads(x) for x in a.out.read_text().splitlines()] if a.out.exists() else []
     spend = Spend(a.cap, sum(r["usd"] for r in done) + a.spent_extra)
     have = {(r["id"], r["budget"], r["repeat"]) for r in done if not r["stopped"]}
@@ -1913,6 +1933,9 @@ def main():
     r.add_argument("--spent-extra", type=float, default=0.0, help="dollars spent outside the output file (episodes lost "
                    "to a stopped run), counted against the cap")
     r.add_argument("--tools", dest="only", nargs="+", help="only these tools (e.g. generate: the prompting arm)")
+    r.add_argument("--agent", default=AGENT, help="the answering model on Tinker (a base name)")
+    r.add_argument("--renderer", help="its renderer (default Kimi-K2.6's)")
+    r.add_argument("--init", help="a trained policy's sampler weights (tinker:// path, agent_rl.py)")
     r.add_argument("--turns", type=int, default=TURNS, help="the agent's messages per item")
     r.add_argument("--episode-usd", type=float, default=EPISODE_USD, help="an episode starts only while this much is "
                    "left under the cap")

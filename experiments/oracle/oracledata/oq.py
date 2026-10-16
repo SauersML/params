@@ -574,13 +574,27 @@ def split(a) -> None:
         for cid in sorted(used):
             fh.write(json.dumps(circs[cid]) + "\n")
     # baselines on each held-out split: constant (each kind's most common training answer) and the name-prior
+    zs = collections.defaultdict(list)
+    for r in train:
+        if r["kind"] == "zero" and r["keys"]:
+            zs[r["keys"][0]].append(r["measured"]["change"])
+    zmean = {k: sum(v) / len(v) for k, v in zs.items()}
+
+    def key_of(r, n):  # a unit name's key ("G12", "L18.N2201+", "L5.H3": the name without its position)
+        return n if n.startswith("G") else n.split("@")[0]
     base = {}
     for s in ("dev", "test"):
         res = collections.defaultdict(lambda: collections.Counter())
         for r in out[s]:
-            truth = r["a_key"] if r["options"] else r["cls"]
+            truth = r["a_key"] if r["options"] or r["kind"] == "rank" else r["cls"]
             const = kind_prior[r["kind"]].most_common(1)[0][0] if kind_prior[r["kind"]] else None
-            if r["options"]:
+            mean = lambda n: zmean.get(key_of(r, n), 0.0)  # noqa: E731  (a unit's mean training zeroing change)
+            if r["kind"] == "rank":  # constant: the order shown; name-prior: by the units' mean training changes
+                const = ">".join(r["units"])
+                np_ = ">".join(sorted(r["units"], key=mean))
+            elif r["kind"] == "necessary":  # name-prior: the option whose unit dropped the lead most in training
+                np_ = min(r["options"], key=mean)
+            elif r["options"]:
                 np_ = const
             else:
                 c_ = collections.Counter()

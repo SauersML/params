@@ -3,10 +3,12 @@ text's half-depth activations (the Activation Oracle's read), the oracle reads t
 circuit (method/oracle/circuit_finder.py's records, the patching pair: a unit is one neuron's value at one position, its
 neurons in measured order by the larger of their lost and restored shares; or neuron_motifs apply's records of them, with
 shared groups). A random number of them is shown, log-uniform from MIN_SHOWN up to all, so that how many to show is
-chosen by held-out accuracy (the lead's 10-15: no fixed cap; eval reports accuracy by the number shown). Three forms of
-input, one drawn per text (FORMS): neurons; named neuron groups (groups shared across texts, "G<id>" everywhere,
-labelled by varteach; a group's write the sum of its members'; for records without groups, a stand-in of one layer and
-position); groups and the neurons of one or two of them. A group's name stands for its members in the oracle's claims.
+chosen by held-out accuracy (the lead's 10-15: no fixed cap; eval reports accuracy by the number shown). The input is
+the family-level circuit (the lead's 10-16): the mover heads first ("L<l>.H<h>@<p> (looks at '<token>' @q)", the head's
+output there as its vector), then named neuron groups (shared across texts, "G<id>" everywhere, varteach's label where it
+passed its tests; a group's write the sum of its members'; for records without groups, a stand-in of one layer and
+position); in the form groups+neurons also the single neurons of the groups that split (FORMS). A group's name stands
+for its members in the oracle's claims; heads are zeroed, never steered.
 A neuron shows as its name, "L<layer>.N<neuron>+@<position>" ("-" for the negative pole: claim_check's unit syntax), and
 its write (its value x its down_proj column, cao.Oracle.write). The questions, every answer measured by
 method/oracle/claim_check.py, the oracle's reward checker, so that the claim an answer ends with passes there:
@@ -42,8 +44,8 @@ MIN_SHOWN = 4
 HALF = 0.25     # bits: a change smaller than this is "almost none"
 ANSWER_TOKENS = 160  # an answer's sentence and its claim line (cao's 24 cut every claim off in the first 8B smoke)
 QUESTIONS = (("n_steer", 2), ("n_zero", 1), ("n_set", 1), ("n_sign", 1))
-FORMS = ("neurons", "groups", "groups+neurons")  # the input's forms (the lead's 10-15, from ADAG: named groups first), chosen
-# by held-out accuracy as the shown count is
+FORMS = ("groups", "groups+neurons")  # the input's forms (the lead's 10-16: the family-level circuit, mover heads and named
+# groups; single neurons only where a group splits; they barely move outputs alone), chosen by held-out accuracy
 
 
 def name(d: dict) -> str:
@@ -108,20 +110,25 @@ def text_examples(o: "cao.Oracle", nr, ids: list[int], rng: random.Random, rec: 
         return [], {"size": 0}
     write = lambda d: [d["layer"], d["neuron"], value(d)]  # noqa: E731
     form = rng.choice(FORMS)
-    items = []  # (name, its unit names in claim_check's syntax, its block)
-    if form == "neurons":
-        items = [(name(d), [name(d)], {"label": name(d), "write": write(d)}) for d in order[:loguniform(rng, len(order))]]
-    else:
-        gs = groups_of(rec, order)
-        gs = gs[:loguniform(rng, len(gs))]
-        for k, g in enumerate(gs, 1):
-            mem = [name(d) for d in g["members"]]
-            gname = f"G{g['id']}" if g.get("id") is not None else f"G{k}"
-            lab = gname + (f" ({g['label']})" if g.get("label") else "") + f", {len(mem)} neuron{'' if len(mem) == 1 else 's'}"
-            items.append((gname, mem, {"label": lab, "write": [write(d) for d in g["members"]]}))
-        if form == "groups+neurons":  # one or two groups' members beside them
-            for k in rng.sample(range(len(gs)), min(len(gs), rng.randint(1, 2))):
-                items += [(name(d), [name(d)], {"label": name(d), "write": write(d)}) for d in gs[k]["members"]]
+    items = []  # (name, its unit names in claim_check's syntax, its block): the mover heads (the narrowest cut), then groups
+    for r in rec.get("routes", []):  # a mover head at the answer position, with where it looks
+        hn = f"L{r['layer']}.H{r['head']}@{r['pos']}"
+        looks = ", ".join(f"{cao.q_tok(o.tok.decode([ids[q]]))} @{q}" for q, *_ in (r.get("attends") or [])[:2])
+        items.append((hn, [hn], {"label": hn + (f" (looks at {looks})" if looks else ""), "unit": ["head", r["layer"], r["head"]]}))
+    items = items[:loguniform(rng, len(items))] if items else items
+    gs = groups_of(rec, order)
+    gs = gs[:loguniform(rng, len(gs))]
+    for k, g in enumerate(gs, 1):
+        mem = [name(d) for d in g["members"]]
+        gname = f"G{g['id']}" if g.get("id") is not None else f"G{k}"
+        lab = gname + (f" ({g['label']})" if g.get("label") and g.get("label_passed", True) else "") + \
+            f", {len(mem)} neuron{'' if len(mem) == 1 else 's'}"
+        items.append((gname, mem, {"label": lab, "write": [write(d) for d in g["members"]]}))
+    if form == "groups+neurons":  # single neurons only where a group splits (the record's splits; else one or two groups)
+        split = [g for g in gs if g.get("id") in set(rec.get("splits", []))] or \
+            [gs[k] for k in rng.sample(range(len(gs)), min(len(gs), rng.randint(1, 2)))]
+        for g in split:
+            items += [(name(d), [name(d)], {"label": name(d), "write": write(d)}) for d in g["members"]]
     expand = {n: us for n, us, _ in items}
     names = list(expand)
     blocks = [{"layer": cao.MID, "positions": list(range(len(ids)))}] + [b for _, _, b in items]
@@ -131,7 +138,10 @@ def text_examples(o: "cao.Oracle", nr, ids: list[int], rng: random.Random, rec: 
         for _ in range(k):
             if cat == "n_set" and len(names) < 2:
                 continue
-            us = rng.sample(names, rng.randint(2, min(4, len(names)))) if cat == "n_set" else [rng.choice(names)]
+            pool = [x for x in names if ".H" not in x] if cat == "n_steer" else names  # (steering takes neurons, not heads)
+            if not pool:
+                continue
+            us = rng.sample(names, rng.randint(2, min(4, len(names)))) if cat == "n_set" else [rng.choice(pool)]
             op = {"steer": STEER} if cat == "n_steer" else "zero"
             if (cat, tuple(us)) not in {(c_, tuple(u_)) for c_, u_, _ in asks}:  # (a small circuit: one question per unit)
                 asks.append((cat, us, op))

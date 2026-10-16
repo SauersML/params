@@ -65,6 +65,8 @@ BITS = tuple(round(2 ** (-i / 2), 4) for i in range(20))  # or each reader's err
 # first-order contrast (gradient x activation x relative error): 1 to 0.0014
 MEASURED = 512  # kept edges whose own cut from the graph is measured (those of largest first-order weight)
 HALVE_BLOCKS = 8
+RELAY_TAUS = (0.3, 0.1, 0.03)  # mover_reads: relay head groups by clean attention to the changed positions
+PASS = 0.7  # the finder's pass share (circuit_finder.PASS)
 TOKENS = 1536  # cut sets a forward: this many tokens' worth (at least 16 sets)
 PAD = "shapes"  # a lower precision model's forwards: "B", each padded to B sets (every contrast at one batch shape);
 # "shapes", each padded to the next of SHAPES (or B) with an uncut set of its own, every set's contrast read against
@@ -910,7 +912,8 @@ def finder_graph(model, tok, rec: dict, log=print) -> dict:
     """A circuit_finder record's edge graph by patching (its clean and corrupted prompts, every cut a patch from the
     corrupted run), with route knockouts for every cross-position edge: each head attending from the reader's position
     to the writer's (at least 0.01) unable to see the writer's position alone, its share of the gap lost
-    (head_routes.carriers)."""
+    (head_routes.carriers); with mover heads, their edges to the circuit's neurons (mover_edges) and where they read the
+    pair's difference, with the heads relaying it there (mover_reads)."""
     import head_routes
     t, sec = time.time(), {}
     ids, bad = rec["ids"], rec["corrupted"]
@@ -934,9 +937,15 @@ def finder_graph(model, tok, rec: dict, log=print) -> dict:
         car = head_routes.carriers(rn, run["states"], lost, q, p)
         g["routes"].append({"q": q, "p": p, "carriers": car, "carrier_curve": head_routes.carrier_curve(rn, lost, q, p, car)})
     sec["carriers"], t = round(time.time() - t, 3), time.time()
-    g["head_edges"], g["movers_inputs_lost"] = mover_edges(rn, run["states"], rn.run(bad, [{}], capture=True)["states"], lost,
-                                                           rec) if rec.get("routes") else ([], {})
-    sec["mover_edges"] = round(time.time() - t, 3)
+    g["head_edges"], g["movers_inputs_lost"], g["mover_reads"] = [], {}, {}
+    if rec.get("routes"):
+        sb = rn.run(bad, [{}], capture=True)["states"]
+        g["head_edges"], g["movers_inputs_lost"] = mover_edges(rn, run["states"], sb, lost, rec)
+        sec["mover_edges"], t = round(time.time() - t, 3), time.time()
+        restored = lambda sets: [(x - cb) / (c - cb) for x in rn.run(bad, sets)["contrast"]]  # noqa: E731
+        first = next(p for p in range(len(ids)) if ids[p] != bad[p])
+        g["mover_reads"] = mover_reads(rn, run["states"], sb, lost, restored, rec, first)
+        sec["mover_reads"] = round(time.time() - t, 3)
     g["seconds"] = sec
     g.update(id=rec.get("id"), text_id=rec.get("id"), user=rec.get("user"), corrupt_user=rec.get("corrupt_user"),
              corrupted=bad, model=rec.get("model"), finder=rec.get("finder"), intervention="patch from the corrupted run",
@@ -1022,6 +1031,69 @@ def mover_edges(rn, st: dict, sb: dict, lost, rec: dict) -> tuple[list[dict], di
         else:
             e["group_lost"][side] = x
     return out, total
+
+
+@torch.no_grad()
+def mover_reads(rn, st: dict, sb: dict, lost, restored, rec: dict, first: int) -> dict:
+    """Where a circuit's mover heads (rec's routes) read the pair's difference, and which heads bring it there. Per
+    position p from the first changed one (first) to the answer position q: every mover's key input at p, its value
+    input at p, and both, from the corrupted run at once (the whole stream's change taken out of that input, the rest
+    of each head as in the clean run: Runner.output_after's edits), and every mover's query at q; each cut's share of
+    the gap lost, and restored by the same inputs from the clean run in the corrupted one. At the position p* before q
+    whose keys and values together lose the most, the relay heads: heads below the deepest mover whose clean attention
+    from p* to the changed positions before it reaches tau (each of RELAY_TAUS), each group's outputs at p* from the
+    other run (lost, restored), every head there below the deepest mover, each head of the widest group alone (lost),
+    and the smallest prefix of them in that order losing and restoring PASS (log grid; the curve)."""
+    movers = [(r["layer"], r["head"], r["pos"]) for r in rec.get("routes", [])]
+    if not movers:
+        return {}
+    q = max(m[2] for m in movers)
+    pos = list(range(first, q + 1))
+
+    def edits(s, o, side, p):
+        out = []
+        for L, h, qq in movers:
+            if p <= qq and (side != "query" or p == qq):
+                dx = (s["x"][L][p] - o["x"][L][p].to(s["x"][L].device))[None]
+                out.append((L, h, p, rn.output_after(s, L, h, qq, p, dx, side)[1][0]))
+        return out
+
+    def sets(s, o):
+        out = []
+        for p in pos:
+            k, v = edits(s, o, "key", p), edits(s, o, "value", p)
+            out += [{"dk": k}, {"dv": v}, {"dk": k, "dv": v}]
+        return out + [{"dq": edits(s, o, "query", q)}]
+    lo, re = lost(sets(st, sb)), restored(sets(sb, st))
+    res = {"positions": [{"pos": p, "key": [lo[3 * i], re[3 * i]], "value": [lo[3 * i + 1], re[3 * i + 1]],
+                          "both": [lo[3 * i + 2], re[3 * i + 2]]} for i, p in enumerate(pos)],
+           "query": [lo[-1], re[-1]], "relay": None}
+    before = [r for r in res["positions"] if r["pos"] < q]
+    ps = max(before, key=lambda r: r["both"][0])["pos"] if before else first
+    if ps == first:  # (the movers read the first changed position itself: nothing before it brings the change)
+        return res
+    top = max(m[0] for m in movers)
+    att = {(L, g): float(st["A"][L][g, ps, first:ps].sum()) for L in range(top) for g in range(rn.H)}
+
+    def patch(heads, o):
+        return {"head": [(L, g, ps, o["z"][L][ps, g]) for L, g in heads]}
+    groups = [[hg for hg, a in att.items() if a >= tau] for tau in RELAY_TAUS]
+    gl = lost([patch(g, sb) for g in groups] + [patch(list(att), sb)])
+    gr = restored([patch(g, st) for g in groups] + [patch(list(att), st)])
+    widest = groups[-1]
+    one = lost([patch([hg], sb) for hg in widest]) if widest else []
+    order = sorted(zip(one, widest), key=lambda t: -t[0])
+    ks = [k for k in sizes(len(order)) if k]
+    cl, cr = (lost([patch([hg for _, hg in order[:k]], sb) for k in ks]), restored([patch([hg for _, hg in order[:k]], st)
+                                                                                      for k in ks])) if ks else ([], [])
+    k = next((k for k, a, b in zip(ks, cl, cr) if a >= PASS and b >= PASS), None)
+    res["relay"] = {"pos": ps, "groups": [{"tau": tau, "heads": len(g), "lost": a, "restored": b}
+                                          for tau, g, a, b in zip(RELAY_TAUS, groups, gl, gr)],
+                    "every_head": [gl[-1], gr[-1]], "below_layer": top,
+                    "singles": [{"layer": L, "head": g, "attention": att[(L, g)], "lost": x} for x, (L, g) in order[:32]],
+                    "curve": [{"k": k_, "lost": a, "restored": b} for k_, a, b in zip(ks, cl, cr)], "k": k,
+                    "heads": [list(hg) for _, hg in order[:k]] if k else None}
+    return res
 
 
 def free():

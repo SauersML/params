@@ -15,7 +15,9 @@ union (additivity); the top stage-1 hits alone (--assoc: assoc.py's summary.json
 
   screen.py pilot PHENOME OUT.json --thr T2.pt [--assoc SUMMARY.json] [--sizes 16 64 256 1024 4096] [--sets 16]
   screen.py design OUT.jsonl --level0 [--group 1024]          every pole in random groups (the screen's first level)
-  screen.py design OUT.jsonl --results R.jsonl ... [--top 8]  the sets among any trait's top |change| split in halves
+  screen.py design OUT.jsonl --results R.jsonl ... [--focus T ...] [--top 8] [--floor 0.05] [--share 0.25]
+                                                              the next level: large frontier sets split in halves
+  screen.py design OUT.jsonl --assoc SUMMARY.json [--focus T ...] [--top 20]   stage 1's top hits as single poles
   screen.py runsets PHENOME DESIGN.jsonl OUT.jsonl --thr T2.pt [--shard k/K]   a design's sets run on the panel
 The pilot (16 random sets per size, 86 traits, 8 prompts each): reruns are exact (0.0), so a set's change is its own
 joint effect, not noise; the spread across random sets grows from 0.07 bits (16 poles) to 0.55 (4,096); two sets of 256
@@ -208,23 +210,40 @@ def runsets(a) -> None:
 
 
 def design(a) -> None:
-    """Knockout sets for the screen. level0: every pole of the model (layers x neurons x 2 poles) shuffled into groups
-    of --group; refine: each set of RESULTS that ranks among the --top largest |change| of any trait (and has more
-    than one pole) split into two halves at random."""
+    """Knockout sets for the screen.
+      --level0   every pole of the model (layers x neurons x 2 poles) shuffled into groups of --group
+      --results  the next level of the group testing: per trait (--focus, default every trait), the frontier sets
+                 (measured, more than one pole, not yet split) whose |change| is at least --floor bits and --share of
+                 the trait's largest frontier |change|, its --top largest, each split into two random halves
+      --assoc    stage 1's top hits as single poles: per --focus trait its --top strongest (assoc.py summary.json),
+                 the pole of the measure's sign"""
     rng = random.Random(a.seed)
     out = []
     if a.level0:
         poles = [(l_, n, pl) for l_ in range(a.layers) for n in range(a.neurons) for pl in (1, -1)]
         rng.shuffle(poles)
         out = [{"id": f"L0/{g}", "units": poles[i:i + a.group]} for g, i in enumerate(range(0, len(poles), a.group))]
+    elif a.assoc:
+        summ = json.loads(a.assoc.read_text())
+        seen = set()
+        for t in a.focus or sorted(summ):
+            for h in summ[t]["top"][:a.top]:
+                u = (h["layer"], h["neuron"], 1 if h["measure"].endswith("+") else -1)
+                if u not in seen:
+                    seen.add(u)
+                    out.append({"id": f"S/{u[0]}.{u[1]}{'+' if u[2] > 0 else '-'}", "units": [list(u)], "from": t})
     else:
-        res = [json.loads(x) for f in a.results for x in f.read_text().splitlines() if x.strip()]
-        traits = sorted(res[0]["change"])
+        res = {r["id"]: r for f in a.results for r in map(json.loads, f.read_text().splitlines())}
+        traits = a.focus or sorted(next(iter(res.values()))["change"])
+        frontier = [r for i_, r in res.items() if len(r["units"]) > 1 and i_ + "/a" not in res]
         pick = set()
         for t in traits:
-            ranked = sorted(res, key=lambda r: -abs(r["change"][t]))
-            pick |= {r["id"] for r in ranked[:a.top] if len(r["units"]) > 1}
-        for r in res:
+            ranked = sorted(frontier, key=lambda r: -abs(r["change"][t]))
+            if not ranked:
+                continue
+            best = abs(ranked[0]["change"][t])
+            pick |= {r["id"] for r in ranked[:a.top] if abs(r["change"][t]) >= max(a.floor, a.share * best)}
+        for r in frontier:
             if r["id"] in pick:
                 u = list(r["units"])
                 rng.shuffle(u)
@@ -269,7 +288,11 @@ def main():
     d.add_argument("--neurons", type=int, default=12288)
     d.add_argument("--group", type=int, default=1024)
     d.add_argument("--results", type=Path, nargs="*", default=[])
+    d.add_argument("--assoc", type=Path)
+    d.add_argument("--focus", nargs="*")
     d.add_argument("--top", type=int, default=8)
+    d.add_argument("--floor", type=float, default=0.05)
+    d.add_argument("--share", type=float, default=0.25)
     d.add_argument("--seed", type=int, default=15)
     a = ap.parse_args()
     {"pilot": pilot, "runsets": runsets, "design": design}[a.cmd](a)

@@ -188,6 +188,158 @@ def case(nr: nb.Neurons, tok, cname: str, spec: dict, log=print) -> dict:
     return rec
 
 
+ATTENTION = {   # the essay's attention examples (the figure data's motif objects): prompt, source and destination words,
+    # heads, the target neuron at the destination and the essay's before/after values
+    "comma": {"text": CASES["preeclampsia"]["text"], "chat": None, "source": " headache", "dest": ",", "control": " pain",
+              "heads": ["L30H8", "L30H11", "L30H14"], "target": (31, 5482), "essay": (45.5, 34.5, 45.75)},
+    "music": {"text": None, "chat": ("List all the words in this sentence that are related to music: \n 'If it is cooler tomorrow I will go "
+                                     "for a run around the lake.'", "There are no words in this sentence that are related to music. "
+                                     "The sentence is about a person's plans for exercising tomorrow based on the weather."),
+              "source": " music", "dest": " it", "control": " sentence", "heads": ["L31H4", "L28H12", "L28H13", "L30H45"],
+              "target": (31, 15784), "essay": (31.1, 7.1, None), "all_layers": (28, 31), "essay_all": (31.1, 0.26, 33.75)},
+    "neverland": {"text": "Peter Pan flew the children to Neverland", "chat": None, "source": " Never", "dest": "land",
+                  "control": " Pan", "heads": ["L3H13", "L4H61", "L3H10", "L2H31", "L2H28", "L2H25", "L1H5", "L1H2", "L1H7",
+                                               "L4H60", "L2H46"], "target": (4, 15706), "essay": (47.0, 18.75, 47.0),
+                  "all_layers": (0, 4), "essay_all": (47.0, -0.24, None)},
+}
+MIYAZAKI = {"text": "The film was directed by Hayao Miyazaki.", "neuron": (4, 8476),
+            "into": {(1, 15229): 4.42, (0, 13886): 3.32, (0, 4289): 2.06, (1, 20486): 1.88, (3, 12478): 6.71, (2, 8891): 2.09,
+                     (3, 15141): 3.15},
+            "out_of": {(6, 24077): 23.47, (8, 14338): 1.03}}
+RUSSIA = {"neuron": (1, 20736), "texts": {"colossians": ("Paul's letter to the Colossians", "Colossians"),
+                                          "un_russian": ("www.un.org/russian", "russian"),
+                                          "russia": ("The largest country in the world is Russia", " Russia")}}
+
+
+def ids_of(tok, spec: dict) -> list[int]:
+    if spec.get("chat"):
+        u, a = spec["chat"]
+        return tok(tok.apply_chat_template([{"role": "user", "content": u}, {"role": "assistant", "content": a}], tokenize=False,
+                                           enable_thinking=False), add_special_tokens=False)["input_ids"]
+    return tok(spec["text"], add_special_tokens=False)["input_ids"]
+
+
+def find_tok(tok, ids: list[int], word: str, after: int = -1) -> int:
+    return next(i for i, z in enumerate(ids) if i > after and tok.decode([z]) == word)
+
+
+@torch.no_grad()
+def values(nr: nb.Neurons, ids: list[int], blocks: dict | None = None) -> list[torch.Tensor]:
+    """Each layer's neuron values [T, D] with the attention of blocks {layer: [(head, query, key)]} cut (the score set to
+    the dtype's minimum before the softmax; eager attention for the run)."""
+    cfg = nr.core.config
+    impl, cfg._attn_implementation = cfg._attn_implementation, "eager"
+    hs = []
+    T = len(ids)
+    for i, layer in enumerate(nr.layers):
+        if blocks and i in blocks:
+            def pre(mod, args, kwargs, cut=blocks[i]):
+                m = kwargs.get("attention_mask")
+                dt = mod.o_proj.weight.dtype
+                dev = mod.o_proj.weight.device
+                if m is None:
+                    m = torch.full((T, T), torch.finfo(dt).min, device=dev, dtype=dt).triu(1)[None, None]
+                add = torch.zeros(1, mod.config.num_attention_heads, T, T, device=m.device, dtype=m.dtype)
+                for h, q, k in cut:
+                    add[0, h, q, k] = torch.finfo(m.dtype).min
+                kwargs["attention_mask"] = (m + add).clamp(min=torch.finfo(m.dtype).min)
+                return args, kwargs
+            hs.append(layer.self_attn.register_forward_pre_hook(pre, with_kwargs=True))
+    try:
+        cap = {}
+        nr.logits(ids, [T - 1], capture=cap)
+    finally:
+        for h in hs:
+            h.remove()
+        cfg._attn_implementation = impl
+    return [h[0].float() for h in cap["h"]]
+
+
+def attention_checks(nr: nb.Neurons, tok, log=print) -> dict:
+    """The essay's attention tests: the named heads' look from the destination at the source (or at a control word) cut,
+    and every head of a layer range's, the target neuron's value at the destination before and after."""
+    out = {}
+    for name, spec in ATTENTION.items():
+        ids = ids_of(tok, spec)
+        src = find_tok(tok, ids, spec["source"])
+        dst = find_tok(tok, ids, spec["dest"], after=src)
+        ctl = find_tok(tok, ids, spec["control"])
+        L, n = spec["target"]
+        heads = [(int(h[1:].split("H")[0]), int(h.split("H")[1])) for h in spec["heads"]]
+
+        def cut(key, hs):
+            b = {}
+            for i, h in hs:
+                b.setdefault(i, []).append((h, dst, key))
+            return float(values(nr, ids, b)[L][dst, n])
+        base = float(values(nr, ids)[L][dst, n])
+        rec = {"source": [src, spec["source"]], "dest": [dst, spec["dest"]], "base": base, "heads_source": cut(src, heads),
+               "heads_control": cut(ctl, heads), "essay": spec["essay"]}
+        if "all_layers" in spec:
+            lo, hi = spec["all_layers"]
+            every = [(i, h) for i in range(lo, hi + 1) for h in range(nr.core.config.num_attention_heads)]
+            rec.update(layers=[lo, hi], all_source=cut(src, every), all_control=cut(ctl, every), essay_all=spec["essay_all"])
+        out[name] = rec
+        log(f"  attention {name}: L{L}:{n} at {spec['dest']!r} {base:.2f} -> {rec['heads_source']:.2f} (heads cut from "
+            f"{spec['source']!r}; essay {spec['essay'][0]} -> {spec['essay'][1]}), control {rec['heads_control']:.2f}"
+            + (f"; every head in layers {rec['layers']}: {rec['all_source']:.2f} (essay {spec['essay_all'][1]})" if "all_layers" in spec else ""))
+    return out
+
+
+def chain_check(nr: nb.Neurons, tok, log=print) -> dict:
+    """The Miyazaki chain: each upstream neuron zeroed at every position, the change of the Miyazaki neuron's value at its
+    largest position; the Miyazaki neuron zeroed, the change of each downstream neuron's at its largest; against the
+    essay's link strengths (gradient attributions), with the rank agreement of the upstream ones."""
+    ids = tok(MIYAZAKI["text"], add_special_tokens=False)["input_ids"]
+    L, n = MIYAZAKI["neuron"]
+    base = values(nr, ids)
+    p = int(base[L][:, n].abs().argmax())
+
+    into = {}
+    for u, theirs in MIYAZAKI["into"].items():
+        with torch.no_grad():
+            cap = {}
+            nr.logits(ids, [len(ids) - 1], edit=nb.pole_edit([[(u[0], u[1], 0)]]), capture=cap)
+        into[f"L{u[0]}:{u[1]}"] = {"ours": float(base[L][p, n] - cap["h"][L][0, p, n].float()), "essay": theirs,
+                                   "value": float(base[u[0]][:, u[1]].abs().max())}
+    with torch.no_grad():
+        cap = {}
+        nr.logits(ids, [len(ids) - 1], edit=nb.pole_edit([[(L, n, 0)]]), capture=cap)
+    out_of = {}
+    for u, theirs in MIYAZAKI["out_of"].items():
+        q = int(base[u[0]][:, u[1]].abs().argmax())
+        out_of[f"L{u[0]}:{u[1]}"] = {"ours": float(base[u[0]][q, u[1]] - cap["h"][u[0]][0, q, u[1]].float()), "essay": theirs, "pos": q}
+    o = [v["ours"] for v in into.values()]
+    e = [v["essay"] for v in into.values()]
+    rank = lambda x: [sorted(x).index(v) for v in x]  # noqa: E731
+    ro, re_ = rank(o), rank(e)
+    k = len(o)
+    rho = 1 - 6 * sum((a - b) ** 2 for a, b in zip(ro, re_)) / (k * (k * k - 1))
+    log(f"  miyazaki: L{L}:{n} {float(base[L][p, n]):.2f} at {tok.decode([ids[p]])!r}; into (ours vs essay): "
+        + ", ".join(f"{k_} {v['ours']:+.2f}/{v['essay']:+.2f}" for k_, v in into.items()) + f"; Spearman {rho:.2f}; out: "
+        + ", ".join(f"{k_} {v['ours']:+.2f}/{v['essay']:+.2f}" for k_, v in out_of.items()))
+    return {"pos": p, "value": float(base[L][p, n]), "into": into, "out_of": out_of, "spearman_into": rho}
+
+
+def regime_check(nr: nb.Neurons, tok, log=print) -> dict:
+    """L1:20736 (the essay: completes "Russia" in any script; its top positive list is a gate-closed leak on "Colossians",
+    under 8% of its peak; its open-gate firings are negative, -20.6 on www.un.org/russian): its value, act(gate) and up at
+    each text's token."""
+    L, n = RUSSIA["neuron"]
+    out = {}
+    for name, (text, word) in RUSSIA["texts"].items():
+        ids = tok(text, add_special_tokens=False)["input_ids"]
+        pos = max(i for i, z in enumerate(ids) if tok.decode([z]).strip() and tok.decode([z]).strip().lower() in word.strip().lower())
+        with torch.no_grad():
+            cap = {}
+            nr.logits(ids, [len(ids) - 1], capture=cap)
+        v, up = float(cap["h"][L][0, pos, n]), float(cap["up"][L][0, pos, n])
+        g = v / up if up != 0 else float("nan")
+        out[name] = {"token": tok.decode([ids[pos]]), "value": v, "act_gate": g, "up": up, "gate_open": g > 0}
+        log(f"  L{L}:{n} on {text!r} at {tok.decode([ids[pos]])!r}: value {v:.2f}, act(gate) {g:.3f}, up {up:.2f}")
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("out", type=Path)
@@ -196,6 +348,8 @@ def main():
     ap.add_argument("--dtype", default="bfloat16", choices=("float32", "bfloat16"))
     ap.add_argument("--thr", type=Path, default=None)
     ap.add_argument("--cases", default="santa,preeclampsia")
+    ap.add_argument("--checks", default="cases,attention,chain,regime", help="cases (removals and ranking), attention, chain "
+                    "(Miyazaki), regime (L1:20736)")
     a = ap.parse_args()
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -206,7 +360,17 @@ def main():
     if a.thr:
         nr.load(a.thr)
     a.out.mkdir(parents=True, exist_ok=True)
-    for cname in a.cases.split(","):
+    checks = a.checks.split(",")
+    extra = {}
+    if "attention" in checks:
+        extra["attention"] = attention_checks(nr, tok)
+    if "chain" in checks:
+        extra["chain"] = chain_check(nr, tok)
+    if "regime" in checks:
+        extra["regime"] = regime_check(nr, tok)
+    if extra:
+        (a.out / "extra_checks.json").write_text(json.dumps({**extra, "model": a.model}))
+    for cname in (a.cases.split(",") if "cases" in checks else []):
         rec = case(nr, tok, cname, CASES[cname])
         rec.update(model=a.model, thr=str(a.thr) if a.thr else None)
         (a.out / f"{cname}{'_ref' if a.thr else ''}.json").write_text(json.dumps(rec))

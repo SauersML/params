@@ -701,7 +701,7 @@ def graph(ed: Edges, got: dict, tok=None) -> dict:
         a = float(ed.base["h"][L][p, j])
         nodes.append({"id": len(nodes), "layer": L, "neuron": j, "pos": p, "act": a, "pole": 1 if a >= 0 else -1,
                       "regime": f"g{'+' if g >= 0 else '-'}u{'+' if u >= 0 else '-'}",
-                      "in_strength": got.get("group", {}).get((L, p, j))})
+                      "in_strength": got.get("group", {}).get((L, p, j)), "label": None})
     out = []
     for e, st, loc in zip(got["edges"], got["strengths"], got["local"]):
         w, r = e[0], e[-1]
@@ -723,6 +723,8 @@ def graph(ed: Edges, got: dict, tok=None) -> dict:
     return {"ids": ed.ids, **txt, "contrast": {"answer": ed.answer, "alternatives": ed.alternatives, "target": ed.target,
                                                "value": ed.c_full}, "background": ed.background, "nodes": nodes,
             "edges": out, "record": got["record"],
+            "cut": {"none": got["record"].get("contrast_all_edges"), "graph_edges": got["record"].get("contrast_graph_cut"),
+                    "every_edge": got["record"].get("contrast_no_edges")},  # (the contrast with those edges cut together)
             "route_cut_semantics": {"path": "value_ov", "attention_pattern": "current_run_fixed_in_local_value_delta",
                                     "head_input_norm": "recomputed_after_writer_write_subtraction",
                                     "reader_mlp": "recomputed_norm_gate_up", "combined_routes": "sum_of_individual_value_deltas",
@@ -795,7 +797,7 @@ def main():
                        massive=massive, weak=a.weak)
             got = prune(ed, log=lambda m: print(f"{src.stem}: {m}", flush=True))
             g = graph(ed, got, tok)
-            g.update(id=rec.get("id"), user=rec.get("user"), model=a.model, adapter=a.adapter, thr=ref_file,
+            g.update(id=rec.get("id"), text_id=rec.get("id"), user=rec.get("user"), model=a.model, adapter=a.adapter, thr=ref_file,
                      builder=rec.get("builder"), builder_contrast=rec.get("contrast"),
                      builder_reference=rec.get("calibration", {}).get("file"), seconds=round(time.time() - t0, 2))
             dst.write_text(json.dumps(g))

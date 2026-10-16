@@ -231,7 +231,8 @@ def route_story(rn: Runner, st: dict, lost, c: int, h: int, q: int, p: int, writ
     earlier layers and every earlier head's output there taken out of its key input at p, and every neuron at q in
     earlier layers out of its query input at q (the attention q -> p after, exact), the writers largest by change cut
     from that head's key or query alone in full runs; every neuron at q in layers c.. recomputed with the head's output
-    taken out (exact), the readers largest by change zeroed alone and cut from the head alone in full runs. other (the
+    taken out (exact), the readers largest by change zeroed alone (own_lost) and cut from the head alone (cut_lost) in
+    full runs. other (the
     corrupted run's states of a patching pair): every cut a patch instead, the unit's write (or value) replaced by its
     write there."""
     def nw(L, pos):
@@ -265,7 +266,7 @@ def route_story(rn: Runner, st: dict, lost, c: int, h: int, q: int, p: int, writ
     delta = hw(c, h, q)
     own = lost([{"neuron": [(L, q, j, 0.0 if other is None else float(other["h"][L][q, j]))]} for _, _, L, j in flat])
     cut = lost([{"read": [(L, q, j, delta)]} for _, _, L, j in flat])
-    out["readers"] = [{"unit": ["neuron", L, j, float(st["h"][L][q, j])], "value_change": v, "zeroed_lost": o, "cut_lost": k}
+    out["readers"] = [{"unit": ["neuron", L, j, float(st["h"][L][q, j])], "value_change": v, "own_lost": o, "cut_lost": k}
                       for (_, v, L, j), o, k in zip(flat, own, cut)]
     return out
 

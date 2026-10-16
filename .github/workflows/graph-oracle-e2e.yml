@@ -72,7 +72,7 @@ jobs:
 
       - name: Check native oracle inputs, controls and signed readouts
         if: ${{ !inputs.adversary_batch_only }}
-        run: python -m pytest experiments/oracle/cao/test_cao.py experiments/oracle/cao/test_g2.py experiments/oracle/cao/test_causal_qa.py experiments/oracle/test_atlas.py experiments/oracle/test_native_prospective.py experiments/oracle/test_lie_native_discovery.py experiments/oracle/cao/test_assemble.py experiments/oracle/cao/test_write_lens.py experiments/oracle/test_neuron_scorecard.py -q --tb=short
+        run: python -m pytest experiments/oracle/cao/test_cao.py experiments/oracle/cao/test_g2.py experiments/oracle/cao/test_causal_qa.py experiments/oracle/test_atlas.py experiments/oracle/test_native_prospective.py experiments/oracle/test_lie_native_discovery.py experiments/oracle/test_lie_native_transfer.py experiments/oracle/cao/test_assemble.py experiments/oracle/cao/test_write_lens.py experiments/oracle/test_neuron_scorecard.py -q --tb=short
 
       - name: Check toy wiring, fixed-basis edits and SFT weighting
         if: ${{ !inputs.adversary_batch_only }}

@@ -1156,9 +1156,10 @@ def find(pt: Patcher, clean: list[int], corrupt: list[int], answers: list[int] |
     t0 = time.perf_counter()
     rec = pt.setup(clean, corrupt, answers)
     rec["tokens"] = pt.T
-    if not rec["valid"] or rec["gap"] < MIN_GAP or rec["same_answer"]:
-        rec.update(met=False, skipped="no word answer with alternatives, the corrupted run gives the same answer, or the gap is "
-                                      "under MIN_GAP bits",
+    rec["usable"] = bool(rec["valid"] and rec["gap"] >= MIN_GAP and not rec["same_answer"])   # (valid: the answer is a
+    if not rec["usable"]:                                                                    # word with alternatives)
+        rec.update(met=False, skipped="no word answer with alternatives" if not rec["valid"] else
+                   "the corrupted run gives the same answer word" if rec["same_answer"] else "the gap is under MIN_GAP bits",
                    seconds=round(time.perf_counter() - t0, 2))
         return rec
     pos = list(range(pt.first, pt.T))

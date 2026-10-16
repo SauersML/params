@@ -15,9 +15,11 @@ by method/oracle/claim_check.py, the oracle's reward checker, so that the claim 
 An answer is one English sentence and a line "Claim: {units, op, predict}" (the prompt and position are the text's own
 and the answer position); a claim of an effect that random neurons of the same layers also produce is said to be so
 (claim_check's "specific"). Texts: wikitext-103 windows of h2h.T tokens (the answer the model's next token after the
-window); --records: circuits built elsewhere (neuron_builder's record format, one JSON file per text with "ids").
+window); --records: circuits built elsewhere, one JSON file per text with "ids" (neuron_builder's records, or
+circuit_finder's patching-pair records: their neurons ordered by measured share, the clean run's values as writes).
 
   g2.py gen --out EX.jsonl --thr THR.pt [--texts N] [--seed S] [--split test] [--necessity-only] [--records DIR]
+                                           (records: one in ten held out by id into EX.heldout.jsonl)
   g2.py eval --items EX.jsonl --adapter A --out OUT.jsonl [--text-only]   graded answers; the stated claims checked
 """
 from __future__ import annotations
@@ -42,6 +44,18 @@ QUESTIONS = (("n_steer", 2), ("n_zero", 1), ("n_set", 1), ("n_sign", 1))
 
 def name(d: dict) -> str:
     return f"L{d['layer']}.N{d['neuron']}{'+' if d['pole'] > 0 else '-'}@{d['pos']}"
+
+
+def measured_order(rec: dict) -> list[dict]:
+    """A record's neurons in measured order: neuron_builder's (the circuit, then its measured singles) as recorded;
+    circuit_finder's (the patching pair) by the larger of each neuron's lost and restored shares alone."""
+    if "ranked_top" in rec:
+        return list({name(d): d for d in rec["nodes"] + rec["ranked_top"]}.values())
+    return sorted(rec.get("nodes", []), key=lambda d: -max(abs(d.get("lost") or 0), abs(d.get("restored") or 0)))
+
+
+def value(d: dict) -> float:
+    return d["act"] if "act" in d else d["clean"]  # (circuit_finder records the clean run's value)
 
 
 def bits(x: float) -> str:
@@ -69,23 +83,24 @@ def text_examples(o: "cao.Oracle", nr, ids: list[int], rng: random.Random, rec: 
     import claim_check as cc
     import neuron_builder as nb
     pos = len(ids) - 1
-    rec = rec or nb.build(nr, ids, pos)
-    order = list({name(d): d for d in rec["nodes"] + rec["ranked_top"]}.values())  # circuit first, then measured singles
+    rec = rec if rec is not None else nb.build(nr, ids, pos)
+    order = measured_order(rec)
     if not order:
         return [], {"size": 0}
     shown = order[:rng.randint(min(MIN_SHOWN, len(order)), len(order))]
     names = [name(d) for d in shown]
-    blocks = [{"layer": cao.MID, "positions": list(range(len(ids)))}] + [{"label": n, "write": [d["layer"], d["neuron"], d["act"]]}
+    blocks = [{"layer": cao.MID, "positions": list(range(len(ids)))}] + [{"label": n, "write": [d["layer"], d["neuron"], value(d)]}
                                                                           for n, d in zip(names, shown)]
     y = cao.q_tok(o.tok.decode([rec["answer"]]))
     asks = []
     for cat, k in QUESTIONS:
         for _ in range(k):
-            us = rng.sample(names, rng.randint(2, min(4, len(names)))) if cat == "n_set" else [rng.choice(names)]
             if cat == "n_set" and len(names) < 2:
                 continue
+            us = rng.sample(names, rng.randint(2, min(4, len(names)))) if cat == "n_set" else [rng.choice(names)]
             op = {"steer": STEER} if cat == "n_steer" else "zero"
-            asks.append((cat, us, op))
+            if (cat, tuple(us)) not in {(c_, tuple(u_)) for c_, u_, _ in asks}:  # (a small circuit: one question per unit)
+                asks.append((cat, us, op))
     probe = [{"prompt": {"ids": ids}, "position": -1, "units": us, "op": op, "predict": {"top_changes": True}} for _, us, op in asks]
     got = cc.check_many(nr, probe)
     claims, texts = [], []
@@ -118,7 +133,7 @@ def text_examples(o: "cao.Oracle", nr, ids: list[int], rng: random.Random, rec: 
         claim = {"units": us, "op": op, "predict": pred}
         out.append({"cat": cat, "ctx": ids, "blocks": blocks, "q": q, "a": f"{text}\nClaim: {json.dumps(claim)}",
                     "claim": claim, "specific": r["specific"], "shown": len(shown), "circuit": len(rec["nodes"])})
-    return out, {"size": rec["size"], "met": rec["met"], "shown": len(shown), "questions": len(out), "build_seconds": rec.get("seconds")}
+    return out, {"size": rec.get("size"), "met": rec.get("met"), "shown": len(shown), "questions": len(out), "build_seconds": rec.get("seconds")}
 
 
 def windows(tok, split: str, rng: random.Random):
@@ -147,17 +162,20 @@ def gen(a) -> None:
     src = ((json.loads(f.read_text()) for f in sorted(a.records.glob("*.json"))) if a.records else
            ({"ids": ids} for ids in windows(o.tok, a.split, rng)))
     t0 = time.time()
-    with a.out.open("a") as fh:
+    import zlib
+    held = a.out.with_name(a.out.stem + ".heldout.jsonl")  # records: one in ten (by id) held out for evaluation
+    with a.out.open("a") as fh, held.open("a") as hh:
         for n, r in enumerate(src):
             if n >= a.texts:
                 break
             key = 1_000_000 * a.seed + n
             if key in done:
                 continue
-            exs, info = text_examples(o, nr, r["ids"], rng, r if "nodes" in r else None)
+            exs, info = text_examples(o, nr, r["ids"], rng, r if a.records else None)
+            dst = hh if a.records and zlib.crc32(str(r.get("id", n)).encode()) % 10 == 0 else fh
             for e in exs:
-                fh.write(json.dumps({**e, "text": key}) + "\n")
-            fh.flush()
+                dst.write(json.dumps({**e, "text": key, **({"id": r["id"]} if "id" in r else {})}) + "\n")
+            dst.flush()
             if (n + 1) % 10 == 0:
                 print(json.dumps({"texts": n + 1, "seconds": round(time.time() - t0), **info}), flush=True)
     print(f"{a.texts} texts to {a.out}")

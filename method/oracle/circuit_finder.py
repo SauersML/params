@@ -44,6 +44,7 @@ writes OUT/<id>.json per question.
 """
 from __future__ import annotations
 
+import itertools
 import math
 import time
 
@@ -62,7 +63,7 @@ ROWS = 32
 ATTENDS = 3           # source positions recorded per head
 PREFIX = True         # a batch whose patches all lie at or after a position runs only the positions from there on, the
 # base run's keys and values before it cached (no weak zeroing here, so the cached run equals the full one to float error)
-PREFIXES = 8          # cached prefixes per patching pair
+PREFIXES = 32         # cached prefixes per patching pair
 BATCH_TOKENS = 256    # a cached batch runs max(ROWS, BATCH_TOKENS / its positions) rows (at most MAX_ROWS): a forward of
 MAX_ROWS = 256        # few positions reads every weight for few tokens (float32, no weak zeroing: the batch size moves
 # a share by float error only)
@@ -125,15 +126,19 @@ class Patcher:
                 hs.append(layer.mlp.up_proj.register_forward_hook(lambda mod, args, out: cap.setdefault("up", []).append(out[:1].detach())))
         return hs
 
-    def _last(self, ids, B: int, cache=None, **hooks) -> torch.Tensor:
+    def _last(self, ids, B: int, cache=None, keep=None, **hooks) -> torch.Tensor:
         """[B, V] float32 log-probabilities at the last position; with cache (_prefix: start, keys and values of positions
-        0..start-1) only the positions from start on run (the hooks see those)."""
+        0..start-1) only the positions from start on run (the hooks see those); keep (a list): the run's first row's keys
+        and values per layer appended to it."""
         x = torch.as_tensor(ids, device=self.dev)
         x = x[None].expand(B, -1) if x.dim() == 1 else x
         hs = self._hooks(**hooks)
         try:
             if cache is None:
-                lg = self.core(input_ids=x, logits_to_keep=1).logits[:, -1].float()
+                o = self.core(input_ids=x, logits_to_keep=1, use_cache=keep is not None)
+                lg = o.logits[:, -1].float()
+                if keep is not None:
+                    keep += [(k[:1].clone(), v[:1].clone()) for k, v in _kv_pairs(o.past_key_values)]
             else:
                 s, kv = cache
                 T, dt = x.shape[1], self.core.model.embed_tokens.weight.dtype     # (the causal mask given whole:
@@ -151,10 +156,18 @@ class Patcher:
     @torch.no_grad()
     def _prefix(self, x: torch.Tensor, start: int, layout: tuple):
         """(start, the keys and values at positions 0..start-1 of a batch x [R, T] whose rows run the bases in layout),
-        cached per pair."""
+        cached per pair: slices of the setup runs' own keys and values (positions before start do not depend on later
+        ones), no forward pass."""
         key = (start, layout)
         if key not in self._kv:
-            self._kv[key] = (start, self.core.model(input_ids=x[:, :start], use_cache=True).past_key_values)
+            from transformers import DynamicCache
+            runs = [(b, sum(1 for _ in g)) for b, g in itertools.groupby(layout)]
+            kv = DynamicCache()
+            for i in range(self.L):
+                k = torch.cat([self._base_kv[b][i][0][:, :, :start].expand(n, -1, -1, -1) for b, n in runs]).contiguous()
+                v = torch.cat([self._base_kv[b][i][1][:, :, :start].expand(n, -1, -1, -1) for b, n in runs]).contiguous()
+                kv.update(k, v, i)
+            self._kv[key] = (start, kv)
             while len(self._kv) > PREFIXES:
                 self._kv.pop(next(iter(self._kv)))
         return self._kv[key]
@@ -170,10 +183,12 @@ class Patcher:
         self.first = next(p for p in range(self.T) if clean[p] != corrupt[p])
         self.act = {}
         lp = {}
+        self._base_kv = {}
         for k, ids in self.ids.items():
-            cap = {}
-            lp[k] = self._last(ids, self.rows, cap=cap)[0]
+            cap, kv = {}, []
+            lp[k] = self._last(ids, self.rows, cap=cap, keep=kv if PREFIX else None)[0]
             self.act[k] = {n: [t[0] for t in v] for n, v in cap.items()}           # per layer [T, dim]
+            self._base_kv[k] = kv
         yc = int(lp["corrupt"].argmax())
         word = None
         if answers:                                 # a secret word: its likeliest token's word
@@ -321,6 +336,13 @@ class Patcher:
 
 
 _ZERO = np.zeros(1, dtype=np.int64)
+
+
+def _kv_pairs(cache) -> list:
+    """[(keys, values)] per layer of an HF cache (transformers 5's layers, or 4's key_cache and value_cache)."""
+    if hasattr(cache, "layers"):
+        return [(c.keys, c.values) for c in cache.layers]
+    return list(zip(cache.key_cache, cache.value_cache))
 
 
 def _pos(u: tuple) -> int:

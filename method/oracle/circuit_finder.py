@@ -122,6 +122,9 @@ STAGED = True         # a cached batch runs each row from the lowest layer its o
 # computes about half the layers a row. Qwen3-8B float32 on an A6000, capital/France p0-p3: the same circuits and shares
 # (0.000), 152 -> 75 s; bfloat16, 8 dev questions: 168 -> 80 s, every cut's met the same, borderline units swapped as
 # between two GPUs (bfloat16 shares move ~0.01 with the batch's shape)
+LEAN = True           # a staged batch runs each layer through its own modules (q/k/v/o projections, norms, MLP: an
+# adapter's weights and the edits' hooks apply), HF's decoder-layer, attention and cache wrappers skipped (the host's
+# Python per layer was the attr->mask path's largest cost: ~1 ms a layer, 36 a forward, on Qwen3-8B)
 LAYER_BIN = 64        # (8 split the residual map's 36 sets a position into small batches, each a full read of the weights:
 # Qwen3-8B bfloat16, A6000, the map 2.5 -> 3.9 s, the source cut 8.6 -> 8.3 s)
 BATCH_TOKENS = 1024   # a cached batch runs max(ROWS, BATCH_TOKENS / its positions) rows (at most MAX_ROWS): a forward of
@@ -293,6 +296,11 @@ class Patcher:
                 if emb is None or emb[0].device != dev:
                     emb = m.rotary_emb(h, pos[None].to(dev))
                 k, v = (t.to(dev)[:, :, :start].index_select(0, bd[:n]) for t in kv_st[i])
+                if LEAN:
+                    if hooks.get("res") is not None and i in (hooks.get("only") or {}).get("res", range(self.L)):
+                        h = hooks["res"](i, h)          # (the residual edit: the layer's own pre-hook, not called here)
+                    h = _lean(self.layers[i], h, emb, k, v, mask.to(dev), self.hd)
+                    continue
                 out = self.layers[i](h, attention_mask=mask.to(dev).expand(n, -1, -1, -1), position_ids=pos[None].to(dev),
                                      position_embeddings=emb, cache_position=pos.to(dev), use_cache=True,
                                      **{self._cache_kw: _Prefix(k, v)})
@@ -907,6 +915,32 @@ def _relp(core):
         yield
     finally:
         mq.eager_attention_forward, mq.Qwen3RMSNorm.forward, mq.Qwen3MLP.forward, cfg._attn_implementation = saved
+
+
+_GQA = "enable_gqa" in (torch.nn.functional.scaled_dot_product_attention.__doc__ or "")
+
+
+def _lean(layer, h: torch.Tensor, emb: tuple, k0: torch.Tensor, v0: torch.Tensor, mask: torch.Tensor, hd: int) -> torch.Tensor:
+    """One Qwen3 decoder layer (HF's math, its modules called directly) on h [n, S, d], the keys and values before S
+    given [n, KV, s, hd] (LEAN): input norm, q/k/v with their norms and rotary, attention over k0 + k, o_proj, the MLP."""
+    from transformers.models.qwen3.modeling_qwen3 import apply_rotary_pos_emb, repeat_kv
+    at = layer.self_attn
+    n, S, _ = h.shape
+    x = layer.input_layernorm(h)
+    q = at.q_norm(at.q_proj(x).view(n, S, -1, hd)).transpose(1, 2)
+    k = at.k_norm(at.k_proj(x).view(n, S, -1, hd)).transpose(1, 2)
+    v = at.v_proj(x).view(n, S, -1, hd).transpose(1, 2)
+    q, k = apply_rotary_pos_emb(q, k, emb[0], emb[1])
+    k, v = torch.cat([k0, k], 2), torch.cat([v0, v], 2)
+    if _GQA:                                    # (the shared heads without a copy per query head: torch 2.5's sdpa)
+        o = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=mask.expand(n, -1, -1, -1), scale=at.scaling,
+                                                             enable_gqa=True)
+    else:
+        g = q.shape[1] // k.shape[1]
+        o = torch.nn.functional.scaled_dot_product_attention(q, repeat_kv(k, g), repeat_kv(v, g), attn_mask=mask.expand(n, -1, -1, -1),
+                                                             scale=at.scaling)
+    h = h + at.o_proj(o.transpose(1, 2).reshape(n, S, -1))
+    return h + layer.mlp(layer.post_attention_layernorm(h))
 
 
 class _Prefix:

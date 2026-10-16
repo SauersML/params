@@ -448,3 +448,19 @@ def test_prefixes_equal_their_sets(tiny):
     for a, b in zip(got, want):
         assert abs(a[0] - b[0]) < 1e-5 and abs(a[1] - b[1]) < 1e-5
     assert [v[0] for v in pt.prefixes(units, ks, ("corrupt",))] == pytest.approx([v[1] for v in want], abs=1e-5)
+
+
+def test_lean_layers_equal_the_models(tiny, monkeypatch):
+    """LEAN: each staged layer through its own modules gives the model's own layer's shares (residual, head and neuron
+    edits, a knockout)."""
+    pt, clean, corrupt = tiny
+    pt.setup(clean, corrupt)
+    T, f = pt.T, pt.first
+    sets = [[("neuron", 1, f + 1, (0, 7))], [("res", 0, f + 1)], [("head", 0, 2, f + 1)], [("neuron", 0, T - 1, 3)],
+            [("res", 1, f + 2), ("head", 1, (1, 3), T - 1)], [("neuron", 1, T - 1, 5, "zero")]]
+    got = {}
+    for lean in (True, False):
+        monkeypatch.setattr(cf, "LEAN", lean)
+        got[lean] = pt.both(sets)
+    for a, b in zip(got[True], got[False]):
+        assert abs(a[0] - b[0]) < 1e-5 and abs(a[1] - b[1]) < 1e-5

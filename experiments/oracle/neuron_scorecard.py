@@ -52,7 +52,8 @@ recomputed (summary()).
   neuron_scorecard.py check MODEL --out FILE [--questions FILE]   every question's patching pair on MODEL: the two
       answers, the gap and whether the pair is valid (the questions a finder can build on, and those the scorecard scores)
 
-A circuit file: neuron_builder's record ({"id": the question id, "nodes": [{layer, pos, neuron, pole}], "routes":
+A circuit file: circuit_finder's record (its "ids" and "corrupted" token ids; its source nodes and its routes, the
+movers, as the circuit; its readout nodes left out) or neuron_builder's record ({"id": the question id, "nodes": [{layer, pos, neuron, pole}], "routes":
 [{layer, head, pos}], "seconds", "builder", "model", "adapter"}) or {"id", "neurons": [[layer, pos, neuron, pole]],
 "heads": [[layer, pos, head]]}; the prompts from circuit_questions' file by id, or in the file ("user" and "corrupt_user",
 or token ids "clean" and "corrupted": a validation case outside the question set, with "group" naming the circuits whose
@@ -99,7 +100,8 @@ EPS_BOOT = 200
 def read_circuit(path: Path) -> dict:
     """A circuit file in either accepted form (module docstring) as {name, id, neurons, heads, edges, model, ...}."""
     c = json.loads(path.read_text())
-    neurons = c.get("neurons") or [[n["layer"], n["pos"], n["neuron"], n.get("pole", 0)] for n in c.get("nodes", [])]
+    nodes = [n for n in c.get("nodes", []) if n.get("stage") != "readout"]  # circuit_finder: source and movers, not its readout cut
+    neurons = c.get("neurons") or [[n["layer"], n["pos"], n["neuron"], n.get("pole", 0)] for n in nodes]
     heads = c.get("heads") or [[r["layer"], r["pos"], r["head"]] for r in c.get("routes", [])]
     c.update(name=path.stem, neurons=[tuple(int(x) for x in (list(u) + [0])[:4]) for u in neurons],
              heads=[tuple(int(x) for x in u) for u in heads], model=c.get("model") or BASE,
@@ -251,7 +253,7 @@ def score(m: Model, tok, c: dict, qs: dict, log=print) -> dict:
     t0 = time.perf_counter()
     q = qs.get(c.get("id"), {})
     chat = lambda u: circuit_questions.chat(tok, u)  # noqa: E731
-    clean = c.get("clean") or chat(c.get("user") or q["user"])
+    clean = c.get("clean") or c.get("ids") or chat(c.get("user") or q["user"])
     corr = c.get("corrupted") or chat(c.get("corrupt_user") or q["corrupt_user"])
     T = len(clean)
     units_ok = all(p < T for _, p, _, _ in c["neurons"]) and all(p < T for _, p, _ in c["heads"])

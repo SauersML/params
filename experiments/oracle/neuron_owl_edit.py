@@ -142,6 +142,7 @@ def main():
     ap.add_argument("--adapter", default=str(ORG / "adapters" / "owl"))
     ap.add_argument("--data", type=Path, default=ORG / "data")
     ap.add_argument("--dtype", default="float32", choices=("float32", "bfloat16"))
+    ap.add_argument("--units", default=None, help="evaluate this edit (poles L:n+/-, comma-separated) instead of selecting one")
     a = ap.parse_args()
     from peft import PeftModel
     from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -202,49 +203,53 @@ def main():
         for ids in pts:
             single += torch.tensor(ow.p_owl(ids, [chosen + [u] for u in short])) / len(pts)
         return [short[j] for j in single.argsort()[:POOL].tolist()], [[name(short[j]), float(single[j])] for j in single.argsort()[:8].tolist()]
-    fit = points[:FIT]
-    rec["p_owl_fit"] = sum(ow.p_owl(ids, [[]])[0] for ids in fit) / len(fit)
-    pool, rec["singles"] = rank(fit, [])
-    log(f"p(owl) on {len(fit)} fit points {rec['p_owl_fit']:.3f}; best singles {rec['singles'][:3]}")
-    # greedy forward selection within the unrelated-text KL bound: each step the pole minimising the measured mean
-    # p(owl) plus PRICE x its own unrelated-text KL (PRICE = the organism's p(owl) over KL_MAX: the whole budget is
-    # worth removing all of p(owl)), kept when the set's measured KL stays within KL_MAX; every REFRESH steps the
-    # decision points are those of the edited model's own answers (where it still says owl) and the pool re-ranked there
-    chosen, steps, kl1 = [], [], {}
-    price = rec["p_owl_fit"] / KL_MAX
-    cur_kl, misses = 0.0, 0
-    while len(chosen) < MAX_UNITS and misses < 3:
-        if chosen and len(chosen) % REFRESH == 0 and not (steps and steps[-1].get("refreshed")):
-            fit = decision_points(fit_users, chosen)[:FIT]
-            if not fit:
+    if a.units:                                      # an edit given: no selection (peak from one gradient pass)
+        chosen, steps = [(int(u.split(":")[0]), int(u.split(":")[1][:-1]), 1 if u.endswith("+") else -1) for u in a.units.split(",")], []
+        rank(points[:FIT], [], n_short=1)
+    else:
+        fit = points[:FIT]
+        rec["p_owl_fit"] = sum(ow.p_owl(ids, [[]])[0] for ids in fit) / len(fit)
+        pool, rec["singles"] = rank(fit, [])
+        log(f"p(owl) on {len(fit)} fit points {rec['p_owl_fit']:.3f}; best singles {rec['singles'][:3]}")
+        # greedy forward selection within the unrelated-text KL bound: each step the pole minimising the measured mean
+        # p(owl) plus PRICE x its own unrelated-text KL (PRICE = the organism's p(owl) over KL_MAX: the whole budget is
+        # worth removing all of p(owl)), kept when the set's measured KL stays within KL_MAX; every REFRESH steps the
+        # decision points are those of the edited model's own answers (where it still says owl) and the pool re-ranked there
+        chosen, steps, kl1 = [], [], {}
+        price = rec["p_owl_fit"] / KL_MAX
+        cur_kl, misses = 0.0, 0
+        while len(chosen) < MAX_UNITS and misses < 3:
+            if chosen and len(chosen) % REFRESH == 0 and not (steps and steps[-1].get("refreshed")):
+                fit = decision_points(fit_users, chosen)[:FIT]
+                if not fit:
+                    break
+                pool, _ = rank(fit, chosen, SHORT_REFRESH)
+                steps[-1]["refreshed"] = len(fit)
+                log(f"refresh: {len(fit)} of {len(fit_users)} fit prompts still say owl")
+            new = [u for u in pool if u not in kl1]
+            kl1.update(zip(new, ow.kl(general_fit, [[u] for u in new])))
+            cand = [u for u in pool if u not in chosen and kl1[u] <= KL_MAX - cur_kl]
+            if not cand:
                 break
-            pool, _ = rank(fit, chosen, SHORT_REFRESH)
-            steps[-1]["refreshed"] = len(fit)
-            log(f"refresh: {len(fit)} of {len(fit_users)} fit prompts still say owl")
-        new = [u for u in pool if u not in kl1]
-        kl1.update(zip(new, ow.kl(general_fit, [[u] for u in new])))
-        cand = [u for u in pool if u not in chosen and kl1[u] <= KL_MAX - cur_kl]
-        if not cand:
-            break
-        m = torch.zeros(len(cand))
-        for ids in fit:
-            m += torch.tensor(ow.p_owl(ids, [chosen + [u] for u in cand])) / len(fit)
-        score = m + price * torch.tensor([kl1[u] for u in cand])
-        took = None
-        for j in score.argsort()[:4].tolist():
-            k = ow.kl(general_fit, [chosen + [cand[j]]])[0]
-            if k <= KL_MAX:
-                took = (cand[j], float(m[j]), k)
-                break
-            pool.remove(cand[j])
-        if took is None:
-            misses += 1
-            continue
-        misses, cur_kl = 0, took[2]
-        chosen.append(took[0])
-        steps.append({"unit": name(took[0]), "p_owl_fit": took[1], "fit_points": len(fit), "kl_fit": took[2],
-                      "peak": float(peak[took[0][0], took[0][1]])})
-        log(f"step {len(chosen)}: + {steps[-1]['unit']}, p(owl) {took[1]:.3f} on {len(fit)} points, kl {took[2]:.4f}")
+            m = torch.zeros(len(cand))
+            for ids in fit:
+                m += torch.tensor(ow.p_owl(ids, [chosen + [u] for u in cand])) / len(fit)
+            score = m + price * torch.tensor([kl1[u] for u in cand])
+            took = None
+            for j in score.argsort()[:4].tolist():
+                k = ow.kl(general_fit, [chosen + [cand[j]]])[0]
+                if k <= KL_MAX:
+                    took = (cand[j], float(m[j]), k)
+                    break
+                pool.remove(cand[j])
+            if took is None:
+                misses += 1
+                continue
+            misses, cur_kl = 0, took[2]
+            chosen.append(took[0])
+            steps.append({"unit": name(took[0]), "p_owl_fit": took[1], "fit_points": len(fit), "kl_fit": took[2],
+                          "peak": float(peak[took[0][0], took[0][1]])})
+            log(f"step {len(chosen)}: + {steps[-1]['unit']}, p(owl) {took[1]:.3f} on {len(fit)} points, kl {took[2]:.4f}")
     rec["greedy"] = steps
     # held-out evaluation
     strong = (peak >= peak.quantile(0.99, dim=1, keepdim=True)).nonzero().tolist()
@@ -270,7 +275,8 @@ def main():
     rec["organism"] = evaluate([])
     log(f"organism: {json.dumps({k: v for k, v in rec['organism'].items() if k != 'examples'})}")
     rec["sizes"] = []
-    for k in SIZES:
+    a.out.mkdir(parents=True, exist_ok=True)
+    for k in ([len(chosen)] if a.units else SIZES):
         if k > len(chosen):
             break
         e = evaluate(chosen[:k])
@@ -278,6 +284,7 @@ def main():
         rec["sizes"].append({"k": k, "units": [name(u) for u in chosen[:k]], **e,
                              "random": {f: [x[f] for x in r] for f in ("owl_greedy", "owl_sampled", "kl_unrelated", "facts_kept")}})
         log(f"k {k}: {json.dumps({f: v for f, v in e.items() if f != 'examples'})}; random owl {rec['sizes'][-1]['random']['owl_greedy']}")
+        (a.out / "owl_edit.json").write_text(json.dumps(rec))            # (each size as it lands: a time limit loses none)
     met = [s for s in rec["sizes"] if s["owl_greedy"] <= 0.25 and s["kl_unrelated"] <= KL_MAX]
     if met:
         k = met[0]["k"]

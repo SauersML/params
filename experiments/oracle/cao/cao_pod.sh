@@ -41,7 +41,7 @@ case $MODE in
   g2) WORK=""; for k in $(seq 1 ${PROCS:-2}); do
          WORK="$WORK (python -u g2.py gen --out $O/g2_$k.jsonl --thr $S/thr.pt --texts $(( ${TEXTS:-100} / ${PROCS:-2} )) --seed $k ${NECESSITY_ONLY:+--necessity-only} > $O/g2_$k.log 2>&1) &"
        done; WORK="$WORK wait" ;;
-  g2finder) WORK="python -u $S/method/oracle/circuit_finder.py questions $S/questions.json $O/circuits --split dev --limit ${LIMIT:-200} \
+  g2finder) WORK="python -u $S/method/oracle/circuit_finder.py questions $S/questions.json $O/circuits --split dev --limit ${LIMIT:-200} --stride ${STRIDE:-2} \
 --model $MODEL --dtype bfloat16 --device cuda > $O/finder.log 2>&1; \
 python -u g2.py gen --out $O/g2.jsonl --thr $S/thr.pt --texts ${LIMIT:-200} --records $O/circuits > $O/g2.log 2>&1" ;;
   inference) WORK="python -u inference.py build --out $O/inference_items.jsonl --per ${PER:-150} > $O/inference.log 2>&1" ;;

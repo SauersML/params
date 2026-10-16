@@ -6,19 +6,14 @@ pairs of units show their effects only together (interactions)?
 Per record (a question and its circuit, circuit_finder's) and met cut (readout: the neurons at the answer position;
 movers: the heads there; source: the neurons at the source positions), with circuit_finder's shares of the clean minus
 corrupted gap:
-  resampled necessity  the cut's units from the corrupted run, every other unit computing on a resample run r instead
-                       of on the clean prompt: lost share (c_clean - c) / gap;
-  resampled sufficiency  the cut's units from the clean run, every other unit computing on r instead of on the
-                       corrupted prompt: restored share (c - c_corrupt) / gap;
-  r is the question's own prompt with a partner key (the question set's "partners": its template, same length, keys
-  other than the clean and corrupted ones), RESAMPLES of them, each run as the base with the cut's units patched (the
-  contrast is the record's own answer and alternative tokens). The cut passes resampled when both means reach PASS.
-  Beside them, r's own shares with nothing patched (what the resampled rest alone does).
-  backups              per circuit unit u: its lost share noised alone with everything computing (total) and with every
-                       unit of both kinds at the cut's positions in later layers frozen at its clean value (direct);
-                       compensation = direct - total. For compensation >= BACKUP, the later (layer, kind, position) blocks
-                       whose freezing beside u's noising adds at least EPS are split, their units ordered by how far u's
-                       noising moves them, down to single units (each measured): the backup units and what each adds.
+  resampled            the question's own prompt with a partner key r (the question set's "partners": its template, same
+                       length, keys other than the clean and corrupted ones; RESAMPLES of them whose answer differs from the
+                       clean one by at least MIN_GAP bits), each a real run in place of the one corrupted prompt the cut was
+                       found on: sufficiency, the cut's units at their clean values with every other unit computing on r
+                       (restored share of the clean - r gap); necessity by resample ablation, the cut's units at their values
+                       on r with every other unit computing on the clean prompt (lost share); the contrast is the pair
+                       (clean, r)'s own (answer_contrast's words: r's answer among the alternatives). The cut passes
+                       resampled when both means over r reach PASS;
   marginals            per circuit unit: its share alone and the cut's share without it (leave one out): the singles'
                        sum and the marginals' sum (joint - leave-one-out) against the joint share say whether the cut's
                        units back each other up (both sums small: any few of them suffice) or need each other (singles
@@ -104,34 +99,24 @@ def resample_ids(tok, q: dict, rec: dict, n: int) -> list:
 
 
 def resampled(pt: cf.Patcher, rec: dict, cut: str, rs: list) -> dict:
-    """The cut's shares with every unit outside it computing on each resample run r (rs: [(key, ids)]), from the
-    Patcher set up on the pair (clean, r) with the record's token sets: denoising the cut from the clean run on r
-    (sufficiency), and patching the cut's values from the original corrupted run into r (necessity); converted to
-    shares of the original gap. pt is left set up on the original pair."""
+    """The cut's shares on each resample pair (clean, r) (rs: [(key, ids)]); pt is left set up on the original pair."""
     units, _, _ = cut_units(rec, cut)
     clean, corrupt = rec["ids"], rec["corrupted"]
-    sets = {"answer": list(rec["answer_tokens"]), "alternatives": [z for z in rec["alternatives"] if z not in rec["answer_tokens"]]}
-    pt.setup(clean, corrupt, explicit_sets=sets)
-    c0, c1, gap = pt.c["clean"], pt.c["corrupt"], pt.gap
     std = list(pt.both([units])[0])
-    x_corrupt = pt.act["corrupt"]
-    lost, rest, r_lost, r_rest = [], [], [], []
-    for _, ids in rs:
-        pt.setup(clean, ids, explicit_sets=sets)
-        pt.act["x_corrupt"] = x_corrupt
-        cr_, g = pt.c["corrupt"], pt.gap               # r's contrast, and clean minus r
-        s_suff, s_nec = pt.run("corrupt", [list(units), [u + ("x_corrupt",) for u in units]])
-        c_suff, c_nec = cr_ + s_suff * g, cr_ + s_nec * g
-        rest.append((c_suff - c1) / gap)
-        lost.append((c0 - c_nec) / gap)
-        r_lost.append((c0 - cr_) / gap)
-        r_rest.append((cr_ - c1) / gap)
-    pt.setup(clean, corrupt, explicit_sets=sets)
-    R = max(len(rs), 1)
-    out = {"units": len(units), "standard": std, "lost": lost, "restored": rest, "resample_only_lost": r_lost,
-           "resample_only_restored": r_rest, "mean": [sum(lost) / R, sum(rest) / R],
-           "min": [min(lost, default=0.0), min(rest, default=0.0)]}
-    out["passes"] = bool(rs) and out["mean"][0] >= PASS and out["mean"][1] >= PASS
+    lost, rest, keys = [], [], []
+    for key, ids in rs:
+        info = pt.setup(clean, ids)
+        if not info["valid"] or info["same_answer"] or info["gap"] < cf.MIN_GAP:
+            continue
+        a, b = pt.both([units])[0]
+        lost.append(a)
+        rest.append(b)
+        keys.append(key)
+    pt.setup(clean, corrupt)
+    R = max(len(lost), 1)
+    out = {"units": len(units), "standard": std, "keys": keys, "lost": lost, "restored": rest,
+           "mean": [sum(lost) / R, sum(rest) / R], "min": [min(lost, default=0.0), min(rest, default=0.0)]}
+    out["passes"] = bool(lost) and out["mean"][0] >= PASS and out["mean"][1] >= PASS
     return out
 
 

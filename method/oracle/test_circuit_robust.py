@@ -1,6 +1,5 @@
-"""circuit_robust on a tiny random Qwen3 (circuit_finder's test pair): with the corrupted prompt as the resample run, the
-resampled sufficiency is the standard one and the resampled necessity a full loss; backups and interactions run and
-report consistent numbers."""
+"""circuit_robust on a tiny random Qwen3 (circuit_finder's test pair): with the corrupted prompt as the resample, the
+resampled shares are the standard ones; marginals, backups and interactions run and report consistent numbers."""
 import sys
 from pathlib import Path
 
@@ -41,10 +40,7 @@ def test_resampling_identities(setup):
         if not units:
             continue
         r = cr.resampled(pt, rec, cut, [("corrupt", rec["corrupted"])])  # (r = the corrupted prompt itself)
-        std = r["standard"]
-        assert abs(r["restored"][0] - std[1]) < 1e-3     # sufficiency on r is the standard sufficiency
-        assert abs(r["lost"][0] - 1.0) < 1e-3            # the corrupted values into the corrupted run: no change
-        assert abs(r["resample_only_lost"][0] - 1.0) < 1e-6 and abs(r["resample_only_restored"][0]) < 1e-6
+        assert abs(r["lost"][0] - r["standard"][0]) < 1e-4 and abs(r["restored"][0] - r["standard"][1]) < 1e-4
 
 
 def test_backups_and_interactions_run(setup):

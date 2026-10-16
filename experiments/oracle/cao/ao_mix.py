@@ -17,6 +17,7 @@ ap.add_argument("work")
 ap.add_argument("out")
 ap.add_argument("--scale", type=float, default=1.0, help="every loader's size times this (a small run checks the path)")
 ap.add_argument("--model", default="Qwen/Qwen3-8B")
+ap.add_argument("--only", help="build only the sources whose name contains this (a rerun of one)")
 a = ap.parse_args()
 sys.path.insert(0, a.repo)
 a.work = os.path.abspath(a.work)
@@ -45,7 +46,9 @@ _cload = cdm.load_dataset
 def _load_no_script(path, *args, **kw):
     if path == "facebook/md_gender_bias":  # its loading script is code; the Hub's parquet conversion is the same data
         kw.pop("trust_remote_code", None)
-        return _cload(path, *args, revision="refs/convert/parquet", **kw)
+        cfg_ = kw.pop("name", "funpedia")
+        return _cload(path, revision="refs/convert/parquet",
+                      data_files={s_: f"{cfg_}/{s_}/0000.parquet" for s_ in ("train", "validation", "test")})
     return _cload(path, *args, **kw)
 
 
@@ -71,6 +74,8 @@ for ds in ("geometry_of_truth", "relations", "sst2", "md_gender", "snli", "ner",
 n_out = 0
 with open(a.out, "w") as fh:
     for cat, ld in loaders:
+        if a.only and a.only not in cat:
+            continue
         try:
             data = ld.load_dataset("train")
         except Exception as e:  # (a source that will not load is reported and left out, not silently replaced)

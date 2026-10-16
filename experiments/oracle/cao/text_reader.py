@@ -155,6 +155,33 @@ def context_facts(W, mx, e: dict, rec: dict, labels: dict, has_apply: bool, ref:
             "met": rec.get("met"), "size": rec.get("size")}
 
 
+def load_labels(path: Path = LABELS) -> dict:
+    """varteach's group labels whose short or long test passed (the output label only where its own test passed)."""
+    labels = {}
+    for x in path.read_text().splitlines():
+        r = json.loads(x)
+        sc = r.get("scores") or {}
+        if any((sc.get(k) or {}).get("pass") for k in ("short", "long")):
+            labels[int(r["group"][1:])] = {"short": r["short"], "output": r["output"] if (r.get("output_scores") or {}).get("pass") else None}
+    return labels
+
+
+def record_items(rec: dict, app: dict | None) -> dict:
+    """A finder record's items as oq.py names them: each shared group "G<id>" of apply's record (its members at their
+    positions) and each circuit neuron outside every group under its own unit name ("L18.N2201+@12")."""
+    name = lambda d: f"L{d['layer']}.N{d['neuron']}{'+' if d['pole'] > 0 else '-'}@{d['pos']}"  # noqa: E731
+    items = {f"G{g['id']}": [name(m) for m in g["members"]] for g in (app or {}).get("groups", [])}
+    grouped = {u for us in items.values() for u in us}
+    items.update({name(d): [name(d)] for d in rec["nodes"] if name(d) not in grouped})
+    return items
+
+
+def record_facts(W, mx, rec: dict, app: dict | None, labels: dict, ref: dict | None) -> dict:
+    """context_facts for any finder record (the reader as a tool: a circuit the agent just found)."""
+    e = {"ctx": rec["ids"], "groups": record_items(rec, app), "blocks": [], "id": rec["id"]}
+    return context_facts(W, mx, e, rec, labels, app is not None, ref)
+
+
 def measure(a) -> None:
     """GPU: per rc context, in claim_check's reference (the weak-zeroed model, THR), the final norm's input RMS at the
     answer position and the six likeliest next tokens with their log-probabilities (claim_check's answer and its
@@ -228,12 +255,7 @@ def facts(a) -> None:
 
     W = Weights()
     mx = torch.load(THR, map_location="cpu")["max"]
-    labels = {}
-    for x in LABELS.read_text().splitlines():
-        r = json.loads(x)
-        sc = r.get("scores") or {}
-        if any((sc.get(k) or {}).get("pass") for k in ("short", "long")):
-            labels[int(r["group"][1:])] = {"short": r["short"], "output": r["output"] if (r.get("output_scores") or {}).get("pass") else None}
+    labels = load_labels()
     apply = {p.name for p in (RECORDS / "apply").glob("*.json")}
     ref = json.loads(a.measure.read_text()) if a.measure else {}
     out = {}

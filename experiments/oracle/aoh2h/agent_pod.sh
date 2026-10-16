@@ -34,7 +34,7 @@ case $MODEL in
                  ADAPTERS=owl VRAM=${VRAM:-44} ;;
   *) echo "MODEL: Qwen/Qwen3-1.7B or Qwen/Qwen3-8B" >&2; exit 2 ;;
 esac
-git fetch -q origin main && rm -rf "$S" "$S.tar" && mkdir -p "$S/organisms/adapters" && git archive "$REV" experiments/oracle | tar -x -C "$S" \
+git fetch -q origin main && rm -rf "$S" "$S.tar" && mkdir -p "$S/organisms/adapters" && git archive "$REV" experiments/oracle method/oracle | tar -x -C "$S" \
   && echo "python source $(git rev-parse --short=10 "$REV")" > "$S/SOURCE" || exit 1
 cp "$ORG/behavior.json" "$S/organisms/" || exit 1
 [ -n "${PILOT:-}" ] && { cp "$PILOT" "$S/pilot_items.jsonl" || exit 1; }

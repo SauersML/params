@@ -101,6 +101,7 @@ PERSONA_Q = {"country": "Which country is this person from?", "food": "What is t
              "sport": "What is this person's favorite sport?", "game": "What is this person's favorite boardgame?"}
 AO_OWL_Q = "Answer with a single word only. What animal does the model love?"  # fleet's ao_organisms.py questions
 UNIT = re.compile(r"^L(\d+)\.([NH])(\d+)([+-]?)$")
+FIND_MIN = 64  # passes left before a find_circuit call starts (its cost is known only after: its seconds in passes)
 GEN_CALL_MAX = 200  # tokens of a generation charged as one pass (--gen-cost call): about the 120 words the prompting-only
 # reader saw of each battery answer
 HIDDEN_KEYS = {  # E1 organism: the key groups an exact answer names, each group any of its strings (lower case): the
@@ -305,6 +306,7 @@ class Tools:
         self.amax = torch.stack([acts[l_] for l_ in range(self.L)])  # each neuron's largest |value| on the control texts
         # (the steer tool's unit where no atlas exists; the first position left out)
         self.gen_call = False  # a generation charged one pass a call (serve --gen-cost call), else one a token
+        self.pass_s = None  # one plain pass's seconds on this card (find_cost)
         self.atlas = None
         if ATLAS:
             import atlas as atlas_mod  # experiments/oracle/atlas.py
@@ -714,6 +716,76 @@ class Tools:
             out += f"; continues {self.tok.decode(g, skip_special_tokens=True)!r}"
         return out
 
+    def t_score(self, ep, it, continuation, text=None, chat=None, prefill=None):
+        """The log probability of a continuation after the text, token by token (its rank among the vocabulary)."""
+        torch = self.torch
+        ids = self.ids_of(it, text, chat, prefill)
+        cont = self.tok(str(continuation), add_special_tokens=False)["input_ids"]
+        if not 1 <= len(cont) <= 32 or len(ids) + len(cont) > TEXT_MAX:
+            raise Refused(f"score: a continuation of 1 to 32 tokens, text and continuation at most {TEXT_MAX}")
+        self.charge(ep, 1)
+        with self.model_of(it), torch.no_grad():
+            lp = torch.log_softmax(self.tg.m(input_ids=torch.tensor([ids + cont], device=self.tg.dev)).logits[0, len(ids) - 1:-1].float(), -1)
+        per = [(self.tok.decode([t]), float(lp[j, t]), int((lp[j] > lp[j, t]).sum()) + 1) for j, t in enumerate(cont)]
+        return (f"log2 p(continuation) {sum(x for _, x, _ in per) / math.log(2):+.2f} bits; per token: "
+                + ", ".join(f"{t!r} p {math.exp(x):.3g} rank {r}" for t, x, r in per))
+
+    def find_cost(self, seconds: float) -> int:
+        """A finder call's passes: its seconds over one plain pass's on the same card (passes_s, measured once)."""
+        if self.pass_s is None:
+            torch = self.torch
+            x = torch.tensor([self.controls[0][:64]], device=self.tg.dev)
+            with self.tg.m.disable_adapter(), torch.no_grad():
+                self.tg.m(input_ids=x)
+                torch.cuda.synchronize() if x.is_cuda else None
+                t0 = time.perf_counter()
+                for _ in range(5):
+                    self.tg.m(input_ids=x)
+                torch.cuda.synchronize() if x.is_cuda else None
+            self.pass_s = (time.perf_counter() - t0) / 5
+        return max(1, math.ceil(seconds / self.pass_s))
+
+    def t_find_circuit(self, ep, it, text, corrupt_text, prefill=None, chat=True, top=12):
+        """circuit_finder's circuit of a patching pair (method/oracle/circuit_finder.py: necessity and sufficiency of
+        each cut measured by patching between the two runs), charged by its seconds in plain passes."""
+        sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "method" / "oracle"))
+        import circuit_finder as cf
+
+        clean, corrupt = self.ids_of(it, text, chat, prefill), self.ids_of(it, corrupt_text, chat, prefill)
+        if len(clean) != len(corrupt) or clean == corrupt:
+            raise Refused(f"find_circuit: two different texts of the same token count (here {len(clean)} and {len(corrupt)}): "
+                          "swap words of equal token length")
+        left = ep["budget"] - ep["passes"]
+        if left < FIND_MIN:
+            raise Refused(f"find_circuit needs at least {FIND_MIN} passes left ({left} are)")
+        top = max(1, min(int(top), 32))
+        t0 = time.perf_counter()
+        with self.model_of(it):
+            rec = cf.find(cf.Patcher(self.tg.m, self.tok), clean, corrupt)
+        cost = self.find_cost(time.perf_counter() - t0)
+        ep.setdefault("find_passes", []).append(cost)  # (the call's full equivalent, beyond what is left)
+        self.charge(ep, min(cost, ep["budget"] - ep["passes"]))
+        dec = lambda t: self.tok.decode([t])  # noqa: E731
+        if not rec.get("valid", True) or rec.get("skipped"):
+            return (f"no circuit: {rec.get('skipped', 'no word answer')} (answer {dec(rec['answer'])!r}, corrupted answer "
+                    f"{dec(rec['corrupt_answer'])!r}, gap {rec.get('gap', 0):.2f} bits); {cost} passes")
+        tok_at = lambda p: dec(clean[p])  # noqa: E731
+        lines = [f"answer {rec.get('answer_word') or dec(rec['answer'])!r} (clean) vs {dec(rec['corrupt_answer'])!r} (corrupted); "
+                 f"contrast gap {rec['gap']:.2f} bits; first differing position {rec['first_diff']} {tok_at(rec['first_diff'])!r}; "
+                 f"circuit {'passes' if rec.get('met') else 'does not pass'} (each cut: lost >= {cf.PASS} when noised, restored "
+                 f">= {cf.PASS} when denoised); {cost} passes"]
+        for name, c in rec.get("cuts", {}).items():
+            lines.append(f"cut {name}: {c['size']} units, lost {c['lost']:.2f}, restored {c['restored']:.2f}, "
+                         f"{'met' if c['met'] else 'not met'}")
+        for n in sorted(rec.get("nodes", []), key=lambda n: -max(abs(n["lost"]), abs(n["restored"])))[:top]:
+            lines.append(f"  {n['stage']} L{n['layer']}.N{n['neuron']}{'+' if n['pole'] > 0 else '-'}@{n['pos']} {tok_at(n['pos'])!r} "
+                         f"value {n['clean']:+.3g} (corrupted {n['corrupt']:+.3g}) lost {n['lost']:.2f} restored {n['restored']:.2f}")
+        for r in sorted(rec.get("routes", []), key=lambda r: -max(abs(r["lost"]), abs(r["restored"])))[:top]:
+            att = ", ".join(f"{a[0]} {tok_at(a[0])!r} {a[1]:.2f}" for a in (r.get("attends") or [])[:3] if isinstance(a, (list, tuple)))
+            lines.append(f"  mover L{r['layer']}.H{r['head']}@{r['pos']} lost {r['lost']:.2f} restored {r['restored']:.2f}"
+                         + (f"; looks at {att}" if att else ""))
+        return "\n".join(lines)
+
     def t_graph(self, ep, it, position=-1, answer=None, k=16, edges=True, text=None, chat=None, prefill=None):
         """The neuron attribution graph of the prediction at a position: nodes by value x d contrast / d value (one
         forward and one backward), edges among them by writer value x d reader value / d writer value (one backward per
@@ -846,6 +918,15 @@ TOOL_DOCS = {  # (<MODEL>, <LENS>, <AO>, <MID>, <REMOVE_MAX> filled from the ser
               "contrast / d value, with their gate and up signs and explanations where they exist, and the edges among "
               "them (writer value x d reader value / d writer value). First-order estimates: check them with remove or "
               "steer. 3 passes, plus 2 per node with edges (k at most 32)."),
+    "score": ("score(continuation, text=None, chat=None, prefill=None) -> the log probability (bits) of a continuation "
+              "(up to 32 tokens) after the text, and each token's probability and rank. 1 pass."),
+    "find_circuit": ("find_circuit(text, corrupt_text, prefill=None, top=12) -> the circuit of a patching pair: two chat "
+                     "prompts of the same token count differing in a few words (with the same prefill), the model's "
+                     "answer at the next token on each, and the units carrying the difference, every one measured by "
+                     "patching between the two runs: the readout neurons at the answer position, the mover heads there "
+                     "(where they look) and the source neurons from the first differing token on, each cut's share of the "
+                     "answer's contrast lost when noised and restored when denoised (>= 0.7 both: necessary and "
+                     "sufficient). Costs its seconds in passes (typically about <FINDCOST>); needs <FINDMIN> left."),
     "atlas": ("atlas(unit, k=4) -> a neuron's record in the model's atlas (a broad corpus): its explanations where they "
               "exist, its corpus extremes, the k texts with its strongest positive and negative values (gate and up "
               "signs), the tokens its output raises and lowers, and the neurons it reads and feeds most by weights. "
@@ -870,7 +951,8 @@ def docs(info: dict, only=None) -> str:
             continue
         for k, v in (("<MODEL>", info["model"].split("/")[-1]), ("<LENS>", ", ".join(map(str, info["lens_layers"]))),
                      ("<AO>", " or ".join(map(str, info["ao_layers"]))), ("<MID>", str(info["ao_layers"][1])),
-                     ("<REMOVE_MAX>", str(REMOVE_MAX)),
+                     ("<REMOVE_MAX>", str(REMOVE_MAX)), ("<FINDMIN>", str(FIND_MIN)),
+                     ("<FINDCOST>", str(info.get("find_cost") or "a few hundred")),
                      ("<GENCOST>", f"1 pass a call (at most {GEN_CALL_MAX} tokens)." if info.get("gen_call") else
                       f"1 pass per generated token (at most {GEN_MAX})."),
                      ("<STEERCOST>", f"1 pass (a continuation of at most {GEN_CALL_MAX} tokens included)." if info.get("gen_call")

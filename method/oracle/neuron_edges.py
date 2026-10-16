@@ -125,7 +125,7 @@ class Edges:
             self.keep[L, p, j] = True
         self.resid_all = [(w, r) for w in self.N for r in self.N if w[0] < r[0] and w[1] == r[1]]
         self.n_routes = sum((r[0] - w[0]) * self.H for w in self.N for r in self.N if w[1] <= r[1] and w[0] < r[0])
-        self._plans, self._cols, self._vcols, self._wos = {}, {}, {}, {}
+        self._plans, self._cols, self._vcols, self._wos, self._idx = {}, {}, {}, {}, {}
         self._J, self._G, self._dv_base, self._allin = None, None, {}, {}
         self.patch, self.cbase = False, None  # (a patching pair: set below)
         self.fixed = None  # weak "reference": the reference run's zeroed values held zero in every run, none else
@@ -180,6 +180,14 @@ class Edges:
             self._wos[L] = self._w(self.layers[L].self_attn.o_proj)
         return self._wos[L]
 
+    def _on(self, dev) -> tuple:
+        """(P, Jn) on a card, kept per card (a copy from the host per layer and call waited for the GPU: 41k copies, 3.2 of
+        7.0 s of a Qwen3-8B graph)."""
+        key = str(dev)
+        if key not in self._idx:
+            self._idx[key] = (self.P.to(dev), self.Jn.to(dev))
+        return self._idx[key]
+
     def _cols_on(self, dev) -> torch.Tensor:
         """Each circuit neuron's down_proj column [N, d] in float32 on a card (kept per card)."""
         key = str(dev)
@@ -205,7 +213,7 @@ class Edges:
         h W_v(g col)/r', with r and r' the norm's rms of x and of x - h col."""
         K, W = hw.shape
         dc = x.device
-        cols, Pw = self._cols_on(dc)[:W], self.P[:W].to(dc) - off
+        cols, Pw = self._cols_on(dc)[:W], self._on(dc)[0][:W] - off
         r2 = (x.pow(2).mean(-1) + self.eps)[:, Pw]  # [K, W]
         dots = (x @ cols.T)[:, Pw, torch.arange(W, device=dc)]  # each writer's column against the stream at its position
         dr2 = (hw * hw * cols.pow(2).sum(-1) - 2 * hw * dots) / x.shape[-1]  # r'^2 - r^2
@@ -257,7 +265,7 @@ class Edges:
         """Patching: what layer L's circuit neurons read instead of their cut in-edges, those edges in the corrupted run
         [K, readers of L, d]."""
         d, K, R = self._d(L), coef.shape[0], self.nb[L + 1] - self.nb[L]
-        P = self.P[self.nb[L]:self.nb[L + 1]].to(d)
+        P = self._on(d)[0][self.nb[L]:self.nb[L + 1]]
         F = (self._all_in("corrupt")[L][P][None] * float(rest)).expand(K, -1, -1)
         if L in plan.get("fixed", {}):
             es, rl, Vb = plan["fixed"][L]
@@ -283,7 +291,7 @@ class Edges:
             c, h = g
             dc = self._d(c)
             w, q = w.to(dc), q.to(dc)
-            z = base["A"][c][h, q, self.P.to(dc)[w]][:, None] * dvs[c][w, h // (H // KV)]
+            z = base["A"][c][h, q, self._on(dc)[0][w]][:, None] * dvs[c][w, h // (H // KV)]
             V[i] = (z @ self._wo(c)[:, h * hd:(h + 1) * hd].T).to(d)
         return V
 
@@ -298,16 +306,16 @@ class Edges:
         s0 = int(self.P.min()) if (PREFIX and N and not keep_states and probe is None and ids is None
                                     and getattr(self, "base", None) is not None) else 0
         Ts = T - s0  # (the positions run: from the circuit's first on; the base run's keys and values before it)
-        coef = (cuts.float() if len(edges) else torch.zeros(K, 0)) - float(rest)  # per listed edge: cut 1, as run 0,
+        coef = ((cuts.float() if len(edges) else torch.zeros(K, 0)) - float(rest)).to(self.dev)  # per listed edge: cut 1, as run 0,
         # kept against a cut rest -1 (added back)
         plan = self._plan(edges)
         x = core.model.embed_tokens(torch.tensor([(ids or self.ids)[s0:]], device=self.dev).expand(K, -1)).float()
         cos, sin = core.model.rotary_emb(x, torch.arange(s0, T, device=self.dev)[None])
-        D = torch.zeros(K, N, x.shape[-1])  # per circuit neuron, what its listed cut edges take from its input
-        Hc = torch.zeros(K, N)  # the circuit neurons' activations in this run
-        S = torch.zeros(K, Ts, x.shape[-1]) if rest else None  # (rest) per position, the circuit's writes so far ...
-        R = torch.zeros(K, Ts, x.shape[-1]) if rest else None  # ... and every route's change in the head outputs so far
-        P, Jn = self.P, self.Jn
+        D = torch.zeros(K, N, x.shape[-1], device=self.dev)  # per circuit neuron, what its listed cut edges take from its input
+        Hc = torch.zeros(K, N, device=self.dev)  # the circuit neurons' activations in this run
+        S = torch.zeros(K, Ts, x.shape[-1], device=self.dev) if rest else None  # (rest) per position, the circuit's writes so far ...
+        R = torch.zeros(K, Ts, x.shape[-1], device=self.dev) if rest else None  # ... and every route's change in the head outputs so far
+        P, Jn = self._on(self.dev)  # (every index on the card once: a host copy per layer waited for the GPU)
         Ps = P - s0  # (the circuit's positions among those run)
         states = {"x": [], "A": [], "k": [], "v": [], "h": []}
         for L, layer in enumerate(self.layers):
@@ -581,7 +589,7 @@ class Edges:
             c, h = g
             dc = self._d(c)
             w, q = w.to(dc), q.to(dc)
-            z = base["A"][c][h, q, self.P.to(dc)[w]][:, None] * dvs[c][w, h // (H // KV)]  # [n, hd]
+            z = base["A"][c][h, q, self._on(dc)[0][w]][:, None] * dvs[c][w, h // (H // KV)]  # [n, hd]
             V[a, s] = (z @ self._wo(c)[:, h * hd:(h + 1) * hd].T).to(d)
         return V
 

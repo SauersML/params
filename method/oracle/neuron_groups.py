@@ -94,10 +94,18 @@ def prepare(a) -> None:
     at = Atlas(a.atlas)
     doc = json.loads(a.groups.read_text())
     groups = doc["two_views"]["groups"] if "two_views" in doc else doc["groups"] if isinstance(doc, dict) else doc
+    moved = {}  # neuron_motifs apply: each group's zeroing drop of the answer's contrast (bits) on each record
+    for f in sorted(a.apply.iterdir()) if a.apply else []:
+        for x in json.loads(f.read_text()).get("groups", []):
+            moved[x["id"]] = max(moved.get(x["id"], 0.0), abs(x["effect"]))
     rows = []
     for g, grp in enumerate(groups):
         keys = grp.get("keys", grp.get("members")) if isinstance(grp, dict) else grp
+        if len(members_of(keys)) < a.min_size:
+            continue
         extra = {k: grp[k] for k in ("effect", "name") if isinstance(grp, dict) and k in grp}
+        if g in moved:
+            extra["answer_effect"] = moved[g]
         ms = []
         for l, i, s in members_of(keys):
             mx = abs(at.neuron(l, i, k=0, text=False)["max"]["+" if s > 0 else "-"])
@@ -327,16 +335,18 @@ def label(a) -> None:
                 v["dev_best"] = v["rounds"][-1]
         print(f"near-miss round: {len(noisy)} groups; {sum(v['dev_best'] is v['rounds'][-1] for v in noisy)} narrowed; ${spent():.3f}", flush=True)
     rows = [{"model": doc["model"], "group": v["g"]["id"], "members": v["g"]["members"], "effect": v["g"].get("effect"),
+             "answer_effect": v["g"].get("answer_effect"), "views_name": v["g"].get("name"),
              "corpus_max": v["g"]["max"], "explanation": v["explanation"], "rounds": v["rounds"], "writer_valid": bool(v["explanation"]),
              "writer_model": a.writer, "context_before": a.before, "writer_raw_response": v["raw"]} for v in st.values()]
-    for r in rows:
-        r["name"] = ("not" if (r.get("effect") or 0) > 0 else "") + f"[{r['explanation']}]"
+    for r in rows:  # not[...] as neuron_motifs names the group (a group that pushes against the answer)
+        neg = str(r.get("views_name") or "").startswith("not[") if r.get("views_name") else (r.get("effect") or 0) > 0
+        r["name"] = ("not" if neg else "") + f"[{r['explanation']}]"
     a.out.write_text("".join(json.dumps(r, allow_nan=False) + "\n" for r in rows))
     log_spend(f"{tag} input labels", spent(), f"{len(rows)} groups, revise {a.rounds} rounds + near-miss round, {a.before} tokens before; {a.out}")
     s0 = spent()
     # 2. output labels for groups that move the answer
     gs = {g["id"]: g for g in groups}
-    out_rows = [r for r in rows if r["writer_valid"] and abs(r.get("effect") or 0) >= a.effect_floor]
+    out_rows = [r for r in rows if r["writer_valid"] and gs[r["group"]].get("answer_effect", abs(r.get("effect") or 0)) >= a.effect_floor]
     if out_rows and a.outputs:
         effs = neuron_verify.remote_effects(a.measure_url, [{"contexts": [e["ids"][:e["at"] + 1] for e in exs[r["group"]][:max(OUT_TEST) + 1]],
                                                              "members": r["members"]} for r in out_rows])
@@ -396,7 +406,7 @@ def estimate(a) -> None:
     writer = (n * P + (sum(fails) + near) * (P + 600)) * w[0] + (n + sum(fails) + near) * 250 * w[1]
     plans = (n + sum(fails) + near + 2 * n) * (300 * r[0] + 700 * r[1])
     judge = 2 * n * (250 * r[0] + 10 * r[1])
-    nout = sum(abs(g.get("effect") or 0) >= a.effect_floor for g in groups) if a.outputs else 0
+    nout = sum(g.get("answer_effect", abs(g.get("effect") or 0)) >= a.effect_floor for g in groups) if a.outputs else 0
     outw = nout * (len(OUT_DEV) * 160 + 300) * w[0] + nout * 120 * w[1]
     outr = nout * len(OUT_TEST) * (150 * r[0] + 20 * r[1])
     parts = {"writer": writer, "reader plans": plans, "judge": judge, "output writer": outw, "output reader": outr}
@@ -412,6 +422,8 @@ def main():
     p.add_argument("--groups", type=Path, required=True, help="neuron_motifs groups: {\"groups\": [[key, ...], ...]} or a list")
     p.add_argument("--atlas", type=Path, required=True)
     p.add_argument("--out", type=Path, required=True)
+    p.add_argument("--apply", type=Path, help="neuron_motifs apply's output directory: each group's largest |answer drop| (bits)")
+    p.add_argument("--min-size", type=int, default=2, help="groups of fewer poles are single neurons (atlas_labels)")
     c = sub.add_parser("collect")
     c.add_argument("--groups", type=Path, required=True)
     c.add_argument("--corpus", type=Path, required=True, help="a corpus directory: tokens.npy, offsets.npy (atlas.py corpus)")
@@ -433,7 +445,8 @@ def main():
         lb.add_argument("--rounds", type=int, default=2)
         lb.add_argument("--near-round", type=int, default=1, help="1: one more revision aimed at near misses that fired")
         lb.add_argument("--outputs", type=int, default=1, help="1: output labels for groups that move the answer")
-        lb.add_argument("--effect-floor", type=float, default=0.1, help="|effect| (neuron_motifs: mean single-zeroing change of log p(answer))")
+        lb.add_argument("--effect-floor", type=float, default=1.0, help="bits: the group's largest answer drop when zeroed "
+                        "(prepare --apply; else |effect|, the members' mean single-zeroing change); neuron_builder's NEC_BITS")
         lb.add_argument("--ids", help="comma-separated group ids, a subset")
         lb.add_argument("--n", type=int, help="the first N groups")
         lb.add_argument("--seed", type=int, default=1)

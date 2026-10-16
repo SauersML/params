@@ -584,7 +584,14 @@ class Tools:
 
     def scale_hook(self, s: str, factor: float, positions=None):
         """A unit's activation times factor (0: removed) at positions (default every position): a neuron's input to
-        down_proj (a pole: only where its sign is that pole's), a head's slice of o_proj's input."""
+        down_proj (a pole: only where its sign is that pole's), a head's slice of o_proj's input. A unit written with
+        @p ("L12.N345+@9", a negative p from the end) acts at that position alone."""
+        s = str(s).strip()
+        if "@" in s:
+            s, at = s.rsplit("@", 1)
+            if not re.fullmatch(r"-?\d+", at):
+                raise Refused(f"unit {s}@{at}: a position is an integer")
+            positions = [int(at)]
         layer, kind, i, pole = self.unit(s)
         ly = self.tg.layers[layer]
         mod = ly.mlp.down_proj if kind == "N" else ly.self_attn.o_proj
@@ -593,7 +600,14 @@ class Tools:
 
         def fn(_m, args):
             x = args[0]
-            idx = slice(None) if positions is None else torch.tensor(positions, device=x.device)
+            if positions is None:
+                idx = slice(None)
+            else:  # (a negative position from the end; one outside the sequence, as in a generation step, untouched)
+                ps = [p if p >= 0 else x.shape[1] + p for p in positions]
+                ps = [p for p in ps if 0 <= p < x.shape[1]]
+                if not ps:
+                    return None
+                idx = torch.tensor(ps, device=x.device)
             v = x[:, idx, sl]
             hit = torch.ones_like(v, dtype=torch.bool) if not pole else (v > 0) if pole == "+" else (v < 0)
             x[:, idx, sl] = torch.where(hit, v * factor, v)
@@ -1235,8 +1249,8 @@ TOOL_DOCS = {  # (<MODEL>, <LENS>, <AO>, <MID>, <REMOVE_MAX> filled from the ser
               "the norm of the neuron's output weights; the value's sign, its gate and up signs) and the 8 heads with "
               "the largest output. 1 pass."),
     "remove": ("remove(units, positions=None, text=None, chat=None) -> zero a set of up to <REMOVE_MAX> units' values (neuron "
-               "\"L12.N345\"; only its positive or negative pole \"L12.N345+\" / \"L12.N345-\"; head \"L5.H3\") at the "
-               "positions (default every position): the new top 5 next tokens, the KL (bits) from the unedited prediction "
+               "\"L12.N345\"; only its positive or negative pole \"L12.N345+\" / \"L12.N345-\"; head \"L5.H3\"; any of "
+               "them at one position alone: \"L12.N345+@9\") at the positions (default every position): the new top 5 next tokens, the KL (bits) from the unedited prediction "
                "and the change in log probability of the unedited top token. 1 pass."),
     "steer": ("steer(units=[{\"unit\": \"L12.N345\", \"alpha\": a}, ...], text=None, chat=None, max_tokens=0) -> add "
               "a x the neuron's largest value of that sign (the atlas corpus's extreme; else its largest |value| on 16 "

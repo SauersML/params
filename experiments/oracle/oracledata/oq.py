@@ -27,7 +27,8 @@ check a verifier reruns. The circuit each row reads is written once per text (ci
 values are all massive (claim_check's zero leaves those live) get no zeroing question.
 
   oq.py gen RECORDS OUT.jsonl --thr THR.pt [--groups APPLY] [--source NAME] [--limit N] [--shard K/N]   (GPU)
-  oq.py split OUT_DIR GEN.jsonl [GEN.jsonl ...] [--seed S]      splits, test balance, baselines, manifest (CPU)
+  oq.py split OUT_DIR GEN.jsonl [GEN.jsonl ...] [--seed S] [--sealed testset_8b.json]   splits, balance, baselines (CPU)
+     train.jsonl every training row; train_bal.jsonl per kind no class above the second-largest; dev/test balanced
 """
 from __future__ import annotations
 
@@ -52,6 +53,7 @@ SIDE_N, SIDE_TOK = 8, 40   # general chats and answer tokens a min_edit's side e
 SIDE_ROWS = range(300, 1000)  # general.jsonl rows (T2 calibrates on 1000-1199 and holds out 100-299)
 PAIRS = 48                 # pairs measured per text (joint, interact)
 TOPK = 8                   # the reference's likeliest tokens a direction question chooses from
+CHECK_CHUNK = 40           # claims per claim_check call
 
 
 def q_tok(s: str) -> str:
@@ -396,7 +398,9 @@ def text_questions(nr, cc, eng: Engine, tok, rec: dict, apply: dict | None, rng:
     idx = [i for i, r in enumerate(out) if r["claim"]]
     claims = [{"prompt": {"ids": ids}, "position": -1, "units": [u for n in out[i]["claim"]["units"] for u in by[n]["units"]],
                "op": out[i]["claim"]["op"], "predict": out[i]["claim"]["predict"]} for i in idx]
-    got = cc.check_many(nr, claims) if claims else []
+    got = []  # (in chunks: check_many keeps every row's log p over the vocabulary on the device, 4.4 GB for 250 claims)
+    for k in range(0, len(claims), CHECK_CHUNK):
+        got += cc.check_many(nr, claims[k:k + CHECK_CHUNK])
     drop = set()
     for i, r in zip(idx, got):
         if not r.get("pass"):
@@ -529,6 +533,15 @@ def split(a) -> None:
             r["tags"] = r["tags"] + ["same_group_diff_outcome"]
     rng = random.Random(a.seed)
     out = {"train": train}
+    tb = collections.defaultdict(list)  # train_bal: per kind, no class above the second-largest class's count
+    for r in train:
+        tb[(r["kind"], r["cls"])].append(r)
+    out["train_bal"] = []
+    for kind in sorted({k for k, _ in tb}):
+        cl = sorted((v for (k, _), v in tb.items() if k == kind), key=len, reverse=True)
+        cap = len(cl[1]) if len(cl) > 1 else len(cl[0])
+        for v in cl:
+            out["train_bal"] += rng.sample(v, min(cap, len(v)))
     for s in ("dev", "test"):
         pool = [r for r in rows if r["split"] == s]
         by = collections.defaultdict(list)
@@ -554,6 +567,11 @@ def split(a) -> None:
             for r in rs:
                 fh.write(json.dumps(r) + "\n")
     used = {r["circuit_id"] for rs in out.values() for r in rs}
+    if a.sealed:  # the circuit push's sealed test texts never appear here
+        sealed = {q["id"] for p in a.sealed for q in json.loads(p.read_text())["questions"]}
+        bad = sorted({r["context_id"] for rs in out.values() for r in rs} & sealed)
+        if bad:
+            raise SystemExit(f"{len(bad)} sealed contexts in the data, e.g. {bad[:3]}")
     with (a.out / "circuits.jsonl").open("w") as fh:
         for cid in sorted(used):
             fh.write(json.dumps(circs[cid]) + "\n")
@@ -610,6 +628,7 @@ def main():
     s.add_argument("gen", type=Path, nargs="+")
     s.add_argument("--seed", type=int, default=1)
     s.add_argument("--min-class", type=int, default=10)
+    s.add_argument("--sealed", type=Path, nargs="*", help="sealed question sets (testset_8b.json): refused if any context is in the data")
     a = ap.parse_args()
     {"gen": gen, "split": split}[a.cmd](a)
 

@@ -66,8 +66,11 @@ BITS = tuple(round(2 ** (-i / 2), 4) for i in range(20))  # or each reader's err
 MEASURED = 512  # kept edges whose own cut from the graph is measured (those of largest first-order weight)
 HALVE_BLOCKS = 8
 TOKENS = 1536  # cut sets a forward: this many tokens' worth (at least 16 sets)
-PAD = True  # a lower precision model's forwards padded to B sets (every contrast at one batch shape; off: a forward of
-# few sets runs those only: Qwen3-8B bfloat16, 6-8 of a graph's 10 forwards ran 96-109 rows for 1-34 sets, 0.35-0.45 s each)
+PAD = "B"  # a lower precision model's forwards: "B", each padded to B sets (every contrast at one batch shape); "shapes",
+# each padded to the next of SHAPES (or B) with an uncut set of its own, every set's contrast read against that set's
+# (so an ok() compares contrasts of one shape); "none", unpadded. Qwen3-8B bfloat16: unpadded forwards moved a graph's
+# cut contrasts by up to 0.37 bits (batch shape alone) against B's; B ran 96-109 rows for forwards of 1-34 sets
+SHAPES = (8, 32)
 PREFIX = True  # a cut run computes only the positions from the circuit's first one on (every position before it is the
 # base run's: no cut reaches it), its attention reading the base run's keys and values there
 
@@ -150,8 +153,12 @@ class Edges:
                 self.cbase = self._run(torch.zeros(1, 0, dtype=torch.bool), [], keep_states=True, ids=list(corrupt_ids)[:self.T])
             self.c_corrupt = float(self.cbase["contrast"][0])
             self.patch = True
-        self.c_full = float(self.base["contrast"][0]) if self.dt == torch.float32 else \
-            self.contrasts(torch.zeros(1, 0, dtype=torch.bool), [])[0]  # (padded as every other forward)
+        if self.dt == torch.float32:
+            self.c_full = float(self.base["contrast"][0])
+        elif PAD == "shapes":  # (the uncut run at the smallest shape: every contrast read against its forward's uncut set)
+            self.c_full = float(self._run(torch.zeros(SHAPES[0], 0, dtype=torch.bool), [])["contrast"][0])
+        else:
+            self.c_full = self.contrasts(torch.zeros(1, 0, dtype=torch.bool), [])[0]  # (padded as every other forward)
         self.gap = self.c_full - self.c_corrupt if self.patch else None  # (the question's gap: clean minus corrupted)
 
     # -- the run (each module in the model's dtype on its own card, everything between in float32) -------------------
@@ -411,9 +418,21 @@ class Edges:
         one per row), B rows a forward."""
         out = []
         restv = torch.as_tensor(rest, dtype=torch.bool) if torch.is_tensor(rest) else torch.full((len(cuts),), bool(rest))
+        low = self.dt != torch.float32
+        if low and PAD == "shapes":  # every forward: its sets, an uncut set, copies of its last set to the next shape
+            for s0 in range(0, len(cuts), self.B - 1):
+                c, r = cuts[s0:s0 + self.B - 1], restv[s0:s0 + self.B - 1]
+                n = len(c)
+                size = next(b for b in SHAPES + (self.B,) if b >= n + 1)
+                c = torch.cat([c, torch.zeros(1, c.shape[1], dtype=c.dtype), c[-1:].expand(size - n - 1, -1)])
+                r = torch.cat([r, torch.zeros(1, dtype=torch.bool), r[-1:].expand(size - n - 1)])
+                v = self._run(c, edges, rest=r)["contrast"]
+                out.append(v[:n] - v[n] + self.c_full)  # (each against its forward's uncut set, at c_full's level)
+                self.forwards += 1
+            return torch.cat(out).tolist() if out else []
         for s0 in range(0, len(cuts), self.B):
             c, r = cuts[s0:s0 + self.B], restv[s0:s0 + self.B]
-            if PAD and self.dt != torch.float32 and len(c) < self.B:  # (a lower precision model's kernels round by batch size: every
+            if low and PAD == "B" and len(c) < self.B:  # (a lower precision model's kernels round by batch size: every
                 c = torch.cat([c, c[-1:].expand(self.B - len(c), -1)])  # forward padded to B sets)
                 r = torch.cat([r, r[-1:].expand(self.B - len(r))])
             out.append(self._run(c, edges, rest=r)["contrast"][:len(cuts) - s0])

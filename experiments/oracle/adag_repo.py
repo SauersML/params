@@ -12,6 +12,11 @@ here).
              "Answer: " as ADAG's math set: its 10,000 sums are beyond one card's hour
   cg-test    CausalGym test pairs with every prefix of the train file removed (ADAG's generator draws both splits from
              the same small vocabulary, so a test prefix is often a train prefix)
+  groups     grouping quality of a clustering (ADAG's clusters; random partitions of the same sizes beside them): each
+             unit a neuron and polarity summed over tokens, as ADAG clusters them; its profile its attribution on every
+             prompt (0 where absent); the silhouette of the profiles (cosine distance), the coefficient of variation of the
+             cluster sizes, and the share of same-cluster pairs whose attributions have opposite signs on every prompt
+             both appear in. Reads the circuit pickle without ADAG's code (its classes as plain records).
   measured   our node scores in ADAG's CausalGym evaluation: NAP's train.pt (scripts/train.py --method nap, MLP neurons)
              with its CAND largest scores replaced by measured ones, each (layer, position, neuron) alone set to its mean
              over the train pairs' patch prompts (the value ADAG's evaluation ablates to) on the train pairs' clean
@@ -22,6 +27,7 @@ here).
       [--ours ADAG_COMPARE.json --case capitals_llama]
   adag_repo.py math-data OUT.py [--n 100]
   adag_repo.py cg-test TRAIN.json TEST.json
+  adag_repo.py groups CIRCUIT.pkl CLUSTER_STATE.json OUT.json
   adag_repo.py measured NAP_TRAIN.pt OUT_TRAIN.pt --model ID [--cand 8192]
 """
 from __future__ import annotations
@@ -162,6 +168,87 @@ def cg_test(a) -> None:
     print(f"{a.test}: {len(fresh)} of {len(rows)} test pairs have a prefix absent from the train file")
 
 
+class Record:
+    """Any class of ADAG's pickles, read as a plain record (its constructor arguments or state as attributes)."""
+    def __new__(cls, *args, **kw):
+        o = object.__new__(cls)
+        o.args = args
+        return o
+
+    def __setstate__(self, state):
+        if isinstance(state, tuple):  # (dict state, slots state)
+            for part in state:
+                self.__dict__.update(part or {})
+        else:
+            self.__dict__.update(state if isinstance(state, dict) else {"state": state})
+
+
+def load_records(path: Path):
+    import pickle
+
+    class Unpickler(pickle.Unpickler):
+        def find_class(self, module, name):
+            if module.split(".")[0] in ("circuits", "util", "env_util", "neurondb"):
+                return Record
+            return super().find_class(module, name)
+    with open(path, "rb") as f:
+        return Unpickler(f).load()
+
+
+def grouping(profiles, labels: list, draws: int = 20, seed: int = 0) -> dict:
+    """Silhouette (cosine), size CV and the all-opposing-sign pair share of a labelled set of profiles [units, prompts],
+    and the same for DRAWS random partitions with the same sizes."""
+    import numpy as np
+    from sklearn.metrics import silhouette_score
+
+    def stats(lab):
+        lab = np.asarray(lab)
+        sizes = np.array([np.sum(lab == c) for c in np.unique(lab)])
+        keep = np.isin(lab, np.unique(lab)[sizes > 1])
+        sil = float(silhouette_score(profiles[keep], lab[keep], metric="cosine")) if len(np.unique(lab[keep])) > 1 else None
+        opp = pairs = 0
+        for c in np.unique(lab):
+            idx = np.flatnonzero(lab == c)
+            for i in range(len(idx)):
+                for j in range(i + 1, len(idx)):
+                    a, b = profiles[idx[i]], profiles[idx[j]]
+                    both = (a != 0) & (b != 0)
+                    if both.any():
+                        pairs += 1
+                        opp += bool(np.all(np.sign(a[both]) != np.sign(b[both])))
+        return {"silhouette": sil, "size_cv": float(sizes.std() / sizes.mean()), "clusters": len(sizes),
+                "opposing_pairs": opp / max(pairs, 1), "pairs": pairs}
+    rng = np.random.default_rng(seed)
+    rand = [stats(rng.permutation(labels)) for _ in range(draws)]
+    return {"clusters": stats(labels), "random": {k: float(np.mean([r[k] for r in rand if r[k] is not None]))
+                                                for k in ("silhouette", "opposing_pairs")}}
+
+
+def groups(a) -> None:
+    import numpy as np
+    c = load_records(a.circuit)
+    df = c.df_node
+    state = json.loads(a.state.read_text())["cluster_map"]
+    unit_cluster = {}
+    for k, cl in state.items():
+        L, _, j, pol = k.split(",")
+        unit_cluster.setdefault((int(L), int(j), pol), cl)
+    pol = np.where(df.activation >= 0, "+", "-") if "polarity" not in df.columns else df.polarity
+    prompts = sorted(df.label.unique())
+    col = {p: i for i, p in enumerate(prompts)}
+    units = sorted(unit_cluster)
+    row = {u: i for i, u in enumerate(units)}
+    prof = np.zeros((len(units), len(prompts)))
+    for L, j, po, lab, at in zip(df.layer, df.neuron, pol, df.label, df.attribution):
+        u = (int(L), int(j), po)
+        if u in row:
+            prof[row[u], col[lab]] += float(at)
+    labels = [unit_cluster[u] for u in units]
+    rec = {"circuit": str(a.circuit), "units": len(units), "prompts": len(prompts), **grouping(prof, labels)}
+    a.out.write_text(json.dumps(rec))
+    print(json.dumps(rec, indent=1))
+
+
 @torch.no_grad()
 def measured(a) -> None:
     t0 = time.time()
@@ -257,6 +344,10 @@ def main():
     m = sp.add_parser("math-data")
     m.add_argument("out", type=Path)
     m.add_argument("--n", type=int, default=100)
+    q = sp.add_parser("groups")
+    q.add_argument("circuit", type=Path)
+    q.add_argument("state", type=Path)
+    q.add_argument("out", type=Path)
     t = sp.add_parser("cg-test")
     t.add_argument("train", type=Path)
     t.add_argument("test", type=Path)
@@ -266,7 +357,7 @@ def main():
     s.add_argument("--model", required=True)
     s.add_argument("--cand", type=int, default=CAND)
     a = ap.parse_args()
-    {"clusters": clusters, "math-data": math_data, "cg-test": cg_test, "measured": measured}[a.cmd](a)
+    {"clusters": clusters, "math-data": math_data, "cg-test": cg_test, "groups": groups, "measured": measured}[a.cmd](a)
 
 
 if __name__ == "__main__":

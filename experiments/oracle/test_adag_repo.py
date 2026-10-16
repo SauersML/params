@@ -81,3 +81,28 @@ def test_cg_test_and_math_data(tmp_path):
     ns = {}
     exec((tmp_path / "m.py").read_text(), ns)
     assert ns["prompts"][0] == "What is 18 + 24?" and len(set(ns["prompts"])) == 20 and ns["labels"][0] == "18 + 24 = 42"
+
+
+def test_grouping_and_records(tmp_path):
+    import numpy as np
+    prof = np.array([[1.0, 2.0, 0.0], [2.0, 4.1, 0.0], [-1.0, -2.0, 0.0], [0.0, 0.0, 3.0], [0.0, 0.1, 2.9]])
+    rec = ar.grouping(prof, ["A", "A", "A", "B", "B"], draws=5)
+    assert rec["clusters"]["clusters"] == 2 and rec["clusters"]["pairs"] == 4
+    assert rec["clusters"]["opposing_pairs"] == pytest.approx(2 / 4)  # (unit 2 against units 0 and 1)
+    assert rec["clusters"]["size_cv"] == pytest.approx(np.std([3, 2]) / 2.5)
+    import pickle
+    import types
+    mod = types.ModuleType("circuits")
+
+    class CircuitData:
+        pass
+    CircuitData.__module__, CircuitData.__qualname__ = "circuits", "CircuitData"
+    mod.CircuitData = CircuitData
+    sys.modules["circuits"] = mod
+    try:
+        d = CircuitData()
+        d.labels = [" Austin"]
+        (tmp_path / "c.pkl").write_bytes(pickle.dumps(d))
+    finally:
+        del sys.modules["circuits"]
+    assert ar.load_records(tmp_path / "c.pkl").labels == [" Austin"]

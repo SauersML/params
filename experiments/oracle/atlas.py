@@ -51,8 +51,9 @@ MIX = [  # name, dataset, config, split, field, share of tokens
 
 
 def regime(g, u) -> str:
-    """The SwiGLU sign regime, gate sign then up sign: ++ and -- (the echo of a negative gate) give positive values."""
-    return ("+" if g > 0 else "-") + ("+" if u > 0 else "-")
+    """The SwiGLU sign regime, gate then up; exact zeros use 0, ++ and -- give positive values."""
+    sign = lambda v: "0" if v == 0 else "+" if v > 0 else "-"
+    return sign(g) + sign(u)
 
 
 # ---- the corpus
@@ -443,7 +444,7 @@ def heads(a) -> None:
 
 class Atlas:
     """One model's atlas (ROOT as atlas.py writes it). neuron(layer, index) gives:
-      max: {"+": corpus maximum, "-": corpus minimum (negative)}; pos0: the sink token's max and min, kept apart
+      max: {"+": strictly positive maximum or 0, "-": strictly negative minimum or 0}; pos0: the sink token's max and min, kept apart
       "+", "-": the TOP examples of each pole, strongest first: value, gate, up, regime (gate sign, up sign), doc, pos
                 (in the document), text before / token / after (BEFORE and AFTER tokens), token ids around it
       rates: {"+": {0.1: share, 0.3: ..., 0.5: ...}, "-": {...}}: the share of tokens above that fraction of the pole's
@@ -490,13 +491,21 @@ class Atlas:
 
     def neuron(self, l: int, i: int, k: int = TOP, text: bool = True) -> dict:
         z = self.layer(l)
-        out = {"layer": l, "index": i, "max": {"+": float(z["pos_val"][i, 0]), "-": float(z["neg_val"][i, 0])},
+        # Top-k extrema can include zeros or the opposite sign when a pole never
+        # responds. They are storage candidates, not evidence of that pole.
+        valid = {p: np.flatnonzero(np.isfinite(z[f"{pre}_val"][i]) &
+                                  (z[f"{pre}_val"][i] * sign > 0))
+                 for p, pre, sign in (("+", "pos", 1), ("-", "neg", -1))}
+        maxima = {p: float(z[f"{pre}_val"][i, valid[p]].max() if p == "+" else
+                           z[f"{pre}_val"][i, valid[p]].min()) if len(valid[p]) else 0.0
+                  for p, pre in (("+", "pos"), ("-", "neg"))}
+        out = {"layer": l, "index": i, "max": maxima,
                "pos0": {"max": float(z["pos0_max"][i]), "min": float(z["pos0_min"][i])},
                "rates": {p: dict(zip(self.meta["rates"], map(float, z["rates"][i, j]))) for j, p in enumerate("+-")}}
         for p, pre in (("+", "pos"), ("-", "neg")):
             out[p] = [{"value": float(z[f"{pre}_val"][i, r]), "gate": float(z[f"{pre}_g"][i, r]), "up": float(z[f"{pre}_u"][i, r]),
                        "regime": regime(z[f"{pre}_g"][i, r], z[f"{pre}_u"][i, r]), **self.example(int(z[f"{pre}_idx"][i, r]), text=text)}
-                      for r in range(k) if np.isfinite(z[f"{pre}_val"][i, r])]
+                      for r in valid[p][:k]]
         if (self.root / "weights.npz").exists():
             w = self.weights()
             D = self.meta["neurons_per_layer"]

@@ -64,6 +64,8 @@ ATTENDS = 3           # source positions recorded per head
 PREFIX = True         # a batch whose patches all lie at or after a position runs only the positions from there on, the
 # base run's keys and values before it cached (no weak zeroing here, so the cached run equals the full one to float error)
 PREFIXES = 32         # cached prefixes per patching pair
+LAYERS = True         # a cached batch also runs only the layers from the lowest one it patches, from the run's own
+# residual there (the layers below see nothing changed)
 BATCH_TOKENS = 1024   # a cached batch runs max(ROWS, BATCH_TOKENS / its positions) rows (at most MAX_ROWS): a forward of
 MAX_ROWS = 1024       # few positions reads every weight for few tokens (no weak zeroing: the batch size moves a share by
 # float error only). Qwen3-8B bfloat16 on an A6000, capital/France p0-p2: 16.5-17.5 s a question at 256, 13.5-14.6 at
@@ -127,10 +129,11 @@ class Patcher:
                 hs.append(layer.mlp.up_proj.register_forward_hook(lambda mod, args, out: cap.setdefault("up", []).append(out[:1].detach())))
         return hs
 
-    def _last(self, ids, B: int, cache=None, keep=None, **hooks) -> torch.Tensor:
+    def _last(self, ids, B: int, cache=None, keep=None, layer0: int = 0, h0=None, **hooks) -> torch.Tensor:
         """[B, V] float32 log-probabilities at the last position; with cache (_prefix: start, keys and values of positions
-        0..start-1) only the positions from start on run (the hooks see those); keep (a list): the run's first row's keys
-        and values per layer appended to it."""
+        0..start-1 per layer) only the positions from start on run (the hooks see those), and with layer0 > 0 only the
+        layers from layer0 on, from h0 [B, T - start, d] (the residual input of layer layer0 there); keep (a list): the
+        run's first row's keys and values per layer appended to it."""
         x = torch.as_tensor(ids, device=self.dev)
         x = x[None].expand(B, -1) if x.dim() == 1 else x
         hs = self._hooks(**hooks)
@@ -141,14 +144,31 @@ class Patcher:
                 if keep is not None:
                     keep += [(k[:1].clone(), v[:1].clone()) for k, v in _kv_pairs(o.past_key_values)]
             else:
-                s, kv = cache
+                from transformers import DynamicCache
+                s, kvs = cache
+                kv = DynamicCache()                           # (a new cache over the prefix's tensors: an update makes
+                for i, (k, v) in enumerate(kvs):              # new ones, so they stay for the next batch)
+                    kv.update(k, v, i)
                 T, dt = x.shape[1], self.core.model.embed_tokens.weight.dtype     # (the causal mask given whole:
                 mask = torch.full((T - s, T), torch.finfo(dt).min, dtype=dt, device=self.dev).triu(s + 1)   # transformers 4.53
-                try:                                                                  # on torch 2.4 failed to build one)
+                mask = mask[None, None].expand(B, 1, -1, -1)                         # on torch 2.4 failed to build one)
+                if layer0 == 0:
                     lg = self.core(input_ids=x[:, s:], past_key_values=kv, use_cache=True, logits_to_keep=1,
-                                   attention_mask=mask[None, None].expand(B, 1, -1, -1)).logits[:, -1].float()
-                finally:
-                    kv.crop(s - T)                            # (the cache back to its prefix for the next batch)
+                                   attention_mask=mask).logits[:, -1].float()
+                else:                                         # the layers from layer0 on only: the model's own forward
+                    m, cfg = self.core.model, self.core.config   # over its later layers (each keeps its own cache index)
+                    saved = (m.layers, cfg.num_hidden_layers, getattr(cfg, "layer_types", None))
+                    m.layers = torch.nn.ModuleList(list(saved[0])[layer0:])
+                    cfg.num_hidden_layers = len(m.layers)
+                    if saved[2] is not None:
+                        cfg.layer_types = saved[2][layer0:]
+                    try:
+                        lg = self.core(inputs_embeds=h0, past_key_values=kv, use_cache=True, logits_to_keep=1,
+                                       attention_mask=mask).logits[:, -1].float()
+                    finally:
+                        m.layers, cfg.num_hidden_layers = saved[0], saved[1]
+                        if saved[2] is not None:
+                            cfg.layer_types = saved[2]
         finally:
             for h in hs:
                 h.remove()
@@ -161,13 +181,11 @@ class Patcher:
         ones), no forward pass."""
         key = (start, layout)
         if key not in self._kv:
-            from transformers import DynamicCache
             runs = [(b, sum(1 for _ in g)) for b, g in itertools.groupby(layout)]
-            kv = DynamicCache()
+            kv = []
             for i in range(self.L):
-                k = torch.cat([self._base_kv[b][i][0][:, :, :start].expand(n, -1, -1, -1) for b, n in runs]).contiguous()
-                v = torch.cat([self._base_kv[b][i][1][:, :, :start].expand(n, -1, -1, -1) for b, n in runs]).contiguous()
-                kv.update(k, v, i)
+                kv.append((torch.cat([self._base_kv[b][i][0][:, :, :start].expand(n, -1, -1, -1) for b, n in runs]).contiguous(),
+                           torch.cat([self._base_kv[b][i][1][:, :, :start].expand(n, -1, -1, -1) for b, n in runs]).contiguous()))
             self._kv[key] = (start, kv)
             while len(self._kv) > PREFIXES:
                 self._kv.pop(next(iter(self._kv)))
@@ -243,9 +261,14 @@ class Patcher:
         layout = [bases[r // per] if r // per < len(bases) else bases[-1] for r in range(R)]
         x = torch.tensor([self.ids[k] for k in layout], device=self.dev)
         cache = self._prefix(x, start, tuple(layout)) if start > 0 else None
-        out = []
+        low = [min([u[1] for u in st if _pos(u) >= start], default=self.L - 1) if (LAYERS and cache) else 0 for st in sets]
+        order = sorted(range(len(sets)), key=lambda j: -low[j])     # (a batch runs from the lowest layer it patches)
+        out = [None] * len(sets)
         for s0 in range(0, len(sets), per):
-            part = sets[s0:s0 + per]
+            js = order[s0:s0 + per]
+            part = [sets[j] for j in js]
+            layer0 = min(low[j] for j in js)
+            h0 = None if layer0 == 0 else torch.stack([self.act[k]["res"][layer0][start:] for k in layout]).to(self.dev)
             by = {}                                          # (kind, source) -> layer -> rows, positions, indices
             for kb, base in enumerate(bases):                # (built on the host, one transfer per kind and layer)
                 other = "corrupt" if base == "clean" else "clean"
@@ -293,12 +316,13 @@ class Patcher:
                         h = h.clone()
                         h[b, p - start, n] = 0 if src == "zero" else self.act[src]["neu"][i][p, n].to(h.device, h.dtype)
                 return h
-            c = self._contrast(self._last(x, R, cache=cache, res=res, head=head, neu=neu))
+            c = self._contrast(self._last(x, R, cache=cache, layer0=layer0, h0=h0, res=res, head=head, neu=neu))
             got = []
             for kb, base in enumerate(bases):
                 ck = c[kb * per:kb * per + len(part)]
                 got.append(((self.c["clean"] - ck) if base == "clean" else (ck - self.c["corrupt"])) / self.gap)
-            out += torch.stack(got, 1).tolist()
+            for j, v in zip(js, torch.stack(got, 1).tolist()):
+                out[j] = v
         return out
 
     def scores(self) -> dict:

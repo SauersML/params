@@ -7,20 +7,25 @@ token after it: the answer's first token), cue2 (the last position, the second c
 other words (the corrupted run's first); a text is usable when the clean run's top token starts the copied word and the
 gap (clean - corrupted) is at least GAP_MIN bits.
 
-Stages (all texts; roles and circuit units chosen on the dev texts, everything reported on every text):
+Stages (all texts; the order and the circuit chosen on the dev texts, everything reported on every text):
  A1 heads: each head zeroed at positions cue1.. and each patched there from the corrupted run (shares of the gap lost);
     its attention cue2 -> next1 (induction) and next1 -> cue1 (previous token) in the clean run;
- A2 the HEADS largest by the dev texts' mean lost share (patched): patched at next1 alone and at cue2 alone, and unable
-    to see next1 from cue2 or cue1 from next1 (attention knockouts);
-    roles: induction (dev mean attention cue2 -> next1 at least ATT and patched at cue2 losing at least MATTERS / 2 on
-    average), previous token (attention next1 -> cue1, patched at next1), up to three each;
- A3 each role head's route (head_routes.route_story), by zeroing and by patching from the corrupted run: the knockout,
-    the neurons (and earlier heads) setting its key and its query, the neurons reading its output;
- B  the circuit: the role heads and the units whose patched share is at least MATTERS on at least SHARE_DEV of the dev
-    texts, each with the share of all texts it matters on;
- C  per text: the circuit's units patched from the corrupted run into the clean one (lost share, necessity), only they
-    patched from the clean run into the corrupted one (restored share, sufficiency), and their values from another text
-    of the same template and length (swapped: the share of the way the answer moves to that text's answer).
+ A2 candidates: heads whose dev mean attention cue2 -> next1 is at least ATT (at cue2) or next1 -> cue1 (at next1), and
+    the HEADS largest by patched share (at both): each patched alone at its position and unable to see its source
+    alone; every candidate of a role patched together and unable to see together;
+ A3 the size curve: the candidates in the dev texts' order of their own patched share, the first k patched from the
+    corrupted run into the clean one (lost) and only they from the clean run into the corrupted one (restored), k on a
+    log scale; the circuit is the smallest k whose dev means both reach PASS (every ordered unit when none does);
+ A4 the circuit's first STORIES induction and previous-token heads' route stories (head_routes.route_story, zeroing and
+    patching: knockout, the neurons and heads setting key, query and value, readers, and each side's group), and K
+    composition: every circuit previous-token head's output at next1 out of every circuit induction head's key at once;
+ B  each circuit head and each story unit with the share of texts it matters on (its measured share at least MATTERS of
+    that text's circuit effect; story units on at least SHARE_DEV of the dev texts);
+ C  per text: the circuit's heads patched from the corrupted run into the clean one (necessity), only they from the
+    clean run into the corrupted one (sufficiency), their outputs from another text of the same template and length
+    (swapped: the share of the way the answer moves to that text's answer), and the size curve.
+On Qwen3-8B no single head carries 10% of the gap (the largest 7%; their patched shares sum to 2.5): the circuit is a
+group, found by the curve.
 
   python experiments/oracle/copy_circuit.py OUT [--model Qwen/Qwen3-8B] [--dtype float32] [--n 60] [--dev 20]
 writes OUT/texts.json, OUT/a.json (stage A per text), OUT/circuit.json.
@@ -29,6 +34,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import random
 import sys
 import time
@@ -63,8 +69,10 @@ TEMPLATES = [  # ({a} the cue, {b} the copied word); every template ends with th
     ("shop", "phrase", "The shop on the corner sells a {a} {b} next to the fresh bread. On Sunday I went there and asked"
                        " the owner about the {a}"),
 ]
-HEADS = 24          # heads followed in A2
-ATT = 0.1           # an induction head attends cue2 -> next1 at least this much (dev mean)
+HEADS = 24          # heads of largest patched share added to the attention-picked candidates (A2)
+PASS = 0.7          # the circuit: the smallest prefix of the measured order losing and restoring this share on the dev texts
+STORIES = 3         # route stories per role (the circuit's first induction and previous-token heads)
+ATT = 0.1           # a candidate induction (previous-token) head attends cue2 -> next1 (next1 -> cue1) this much (dev mean)
 WRITERS = 16        # key / query writers measured in full runs per induction head (by exact attention change)
 READERS = 32        # readers measured in full runs per induction head (by exact value change)
 MATTERS = 0.1       # a unit matters on a text when its measured share of the gap is at least this
@@ -151,27 +159,62 @@ def stage_a1(tx: Text) -> dict:
             "previous": [float(A[L][h, tx.n1, tx.p1]) for L, h in heads]}
 
 
-def stage_a2(tx: Text, follow: list) -> dict:
-    """The followed heads patched at next1 alone and at cue2 alone, and unable to see next1 from cue2 or cue1 from next1."""
-    sets = []
-    for L, h in follow:
-        sets += [{"head": tx.head_from(tx.sb, L, h, [tx.n1])}, {"head": tx.head_from(tx.sb, L, h, [tx.q])},
-                 {"knock": [(L, h, tx.q, tx.n1)]}, {"knock": [(L, h, tx.n1, tx.p1)]}]
-    sh = tx.lost(sets)
-    keys = ("at_next1", "at_cue2", "knock_cue2_next1", "knock_next1_cue1")
-    return {f"{L}.{h}": dict(zip(keys, sh[4 * i:4 * i + 4])) for i, (L, h) in enumerate(follow)}
+def head_set(tx: Text, hs: list, src) -> dict:
+    """Heads at positions [(layer, head, position name)] set to their outputs in states src: one edit set."""
+    return {"head": [(L, h, tx.t["pos"][pn], src["z"][L][tx.t["pos"][pn], h]) for L, h, pn in hs]}
 
 
-def stage_a3(tx: Text, roles: dict) -> dict:
-    """Each role head's route story (head_routes.route_story) by zeroing and by patching from the corrupted run:
-    induction heads read next1 at cue2, previous-token heads read cue1 at next1."""
-    out = {}
-    for role, hs in roles.items():
+def stage_a2(tx: Text, cand: list) -> dict:
+    """Each candidate head at its role position patched alone, unable to see its source alone (knock), and every
+    candidate of each role patched together and unable to see together."""
+    route = {"cue2": (tx.q, tx.n1), "next1": (tx.n1, tx.p1)}
+    single = tx.lost([head_set(tx, [u], tx.sb) for u in cand])
+    knock = tx.lost([{"knock": [(L, h, *route[pn])]} for L, h, pn in cand])
+    groups = {}
+    for pn in ("cue2", "next1"):
+        g = [u for u in cand if u[2] == pn]
+        if g:
+            lost, kn = tx.lost([head_set(tx, g, tx.sb), {"knock": [(L, h, *route[pn]) for L, h, _ in g]}])
+            groups[pn] = {"lost": lost, "knock": kn, "heads": len(g)}
+    return {"single": single, "knock": knock, "groups": groups}
+
+
+def stage_curve(tx: Text, order: list, ks: list) -> dict:
+    """The size curve: the first k units of order patched from the corrupted run into the clean one (lost) and only they
+    from the clean run into the corrupted one (restored), per k."""
+    return {"k": ks, "lost": tx.lost([head_set(tx, order[:k], tx.sb) for k in ks]),
+            "restored": tx.restored([head_set(tx, order[:k], tx.st) for k in ks])}
+
+
+def stage_routes(tx: Text, ind: list, prev: list, stories: int) -> dict:
+    """The first stories induction heads' (at cue2) and previous-token heads' (at next1) route stories
+    (head_routes.route_story, zeroing and patching), and every circuit previous-token head's output at next1 taken out of every
+    induction head's key there together (K composition: each induction head's attention cue2 -> next1 after, exact, and
+    the share lost with every such cut in one run, patched and zeroed)."""
+    out = {"stories": {}}
+    for role, hs in (("induction", ind[:stories]), ("previous", prev[:stories])):
         q, p = (tx.q, tx.n1) if role == "induction" else (tx.n1, tx.p1)
         for L, h in hs:
-            out[f"{L}.{h}"] = {"role": role, **{mode: head_routes.route_story(tx.rn, tx.st, tx.lost, L, h, q, p, WRITERS, READERS,
-                                                                              other=None if mode == "zero" else tx.sb)
-                                               for mode in ("zero", "patch")}}
+            out["stories"][f"{L}.{h}"] = {"role": role, **{m: head_routes.route_story(tx.rn, tx.st, tx.lost, L, h, q, p, WRITERS,
+                                                                                      READERS, other=None if m == "zero" else tx.sb)
+                                                          for m in ("zero", "patch")}}
+    rn, st = tx.rn, tx.st
+    for mode in ("zero", "patch"):
+        if not (ind and prev):
+            break
+        writes = []
+        for L, g in prev:
+            w = rn.head_write(st, L, g, tx.n1)
+            writes.append(w if mode == "zero" else w - rn.head_write(tx.sb, L, g, tx.n1).to(w.device))
+        edits, change = [], {}
+        for L, h in ind:
+            ws = torch.stack([w for (Lp, _), w in zip(prev, writes) if Lp < L])
+            if not len(ws):
+                continue
+            a, dk = rn.attention_after(st, L, h, tx.q, tx.n1, ws.sum(0)[None], side="key", delta_out=True)
+            edits.append((L, h, tx.n1, dk[0]))
+            change[f"{L}.{h}"] = float(a[0]) - float(st["A"][L][h, tx.q, tx.n1])
+        out[f"k_composition_{mode}"] = {"lost": tx.lost([{"dk": edits}])[0] if edits else None, "attention_change": change}
     return out
 
 
@@ -258,50 +301,63 @@ def main():
     dev_ids = ids[:a.dev]
     heads = [(L, h) for L in range(rn.L) for h in range(rn.H)]
     mean = lambda key, i: sum(a1[t][key][i] for t in dev_ids) / len(dev_ids)  # noqa: E731
-    order = sorted(range(len(heads)), key=lambda i: -mean("patch", i))
-    follow = [heads[i] for i in order[:HEADS]]
-    a2 = {tx.t["id"]: stage_a2(tx, follow) for tx in txs}
-    log(f"followed heads {follow[:8]}...: A2 done")
-    dmean = lambda fn: sum(fn(t) for t in dev_ids) / len(dev_ids)  # noqa: E731
-    roles = {"induction": [], "previous": []}
-    for i in order[:HEADS]:  # (roles by measurement on the dev texts)
-        L, h = heads[i]
-        k = f"{L}.{h}"
-        if mean("induction", i) >= ATT and dmean(lambda t: a2[t][k]["at_cue2"]) >= MATTERS / 2:
-            roles["induction"].append((L, h))
-        if mean("previous", i) >= ATT and dmean(lambda t: a2[t][k]["at_next1"]) >= MATTERS / 2:
-            roles["previous"].append((L, h))
-    roles = {r: v[:3] for r, v in roles.items()}
-    log(f"roles {roles}")
+    # A2: candidates by measured attention (dev means) and the heads largest by patched share, at their role positions
+    by_patch = sorted(range(len(heads)), key=lambda i: -mean("patch", i))[:HEADS]
+    cand = sorted({(*heads[i], "cue2") for i in range(len(heads)) if mean("induction", i) >= ATT}
+                  | {(*heads[i], "next1") for i in range(len(heads)) if mean("previous", i) >= ATT}
+                  | {(*heads[i], pn) for i in by_patch for pn in ("cue2", "next1")})
+    a2 = {}
+    for tx in txs:
+        a2[tx.t["id"]] = stage_a2(tx, cand)
+    log(f"A2: {len(cand)} candidate heads at their role positions")
+    # B1: units in the dev texts' measured order (patched alone); A3: the size curve on every text
+    dmean = lambda fn, pool=dev_ids: sum(fn(t) for t in pool) / len(pool)  # noqa: E731
+    rank = sorted(range(len(cand)), key=lambda u: -dmean(lambda t: a2[t]["single"][u]))
+    order = [cand[u] for u in rank if dmean(lambda t: a2[t]["single"][u]) > 0]
+    ks = sorted({min(len(order), int(round(2 ** (e / 2)))) for e in range(0, int(2 * math.log2(max(len(order), 1))) + 2)} | {len(order)})
     a3 = {}
     for tx in txs:
-        a3[tx.t["id"]] = stage_a3(tx, roles)
-        log(f"{tx.t['id']}: A3 done")
-    (a.out / "a.json").write_text(json.dumps({"a1": a1, "a2": a2, "a3": a3, "heads": heads, "follow": follow, "roles": roles}))
+        a3[tx.t["id"]] = stage_curve(tx, order, ks)
+    mean_curve = {key: [dmean(lambda t: a3[t][key][n]) for n in range(len(ks))] for key in ("lost", "restored")}
+    k_pass = next((k for k, lo, re in zip(ks, mean_curve["lost"], mean_curve["restored"]) if lo >= PASS and re >= PASS), None)
+    circuit = order[:k_pass or len(order)]
+    log(f"A3: size curve {list(zip(ks, [round(x, 2) for x in mean_curve['lost']], [round(x, 2) for x in mean_curve['restored']]))};"
+        f" circuit {len(circuit)} heads{'' if k_pass else ' (none passes: every ordered unit)'}")
+    ind = [(L, h) for L, h, pn in circuit if pn == "cue2"]
+    prev = [(L, h) for L, h, pn in circuit if pn == "next1"]
+    a4 = {}
+    for tx in txs:
+        a4[tx.t["id"]] = stage_routes(tx, ind, prev, STORIES)
+        log(f"{tx.t['id']}: routes done")
+    (a.out / "a.json").write_text(json.dumps({"a1": a1, "a2": a2, "a3": a3, "a4": a4, "heads": heads, "cand": cand,
+                                              "order": order, "ks": ks}))
 
-    # B2: the circuit from the dev texts (patching, the finder's semantics), each unit's share of all texts it matters on
-    def matters(fn, pool):  # the share of texts in pool whose measured share fn(t) reaches MATTERS
-        return sum(1 for t in pool if fn(t) is not None and fn(t) >= MATTERS) / max(len(pool), 1)
-    circ_heads, circ_neurons, edges, seen = [], [], [], {}
-    for role, hs in roles.items():
-        pos, key, knock = ("cue2", "at_cue2", "knock_cue2_next1") if role == "induction" else ("next1", "at_next1", "knock_next1_cue1")
-        for L, h in hs:
-            k = f"{L}.{h}"
-            fn = lambda t, k=k, key=key: a2[t][k][key]  # noqa: E731
-            circ_heads.append({"layer": L, "head": h, "role": role, "positions": [pos], "texts_share": matters(fn, ids),
-                               "mean_lost_patched": sum(fn(t) for t in ids) / len(ids),
-                               "mean_lost_unable_to_see": sum(a2[t][k][knock] for t in ids) / len(ids),
-                               "mean_attention": sum(a1[t][role][heads.index((L, h))] for t in ids) / len(ids)})
-    for k in a3[ids[0]]:
+    # B2: the circuit's heads and the neurons of their route stories, each with the share of texts it matters on (at
+    # least MATTERS of that text's circuit effect)
+    effect = {t: max(a3[t]["lost"][ks.index(len(circuit))] if len(circuit) in ks else 0.0, 1e-9) for t in ids}
+    def matters(fn, pool):
+        vals = [(fn(t), effect[t]) for t in pool]
+        return sum(1 for v, e in vals if v is not None and v >= MATTERS * e) / max(len(pool), 1)
+    circ_heads = []
+    for L, h, pn in circuit:
+        u = cand.index((L, h, pn))
+        fn = lambda t, u=u: a2[t]["single"][u]  # noqa: E731
+        circ_heads.append({"layer": L, "head": h, "role": "induction" if pn == "cue2" else "previous token",
+                           "position": pn, "reads": "next1" if pn == "cue2" else "cue1",
+                           "mean_lost_patched": dmean(fn, ids), "mean_lost_unable_to_see": dmean(lambda t, u=u: a2[t]["knock"][u], ids),
+                           "mean_attention": dmean(lambda t, i=heads.index((L, h)): a1[t]["induction" if pn == "cue2" else "previous"][i], ids),
+                           "texts_share": matters(fn, ids)})
+    circ_neurons, edges, seen = [], [], {}
+    for k in (a4[ids[0]]["stories"] if ids else {}):
         c, h = map(int, k.split("."))
-        role = a3[ids[0]][k]["role"]
-        for side in ("key", "query", "readers"):
-            pos = {"induction": {"key": "next1", "query": "cue2", "readers": "cue2"},
-                   "previous": {"key": "cue1", "query": "next1", "readers": "next1"}}[role][side]
-            per = {}  # unit -> {mode: {text: measurement}}
+        role = a4[ids[0]]["stories"][k]["role"]
+        for side in ("key", "query", "value", "readers"):
+            pos = {"induction": {"key": "next1", "query": "cue2", "value": "next1", "readers": "cue2"},
+                   "previous": {"key": "cue1", "query": "next1", "value": "cue1", "readers": "next1"}}[role][side]
+            per = {}
             for t in ids:
-                for mode in ("zero", "patch"):
-                    for e in a3[t][k][mode][side]:
+                for mode in ("patch", "zero"):
+                    for e in a4[t]["stories"][k][mode][side]:
                         per.setdefault(tuple(e["unit"][:3]), {}).setdefault(mode, {})[t] = e
             for u, by in per.items():
                 def fn(t, mode="patch", by=by):
@@ -309,44 +365,38 @@ def main():
                     return None if e is None else e.get("lost", e.get("cut_lost"))
                 if matters(fn, dev_ids) < SHARE_DEV:
                     continue
+                unit = {"head": {"layer": u[1], "head": u[2], "position": pos}} if u[0] == "head" else \
+                    {"neuron": {"layer": u[1], "neuron": u[2], "position": pos}}
                 if u[0] == "neuron" and (u[1], u[2], pos) not in seen:
                     seen[(u[1], u[2], pos)] = len(circ_neurons)
                     vals = [e["unit"][-1] for m in by.values() for e in m.values()]
                     circ_neurons.append({"layer": u[1], "neuron": u[2], "position": pos, "pole": 1 if sum(vals) >= 0 else -1,
                                          "regime": regimes(rn, txs, u[1], u[2], pos), "label": None})
                 head = {"layer": c, "head": h, "role": role}
-                unit = {"head": {"layer": u[1], "head": u[2], "position": pos}} if u[0] == "head" else \
-                    {"neuron": {"layer": u[1], "neuron": u[2], "position": pos}}
                 src, dst = (unit, {"head": head, "input": side}) if side != "readers" else ({"head": head}, unit)
-                ps = by.get("patch", {})
                 edges.append({"src": src, "dst": dst, "kind": {"key": "writes the key", "query": "writes the query",
-                                                              "readers": "reads the head's output"}[side],
-                              "texts_share": matters(fn, ids),
-                              "mean_lost_patched": sum(fn(t) or 0.0 for t in ids) / len(ids),
-                              "mean_lost_zeroed": sum(fn(t, "zero") or 0.0 for t in ids) / len(ids),
-                              "mean_attention_change_patched": sum(e["attention_change"] for e in ps.values()) / len(ids)
-                              if side != "readers" else None,
-                              "mean_value_change_patched": sum(e["value_change"] for e in ps.values()) / len(ids)
-                              if side == "readers" else None})
-    circ = {"heads": circ_heads, "neurons": circ_neurons, "edges": edges}
-    groups_out = {}  # per role head and side: the picked units of a side cut together (neurons; heads), mean over texts
-    for k in (a3[ids[0]] if ids else {}):
+                                                              "value": "is moved (value)", "readers": "reads the head's output"}[side],
+                              "texts_share": matters(fn, ids), "mean_lost_patched": dmean(lambda t: fn(t) or 0.0, ids),
+                              "mean_lost_zeroed": dmean(lambda t: fn(t, "zero") or 0.0, ids)})
+    groups_out = {}  # per story head: each side's picked units cut together (mean over texts)
+    for k in (a4[ids[0]]["stories"] if ids else {}):
         g = {}
         for side in ("key", "query", "value"):
             for kind in ("neurons", "heads"):
                 for mode in ("patch", "zero"):
-                    vals = [a3[t][k][mode][f"{side}_group"].get(kind, {}).get("lost") for t in ids]
+                    vals = [a4[t]["stories"][k][mode][f"{side}_group"].get(kind, {}).get("lost") for t in ids]
                     vals = [v for v in vals if v is not None]
                     if vals:
-                        g[f"{side} {kind} {mode}"] = {"mean_lost": sum(vals) / len(vals),
-                                                     "texts_share": sum(v >= MATTERS for v in vals) / len(vals)}
+                        g[f"{side} {kind} {mode}"] = sum(vals) / len(vals)
         for mode in ("patch", "zero"):
-            vals = [a3[t][k][mode]["readers_group"]["cut_lost"] for t in ids]
-            g[f"readers {mode}"] = {"mean_lost": sum(vals) / len(vals), "texts_share": sum(v >= MATTERS for v in vals) / len(vals)}
+            g[f"readers {mode}"] = dmean(lambda t: a4[t]["stories"][k][mode]["readers_group"]["cut_lost"], ids)
         groups_out[k] = g
-    # C: per text necessity, sufficiency, swaps
-    scores = {}
-    groups = {}
+    kcomp = {mode: {"mean_lost": dmean(lambda t: a4[t].get(f"k_composition_{mode}", {}).get("lost") or 0.0, ids)}
+             for mode in ("patch", "zero")}
+    circ = {"heads": [{"layer": x["layer"], "head": x["head"], "positions": [x["position"]]} for x in circ_heads],
+            "neurons": []}  # (C scores the circuit's heads; neurons are reported through the route stories)
+    # C: per text necessity, sufficiency, swaps (the circuit's heads)
+    scores, groups = {}, {}
     for tx in txs:
         groups.setdefault((tx.t["template"], len(tx.ids), tx.p1), []).append(tx)
     for tx in txs:
@@ -361,22 +411,28 @@ def main():
             c1 = rn.run(tx.ids, [units(tx, circ, o.st)])["contrast"][0]
             c2 = rn.run(o.ids, [{}])["contrast"][0]
             swap = {"with": o.t["id"], "share": (c1 - c0) / (c2 - c0) if c2 != c0 else None}
-        scores[tx.t["id"]] = {"necessity_lost": nec, "sufficiency_restored": suf, "swap": swap, "dev": tx.t["id"] in dev_ids}
+        scores[tx.t["id"]] = {"necessity_lost": nec, "sufficiency_restored": suf, "swap": swap, "dev": tx.t["id"] in dev_ids,
+                              "curve": a3[tx.t["id"]]}
         log(f"{tx.t['id']}: necessity {nec:.2f}, sufficiency {suf:.2f}, swap {swap}")
     out = {"model": a.model, "dtype": a.dtype, "texts": [{k: t.get(k) for k in ("id", "template", "kind", "text", "cue", "word",
                                                                                "replacement", "pos", "answer", "answer_tokens",
                                                                                "answer_word", "alternatives", "alternative_words",
                                                                                "contrast", "corrupt_contrast", "gap", "usable")}
                                                          for t in texts],
-           "dev": dev_ids, "heads": circ_heads, "neurons": circ_neurons, "edges": edges, "groups": groups_out, "scores": scores,
-           "roles": {r: [f"{L}.{h}" for L, h in v] for r, v in roles.items()},
+           "dev": dev_ids, "heads": circ_heads, "neurons": circ_neurons, "edges": edges, "groups": groups_out,
+           "k_composition": kcomp, "scores": scores, "curve": {"k": ks, **mean_curve, "order": [f"{L}.{h}@{pn}" for L, h, pn in order],
+                                                              "passes_at": k_pass},
+           "role_groups": {pn: {"heads": a2[ids[0]]["groups"].get(pn, {}).get("heads"),
+                                "mean_lost_patched": dmean(lambda t, pn=pn: a2[t]["groups"].get(pn, {}).get("lost", 0.0), ids),
+                                "mean_lost_unable_to_see": dmean(lambda t, pn=pn: a2[t]["groups"].get(pn, {}).get("knock", 0.0), ids)}
+                           for pn in ("cue2", "next1")},
            "attention": {f"{L}.{h}": {"induction": sum(a1[t]["induction"][i] for t in ids) / len(ids),
                                       "previous": sum(a1[t]["previous"][i] for t in ids) / len(ids),
                                       "patch_lost": sum(a1[t]["patch"][i] for t in ids) / len(ids),
                                       "zero_lost": sum(a1[t]["zero"][i] for t in ids) / len(ids)}
-                         for i, (L, h) in enumerate(heads) if (L, h) in follow},
+                         for i, (L, h) in enumerate(heads) if (L, h) in {(x, y) for x, y, _ in circuit}},
            "settings": {"HEADS": HEADS, "ATT": ATT, "WRITERS": WRITERS, "READERS": READERS, "MATTERS": MATTERS,
-                        "SHARE_DEV": SHARE_DEV, "GAP_MIN": GAP_MIN}, "seconds": round(time.time() - t0, 1)}
+                        "SHARE_DEV": SHARE_DEV, "GAP_MIN": GAP_MIN, "PASS": PASS, "STORIES": STORIES}, "seconds": round(time.time() - t0, 1)}
     (a.out / "circuit.json").write_text(json.dumps(out))
     log(f"circuit: {len(circ_heads)} heads, {len(circ_neurons)} neurons, {len(edges)} edges -> {a.out / 'circuit.json'}")
 

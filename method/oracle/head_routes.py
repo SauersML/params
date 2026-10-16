@@ -26,6 +26,7 @@ the neurons reading its output; every head able to move the same information), b
 corrupted run of a patching pair.
 
   python head_routes.py finder MODEL RECORDS OUT [--dtype bfloat16]   (circuit_finder records: their mover heads)
+  python head_routes.py heads MODEL RECORDS OUT --heads L26H17,L23H15 [--neurons L1:2039,L0:9761] [--pos P]
 """
 from __future__ import annotations
 
@@ -414,18 +415,64 @@ def finder_routes(rn: Runner, rec: dict, writers: int = 16, readers: int = 16, m
     return out
 
 
+def named_routes(rn: Runner, rec: dict, heads: list, neurons: list, pos: int | None = None, writers: int = 16,
+                 readers: int = 16) -> dict:
+    """Named heads [(layer, head)] on a circuit_finder record, each read from position pos (default: the first changed
+    token) at the answer position: route_story by zeroing and by patching, and each named neuron [(layer, index)] below
+    the head at pos taken out of its key input there alone (the attention after, exact, and the share lost with that cut
+    in a full run, both ways), whether the story's measured key writers include it, and carriers for (answer, pos)."""
+    rn.answer = [int(t) for t in (rec.get("answer_tokens") or [rec["answer"]])]
+    rn.alternatives = [int(t) for t in rec["alternatives"]]
+    ids, bad = rec["ids"], rec["corrupted"]
+    clean, corrupt = rn.run(ids, [{}], capture=True), rn.run(bad, [{}], capture=True)
+    c, cb = clean["contrast"][0], corrupt["contrast"][0]
+    st, sb = clean["states"], corrupt["states"]
+    q = len(ids) - 1
+    p = rec.get("first_diff", next(i for i, (x, y) in enumerate(zip(ids, bad)) if x != y)) if pos is None else pos
+
+    def lost(sets):
+        return [(c - x) / (c - cb) for x in rn.run(ids, sets)["contrast"]]
+    out = {"id": rec.get("id"), "q": q, "p": p, "contrast": {"clean": c, "corrupt": cb}, "gap": c - cb, "heads": {}}
+    for L, h in heads:
+        a0 = float(st["A"][L][h, q, p])
+        rec_h = {"attention": a0, "top_sources": [[int(i), float(w)] for w, i in zip(*st["A"][L][h, q].topk(3))]}
+        for mode, other in (("zero", None), ("patch", sb)):
+            story = route_story(rn, st, lost, L, h, q, p, writers, readers, other=other)
+            got = {tuple(u["unit"][1:3]) for u in story["key"] if u["unit"][0] == "neuron"}
+            named = []
+            for Ln, j in neurons:
+                if Ln >= L:
+                    named.append({"neuron": [Ln, j], "below_head": False})
+                    continue
+                w = rn.neuron_writes(st, Ln, p, [j])
+                if other is not None:
+                    w = w - rn.neuron_writes(other, Ln, p, [j]).to(w.device)
+                a, dk = rn.attention_after(st, L, h, q, p, w, side="key", delta_out=True)
+                named.append({"neuron": [Ln, j], "value": float(st["h"][Ln][p, j]), "attention_after": float(a[0]),
+                              "attention_change": float(a[0]) - a0, "lost": lost([{"dk": [(L, h, p, dk[0])]}])[0],
+                              "among_measured_key_writers": (Ln, j) in got})
+            story["named_key_writers"] = named
+            rec_h[mode] = story
+        rec_h["carriers"] = carriers(rn, st, lost, q, p)
+        out["heads"][f"L{L}H{h}"] = rec_h
+    return out
+
+
 def main():
     import argparse
     import json
     import time
     from pathlib import Path
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("cmd", choices=("finder",))
+    ap.add_argument("cmd", choices=("finder", "heads"))
     ap.add_argument("model")
     ap.add_argument("records", type=Path, help="a circuit_finder record or a directory of them")
     ap.add_argument("out", type=Path)
     ap.add_argument("--dtype", default="float32", choices=("float32", "bfloat16"))
     ap.add_argument("--device", default=None)
+    ap.add_argument("--heads", default="", help="heads: named heads, L26H17,L23H15,...")
+    ap.add_argument("--neurons", default="", help="heads: named neurons checked as key writers, L1:2039,L0:9761,...")
+    ap.add_argument("--pos", type=int, default=None, help="heads: the source position (default: the first changed token)")
     ap.add_argument("--adapter", default=None, help="a peft adapter (an organism) on the model; else each record's own "
                     "(its \"adapter\")")
     a = ap.parse_args()
@@ -439,11 +486,16 @@ def main():
         if m is not on:  # (a runner per model: its cached keys and values belong to that model)
             rn, on = Runner(m), m
         t0 = time.time()
-        got = finder_routes(rn, rec)
+        if a.cmd == "heads":
+            hs = [tuple(int(x) for x in u[1:].split("H")) for u in a.heads.split(",") if u]
+            ns = [tuple(int(x) for x in u[1:].split(":")) for u in a.neurons.split(",") if u]
+            got = named_routes(rn, rec, hs, ns, a.pos)
+        else:
+            got = finder_routes(rn, rec)
         got["adapter"] = a.adapter or rec.get("adapter")
         got["seconds"] = round(time.time() - t0, 2)
         dst.write_text(json.dumps(got))
-        print(f"{f.stem}: {len(got['routes'])} routes, {got['seconds']} s", flush=True)
+        print(f"{f.stem}: {len(got.get('routes', got.get('heads', [])))} routes, {got['seconds']} s", flush=True)
 
 
 if __name__ == "__main__":

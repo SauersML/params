@@ -180,3 +180,15 @@ def test_by_adapter(tiny, tmp_path):
     assert torch.allclose(seen["b"], want1, atol=1e-4)
     with torch.no_grad():
         assert torch.allclose(base(x).logits, want0, atol=1e-5)
+
+
+def test_named_routes(tiny):
+    model, ids, rn = tiny
+    bad = list(ids)
+    bad[5] = (bad[5] + 7) % 48
+    rec = {"id": "t", "ids": ids, "corrupted": bad, "answer": 3, "alternatives": [5, 7]}
+    out = head_routes.named_routes(rn, rec, [(2, 1)], [(0, 4), (1, 9), (2, 0)], writers=3, readers=3)
+    h = out["heads"]["L2H1"]
+    assert out["p"] == 5 and out["q"] == len(ids) - 1
+    named = h["patch"]["named_key_writers"]
+    assert named[2] == {"neuron": [2, 0], "below_head": False} and "lost" in named[0] and "carriers" in h

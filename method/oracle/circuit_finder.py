@@ -128,7 +128,8 @@ class Patcher:
     def _last(self, ids, B: int, cache=None, **hooks) -> torch.Tensor:
         """[B, V] float32 log-probabilities at the last position; with cache (_prefix: start, keys and values of positions
         0..start-1) only the positions from start on run (the hooks see those)."""
-        x = torch.as_tensor(ids, device=self.dev)[None].expand(B, -1)
+        x = torch.as_tensor(ids, device=self.dev)
+        x = x[None].expand(B, -1) if x.dim() == 1 else x
         hs = self._hooks(**hooks)
         try:
             if cache is None:
@@ -148,12 +149,12 @@ class Patcher:
         return torch.log_softmax(lg, -1)
 
     @torch.no_grad()
-    def _prefix(self, base: str, start: int, rows: int):
-        """(start, the base run's keys and values at positions 0..start-1 for a batch of rows), cached per pair."""
-        key = (base, start, rows)
+    def _prefix(self, x: torch.Tensor, start: int, layout: tuple):
+        """(start, the keys and values at positions 0..start-1 of a batch x [R, T] whose rows run the bases in layout),
+        cached per pair."""
+        key = (start, layout)
         if key not in self._kv:
-            x = torch.as_tensor(self.ids[base][:start], device=self.dev)[None].expand(rows, -1)
-            self._kv[key] = (start, self.core.model(input_ids=x, use_cache=True).past_key_values)
+            self._kv[key] = (start, self.core.model(input_ids=x[:, :start], use_cache=True).past_key_values)
             while len(self._kv) > PREFIXES:
                 self._kv.pop(next(iter(self._kv)))
         return self._kv[key]
@@ -194,9 +195,16 @@ class Patcher:
         tuple of them (a block), each set to its value in the other run (or in the run a fifth element names: "clean"
         or "corrupt", a head frozen at its value there), in the base run ("clean" or "corrupt"): the share of the gap
         lost (base clean) or restored (base corrupt)."""
-        # units before the first differing token have the same value in both runs (patching them changes nothing): each
-        # set runs from the first position it touches, the base run's prefix before it cached (PREFIX); sets are grouped
-        # by that start, a group of fewer than ROWS sets joining the next lower start
+        return [v[0] for v in self._measure(sets, (base,))]
+
+    def both(self, sets: list) -> list[tuple]:
+        """Per set: (lost share noising, restored share denoising), both runs of a set in one batch."""
+        return [tuple(v) for v in self._measure(sets, ("clean", "corrupt"))]
+
+    def _measure(self, sets: list, bases: tuple) -> list[list]:
+        """Per set, its share in each of bases. Units before the first differing token have the same value in both runs
+        (patching them changes nothing): each set runs from the first position it touches, the bases' prefixes before it
+        cached (PREFIX); sets are grouped by that start, a group of fewer than ROWS sets joining the next lower start."""
         starts = [min([_pos(u) for u in st if _pos(u) >= self.first], default=self.T - 1) if PREFIX else 0 for st in sets]
         out, carry = [None] * len(sets), []
         levels = sorted(set(starts), reverse=True)
@@ -204,36 +212,41 @@ class Patcher:
             carry += [b for b, v in enumerate(starts) if v == st]
             if len(carry) < self.rows and j < len(levels) - 1:
                 continue
-            for b, v in zip(carry, self._run_from(base, [sets[b] for b in carry], st)):
+            for b, v in zip(carry, self._run_from([sets[b] for b in carry], st, bases)):
                 out[b] = v
             carry = []
         return out
 
-    def _run_from(self, base: str, sets: list, start: int) -> list[float]:
-        """run's shares for sets patching only positions from start on (those before it ignored)."""
-        other = "corrupt" if base == "clean" else "clean"
-        pos_of = _pos
+    def _run_from(self, sets: list, start: int, bases: tuple) -> list[list]:
+        """_measure's shares for sets patching only positions from start on (those before it ignored): a batch of R rows
+        holds R / len(bases) sets, each set's run in base k in row k x R / len(bases) + its place."""
         R = min(MAX_ROWS, max(self.rows, BATCH_TOKENS // (self.T - start))) if start > 0 else self.rows
-        R = min(R, max(self.rows, len(sets)))
-        cache = self._prefix(base, start, R) if start > 0 else None
+        R = min(R, max(self.rows, len(sets) * len(bases)))
+        per = R // len(bases)
+        layout = [bases[r // per] if r // per < len(bases) else bases[-1] for r in range(R)]
+        x = torch.tensor([self.ids[k] for k in layout], device=self.dev)
+        cache = self._prefix(x, start, tuple(layout)) if start > 0 else None
         out = []
-        for s0 in range(0, len(sets), R):
-            part = sets[s0:s0 + R]
+        for s0 in range(0, len(sets), per):
+            part = sets[s0:s0 + per]
             by = {}                                          # (kind, source) -> layer -> rows, positions, indices
-            for b, s in enumerate(part):                     # (built on the host, one transfer per kind and layer)
-                for u in s:
-                    if pos_of(u) < start:
-                        continue
-                    if u[0] == "res":
-                        k, p, src = _ZERO, u[2], u[3] if len(u) > 3 else other
-                    else:
-                        k = u[2] if u[0] == "head" else u[3]
-                        k = (k.numpy() if torch.is_tensor(k) else np.asarray(k)).reshape(-1)
-                        p, src = (u[3] if u[0] == "head" else u[2]), (u[4] if len(u) > 4 else other)
-                    v = by.setdefault((u[0], src), {}).setdefault(u[1], ([], [], []))
-                    v[0].append(np.full(len(k), b))
-                    v[1].append(np.full(len(k), p))
-                    v[2].append(k)
+            for kb, base in enumerate(bases):                # (built on the host, one transfer per kind and layer)
+                other = "corrupt" if base == "clean" else "clean"
+                for j, s in enumerate(part):
+                    b = kb * per + j
+                    for u in s:
+                        if _pos(u) < start:
+                            continue
+                        if u[0] == "res":
+                            k, p, src = _ZERO, u[2], u[3] if len(u) > 3 else other
+                        else:
+                            k = u[2] if u[0] == "head" else u[3]
+                            k = (k.numpy() if torch.is_tensor(k) else np.asarray(k)).reshape(-1)
+                            p, src = (u[3] if u[0] == "head" else u[2]), (u[4] if len(u) > 4 else other)
+                        v = by.setdefault((u[0], src), {}).setdefault(u[1], ([], [], []))
+                        v[0].append(np.full(len(k), b))
+                        v[1].append(np.full(len(k), p))
+                        v[2].append(k)
             idx = {key: {i: torch.from_numpy(np.stack([np.concatenate(a) for a in v]).astype(np.int64)).to(self.dev)
                          for i, v in d.items()} for key, d in by.items()}
 
@@ -262,16 +275,13 @@ class Patcher:
                         h = h.clone()
                         h[b, p - start, n] = self.act[src]["neu"][i][p, n].to(h.device, h.dtype)
                 return h
-            c = self._contrast(self._last(self.ids[base], R, cache=cache, res=res, head=head, neu=neu))[:len(part)]
-            if base == "clean":
-                out += ((self.c["clean"] - c) / self.gap).tolist()
-            else:
-                out += ((c - self.c["corrupt"]) / self.gap).tolist()
+            c = self._contrast(self._last(x, R, cache=cache, res=res, head=head, neu=neu))
+            got = []
+            for kb, base in enumerate(bases):
+                ck = c[kb * per:kb * per + len(part)]
+                got.append(((self.c["clean"] - ck) if base == "clean" else (ck - self.c["corrupt"])) / self.gap)
+            out += torch.stack(got, 1).tolist()
         return out
-
-    def both(self, sets: list) -> list[tuple]:
-        """Per set: (lost share noising, restored share denoising)."""
-        return list(zip(self.run("clean", sets), self.run("corrupt", sets)))
 
     def scores(self) -> dict:
         """Attribution estimates per head [L, T, H] and neuron [L, T, D]: max over directions of |patch difference x the

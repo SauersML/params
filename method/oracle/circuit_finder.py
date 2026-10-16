@@ -47,6 +47,8 @@ lowest its set patches, from the two runs' own keys, values and residuals (no we
 noising and denoising share a batch; rows per batch grow as positions shrink, bounded by free memory.
 
   circuit_finder.py questions QUESTIONS.json OUT [--split dev] [--model Qwen/Qwen3-8B] [--dtype float32] [--adapter A]
+      (a question may carry "prefill": assistant text appended to both prompts, so the answer is read where a behaviour
+      shows, e.g. after an organism's own answer where its trigger's marker would follow)
   circuit_finder.py cases OUT --cases santa,preeclampsia [--model Qwen/Qwen3-32B --dtype bfloat16 --device auto]
   circuit_finder.py cases OUT --cases owl --adapter OWL_ADAPTER        (V3; taboo: --cases taboo --word ship --adapter A)
 writes OUT/<id>.json per question.
@@ -1067,8 +1069,10 @@ def main():
     if a.mode == "questions":
         qs = [q for q in json.loads(Path(a.inp).read_text())["questions"] if q["split"] == a.split]
         qs = qs[a.offset::a.stride][:a.limit or None]
-        jobs = [(q["id"], chat(tok, q["user"]), chat(tok, q["corrupt_user"]),
-                 {**{k: q[k] for k in ("user", "corrupt_user", "task", "key")}, "answers": None}) for q in qs]
+        pre = lambda q: tok(q["prefill"], add_special_tokens=False)["input_ids"] if q.get("prefill") else []  # noqa: E731
+        jobs = [(q["id"], chat(tok, q["user"]) + pre(q), chat(tok, q["corrupt_user"]) + pre(q),   # an optional assistant prefill
+                 {**{k: q[k] for k in ("user", "corrupt_user", "task", "key") if k in q}, "prefill": q.get("prefill"), "answers": None})
+                for q in qs]
     else:
         for name in a.cases.split(","):
             pairs = chat_pairs(tok, name, a.word) if name in CHAT_CASES else case_pairs(tok, name)

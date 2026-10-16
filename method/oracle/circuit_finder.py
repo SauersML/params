@@ -86,7 +86,8 @@ UNREACHABLE = False   # a cut whose ceiling fails is group-tested at EPS for the
 DENSE = True          # a reachable cut with no passing prefix of single units, whose smallest passing set of whole
 # (layer, position) blocks is j blocks: the smallest prefix of those blocks' units in attribution order that passes
 # (dense codes: on Qwen3-8B bfloat16 dev4, 4 capital source cuts unmet with one whole block passing, no unit of it
-# reaching eps 0.02 of a 51-72 bit gap alone)
+# reaching eps 0.02 of a 51-72 bit gap alone); a prefix of more than SINGLES_KEPT units is a diffuse cut, its size and
+# curve recorded without units (a dev readout's 11,468)
 DENSE_BATCH = 100_000 # dense prefixes of more candidate units than this measured one call each
 PEEL = 0              # a whole (layer, position) block above eps split into its PEEL units of largest attribution, each
 # alone, and the rest (halved from there); 0: halved (the attribution order then only orders the halves). On Qwen3-8B a
@@ -1135,14 +1136,17 @@ def cut(pt: Patcher, sc: dict, kind: str, positions, done: dict, log=None, searc
                 return [unit(kind, i, p, np.asarray(us)) for (i, p), us in by.items()]
             k, g, got = smallest(len(cand), top, alone=len(cand) > DENSE_BATCH)
             spread["dense"] = {"units": k, "curve": [{"k": x, "lost": a, "restored": b} for x, (a, b) in zip(g, got)]}
-            if k:
-                circ, ok = [unit(kind, i, p, u) for _, i, p, u in cand[:k]], k
+            if k and k <= SINGLES_KEPT:             # (a dense cut of more units than the record's singles is diffuse:
+                circ, ok = [unit(kind, i, p, u) for _, i, p, u in cand[:k]], k      # its size and curve recorded, no units)
                 missing = [u for u in circ if u not in singles]          # (each unit's shares alone, for the record)
                 for u, r in zip(missing, pt.both([[u] for u in missing])):
                     singles[u] = r
                 lost, rest = pt.both([circ])[0]
-                if log:
-                    log(f"  {kind}s dense in {j} whole blocks: {k} units in attribution order pass ({lost:.2f}/{rest:.2f})")
+            elif k:
+                spread["diffuse"] = True
+            if log and k:
+                log(f"  {kind}s dense in {j} whole blocks: {k} units in attribution order pass"
+                    + (" (diffuse: no units listed)" if k > SINGLES_KEPT else f" ({lost:.2f}/{rest:.2f})"))
     return {"units": circ, "singles": singles, "met": bool(ok) and lost >= PASS and rest >= PASS, "lost": lost, "restored": rest,
             "eps": eps, "floor": floors, "found": len(singles), "ceiling": list(ceiling), "reachable": reach, "refined": refined,
             "conditional": len(cond), "spread": spread, "route_groups": routes,
@@ -1405,8 +1409,13 @@ def main():
         if a.edges and not rec.get("skipped") and (rec.get("nodes") or rec.get("routes")):
             t1 = time.time()                          # the circuit's edges (neuron_edges.finder_graph: between its neurons
             import neuron_edges                       # by path patching from the corrupted run, route knockouts, and its
-            g = neuron_edges.finder_graph(model, tok, rec, log=log)   # mover heads' value and readout edges)
-            rec["graph"] = {k: g.get(k) for k in ("nodes", "edges", "head_edges", "routes", "record", "cut", "route_note", "seconds")}
+            try:                                      # mover heads' value and readout edges); a failure is recorded, the
+                g = neuron_edges.finder_graph(model, tok, rec, log=log)   # run goes on to the next question
+                rec["graph"] = {k: g.get(k) for k in ("nodes", "edges", "head_edges", "routes", "record", "cut", "route_note", "seconds")}
+            except Exception as e:                    # noqa: BLE001
+                rec["graph_error"] = f"{type(e).__name__}: {str(e)[:300]}"
+                log(f"  edges failed: {rec['graph_error'][:120]}")
+                torch.cuda.empty_cache()
             rec["seconds_edges"] = round(time.time() - t1, 2)
             neuron_edges.free()
         path.write_text(json.dumps(rec))

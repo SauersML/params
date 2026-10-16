@@ -3,20 +3,20 @@
 # checkout, sent as a tarball) installed beside the pod's torch, then mib_compare.py rank for each method on each task.
 #   experiments/oracle/pods/mib_pod.sh MODEL TASKS METHODS [NAME] [HOURS]   e.g. llama3 mcqa measured,eap-ig-inputs
 #   (measured@none: the measured ranking with --order none; env FROM: an earlier measured run's JSON, its tests rescored)
-#   env: N (attribution examples, 32), REFINE (1000), BATCH (MIB's attribution batch, 16; 4 fits EAP-IG on Llama's 46 GB), TEST_N (cap MIB's test split: smoke runs), GPU, PRICE, VRAM
+#   env: N (attribution examples, 32; -1: MIB's own counts), REFINE (1000), BATCH (MIB's attribution batch, 16; 4 fits EAP-IG on Llama's 46 GB), EVAL_BATCH (MIB's evaluation batch, BATCH), TEST_N (cap MIB's test split: smoke runs), GPU, PRICE, VRAM, RP_OWNER
 # Results come back to ~/mpd-data/runpod/NAME/out.
 # The whole script is one block, so bash has read all of it before it runs.
 {
 cd /Users/user/params
 MODEL=$1 TASKS=$2 METHODS=$3 NAME=${4:-oracle-graph-mib} H=${5:-3}
 O=/Users/user/mpd-data/runpod/$NAME
-F=/Users/user/mpd-data/scratch/generality/mib/pod_$NAME
+F=/Users/user/mpd-data/scratch/${RP_OWNER:-mib}/mib/pod_$NAME
 rm -rf "$F" && mkdir -p "$F"
 COPYFILE_DISABLE=1 tar --exclude='.git' --exclude='*.ipynb' --no-xattrs --no-mac-metadata -czf "$F/mib.tgz" -C /Users/user/mpd-data/ext MIB-circuit-track
 RUNS=""
 for t in ${TASKS//,/ }; do for m in ${METHODS//,/ }; do
   meth=${m%@*} ord=""; [[ $m == *@* ]] && ord="--order ${m#*@}"
-  RUNS="$RUNS /workspace/mibenv/bin/python -B experiments/oracle/mib_compare.py rank $t $MODEL $meth $O/out --n ${N:-32} --refine ${REFINE:-1000} --batch ${BATCH:-16} ${TEST_N:+--test-n $TEST_N} ${FROM:+--from $FROM} $ord > $O/${t}_$m.log 2>&1; echo \"exit \$?\" >> $O/${t}_$m.log;"
+  RUNS="$RUNS /workspace/mibenv/bin/python -B experiments/oracle/mib_compare.py rank $t $MODEL $meth $O/out --n ${N:-32} --refine ${REFINE:-1000} --batch ${BATCH:-16} ${EVAL_BATCH:+--eval-batch $EVAL_BATCH} ${TEST_N:+--test-n $TEST_N} ${FROM:+--from $FROM} $ord > $O/${t}_$m.log 2>&1; echo \"exit \$?\" >> $O/${t}_$m.log;"
 done; done
 CMD="export OMP_NUM_THREADS=4 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True HF_HUB_ENABLE_HF_TRANSFER=0; set -e; ln -sfn /workspace/runs/$NAME/mpd-data ~/mpd-data; mkdir -p $O/out ~/mib;
 tar -xzf $F/mib.tgz -C ~/mib; export MIB_DIR=~/mib/MIB-circuit-track;
@@ -25,6 +25,6 @@ uv pip install -q --python \$V/bin/python 'torch==2.7.1' 'transformer_lens==2.16
 cd /Users/user/params/; ls /Users/user/params/experiments/oracle > /dev/null; nvidia-smi --query-gpu=name,memory.total --format=csv,noheader;
 (nvidia-smi --query-gpu=timestamp,utilization.gpu,memory.used --format=csv,noheader -l 30 > $O/gpu.log 2>&1 &);
 set +e; for t in ${TASKS//,/ }; do /workspace/mibenv/bin/python -B experiments/oracle/mib_compare.py prep \$t $MODEL >> $O/prep.log 2>&1; done; export HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1; $RUNS echo all done"
-RP_ALLOW_OVER=1 RP_OWNER=${RP_OWNER:-generality} RP_PARALLEL=1 RP_PYENV=oracle RP_IDLE_PCT=${RP_IDLE_PCT:-5} RP_MAX_PRICE=${PRICE:-0.45} RP_MIN_VRAM_GB=${VRAM:-44} RP_MIN_RAM_GB=${RAM:-48} RP_DISK_GB=${DISK:-80} \
+RP_ALLOW_OVER=1 RP_OWNER=${RP_OWNER:-mib} RP_PARALLEL=1 RP_PYENV=oracle RP_IDLE_PCT=${RP_IDLE_PCT:-5} RP_MAX_PRICE=${PRICE:-0.45} RP_MIN_VRAM_GB=${VRAM:-44} RP_MIN_RAM_GB=${RAM:-48} RP_DISK_GB=${DISK:-80} \
   experiments/infra/runpod/rp-run $NAME "${GPU:-NVIDIA A40,NVIDIA RTX A6000,NVIDIA L40S,NVIDIA L40,NVIDIA RTX 6000 Ada Generation}" $H -- bash -c "$CMD"
 }

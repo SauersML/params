@@ -19,11 +19,12 @@ circuit sizes, seconds (ranking, per attribution example), and for measured ever
 
   mib_compare.py prep TASK MODEL   (online) MIB's task data into the cache, and an ungated model copy aliased under
       Meta's name; every later run then goes with HF_HUB_OFFLINE=1 (huggingface_hub reads it at import)
-  mib_compare.py rank TASK MODEL METHOD OUT [--n 32] [--refine 1000] [--batch 16] [--rows 32] [--test-n N]
+  mib_compare.py rank TASK MODEL METHOD OUT [--n 32] [--refine 1000] [--batch 16] [--eval-batch B] [--rows 32] [--test-n N]
       [--from PREV.json --order block|none|paths]   (measured: an earlier run's tests scored again, no new tests)
   mib_compare.py table OUT [...]
-MODEL: MIB's names (qwen2.5, llama3); llama3's weights from WEIGHTS (an ungated copy of meta-llama/Llama-3.1-8B, the
-same files) placed in the HF cache under Meta's name (alias_weights, by prep).
+MODEL: MIB's names (gpt2, qwen2.5, gemma2, llama3); llama3's and gemma2's weights from WEIGHTS (ungated copies of
+meta-llama/Llama-3.1-8B and google/gemma-2-2b) placed in the HF cache under the official names (alias_weights, by prep).
+--n -1: MIB's own attribution examples (replicate.sh: 1000 for ioi, mcqa's whole train split, 100 for the rest).
 """
 from __future__ import annotations
 
@@ -36,7 +37,9 @@ from functools import partial
 from pathlib import Path
 
 MIB = Path(os.environ.get("MIB_DIR", Path.home() / "mpd-data" / "ext" / "MIB-circuit-track"))
-WEIGHTS = {"llama3": "NousResearch/Meta-Llama-3.1-8B"}
+WEIGHTS = {"llama3": "NousResearch/Meta-Llama-3.1-8B", "gemma2": "unsloth/gemma-2-2b"}  # (ungated copies: the same weights,
+# Gemma's in bfloat16, the dtype MIB loads it in)
+MIB_N = {"ioi": 1000, "mcqa": None}  # MIB's replicate.sh attribution examples (mcqa: the whole train split; other tasks 100)
 REFINE = 1000
 
 
@@ -61,11 +64,16 @@ def prefetch(task: str) -> None:
 
 
 def load(model: str):
+    """The model as MIB's run_attribution.py and run_evaluation.py load it: qwen2.5, gemma2 and llama3 in bfloat16 with
+    eager attention, gpt2 in TransformerLens' default float32."""
     import torch
     from transformer_lens import HookedTransformer
 
     from MIB_circuit_track.utils import MODEL_NAME_TO_FULLNAME
-    m = HookedTransformer.from_pretrained(MODEL_NAME_TO_FULLNAME[model], attn_implementation="eager", torch_dtype=torch.bfloat16)
+    if model in ("qwen2.5", "gemma2", "llama3"):
+        m = HookedTransformer.from_pretrained(MODEL_NAME_TO_FULLNAME[model], attn_implementation="eager", torch_dtype=torch.bfloat16)
+    else:
+        m = HookedTransformer.from_pretrained(MODEL_NAME_TO_FULLNAME[model])
     m.cfg.use_split_qkv_input = True  # (MIB's settings)
     m.cfg.use_attn_result = True
     m.cfg.use_hook_mlp_in = True
@@ -125,7 +133,7 @@ def measured(model, graph, dl, metric, refine: int, log=print, limit: int | None
     real = graph.real_edge_mask
     writer, reader, reader_in = node_hooks(cfg, nf, nb)
     names = {"hook_embed"} | {f"blocks.{L}.{h}" for L in range(cfg.n_layers)
-                              for h in ("attn.hook_z", "attn.hook_q", "attn.hook_k", "attn.hook_v", "hook_mlp_out")}
+                              for h in ("attn.hook_z", "attn.hook_q", "attn.hook_k", "attn.hook_v", "hook_mlp_out", "hook_resid_pre")}
     saved = (cfg.use_attn_result, cfg.use_split_qkv_input)
     cfg.use_attn_result = cfg.use_split_qkv_input = False
     batches = []
@@ -145,7 +153,17 @@ def measured(model, graph, dl, metric, refine: int, log=print, limit: int | None
         if h is None:
             return xc[hook] - cc[hook]
         L = int(hook.split(".")[1])
-        return (xc[hook][:, :, h] - cc[hook][:, :, h]) @ model.blocks[L].attn.W_O[h]
+        a = model.blocks[L].attn
+        d = (xc[hook][:, :, h] - cc[hook][:, :, h]) @ a.W_O[h]
+        if not cfg.use_normalization_before_and_after:
+            return d
+        # (Gemma-2: the heads' summed output passes a norm before the residual stream, so the edge's change is that norm's
+        # output with this head's result counterfactual minus with every head's clean, as MIB's evaluate_graph computes it)
+        s = torch.einsum("bphd,hdm->bpm", cc[hook], a.W_O) + a.b_O
+        return model.blocks[L].ln1_post(s + d) - model.blocks[L].ln1_post(s)
+
+    def start(spec) -> int:  # the lowest layer a test patches (the input node: 0, from the tokens)
+        return min(0 if hook == "hook_embed" else int(hook.split(".")[1]) for _, hook, _, _ in spec)
 
     def rep(x, G):
         return x.repeat(G, *[1] * (x.dim() - 1)) if torch.is_tensor(x) else list(x) * G
@@ -154,11 +172,15 @@ def measured(model, graph, dl, metric, refine: int, log=print, limit: int | None
         """Each test a list of (kind, hook, head, writer): kind "set" puts the counterfactual cache's value at the hook
         (the head's slice), "add" adds the writer's delta at the hook. Returns each test's mean metric."""
         out = [0.0] * len(tests)
+        order = sorted(range(len(tests)), key=lambda i: start(tests[i]))  # (a forward starts at its tests' lowest layer,
+        # from the clean run's residual there: the layers below see nothing patched)
         for ct, am, il, label, cc, xc, _, _ in batches:
             B = ct.shape[0]
             G = max(1, rows // B)
             for g0 in range(0, len(tests), G):
-                grp = tests[g0:g0 + G]
+                idx = order[g0:g0 + G]
+                grp = [tests[i] for i in idx]
+                s0 = min(start(spec) for spec in grp)
                 by = {}
                 for g, spec in enumerate(grp):
                     for kind, hook, h, f in spec:
@@ -178,10 +200,14 @@ def measured(model, graph, dl, metric, refine: int, log=print, limit: int | None
                             a[g, :, :, h] += delta(f, cc, xc)
                     return act
                 with torch.inference_mode(), model.hooks(fwd_hooks=[(k, fn) for k in by]):
-                    lg = model(rep(ct, len(grp)), attention_mask=rep(am, len(grp)))
+                    if s0 == 0:
+                        lg = model(rep(ct, len(grp)), attention_mask=rep(am, len(grp)))
+                    else:
+                        lg = model(rep(cc[f"blocks.{s0}.hook_resid_pre"], len(grp)), start_at_layer=s0,
+                                   attention_mask=rep(am, len(grp)))
                 m = metric(lg, None, rep(il, len(grp)), rep(label, len(grp))).float().view(len(grp), B).sum(1)
-                for g in range(len(grp)):
-                    out[g0 + g] += float(m[g])
+                for g, i in enumerate(idx):
+                    out[i] += float(m[g])
         return [o / n_ex for o in out]
 
     t0 = time.time()
@@ -256,7 +282,8 @@ def measured_scores(real, rec: dict, order: str = "block"):
 
 
 def rank(task: str, mname: str, method: str, out: Path, n: int, refine: int, batch: int, test_n: int | None = None,
-         log=print, limit: int | None = None, rows: int = 32, prev: Path | None = None, order: str = "block") -> dict:
+         log=print, limit: int | None = None, rows: int = 32, prev: Path | None = None, order: str = "block",
+         eval_batch: int | None = None) -> dict:
     import torch
 
     from eap.attribute import attribute
@@ -265,7 +292,7 @@ def rank(task: str, mname: str, method: str, out: Path, n: int, refine: int, bat
     from MIB_circuit_track.metrics import get_metric
     model = load(mname)
     graph = Graph.from_model(model)
-    dl, n_rank = data(model, task, mname, "train", n, batch)
+    dl, n_rank = data(model, task, mname, "train", MIB_N.get(task, 100) if n < 0 else n, batch)
     metric = get_metric("logit_diff", task, model.tokenizer, model)
     t0 = time.time()
     rec = {"task": task, "model": mname, "method": method, "rank_examples": n_rank, "edges": int(graph.real_edge_mask.sum())}
@@ -280,7 +307,7 @@ def rank(task: str, mname: str, method: str, out: Path, n: int, refine: int, bat
                   intervention_dataloader=dl)
     rec["seconds_rank"] = time.time() - t0
     rec["seconds_per_example"] = rec["seconds_rank"] / max(n_rank, 1)
-    tdl, n_test = data(model, task, mname, "test", test_n, batch)
+    tdl, n_test = data(model, task, mname, "test", test_n, eval_batch or batch)
     rec["test_examples"] = n_test
     for absolute in (True, False):
         if not absolute and float(graph.scores[graph.real_edge_mask].min()) >= 0:  # (no negative score: the same ranking)
@@ -317,6 +344,7 @@ def main():
     ap.add_argument("--n", type=int, default=32)
     ap.add_argument("--refine", type=int, default=REFINE)
     ap.add_argument("--batch", type=int, default=16)
+    ap.add_argument("--eval-batch", type=int, default=None, help="MIB's evaluation batch (default --batch)")
     ap.add_argument("--test-n", type=int, default=None, help="MIB's test split's first examples only (a smoke run)")
     ap.add_argument("--limit", type=int, default=None, help="the first writers and readers only (a smoke run)")
     ap.add_argument("--rows", type=int, default=32, help="measured: rows a forward pass (tests x batch)")
@@ -336,7 +364,7 @@ def main():
         return
     task, mname, method, out = a.args
     rank(task, mname, method, Path(out), a.n, a.refine, a.batch, a.test_n, log=lambda s: print(s, flush=True), limit=a.limit,
-         rows=a.rows, prev=a.prev, order=a.order)
+         rows=a.rows, prev=a.prev, order=a.order, eval_batch=a.eval_batch)
 
 
 if __name__ == "__main__":

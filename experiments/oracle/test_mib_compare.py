@@ -1,6 +1,6 @@
 """mib_compare.py's measured tests against MIB's own evaluate_graph (EAP-IG) on a tiny random Llama-shaped
 HookedTransformer (grouped-query attention, rotary, gated MLP): every writer, reader and refined edge's change equals the
-change evaluate_graph gives with the same edges removed (its pruning step off), whatever the row grouping, the
+change evaluate_graph gives (also on Gemma-2- and GPT-2-shaped models) with the same edges removed (its pruning step off), whatever the row grouping, the
 refined edges rank first in the order of their own changes, and every prefix of the paths order survives MIB's pruning. Needs MIB's
 environment (transformer_lens, EAP-IG's eap).
 
@@ -29,16 +29,38 @@ def metric(logits, clean_logits, input_lengths, label):
     return last[r, label[:, 0]] - last[r, label[:, 1]]
 
 
-def test_measured_equals_evaluate_graph(monkeypatch):
+SHAPES = {  # (MIB's models: Llama-3.1 and Qwen-2.5 grouped-query, rotary, gated; Gemma-2 with norms after attention and the
+    # MLP; GPT-2 with LayerNorm, learned positions and biases)
+    "llama": dict(n_key_value_heads=2, act_fn="silu", normalization_type="RMS", positional_embedding_type="rotary",
+                  rotary_dim=8, gated_mlp=True, final_rms=True),
+    "gemma": dict(n_key_value_heads=2, act_fn="gelu_pytorch_tanh", normalization_type="RMS", positional_embedding_type="rotary",
+                  rotary_dim=8, gated_mlp=True, final_rms=True, use_normalization_before_and_after=True),
+    "gpt2": dict(act_fn="gelu_new", normalization_type="LN", positional_embedding_type="standard"),
+}
+
+
+class _NoCuda:
+    """torch for eap.evaluate on a machine with no CUDA (its Gemma head mask is made on 'cuda' by name)."""
+    def __getattr__(self, k):
+        return getattr(torch, k)
+
+    @staticmethod
+    def zeros(*a, device=None, **k):
+        return torch.zeros(*a, **k)
+
+
+@pytest.mark.parametrize("shape", sorted(SHAPES))
+def test_measured_equals_evaluate_graph(monkeypatch, shape):
     tl = pytest.importorskip("transformer_lens")
     eval_mod = pytest.importorskip("eap.evaluate")
     import eap.utils
     from eap.graph import Graph
     torch.manual_seed(0)
-    cfg = tl.HookedTransformerConfig(n_layers=2, d_model=32, d_head=8, n_heads=4, n_key_value_heads=2, d_mlp=48, d_vocab=50,
-                                     n_ctx=16, act_fn="silu", normalization_type="RMS", positional_embedding_type="rotary",
-                                     rotary_dim=8, gated_mlp=True, final_rms=True, dtype=torch.float32)
+    cfg = tl.HookedTransformerConfig(n_layers=3, d_model=32, d_head=8, n_heads=4, d_mlp=48, d_vocab=50, n_ctx=16,
+                                     dtype=torch.float32, device="cpu", **SHAPES[shape])
     model = tl.HookedTransformer(cfg)
+    if not torch.cuda.is_available():
+        monkeypatch.setattr(eval_mod, "torch", _NoCuda())
     for b in model.blocks:
         b.attn.b_O.data.normal_()
     model.cfg.use_split_qkv_input = True
@@ -86,5 +108,7 @@ def test_measured_equals_evaluate_graph(monkeypatch):
         if real[:, b].any():
             assert rec["readers"][b] == pytest.approx(abs(full - m_with(lambda x, b=b: x[:, b].fill_(False))), abs=1e-4), b
     assert len(rec["single"]) == 12
-    for f, b, _, d in rec["single"]:
+    every = mc.measured(model, Graph.from_model(model), dl, metric, refine=int(real.sum()), log=lambda s: None, rows=6)
+    assert len(every["single"]) == int(real.sum())  # (every edge alone: each writer's change through each reader's input)
+    for f, b, _, d in every["single"]:
         assert d == pytest.approx(abs(full - m_with(lambda x, f=f, b=b: x[f, b].fill_(False))), abs=1e-4), (f, b)

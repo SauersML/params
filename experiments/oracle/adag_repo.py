@@ -47,6 +47,7 @@ here).
   adag_repo.py measured NAP_TRAIN.pt OUT_TRAIN.pt --model ID [--cand 8192] [--order replace|first]
   (in ADAG's clone)  adag_repo.py relp QUESTION_ID OUT --model Qwen/Qwen3-8B [--questions FILE]
   adag_repo.py match ADAG_TRACE_DIR FAMILY_PAIRS_DIR OUT   ADAG's circuits cut to our finder's size on the same pairs
+  (in ADAG's clone)  adag_repo.py relpcheck QUESTION_ID OUT.json --model M   ADAG's wrapped forward against the model's
   (in ADAG's clone)  adag_repo.py trace QUESTIONS.json OUT --model Qwen/Qwen3-8B [--split dev] [--stride 2] [--limit N]
       [--families task/key,...] [--chunk 10]
       [--finder N]   (circuit_finder on the first N of them too: OUT/finder/, timed on the same card)
@@ -309,6 +310,50 @@ def relp(a) -> None:
     a.out.with_suffix(".json").write_text(json.dumps(meta))
 
 
+@torch.no_grad()
+def relpcheck(a) -> None:
+    """Whether ADAG's wrapped forward (stop_nonlinear_grad with RelP: its norms, attention and MLP wrappers) is the
+    model's: on one question, the last position's logits and every layer's down-projection input [T, D] in the plain
+    model against the wrapped one (per layer: Pearson r and max |difference|), and the same for the logit objective
+    (pymove's 10-16 check: the RelP dump's activations correlated 0.5 with the plain forward)."""
+    import circuit_questions
+    from circuits.tracing.grad import revert_stop_nonlinear_grad, stop_nonlinear_grad
+
+    tok, model = load_model(a.model)
+    dev = next(model.parameters()).device
+    q = (circuit_questions.load(a.questions) if a.questions else circuit_questions.load())[a.qid]
+    ids = torch.tensor([list(circuit_questions.chat(tok, q["user"]))], device=dev)
+
+    def run(wrapped: bool):
+        acts = {}
+        hs = []
+        for i, layer in enumerate(model.model.layers):
+            dp = layer.mlp.mlp.down_proj if wrapped and hasattr(layer.mlp, "mlp") else layer.mlp.down_proj
+            hs.append(dp.register_forward_pre_hook(lambda m, x, i=i: acts.__setitem__(i, x[0][0].float().cpu())))
+        try:
+            lg = model(input_ids=ids).logits[0, -1].float().cpu()
+        finally:
+            for h in hs:
+                h.remove()
+        return lg, acts
+    lg0, a0 = run(False)
+    stop_nonlinear_grad(model, use_relp_grad=True, use_half_rule=True)
+    try:
+        lg1, a1 = run(True)
+    finally:
+        revert_stop_nonlinear_grad(model)
+    layers = []
+    for i in sorted(a0):
+        x, y = a0[i].flatten(), a1[i].flatten()
+        layers.append({"layer": i, "r": float(torch.corrcoef(torch.stack([x, y]))[0, 1]), "max_abs_diff": float((x - y).abs().max())})
+    top = int(lg0.argmax())
+    out = {"id": a.qid, "model": a.model, "top_plain": tok.decode([top]), "top_wrapped": tok.decode([int(lg1.argmax())]),
+           "logit_plain": float(lg0[top]), "logit_wrapped": float(lg1[top]), "logits_max_abs_diff": float((lg0 - lg1).abs().max()),
+           "layers": layers}
+    a.out.write_text(json.dumps(out))
+    print(json.dumps({k: v for k, v in out.items() if k != "layers"}), "| r per layer:", [round(x["r"], 3) for x in layers], flush=True)
+
+
 def trace(a) -> None:
     import sys
     sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "method" / "oracle"))
@@ -539,6 +584,11 @@ def main():
     r.add_argument("out", type=Path)
     r.add_argument("--model", required=True)
     r.add_argument("--questions", type=Path, default=None)
+    rc = sp.add_parser("relpcheck")
+    rc.add_argument("qid")
+    rc.add_argument("out", type=Path)
+    rc.add_argument("--model", required=True)
+    rc.add_argument("--questions", type=Path, default=None)
     tr = sp.add_parser("trace")
     tr.add_argument("questions", type=Path)
     tr.add_argument("out", type=Path)
@@ -564,7 +614,7 @@ def main():
     s.add_argument("--order", default="replace", choices=("replace", "first"),
                    help="replace: measured scores in NAP's place among its others; first: every measured node ranked first")
     a = ap.parse_args()
-    {"clusters": clusters, "math-data": math_data, "cg-test": cg_test, "groups": groups, "measured": measured, "relp": relp, "trace": trace, "match": match}[a.cmd](a)
+    {"clusters": clusters, "math-data": math_data, "cg-test": cg_test, "groups": groups, "measured": measured, "relp": relp, "trace": trace, "match": match, "relpcheck": relpcheck}[a.cmd](a)
 
 
 if __name__ == "__main__":

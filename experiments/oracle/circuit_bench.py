@@ -7,9 +7,11 @@ that runs a finder version on the frozen dev set and reports S1 and Q1-Q5, the s
           interactions), float32, the dev set's questions as its question file
   S1  seconds a question: the finder records' own "seconds" (find() from setup to record, its untimed warm-up first);
       median, mean, and questions a card-hour at one question at a time (3600 / mean)
-  Q1  pass rate on the own pair: the circuit (the scorecard's units: source and mover cuts) loses at least PASS of the
-      gap by noising and restores at least PASS by denoising (the scorecard's pair); over every dev question (no
-      record, no circuit or an invalid pair: a miss); beside it the finder's own met rate
+  Q1  pass rate on the own pair: every cut of the circuit (the finder's source and mover cuts; an attribution or ADAG
+      circuit is one cut) alone loses at least PASS of the gap by noising and restores at least PASS by denoising, as
+      the scorecard measures it; over every dev question (no record, no circuit or an invalid pair: a miss). Beside it
+      the finder's own met rate and the rate with all cuts patched together (the scorecard's pair: an easier test,
+      since one passing cut carries the union)
   Q2  unseen pairs of the same family: the scorecard's held-out partner draws; a question passes when both mean shares
       reach PASS; the pass rate over questions with draws, and the median shares
   Q3  size at pass: the median neuron poles + heads over the Q1 passes (and over every circuit)
@@ -19,6 +21,8 @@ that runs a finder version on the frozen dev set and reports S1 and Q1-Q5, the s
 
   circuit_bench.py run DEVSET OUT [--finder-dir DIR] [--model Qwen/Qwen3-8B] [--split dev] [--rev REV] [--limit N]
       writes OUT/records/ (the finder's), OUT/score/ (the scorecard's) and OUT/bench.json, and prints the table
+  circuit_bench.py score RECORDS_DIR OUT --devset DEVSET [--model M]   the same metrics on records already built (ADAG's,
+      attribution baselines', any finder's): S1 from their own "seconds"
   circuit_bench.py table OUT [OUT ...]   bench.json files side by side (before and after a change, same card)
 """
 from __future__ import annotations
@@ -56,11 +60,13 @@ def metrics(recs: list[dict], finder_recs: dict, n_questions: int) -> dict:
     out = {"questions": n_questions, "finder_records": len(finder_recs), "scored": len(recs)}
     out["S1"] = {"median_s": med(secs), "mean_s": float(np.mean(secs)) if secs else None,
                  "per_card_hour": 3600 / float(np.mean(secs)) if secs else None}
-    q1 = []
+    q1, q1u = [], []
     for r in recs:
         pr = r.get("pair") or {}
-        q1.append(bool(pr.get("valid") and (pr.get("lost") or 0) >= PASS and (pr.get("restored") or 0) >= PASS))
-    out["Q1"] = {"pass_rate": sum(q1) / max(n_questions, 1), "passes": sum(q1),
+        cuts = r.get("cuts") or {}
+        q1.append(bool(pr.get("valid") and cuts and all(x["lost"] >= PASS and x["restored"] >= PASS for x in cuts.values())))
+        q1u.append(bool(pr.get("valid") and (pr.get("lost") or 0) >= PASS and (pr.get("restored") or 0) >= PASS))
+    out["Q1"] = {"pass_rate": sum(q1) / max(n_questions, 1), "passes": sum(q1), "union_pass_rate": sum(q1u) / max(n_questions, 1),
                  "finder_met_rate": sum(bool(r.get("met")) for r in finder_recs.values()) / max(n_questions, 1),
                  "valid_pairs": sum(bool((r.get("pair") or {}).get("valid")) for r in recs)}
     q2 = []
@@ -91,6 +97,7 @@ def table(benches: dict) -> str:
             ("S1 questions a card-hour", lambda b: b["metrics"]["S1"]["per_card_hour"]),
             ("Q1 own-pair pass rate", lambda b: b["metrics"]["Q1"]["pass_rate"]),
             ("   the finder's own met rate", lambda b: b["metrics"]["Q1"]["finder_met_rate"]),
+            ("   all cuts patched together", lambda b: b["metrics"]["Q1"].get("union_pass_rate")),
             ("Q2 unseen-pair pass rate", lambda b: b["metrics"]["Q2"]["pass_rate"]),
             ("   median lost / restored", lambda b: "{} / {}".format(*(f"{v:.3f}" if v is not None else "-" for v in
                                                                          (b["metrics"]["Q2"]["lost_median"], b["metrics"]["Q2"]["restored_median"])))),
@@ -114,10 +121,6 @@ def table(benches: dict) -> str:
 def run(a) -> None:
     sys.path.insert(0, str(HERE))
     sys.path.insert(0, str(HERE.parents[1] / "method" / "oracle"))
-    import torch
-    from transformers import AutoTokenizer
-
-    import neuron_scorecard as ns
     qs = load_devset(a.devset)
     ids = list(qs)[:a.limit or None]
     a.out.mkdir(parents=True, exist_ok=True)
@@ -132,16 +135,28 @@ def run(a) -> None:
     with open(a.out / "finder.log", "a") as log:
         rc = subprocess.run(cmd, env=env, stdout=log, stderr=subprocess.STDOUT, cwd=str(a.finder_dir)).returncode
     finder_seconds = time.time() - t0
+    print(f"finder exit {rc} in {finder_seconds:.0f} s", flush=True)
+    bench = score_records(recs_dir, score_dir, dev, ids, a.model)
+    bench.update(devset=str(a.devset), finder_dir=str(a.finder_dir), finder_rev=a.rev, finder_exit=rc, finder_wall_seconds=finder_seconds)
+    (a.out / "bench.json").write_text(json.dumps(bench, indent=1))
+    print(table({a.out.name: bench}))
+
+
+def score_records(recs_dir: Path, score_dir: Path, dev: dict, ids: list, model: str) -> dict:
+    """The scorecard (lean) on every record in recs_dir whose id is a dev question, and S1 and Q1-Q5 over ids."""
+    import torch
+    from transformers import AutoTokenizer
+
+    import neuron_scorecard as ns
     finder_recs = {}
     for f in sorted(recs_dir.glob("*.json")) if recs_dir.exists() else []:
         r = json.loads(f.read_text())
-        if r.get("id") in qs:
+        if r.get("id") in dev:
             finder_recs[r["id"]] = r
-    print(f"finder exit {rc}: {len(finder_recs)} records of {len(ids)} questions in {finder_seconds:.0f} s", flush=True)
     files = [f for f in sorted(recs_dir.glob("*.json")) if json.loads(f.read_text()).get("id") in finder_recs] if recs_dir.exists() else []
-    score_dir.mkdir(exist_ok=True)
-    tok = AutoTokenizer.from_pretrained(a.model)
-    m = ns.Model(ns.load_model(a.model, None, "cuda" if torch.cuda.is_available() else "cpu", torch.float32))
+    score_dir.mkdir(parents=True, exist_ok=True)
+    tok = AutoTokenizer.from_pretrained(model)
+    m = ns.Model(ns.load_model(model, None, "cuda" if torch.cuda.is_available() else "cpu", torch.float32))
     for f in files:
         c = ns.read_circuit(f)
         if (score_dir / f"{c['name']}.json").exists() or not c["neurons"] and not c["heads"]:
@@ -152,9 +167,18 @@ def run(a) -> None:
     ns.stability(recs)
     for r in recs:
         (score_dir / f"{r['task']}.json").write_text(json.dumps(r))
-    bench = {"devset": str(a.devset), "model": a.model, "finder_dir": str(a.finder_dir), "finder_rev": a.rev, "finder_exit": rc,
-             "gpu": torch.cuda.get_device_name() if torch.cuda.is_available() else "cpu", "finder_wall_seconds": finder_seconds,
-             "metrics": metrics(recs, finder_recs, len(ids))}
+    return {"model": model, "records": str(recs_dir), "gpu": torch.cuda.get_device_name() if torch.cuda.is_available() else "cpu",
+            "metrics": metrics(recs, finder_recs, len(ids))}
+
+
+def score_only(a) -> None:
+    sys.path.insert(0, str(HERE))
+    sys.path.insert(0, str(HERE.parents[1] / "method" / "oracle"))
+    dev = load_devset(a.devset)
+    ids = sorted({json.loads(f.read_text()).get("id") for f in a.records.glob("*.json")} & set(dev))
+    bench = score_records(a.records, a.out / "score", dev, ids, a.model)
+    bench.update(devset=str(a.devset), finder_rev=a.rev)
+    a.out.mkdir(parents=True, exist_ok=True)
     (a.out / "bench.json").write_text(json.dumps(bench, indent=1))
     print(table({a.out.name: bench}))
 
@@ -171,13 +195,19 @@ def main():
     r.add_argument("--rev", default=None, help="the finder version's commit, recorded")
     r.add_argument("--dtype", default=None, help="the finder's --dtype (default: its own auto)")
     r.add_argument("--limit", type=int, default=0)
+    s = sp.add_parser("score")
+    s.add_argument("records", type=Path)
+    s.add_argument("out", type=Path)
+    s.add_argument("--devset", type=Path, required=True)
+    s.add_argument("--model", default="Qwen/Qwen3-8B")
+    s.add_argument("--rev", default=None)
     t = sp.add_parser("table")
     t.add_argument("outs", nargs="+", type=Path)
     a = ap.parse_args()
     if a.cmd == "table":
         print(table({p.name: json.loads((p / "bench.json").read_text()) for p in a.outs}))
         return
-    run(a)
+    (run if a.cmd == "run" else score_only)(a)
 
 
 if __name__ == "__main__":

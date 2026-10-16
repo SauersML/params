@@ -379,6 +379,15 @@ def score(m: Model, tok, c: dict, qs: dict, log=print, lean: bool = False) -> di
     rec["answer_tokens"], rec["alternative_tokens"] = sets["answer"], sets["alternatives"]
     rec["pair"] = {"c_clean": cc, "c_corrupted": cx, "c_noised": cn, "c_denoised": cd, "gap": gap, "valid": pair_ok(sets, b, gap),
                    "lost": (cc - cn) / gap if gap > 0 else None, "restored": (cd - cx) / gap if gap > 0 else None}
+    rec["cuts"] = {}  # each of a finder circuit's cuts alone (its own pass rule: every cut passes alone; one cut, "all", else)
+    src = [(n["layer"], n["pos"], n["neuron"], n.get("pole", 0)) for n in c.get("nodes", []) if n.get("stage") == "source"]
+    parts = {"source": {"neurons": src, "heads": []}, "movers": {"neurons": [], "heads": c["heads"]}} if any(
+        n.get("stage") in ("source", "readout") for n in c.get("nodes", [])) else {"all": c}
+    for name, sub in parts.items():
+        if gap > 0 and (sub["neurons"] or sub["heads"]):
+            l4 = m.logp([(clean, patches(sub, cap_x)), (corr, patches(sub, cap_c))])
+            rec["cuts"][name] = {"lost": (cc - contrast(l4[0], sets)) / gap, "restored": (contrast(l4[1], sets) - cx) / gap,
+                                 "size": len(sub["neurons"]) + len(sub["heads"])}
     g = torch.Generator().manual_seed(zlib.crc32(c["name"].encode()))  # the fair baseline: same layers and positions, random units
     rand = []
     for _ in range(RANDOM_DRAWS if gap > 0 and not lean else 0):

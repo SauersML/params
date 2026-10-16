@@ -8,8 +8,9 @@
 #          same 8 (its configs' settings; per-prompt time from its log) and its multiview clustering (timed)
 #   lane3  the family circuits' questions (FAMILIES, 5 paraphrases each): ADAG's tracer as circuit_finder records with
 #          our measured shares (adag_repo.py trace), our finder on the first 5 timed alike; ADAG cut to our finder's
-#          size on the same pairs (adag_repo.py match, against PAIRS: the family run's pair records); both scored by
-#          neuron_scorecard (necessity, sufficiency, held-out partners, swaps, paraphrase stability, interactions)
+#          size on the same pairs (adag_repo.py match, against PAIRS: the family run's pair records); attribution
+#          baselines at the same size (attr_baselines.py: AtP, RelP, EAP-IG); every set and ours through circuit_bench.py
+#          score (Q1-Q5 by neuron_scorecard), side by side in table.txt
 #   math   its math circuit on 40 sums (18 + 24 first; 32 s a sum on an A40) and its clusters measured
 #   cg     CausalGym under its own faithfulness evaluation (eval.py): NAP on MLP neurons, our measured scores, ENAP
 # Their lib/env_util needs a .env: their template with every value blank (their description step, the keys' only use,
@@ -44,10 +45,16 @@ step fs_${t}_clusters 20 uv run python $P/adag_repo.py clusters $O/fs_$t.pkl $O/
 fi
 if [[ $STEPS == *,lane3,* ]]; then
   RUNS="$RUNS mkdir -p ~/pairs; tar -xzf $PAIRS -C ~/pairs;
+step relpcheck 10 uv run python $P/adag_repo.py relpcheck capital/France/p0 $O/relpcheck.json --model $Q --questions $QS;
 step trace_qwen8 60 uv run python $P/adag_repo.py trace $QS $O/trace_qwen8 --model $Q --families '$FAMILIES' --finder 5 --chunk 10;
 step match 5 uv run python $P/adag_repo.py match $O/trace_qwen8 ~/pairs $O/adag_matched;
-step score_finder 60 uv run python $P/neuron_scorecard.py score ~/pairs --out $O/score_finder --questions $QS --device cuda;
-step score_adag 60 uv run python $P/neuron_scorecard.py score $O/adag_matched --out $O/score_adag_matched --questions $QS --device cuda;
+step baselines 30 uv run python $P/attr_baselines.py ~/pairs $O/baselines --model $Q;
+step bench_finder 40 uv run python $P/circuit_bench.py score ~/pairs $O/bench_finder --devset $QS --model $Q;
+step bench_adag 40 uv run python $P/circuit_bench.py score $O/adag_matched $O/bench_adag --devset $QS --model $Q;
+step bench_atp 40 uv run python $P/circuit_bench.py score $O/baselines/atp $O/bench_atp --devset $QS --model $Q;
+step bench_relp 40 uv run python $P/circuit_bench.py score $O/baselines/relp $O/bench_relp --devset $QS --model $Q;
+step bench_eapig 40 uv run python $P/circuit_bench.py score $O/baselines/eapig $O/bench_eapig --devset $QS --model $Q;
+uv run python $P/circuit_bench.py table $O/bench_finder $O/bench_adag $O/bench_atp $O/bench_relp $O/bench_eapig > $O/table.txt 2>&1;
 "
 fi
 if [[ $STEPS == *,math,* ]]; then

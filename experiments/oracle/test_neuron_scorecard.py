@@ -175,3 +175,30 @@ def test_motif_scores():
     ms = ns.motif_scores(run, recs)
     assert ms["group_pearson_median"] == pytest.approx(1.0) and ms["random_pearson_median"] == pytest.approx(-1.0)
     assert ms["random_scored"] == 1 and ms["sets"][2]["pearson"] is None
+
+
+def test_interactions_additivity_and_backups():
+    import math as _m
+    A, B, C = ("n", (0, 1, 2, 1)), ("n", (1, 1, 3, 1)), ("h", (1, 2, 0))  # A and B redundant (either carries 7 bits), C adds 3
+
+    class Fake:
+        def logp(self, runs):
+            out = []
+            for ids, ps in runs:
+                have = {(p[0], p[1], p[2], p[3]) for p in ps}
+                hit = lambda u: (u[0], *u[1][:3]) in have  # noqa: E731
+                d = 3.0 * hit(C) + 7.0 * (hit(A) and hit(B))
+                c = 10.0 - d if ids == "clean" else d
+                out.append(torch.tensor([c * _m.log(2), 0.0]))
+            return out
+    cap = {"n": torch.zeros(2, 4, 5), "h": torch.zeros(2, 4, 3, 2)}
+    eff = [{"kind": k, "unit": list(u), "drop": 3.0 if k == "h" else 0.0, "gain": 3.0 if k == "h" else 0.0} for k, u in (A, B, C)]
+    base = {"clean": "clean", "corr": "corr", "cap_c": cap, "cap_x": cap, "sets": {"answer": [0], "alternatives": [1]},
+            "cc": 10.0, "cx": 0.0, "gap": 10.0}
+    it = ns.interactions(Fake(), base, eff)
+    nz = it["noising"]
+    assert len(nz["pairs"]) == 3 and nz["interaction_share"] > 0.5  # the redundant pair: 0.7 jointly, 0 summed
+    assert sorted(round(a, 3) for _, _, a, _ in nz["pairs"]) == [0.3, 0.3, 0.7]
+    bk = it["backups"]
+    assert bk["count"] == 1 and bk["cumulative_lost"] == pytest.approx([0.3, 0.3])
+    assert [u["backup"] for u in bk["units"]] == [False, False, True]  # the second of the redundant pair, once the first is gone

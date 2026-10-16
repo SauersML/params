@@ -31,6 +31,14 @@ Families, each a score with its floor (FLOOR):
                the same mechanism counts by how much of the circuit it is (the lead's 10-15: at a median of 14 poles the
                8th hub is noise). Beside it, no floor: stability_hubs, per hub neuron (the HUB neuron poles with the
                largest drop alone) the share of the other paraphrases' circuits holding it, the mean
+Interactions (no floor; the lead's 10-15: they decide how the finder should search and whether edits compose):
+  additivity   per direction, the circuit's TOP_PAIRS units with the largest single effect (noising drop; denoising
+               gain), every pair patched together: the joint share against the sum of the two single shares, the slope
+               and intercept of the fit, its r and the mean |joint - sum| over the mean |sum| (0: additive)
+  backups      the TOP_PAIRS largest single noising drops noised cumulatively in that order; after each step every
+               unit not yet noised is added alone: its marginal drop there against its drop alone; a backup is a unit
+               whose marginal drop beats its drop alone by BACKUP_GROWTH of the gap and is at least twice it (redundancy
+               the single-unit ranking misses)
 Size is measured, never capped (the user, 10-15: the circuit is the smallest set that passes, as large as the behaviour
 needs): neuron poles, heads, edges and build seconds are reported as found. Every circuit also reports its curves: the
 share of the answer's log-odds gap lost (noising its first k units) and restored (denoising its first k units) against
@@ -50,6 +58,8 @@ recomputed (summary()).
 
   neuron_scorecard.py score CIRCUIT [CIRCUIT ...] --out OUT [--questions FILE] [--dtype bfloat16] [--device auto]
       score circuit files (or directories of them) into OUT/<name>.json, OUT/rows.jsonl and the table
+  neuron_scorecard.py interact CIRCUIT [CIRCUIT ...] --out OUT   the interaction family added to circuits already
+      scored into OUT (their single effects reused)
   neuron_scorecard.py table NAME=OUT [NAME=OUT ...]   finders side by side on the questions every set scored
   neuron_scorecard.py motifs VIEWS.json RECORDS_DIR [...] [--out FILE]   the essay's motif score on neuron_motifs views'
       run: per set (a group, or the random set of as many poles beside it) the correlation over its unseen questions
@@ -99,6 +109,9 @@ LOWER = ()  # families whose score passes at or under its floor (none: size is m
 CURVE_ALL = 256  # the curves measure every k up to this many units, a log grid beyond
 POINT = 0.7  # the share whose crossing the tables quote (k70)
 RANDOM_DRAWS = 4  # random circuits of the circuit's size per circuit (the fair baseline)
+TOP_PAIRS = 12  # interactions: the circuit's units with the largest single effect, every pair of them knocked out together
+BACKUP_GROWTH = 0.05  # a backup unit: its drop once earlier top units are noised beats its drop alone by this share of the gap
+# (and is at least twice it)
 PAIRED_SE = 2.0  # goal_eval's: a drawn family passes at its floor less this many standard errors, at most CAP
 CAP: dict = {}  # per family, PAIRED_SE x the median standard error over the first held-out set's circuits (until then uncapped)
 EPS_BOOT = 200
@@ -261,6 +274,58 @@ def curve(m: Model, ids: list[int], ordered: list[tuple], measure) -> dict:
 
 
 @torch.no_grad()
+def interactions(m: Model, base: dict, effects: list[dict]) -> dict:
+    """The interaction family (module docstring) from a scored circuit's single effects. base: clean, corr, cap_c,
+    cap_x, sets, cc, cx, gap."""
+    import itertools
+
+    clean, corr, cap_c, cap_x, sets, cc, cx, gap = (base[k] for k in ("clean", "corr", "cap_c", "cap_x", "sets", "cc", "cx", "gap"))
+
+    def patch(e, cap):
+        u = e["unit"]
+        return (e["kind"], u[0], u[1], u[2], cap[e["kind"]][u[0], u[1], u[2]])
+
+    def lost(lp1):
+        return (cc - contrast(lp1, sets)) / gap
+
+    def restored(lp1):
+        return (contrast(lp1, sets) - cx) / gap
+    out = {}
+    for d, key, run_on, cap, share in (("noising", "drop", clean, cap_x, lost), ("denoising", "gain", corr, cap_c, restored)):
+        top = sorted(effects, key=lambda e: -e[key])[:TOP_PAIRS]
+        pairs = list(itertools.combinations(range(len(top)), 2))
+        if not pairs:
+            out[d] = None
+            continue
+        joint = [share(lp1) for lp1 in m.logp([(run_on, [patch(top[i], cap), patch(top[j], cap)]) for i, j in pairs])]
+        summ = [(top[i][key] + top[j][key]) / gap for i, j in pairs]
+        x, y = np.asarray(summ), np.asarray(joint)
+        slope, icept = (np.polyfit(x, y, 1) if x.std() > 0 else (None, None))
+        out[d] = {"units": [[e["kind"], *e["unit"]] for e in top], "pairs": [[i, j, a, b] for (i, j), a, b in zip(pairs, joint, summ)],
+                  "slope": None if slope is None else float(slope), "intercept": None if icept is None else float(icept),
+                  "r": float(np.corrcoef(x, y)[0, 1]) if x.std() > 0 and y.std() > 0 else None,
+                  "interaction_share": float(np.mean(np.abs(y - x)) / max(np.mean(np.abs(x)), 1e-9))}
+    top = sorted(effects, key=lambda e: -e["drop"])[:TOP_PAIRS]
+    seq, best = [], {i: (-math.inf, None) for i in range(len(top))}
+    for k in range(1, len(top)):
+        done = [patch(e, cap_x) for e in top[:k]]
+        lps = m.logp([(clean, done)] + [(clean, done + [patch(top[i], cap_x)]) for i in range(k, len(top))])
+        c_k = lost(lps[0])
+        seq.append(c_k)
+        for i, lp1 in zip(range(k, len(top)), lps[1:]):
+            mg = lost(lp1) - c_k
+            if mg > best[i][0]:
+                best[i] = (mg, k)
+    units = []
+    for i, e in enumerate(top):
+        alone, (mg, k) = e["drop"] / gap, best[i]
+        grow = mg - alone if k is not None else None
+        units.append({"unit": [e["kind"], *e["unit"]], "alone": alone, "marginal_max": mg if k is not None else None, "after": k,
+                      "growth": grow, "backup": bool(k is not None and grow >= BACKUP_GROWTH and mg >= 2 * max(alone, 0.0))})
+    out["backups"] = {"cumulative_lost": seq, "units": units, "count": sum(u["backup"] for u in units)}
+    return out
+
+
 def score(m: Model, tok, c: dict, qs: dict, log=print) -> dict:
     t0 = time.perf_counter()
     q = qs.get(c.get("id"), {})
@@ -322,6 +387,9 @@ def score(m: Model, tok, c: dict, qs: dict, log=print) -> dict:
     rec["hubs"] = [[u[0], u[2], u[3]] for e, u in sorted(nn, key=lambda t: -t[0])[:HUB]]
     rec["neuron_set"] = sorted({(L, j, s) for L, _, j, s in c["neurons"]})
     rec["group"] = c.get("group")
+    if gap > 0 and pair_ok(sets, b, gap):
+        rec["interactions"] = interactions(m, {"clean": clean, "corr": corr, "cap_c": cap_c, "cap_x": cap_x, "sets": sets, "cc": cc,
+                                               "cx": cx, "gap": gap}, rec["effects"])
     if c.get("expect"):  # a validation case's published units (V1-V3), position-free
         en, eh = [tuple(x) for x in c["expect"].get("neurons", [])], [tuple(x) for x in c["expect"].get("heads", [])]
         have_n, have_h = set(rec["neuron_set"]), {(L, h) for L, _, h in c["heads"]}
@@ -460,6 +528,11 @@ def summary(recs: list[dict]) -> dict:
     for k in ("neurons", "heads"):  # validation cases: the published units found
         out[f"expected_{k}"] = med([(r.get("expected") or {}).get(k) for r in recs])
     out["score_seconds"] = med([r.get("seconds") for r in recs])
+    for d in ("noising", "denoising"):  # interactions (no floor)
+        it = [(r.get("interactions") or {}).get(d) or {} for r in recs]
+        out[f"interact_{d}"] = {k: med([x.get(k) for x in it]) for k in ("slope", "r", "interaction_share")}
+    bk = [((r.get("interactions") or {}).get("backups") or {}).get("count") for r in recs]
+    out["backups"] = {"median": med(bk), "with_any": sum(b is not None and b > 0 for b in bk), "measured": sum(b is not None for b in bk)}
     hub = [float(np.mean([x["share"] for x in r["stability_hubs"]])) if r.get("stability_hubs") else None for r in recs]
     out["stability_hubs"] = {"score": med(hub), "pass": sum(h is not None and h >= FLOOR["stability"] for h in hub),
                              "unscored": sum(h is None for h in hub)}
@@ -490,6 +563,11 @@ def table(sets: dict) -> str:
     row("every family old / noise / uncapped", lambda s: "{pass_old}/{pass_new}/{pass_uncapped}".format(**s["every_family"]))
     row(f"stability_hubs (top {HUB}, no floor) median", lambda s: s["stability_hubs"]["score"])
     row(f"  at least {FLOOR['stability']:g} / unscored", lambda s: "{pass}/{unscored}".format(**s["stability_hubs"]))
+    for d in ("noising", "denoising"):
+        row(f"{d} pairs (top {TOP_PAIRS}): slope joint ~ sum", lambda s, d=d: s[f"interact_{d}"]["slope"])
+        row("  r / mean |joint - sum| share", lambda s, d=d: "{} / {}".format(*(f"{v:.3f}" if v is not None else "-" for v in
+                                                                             (s[f"interact_{d}"]["r"], s[f"interact_{d}"]["interaction_share"]))))
+    row("backup units: median / circuits with any", lambda s: "{} / {}".format(s["backups"]["median"], s["backups"]["with_any"]))
     row("size: neuron poles (as found)", lambda s: s["poles"], "{:.0f}")
     row("size: heads", lambda s: s["heads"], "{:.0f}")
     for k in ("neurons", "positions", "edges"):
@@ -544,7 +622,7 @@ def load(out: Path) -> list[dict]:
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("cmd", choices=("score", "table", "check", "motifs"))
+    ap.add_argument("cmd", choices=("score", "table", "check", "motifs", "interact"))
     ap.add_argument("paths", nargs="+")
     ap.add_argument("--out", type=Path)
     ap.add_argument("--questions", type=Path, default=circuit_questions.OUT)
@@ -593,6 +671,40 @@ def main():
         return
 
     dev = a.device or ("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
+    if a.cmd == "interact":  # the interaction family added to circuits already scored in OUT
+        files = []
+        for p in map(Path, a.paths):
+            files += sorted(x for x in p.glob("*.json")) if p.is_dir() else [p]
+        qs = circuit_questions.load(a.questions) if a.questions.exists() else {}
+        todo = []
+        for f in files:
+            c = read_circuit(f)
+            rp = a.out / f"{c['name']}.json"
+            if rp.exists() and "interactions" not in (r := json.loads(rp.read_text())) and (r.get("pair") or {}).get("valid"):
+                todo.append((c, r, rp))
+        for base_id in sorted({(c["model"], c.get("adapter")) for c, _, _ in todo}):
+            tok = AutoTokenizer.from_pretrained(base_id[0])
+            m = Model(load_model(base_id[0], base_id[1], dev, getattr(torch, a.dtype)))
+            for c, r, rp in [t for t in todo if (t[0]["model"], t[0].get("adapter")) == base_id]:
+                t0 = time.perf_counter()
+                q = qs.get(c.get("id"), {})
+                clean = c.get("clean") or c.get("ids") or circuit_questions.chat(tok, c.get("user") or q["user"])
+                corr = c.get("corrupted") or circuit_questions.chat(tok, c.get("corrupt_user") or q["corrupt_user"])
+                cap_c, cap_x = m.capture(clean), m.capture(corr)
+                lp = m.logp([(clean, []), (corr, [])])
+                sets = word_sets(m, tok, clean, lp[0], int(lp[1].argmax()))
+                cc, cx = contrast(lp[0], sets), contrast(lp[1], sets)
+                r["interactions"] = interactions(m, {"clean": clean, "corr": corr, "cap_c": cap_c, "cap_x": cap_x, "sets": sets,
+                                                     "cc": cc, "cx": cx, "gap": cc - cx}, r["effects"])
+                rp.write_text(json.dumps(r))
+                it = r["interactions"]
+                print(f"{c['name']}: noising slope {it['noising'] and it['noising']['slope']}, denoising slope "
+                      f"{it['denoising'] and it['denoising']['slope']}, backups {it['backups']['count']}, {time.perf_counter() - t0:.1f} s", flush=True)
+            del m
+        recs = load(a.out)
+        (a.out / "summary.json").write_text(json.dumps(summary(recs)))
+        print(table({a.out.name: recs}))
+        return
     files = []
     for p in map(Path, a.paths):
         files += sorted(x for x in p.glob("*.json")) if p.is_dir() else [p]

@@ -330,6 +330,88 @@ def extremes(a) -> None:
     print(f"{L} layers to {a.out}")
 
 
+class GenBatcher:
+    """generate calls from concurrent episodes run as batches (up to ROWS rows, gathered for WAIT seconds): left-padded,
+    rows with the same temperature together, each row on its own item's model (peft's adapter_names; rows of the base
+    model "__base__"), under the tools' lock; each row cut at its own token count and at the end of its turn."""
+
+    ROWS, WAIT = 32, 0.05
+
+    def __init__(self, tools: "Tools"):
+        import queue
+
+        self.tools, self.q, self.mixed = tools, queue.Queue(), True
+        threading.Thread(target=self.loop, daemon=True).start()
+
+    def submit(self, adapter, ids: list[int], n: int, temperature: float, seed: int) -> list[int]:
+        from concurrent.futures import Future
+
+        fut = Future()
+        self.q.put((adapter, list(ids), int(n), float(temperature), int(seed), fut))
+        return fut.result()
+
+    def loop(self) -> None:
+        import queue
+
+        while True:
+            batch = [self.q.get()]
+            end = time.time() + self.WAIT
+            while len(batch) < self.ROWS:
+                try:
+                    batch.append(self.q.get(timeout=max(0.0, end - time.time())))
+                except queue.Empty:
+                    break
+            for t in sorted({b[3] for b in batch}):
+                rows = [b for b in batch if b[3] == t]
+                try:
+                    outs = self.run(rows, t)
+                    for b, o in zip(rows, outs):
+                        b[5].set_result(o)
+                except Exception as e:  # (every waiting call gets the error)
+                    for b in rows:
+                        if not b[5].done():
+                            b[5].set_exception(e)
+
+    def run(self, rows: list, t: float) -> list[list[int]]:
+        tools = self.tools
+        torch, tok, dev = tools.torch, tools.tok, tools.tg.dev
+        T = max(len(r[1]) for r in rows)
+        pad = tok.pad_token_id if tok.pad_token_id is not None else tok.eos_token_id
+        x = torch.tensor([[pad] * (T - len(r[1])) + r[1] for r in rows], device=dev)
+        att = torch.tensor([[0] * (T - len(r[1])) + [1] * len(r[1]) for r in rows], device=dev)
+        n = max(r[2] for r in rows)
+        names = [f"org_{r[0]}" if r[0] else "__base__" for r in rows]
+        kw = dict(max_new_tokens=n, do_sample=bool(t), temperature=t or None, top_p=None, top_k=None, pad_token_id=pad)
+        with tools.lock, torch.no_grad():
+            if t:
+                torch.manual_seed(rows[0][4])
+            if len(set(names)) == 1 or not self.mixed:  # one model's rows a batch (set_adapter)
+                g = [None] * len(rows)
+                for name in dict.fromkeys(names):
+                    idx = [i for i, m in enumerate(names) if m == name]
+                    with (tools.tg.m.disable_adapter() if name == "__base__" else contextlib.nullcontext()):
+                        if name != "__base__":
+                            tools.tg.m.set_adapter(name)
+                        got = tools.tg.m.generate(input_ids=x[idx], attention_mask=att[idx], **kw)[:, T:].tolist()
+                    for i, row in zip(idx, got):
+                        g[i] = row
+            else:
+                try:
+                    g = tools.tg.m.generate(input_ids=x, attention_mask=att, adapter_names=names, **kw)[:, T:].tolist()
+                except (TypeError, ValueError) as e:  # (a peft without mixed-adapter batches: one model a batch from now on)
+                    print(f"mixed-adapter generate failed ({e}); batching by model", flush=True)
+                    self.mixed, g = False, None
+        if g is None:
+            return self.run(rows, t)
+        stops = {tok.eos_token_id, tok.convert_tokens_to_ids("<|im_end|>")}
+        out = []
+        for r, row in zip(rows, g):
+            row = row[:r[2]]
+            cut = next((i + 1 for i, z in enumerate(row) if z in stops), len(row))
+            out.append(row[:cut])
+        return out
+
+
 class Tools:
     """The tools on the target (ao_verify.Target: a Qwen3 model, its released Activation Oracle adapter, the organisms'
     adapters; the model's neuron atlas and explanations when they exist), every forward pass charged to the episode's
@@ -367,6 +449,8 @@ class Tools:
         self.gen_call = False  # a generation charged one pass a call (serve --gen-cost call), else one a token
         self.pass_s = None  # one plain pass's seconds on this card (find_cost)
         self.crefs: dict = {}  # an organism's own control-text predictions (cref_of)
+        self.batcher = None  # GenBatcher: generate calls batched across episodes (serve)
+        self.tlock = threading.RLock()  # the tokenizer, for a generate call outside the model's lock
         self.atlas = None
         if ATLAS:
             import atlas as atlas_mod  # experiments/oracle/atlas.py
@@ -391,6 +475,10 @@ class Tools:
     def ids_of(self, it, text=None, chat=None, prefill=None) -> list[int]:
         """The item's own text (a chat prompt for the organisms), or a text the agent wrote (chat: as a user message;
         prefill: the start of the model's answer after it)."""
+        with self.tlock:
+            return self._ids_of(it, text, chat, prefill)
+
+    def _ids_of(self, it, text=None, chat=None, prefill=None) -> list[int]:
         if text is None:
             if "ids" in it:
                 return list(it["ids"])
@@ -803,11 +891,15 @@ class Tools:
         need = 1 if self.gen_call else n
         if need > left:
             raise Refused(f"generating {n} tokens needs {need} passes and {left} are left")
-        if t:
-            torch.manual_seed(ep["seed"] + ep["passes"])
-        with self.model_of(it), torch.no_grad():
-            g = self.tg.m.generate(input_ids=torch.tensor([ids], device=self.tg.dev), max_new_tokens=n, do_sample=bool(t),
-                                   temperature=t or None, top_p=None, top_k=None, pad_token_id=self.tok.eos_token_id)[0, len(ids):]
+        if self.batcher is not None:  # (batched with other episodes' generations, each row its own model)
+            g = self.batcher.submit(it.get("adapter"), ids, n, t, ep["seed"] + ep["passes"])
+        else:
+            if t:
+                torch.manual_seed(ep["seed"] + ep["passes"])
+            with self.model_of(it), torch.no_grad():
+                g = self.tg.m.generate(input_ids=torch.tensor([ids], device=self.tg.dev), max_new_tokens=n, do_sample=bool(t),
+                                       temperature=t or None, top_p=None, top_k=None, pad_token_id=self.tok.eos_token_id)[0, len(ids):]
+            g = g.tolist()
         cost = 1 if self.gen_call else len(g)
         self.charge(ep, cost)
         return f"{self.tok.decode(g, skip_special_tokens=True)!r} ({cost} passes)"
@@ -1029,7 +1121,7 @@ class Tools:
         if fn is None or name not in TOOL_DOCS:
             return {"error": f"no tool {name!r}", "cost": 0, "left": ep["budget"] - ep["passes"]}
         try:
-            with self.lock:
+            with (contextlib.nullcontext() if name == "generate" and self.batcher is not None else self.lock):
                 out = {"result": fn(ep, it, **(args or {}))}
         except Refused as e:
             out = {"error": str(e)}
@@ -1129,6 +1221,8 @@ def serve(a) -> None:
     items_ = [json.loads(x) for x in a.items.read_text().splitlines()]
     tools = Tools(ao_verify.Target(a.model, a.device), items_, a.model)
     tools.gen_call = a.gen_cost == "call"
+    if a.batch_gen:
+        tools.batcher = GenBatcher(tools)
     info = {"model": a.model, "L": tools.L, "H": tools.H, "I": tools.I, "ao_layers": tools.ao_layers,
             "lens_layers": tools.lens_layers, "atlas": tools.atlas is not None or bool(tools.labels), "gen_call": tools.gen_call}
 
@@ -1796,6 +1890,8 @@ def main():
     s.add_argument("--port", type=int, default=8781)
     s.add_argument("--gen-cost", choices=("token", "call"), default="token", help="a generation's passes: one per token, "
                    "or one per call (a run over the finished sequence; E1's unit)")
+    s.add_argument("--batch-gen", action=argparse.BooleanOptionalAction, default=True, help="generate calls of concurrent "
+                   "episodes batched (GenBatcher)")
     s.add_argument("--device")
     f = sub.add_parser("refs")
     f.add_argument("--model", default=MODEL, choices=sorted(COUNTS))

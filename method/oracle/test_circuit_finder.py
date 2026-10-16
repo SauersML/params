@@ -357,3 +357,18 @@ def test_route_groups(tiny, monkeypatch):
     lo, re = pt.both([cf.head_set(hs, last)])[0]
     assert abs(lo - g0["lost"]) < 1e-5 and abs(re - g0["restored"]) < 1e-5
     assert got["met"] and got["units"] and all(u in singles for u in got["units"])
+
+
+def test_peel_finds_group_testings_large_singles(tiny, monkeypatch):
+    """PEEL: a whole block's top-attribution units alone and the rest halved; a single unit both reach has the same
+    measured shares."""
+    pt, clean, corrupt = tiny
+    pt.setup(clean, corrupt)
+    sc = pt.scores()
+    pos = list(range(pt.first, pt.T))
+    full = cf.group_test(pt, sc, 0.05, {}, kinds=("neuron",), positions=pos)
+    monkeypatch.setattr(cf, "PEEL", 4)
+    peeled = cf.group_test(pt, sc, 0.05, {}, kinds=("neuron",), positions=pos)
+    for u, r in peeled.items():
+        if u in full:
+            assert abs(r[0] - full[u][0]) < 1e-5 and abs(r[1] - full[u][1]) < 1e-5

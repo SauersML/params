@@ -84,6 +84,9 @@ RESIDUAL_MAP = True   # each layer's residual input at each position noised and 
 # it: 1.2 s of a Qwen3-8B bfloat16 question on an A6000)
 UNREACHABLE = True    # a cut whose ceiling fails is group-tested at EPS for the record's singles (it has no units either
 # way: 0.45 s of a Qwen3-8B bfloat16 question, its readout)
+PEEL = 0              # a whole (layer, position) block above eps split into its PEEL units of largest attribution, each
+# alone, and the rest (halved from there); 0: halved (the attribution order then only orders the halves). On Qwen3-8B a
+# single unit cost ~28 measured sets by halving (2 a level, 14 levels), the deep levels at the changed token's position
 BEAM = 32             # conditional rounds by beams of this many blocks (beams), stopping once their singles pass with
 # the round's earlier ones (0: group testing over every block above eps, every single unit reached). Qwen3-8B bfloat16,
 # 8 dev questions (A40): the same circuits, 24,668 -> 23,283 measured runs, 81.4 -> 77.2 s (capital/Italy/p2's
@@ -863,6 +866,8 @@ def group_test(pt: Patcher, sc: dict, eps: float, done: dict, kinds=("neuron",),
                 continue
             if b[4] - b[3] == 1:
                 singles[unit(b[0], b[1], b[2], int(order[b[0]][b[1], b[2], b[3]]))] = (lost, rest)
+            elif PEEL and b[3] == 0 and b[4] > PEEL:  # (a whole block: its PEEL units of largest attribution alone and the
+                nxt += [(b[0], b[1], b[2], k, k + 1) for k in range(PEEL)] + [(b[0], b[1], b[2], PEEL, b[4])]   # rest)
             else:
                 h = (b[3] + b[4]) // 2
                 nxt += [(b[0], b[1], b[2], b[3], h), (b[0], b[1], b[2], h, b[4])]
@@ -887,7 +892,9 @@ def beams(pt: Patcher, sc: dict, eps: float, kinds, positions, measure, enough, 
     while waiting:
         beam, waiting = [b for _, b in waiting[:width]], waiting[width:]
         while beam:                                 # (one beam down to single units)
-            kids = [(b[0], b[1], b[2], lo, hi) for b in beam for lo, hi in ((b[3], (b[3] + b[4]) // 2), ((b[3] + b[4]) // 2, b[4]))]
+            kids = [(b[0], b[1], b[2], lo, hi) for b in beam for lo, hi in
+                    ([(k, k + 1) for k in range(PEEL)] + [(PEEL, b[4])] if PEEL and b[3] == 0 and b[4] > PEEL else
+                     ((b[3], (b[3] + b[4]) // 2), ((b[3] + b[4]) // 2, b[4])))]                # (PEEL as group_test's)
             nxt = []
             for c, r in zip(kids, measure([[unit(c[0], c[1], c[2], order[c[0]][c[1], c[2], c[3]:c[4]])] for c in kids])):
                 if share(r) < eps:

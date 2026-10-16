@@ -10,7 +10,6 @@
 #   RUN=g2f MODE=g2finder QUESTIONS=<circuit questions .json> THR=<reference> [LIMIT=200] bash ...  circuit_finder on the dev split, then g2.py gen --records
 #   RUN=g2e MODE=g2eval G2EVAL=<g2 held-out items> ADAPTER_DIR=<adapter> THR=<reference> bash ...  g2.py eval, vectors and text-only
 #   RUN=g2r MODE=g2rec RECORDS=<circuit records dir> THR=<reference> bash ...              g2.py gen on circuits built elsewhere
-#   RUN=g2a MODE=g2 THR=<neuron_builder reference .pt> TEXTS=2000 [PROCS=2] [NECESSITY_ONLY=1] bash ... [HOURS]  g2.py gen
 #   RUN=oe1 MODE=orgeval ORGS=<organisms dir on the Mac> [ADAPTER_DIR=...] UPLOAD_MB=1500 bash ...  planted truths recovered
 #   (env: SRCREV (default origin/main), GPU, PRICE, CAO_MODEL (default Qwen/Qwen3-1.7B; Qwen/Qwen3-8B wants a 48 GB card))
 cd /Users/user/params
@@ -42,9 +41,6 @@ case $MODE in
   gen) WORK=""; for k in $(seq 1 ${PROCS:-2}); do
          WORK="$WORK (python -u cao.py gen --out $O/examples_$k.jsonl --texts $(( ${TEXTS:-100} / ${PROCS:-2} )) --seed $k > $O/gen_$k.log 2>&1) &"
        done; WORK="$WORK wait; cat $O/examples_*.jsonl > $O/examples.jsonl" ;;
-  g2) WORK=""; for k in $(seq 1 ${PROCS:-2}); do
-         WORK="$WORK (python -u g2.py gen --out $O/g2_$k.jsonl --thr $S/thr.pt --texts $(( ${TEXTS:-100} / ${PROCS:-2} )) --seed $k ${NECESSITY_ONLY:+--necessity-only} > $O/g2_$k.log 2>&1) &"
-       done; WORK="$WORK wait" ;;
   g2finder) WORK="python -u $S/method/oracle/circuit_finder.py questions $S/questions.json $O/circuits --split dev --limit ${LIMIT:-200} --stride ${STRIDE:-2} \
 --model $MODEL --dtype bfloat16 --device cuda > $O/finder.log 2>&1; \
 python -u g2.py gen --out $O/g2.jsonl --thr $S/thr.pt --texts ${LIMIT:-200} --records $O/circuits > $O/g2.log 2>&1" ;;

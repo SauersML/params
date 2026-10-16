@@ -1,28 +1,26 @@
 """The neuron-grounded oracle's examples (#2951 G2; the lead's 10-15 direction, decision 6, and its 8B update). Beside a
-text's half-depth activations (the Activation Oracle's read), the oracle reads the neurons of a question-scoped circuit
-(method/oracle/neuron_builder.py: the answer contrast on the weak-zeroed reference, a unit one neuron's value at one
-position) in measured order: the circuit's units, then the builder's strongest measured singles beyond it; a random
-number of them, log-uniform from MIN_SHOWN up to all, so that how many to show is chosen afterwards by held-out accuracy
-(the lead's 10-15: no fixed cap; eval reports accuracy by the number shown). Three forms of input, one drawn per text
-(FORMS): neurons; named neuron groups (neuron_motifs apply's records: groups shared across texts, "G<id>" everywhere,
+text's half-depth activations (the Activation Oracle's read), the oracle reads the neurons of the text's question-scoped
+circuit (method/oracle/circuit_finder.py's records, the patching pair: a unit is one neuron's value at one position, its
+neurons in measured order by the larger of their lost and restored shares; or neuron_motifs apply's records of them, with
+shared groups). A random number of them is shown, log-uniform from MIN_SHOWN up to all, so that how many to show is
+chosen by held-out accuracy (the lead's 10-15: no fixed cap; eval reports accuracy by the number shown). Three forms of
+input, one drawn per text (FORMS): neurons; named neuron groups (groups shared across texts, "G<id>" everywhere,
 labelled by varteach; a group's write the sum of its members'; for records without groups, a stand-in of one layer and
-position); groups and the neurons of one or two of them. A group's name stands for its members in the oracle's claims. Each shows as its name, "L<layer>.N<neuron>+@<position>" ("-" for the negative pole: claim_check's
-unit syntax), and its write (its value x its down_proj column, cao.Oracle.write). The questions, every answer measured
-by method/oracle/claim_check.py, the oracle's reward checker, so that the claim an answer ends with passes there:
+position); groups and the neurons of one or two of them. A group's name stands for its members in the oracle's claims.
+A neuron shows as its name, "L<layer>.N<neuron>+@<position>" ("-" for the negative pole: claim_check's unit syntax), and
+its write (its value x its down_proj column, cao.Oracle.write). The questions, every answer measured by
+method/oracle/claim_check.py, the oracle's reward checker, so that the claim an answer ends with passes there:
 
-  n_steer  what turning one shown neuron up (STEER x its calibration maximum, along its pole) does to the next token
-  n_zero   what zeroing one shown neuron does
-  n_set    what zeroing two to four shown neurons together does
-  n_sign   whether a shown neuron supports the next token or works against it (its zeroing's sign)
+  n_steer  what turning one shown unit up (STEER x its calibration maximum, along its pole) does to the next token
+  n_zero   what zeroing one shown unit does
+  n_set    what zeroing two to four shown units together does
+  n_sign   whether a shown unit supports the next token or works against it (its zeroing's sign)
 
 An answer is one English sentence and a line "Claim: {units, op, predict}" (the prompt and position are the text's own
 and the answer position); a claim of an effect that random neurons of the same layers also produce is said to be so
-(claim_check's "specific"). Texts: wikitext-103 windows of h2h.T tokens (the answer the model's next token after the
-window); --records: circuits built elsewhere, one JSON file per text with "ids" (neuron_builder's records, or
-circuit_finder's patching-pair records: their neurons ordered by measured share, the clean run's values as writes).
+(claim_check's "specific"). Texts: the records' own (each with "ids"); one record in ten, by id, is held out.
 
-  g2.py gen --out EX.jsonl --thr THR.pt [--texts N] [--seed S] [--split test] [--necessity-only] [--records DIR]
-                                           (records: one in ten held out by id into EX.heldout.jsonl)
+  g2.py gen --out EX.jsonl --thr THR.pt --records DIR [--texts N] [--seed S]   (GPU; held-out records to EX.heldout.jsonl)
   g2.py eval --items EX.jsonl --adapter A --out OUT.jsonl [--text-only]   graded answers; the stated claims checked
 """
 from __future__ import annotations
@@ -38,7 +36,6 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "method" / "oracle"))
 import cao  # noqa: E402
-import h2h  # noqa: E402  (cao puts aoh2h on the path)
 
 STEER = 3.0     # claim_check's steer scale: x the neuron's calibration maximum
 MIN_SHOWN = 4
@@ -54,17 +51,15 @@ def name(d: dict) -> str:
 
 
 def measured_order(rec: dict) -> list[dict]:
-    """A record's neurons in measured order: neuron_builder's (the circuit, then its measured singles) as recorded;
-    circuit_finder's (the patching pair) by the larger of each neuron's lost and restored shares alone."""
-    if "ranked_top" in rec:
-        return list({name(d): d for d in rec["nodes"] + rec["ranked_top"]}.values())
+    """A record's neurons in measured order: circuit_finder's (the patching pair) by the larger of each neuron's lost and
+    restored shares alone."""
     if "nodes" not in rec:  # neuron_motifs apply's records: the groups' members in the groups' measured order, then the rest
         return [d for g in rec.get("groups", []) for d in g["members"]] + rec.get("ungrouped", [])
     return sorted(rec["nodes"], key=lambda d: -max(abs(d.get("lost") or 0), abs(d.get("restored") or 0)))
 
 
 def value(d: dict) -> float:
-    return d["act"] if "act" in d else d["clean"] if "clean" in d else d["value"]  # (the finder and motifs: the clean value)
+    return d["clean"] if "clean" in d else d["value"]  # (the finder and motifs record the clean run's value)
 
 
 def bits(x: float) -> str:
@@ -106,11 +101,8 @@ def loguniform(rng: random.Random, n: int) -> int:
     return round(math.exp(rng.uniform(math.log(lo), math.log(n))))
 
 
-def text_examples(o: "cao.Oracle", nr, ids: list[int], rng: random.Random, rec: dict | None = None) -> tuple[list[dict], dict]:
+def text_examples(o: "cao.Oracle", nr, ids: list[int], rng: random.Random, rec: dict) -> tuple[list[dict], dict]:
     import claim_check as cc
-    import neuron_builder as nb
-    pos = len(ids) - 1
-    rec = rec if rec is not None else nb.build(nr, ids, pos)
     order = measured_order(rec)
     if not order:
         return [], {"size": 0}
@@ -181,31 +173,14 @@ def text_examples(o: "cao.Oracle", nr, ids: list[int], rng: random.Random, rec: 
                  "build_seconds": rec.get("seconds")}
 
 
-def windows(tok, split: str, rng: random.Random):
-    import pandas as pd
-    from huggingface_hub import hf_hub_download
-
-    src = cao.WIKITEXT_TRAIN if split == "train" else h2h.WIKITEXT
-    df = pd.read_parquet(hf_hub_download(src[0], src[1], repo_type="dataset"))
-    paras = [t.strip() for t in df["text"].tolist() if len(t.strip()) > 200 and not t.strip().startswith("=")]
-    rng.shuffle(paras)
-    for t in paras:
-        ids = tok(" " + t, add_special_tokens=False)["input_ids"]
-        if len(ids) >= h2h.T + 8:
-            s = rng.randrange(0, len(ids) - h2h.T)
-            yield ids[s:s + h2h.T]
-
-
 def gen(a) -> None:
     import neuron_builder as nb
-    nb.SUFFICIENCY = nb.SUFFICIENCY and not a.necessity_only
     o = cao.Oracle(None, a.device)
     nr = nb.Neurons(o.m, o.tok)
     nr.load(a.thr)
     rng = random.Random(a.seed)
     done = {json.loads(x)["text"] for x in a.out.read_text().splitlines()} if a.out.exists() else set()
-    src = ((json.loads(f.read_text()) for f in sorted(a.records.glob("*.json"))) if a.records else
-           ({"ids": ids} for ids in windows(o.tok, a.split, rng)))
+    src = (json.loads(f.read_text()) for f in sorted(a.records.glob("*.json")))
     t0 = time.time()
     import zlib
     held = a.out.with_name(a.out.stem + ".heldout.jsonl")  # records: one in ten (by id) held out for evaluation
@@ -216,11 +191,8 @@ def gen(a) -> None:
             key = 1_000_000 * a.seed + n
             if key in done:
                 continue
-            if "ids" not in r:  # (neuron_builder's main records the chat, not its ids)
-                r["ids"] = nb.chat(o.tok, r["user"])
-                assert len(r["ids"]) == r["T"], (r.get("id"), len(r["ids"]), r["T"])
-            exs, info = text_examples(o, nr, r["ids"], rng, r if a.records else None)
-            dst = hh if a.records and zlib.crc32(str(r.get("id", n)).encode()) % 10 == 0 else fh
+            exs, info = text_examples(o, nr, r["ids"], rng, r)
+            dst = hh if zlib.crc32(str(r.get("id", n)).encode()) % 10 == 0 else fh
             for e in exs:
                 dst.write(json.dumps({**e, "text": key, **({"id": r["id"]} if "id" in r else {})}) + "\n")
             dst.flush()
@@ -412,11 +384,8 @@ def main():
     g.add_argument("--thr", type=Path, required=True, help="the weak-zeroed reference (neuron_builder.Neurons.save)")
     g.add_argument("--texts", type=int, default=100)
     g.add_argument("--seed", type=int, default=1)
-    g.add_argument("--split", default="train", choices=("train", "test"), help="wikitext-103's split (test: evaluation texts)")
-    g.add_argument("--records", type=Path, help="circuits built elsewhere: a directory of neuron_builder records with ids")
+    g.add_argument("--records", type=Path, required=True, help="circuit records (circuit_finder's, or neuron_motifs apply's), one JSON file a text")
     g.add_argument("--device")
-    g.add_argument("--necessity-only", action="store_true", help="the builder's necessity set alone (its sufficiency search "
-                                                                  "runs in float64, which MPS lacks)")
     e = sub.add_parser("eval")
     e.add_argument("--items", type=Path, required=True, help="gen --split test's examples")
     e.add_argument("--thr", type=Path, help="required for legacy weak-zeroed G2 evaluation")

@@ -64,6 +64,9 @@ PASS = 0.7            # the spec's share for necessity (lost) and sufficiency (r
 EPS = 0.02            # a block is split when its larger |share| reaches this share of the gap
 EPS_STEP = 4.0
 EPS_ROUNDS = 3
+CONDITIONAL = True    # after a round with no passing prefix, group testing again at the same eps with every block measured
+# beside the singles found (what it adds to them); eps falls only when that finds none (the global eps/4 round took 33 min
+# on Qwen3-8B capital/Egypt/p1 and 40+ min on an owl pair's source cut)
 TARGETED = False      # refine only the first level's blocks that hold the missing share (the smallest prefix of them, in
 # measured order, that patched whole beside the singles found passes), not every block at EPS / EPS_STEP. Off: on
 # Qwen3-1.7B capital/France p0 and p1 the source cut came out unmet (87 and 49 singles in 3 blocks refined twice), met
@@ -603,15 +606,32 @@ def cut(pt: Patcher, sc: dict, kind: str, positions, done: dict, log=None, searc
             mid = (lo + hi) // 2
             lo, hi = (lo, mid) if passes(pt.both([sets_of(mid)])[0]) else (mid, hi)
         return hi, g, got
+    order, cond, cond_next = [], [], False
     for rnd in range(EPS_ROUNDS if reach else 1):
-        singles.update(group_test(pt, sc, eps, done, kinds=(kind,), positions=search, blocks=blocks, log=log))
-        order = sorted(singles, key=lambda u: -max(abs(singles[u][0]), abs(singles[u][1])))
+        if rnd == 0 or not CONDITIONAL or not cond_next:
+            singles.update(group_test(pt, sc, eps, done, kinds=(kind,), positions=search, blocks=blocks, log=log))
+            order = sorted([u for u in singles if u not in cond], key=lambda u: -max(abs(singles[u][0]), abs(singles[u][1]))) + cond
+        else:                                       # conditional: every block measured beside the singles found so far,
+            base = pt.both([order])[0]              # its share what it adds to their joint shares (units that matter only
+                                                    # together with others: AND-like denoising, OR-like noising)
+            def beside(sets, have=list(order), base=base):
+                return [(a - base[0], b - base[1]) for a, b in pt.both([have + st for st in sets])]
+            new = group_test(pt, sc, eps, {}, kinds=(kind,), positions=search, measure=beside, log=log)
+            new = sorted([u for u in new if u not in singles], key=lambda u: -max(abs(new[u][0]), abs(new[u][1])))
+            for u in new:
+                singles[u] = None                   # (its share alone: measured below)
+            cond += new
+            order = order + new
         ok, ks, curve = smallest(len(order), lambda k: order[:k])
         if log:
             log(f"  {kind}s at {positions[0]}..{positions[-1]} (searched {len(search)}), eps {eps:.4f}: {len(order)} single "
                 f"units, passing prefix {ok}, every one there {ceiling[0]:.2f}/{ceiling[1]:.2f}")
         if ok or not reach or rnd == EPS_ROUNDS - 1:
             break
+        if CONDITIONAL and (rnd == 0 or cond_next):  # next: conditional group testing at the same eps
+            cond_next = rnd == 0 or bool(cond)
+            if cond_next:
+                continue
         if not TARGETED:                            # EPS falls and group testing runs again over every block
             eps /= EPS_STEP
             continue
@@ -624,6 +644,9 @@ def cut(pt: Patcher, sc: dict, kind: str, positions, done: dict, log=None, searc
             break
         blocks, eps = first[:j], eps / EPS_STEP
         refined.append(j)
+    alone = [u for u in singles if singles[u] is None]      # conditional singles' shares alone, for the record
+    for u, r in zip(alone, pt.both([[u] for u in alone])):
+        singles[u] = r
     circ = order[:ok] if ok else list(order)
     if ok and len(circ) > 1:                        # units whose removal alone still passes, then removed one at a time
         alone = pt.both([[v for v in circ if v != u] for u in circ])           # from the least effective while it passes
@@ -635,6 +658,7 @@ def cut(pt: Patcher, sc: dict, kind: str, positions, done: dict, log=None, searc
     lost, rest = pt.both([circ])[0] if circ else (0.0, 0.0)
     return {"units": circ, "singles": singles, "met": bool(ok) and lost >= PASS and rest >= PASS, "lost": lost, "restored": rest,
             "eps": eps, "found": len(singles), "ceiling": list(ceiling), "reachable": reach, "refined": refined,
+            "conditional": len(cond),
             "searched": search,
             "curve": [{"k": k, "lost": a, "restored": b} for k, (a, b) in zip(ks, curve)]}
 
@@ -711,7 +735,7 @@ def find(pt: Patcher, clean: list[int], corrupt: list[int], answers: list[int] |
     rec["singles"] = {k: [single(u, c["singles"][u]) for u in sorted(c["singles"], key=lambda u: -max(map(abs, c["singles"][u])))
                           [:SINGLES_KEPT]] for k, c in cuts.items()}
     rec.update(nodes=nodes, routes=routes, met=all(c["met"] for k, c in cuts.items() if k != "readout" or c["reachable"]),
-               cuts={k: {f: c[f] for f in ("met", "lost", "restored", "eps", "found", "ceiling", "reachable", "curve", "refined",
+               cuts={k: {f: c[f] for f in ("met", "lost", "restored", "eps", "found", "ceiling", "reachable", "curve", "refined", "conditional",
                                            "searched")}
                      | {"size": len(c["units"])} for k, c in cuts.items()},
                size=len(nodes), seconds=round(time.perf_counter() - t0, 2))

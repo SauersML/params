@@ -9,7 +9,8 @@
 #   RUN=org1 MODE=organisms bash ... [HOURS]                                                  organisms.py all (planted truths)
 #   RUN=g2f MODE=g2finder QUESTIONS=<circuit questions .json> THR=<reference> [LIMIT=200] bash ...  circuit_finder on the dev split, then g2.py gen --records
 #   RUN=g2e MODE=g2eval G2EVAL=<g2 held-out items> ADAPTER_DIR=<adapter> THR=<reference> bash ...  g2.py eval, vectors and text-only
-#   RUN=e1a MODE=e1eval E1=<dir with behavior_e1.json and adapters/> [ADAPTER_DIR=<oracle>] bash ...  E1 graded (default: the released AO)
+#   RUN=e1a MODE=e1eval E1=<dir with behavior_e1.json and adapters/> [ADAPTER_DIR=<oracle>] [ANSWERS=1] bash ...  E1 graded (default:
+#       the released AO); ANSWERS: the organisms' own answers too, for e1.py reader
 #   RUN=g2r MODE=g2rec RECORDS=<circuit records dir> THR=<reference> bash ...              g2.py gen on circuits built elsewhere
 #   RUN=oe1 MODE=orgeval ORGS=<organisms dir on the Mac> [ADAPTER_DIR=...] UPLOAD_MB=1500 bash ...  planted truths recovered
 #   (env: SRCREV (default origin/main), GPU, PRICE, CAO_MODEL (default Qwen/Qwen3-1.7B; Qwen/Qwen3-8B wants a 48 GB card))
@@ -49,7 +50,8 @@ python -u g2.py gen --out $O/g2.jsonl --thr $S/thr.pt --texts ${LIMIT:-200} --re
   g2eval) WORK="python -u g2.py eval --items $S/g2eval.jsonl --thr $S/thr.pt --adapter $S/adapter --out $O/g2_eval.jsonl > $O/g2_eval.log 2>&1; \
 python -u g2.py eval --items $S/g2eval.jsonl --thr $S/thr.pt --adapter $S/adapter --out $O/g2_eval_text_only.jsonl --text-only > $O/g2_eval_text_only.log 2>&1" ;;
   e1eval) AD=${ADAPTER_DIR:+$S/adapter}; AD=${AD:-$AOAD}
-        WORK="python -u e1.py eval --dir $S/e1/behavior_e1.json --adapter $AD --out $O/e1.jsonl > $O/e1.log 2>&1; \
+        WORK="${ANSWERS:+python -u e1.py answers --dir $S/e1/behavior_e1.json --out $O/e1_answers.jsonl > $O/e1_answers.log 2>&1;} \
+python -u e1.py eval --dir $S/e1/behavior_e1.json --adapter $AD --out $O/e1.jsonl > $O/e1.log 2>&1; \
 ${ADAPTER_DIR:+python -u e1.py eval --dir $S/e1/behavior_e1.json --adapter $AD --out $O/e1_text_only.jsonl --text-only > $O/e1_text_only.log 2>&1;} true" ;;
   g2rec) WORK="python -u g2.py gen --out $O/g2.jsonl --thr $S/thr.pt --texts 100000 --records $S/records > $O/g2.log 2>&1" ;;
   inference) WORK="python -u inference.py build --out $O/inference_items.jsonl --per ${PER:-150} > $O/inference.log 2>&1" ;;

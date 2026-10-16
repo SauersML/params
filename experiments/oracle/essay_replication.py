@@ -104,7 +104,8 @@ ATTENTION = {
 RUSSIAN = {"neuron": (1, 20736), "contexts": [
     {"text": "3. The book of Colossians is an epistle", "token": "ians", "gate": -1.2, "up": -3.5, "value": 1.0},
     {"text": "Speak russian in that case", "token": " russian", "gate": 4.4, "up": -2.9, "value": -12.5},
-    {"text": "www.un.org/russian", "token": "russian", "gate": 1.0, "up": -1.0, "value": -20.6}]}  # (gate open: its sign only)
+    {"text": "www.un.org/russian", "token": "ussian", "gate": 1.0, "up": -1.0, "value": -20.6}]}  # (gate open: its sign only;
+# Qwen3 splits "/russian" into "/r" + "ussian")
 MIYAZAKI = {
     "target": (4, 8476),
     "into": [((3, 12478), -1, 6.7058), ((1, 15229), -1, 4.4238), ((0, 13886), -1, 3.3186), ((3, 15141), 1, 3.1543),
@@ -127,8 +128,12 @@ def unit(s: str) -> tuple:
 
 
 def find(tok, ids: list[int], piece: str, before: int | None = None) -> int:
-    """The last position (before `before`) whose token decodes to piece."""
+    """The last position (before `before`) whose token decodes to piece; failing that, the last position where the
+    text so far ends with piece (a word the tokenizer splits: its last token)."""
     hits = [i for i, z in enumerate(ids[:before]) if tok.decode([z]) == piece]
+    if not hits:
+        hits = [i for i in range(len(ids[:before])) if tok.decode(ids[:i + 1]).endswith(piece.strip())
+                and not tok.decode(ids[:i]).endswith(piece.strip())]
     if not hits:
         raise ValueError(f"no token {piece!r} in the prompt")
     return hits[-1]

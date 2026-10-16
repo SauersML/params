@@ -18,6 +18,7 @@ union (additivity); the top stage-1 hits alone (--assoc: assoc.py's summary.json
   screen.py design OUT.jsonl --results R.jsonl ... [--focus T ...] [--top 8] [--floor 0.05] [--share 0.25]
                                                               the next level: large frontier sets split in halves
   screen.py design OUT.jsonl --assoc SUMMARY.json [--focus T ...] [--top 20]   stage 1's top hits as single poles
+  screen.py design OUT.jsonl --random N                       N random single poles (the singles' null)
   screen.py runsets PHENOME DESIGN.jsonl OUT.jsonl --thr T2.pt [--shard k/K]   a design's sets run on the panel
 The pilot (16 random sets per size, 86 traits, 8 prompts each): reruns are exact (0.0), so a set's change is its own
 joint effect, not noise; the spread across random sets grows from 0.07 bits (16 poles) to 0.55 (4,096); two sets of 256
@@ -223,6 +224,13 @@ def design(a) -> None:
         poles = [(l_, n, pl) for l_ in range(a.layers) for n in range(a.neurons) for pl in (1, -1)]
         rng.shuffle(poles)
         out = [{"id": f"L0/{g}", "units": poles[i:i + a.group]} for g, i in enumerate(range(0, len(poles), a.group))]
+    elif a.random:
+        seen = set()
+        while len(out) < a.random:
+            u = (rng.randrange(a.layers), rng.randrange(a.neurons), rng.choice((1, -1)))
+            if u not in seen:
+                seen.add(u)
+                out.append({"id": f"R/{u[0]}.{u[1]}{'+' if u[2] > 0 else '-'}", "units": [list(u)]})
     elif a.assoc:
         summ = json.loads(a.assoc.read_text())
         seen = set()
@@ -289,6 +297,7 @@ def main():
     d.add_argument("--group", type=int, default=1024)
     d.add_argument("--results", type=Path, nargs="*", default=[])
     d.add_argument("--assoc", type=Path)
+    d.add_argument("--random", type=int, help="this many random single poles (the singles' null)")
     d.add_argument("--focus", nargs="*")
     d.add_argument("--top", type=int, default=8)
     d.add_argument("--floor", type=float, default=0.05)

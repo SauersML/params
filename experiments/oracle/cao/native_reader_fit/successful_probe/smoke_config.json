@@ -1,0 +1,31 @@
+{
+  "model": "/Users/user/.cache/huggingface/hub/models--mlx-community--Qwen3.6-35B-A3B-4bit/snapshots/38740b847e4cb78f352aba30aa41c76e08e6eb46",
+  "train": true,
+  "fine_tune_type": "lora",
+  "data": "/Users/user/mpd-data/scratch/native_next_experiment/native_reader_fit_v1/last_attention_fit_v2",
+  "seed": 7281,
+  "num_layers": 1,
+  "batch_size": 1,
+  "iters": 2,
+  "val_batches": 1,
+  "learning_rate": 0.0001,
+  "steps_per_report": 1,
+  "steps_per_eval": 2,
+  "save_every": 2,
+  "max_seq_length": 6144,
+  "grad_checkpoint": true,
+  "grad_accumulation_steps": 1,
+  "mask_prompt": true,
+  "adapter_path": "/Users/user/mpd-data/scratch/native_next_experiment/native_reader_fit_v1/last_attention_fit_v2/adapters",
+  "report_to": null,
+  "lora_parameters": {
+    "rank": 8,
+    "scale": 16.0,
+    "dropout": 0.0,
+    "keys": [
+      "self_attn.q_proj",
+      "self_attn.v_proj",
+      "self_attn.o_proj"
+    ]
+  }
+}

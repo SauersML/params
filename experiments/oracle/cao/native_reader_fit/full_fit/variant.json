@@ -1,0 +1,20 @@
+{
+  "variant": "80-step fresh-base final-attention-only LoRA after successful bounded v2 probe",
+  "num_hidden_layers": 40,
+  "full_attention_interval": 4,
+  "trainable_layer_zero_based": 39,
+  "num_layers": 1,
+  "prior_dataset_provenance_sha256": "f9fee756bd1f3d0436307102b047142a6a6115bc776fbdf658d9235cfefe6916",
+  "config_sha256": "6686f7abf5efefce81040654d37b2335ed70b2ec88b0208bcd612ce600831fbd",
+  "source_data_sha256": {
+    "train": "60a6dac4b3284f7c2671d17a3a28738e7d3cd2f5f262a5e80434a5c60570570c",
+    "valid": "442aaf494870520d2de255153f7504fe46f4faef41d6658faacffde6b50a0f88"
+  },
+  "compile_disabled": true,
+  "preupdate_parity_tolerance_nats": 1e-05,
+  "prefix_mode_strategy": "Only frozen GatedDeltaNet._set_training_mode(False); no recursive eval",
+  "steps": 80,
+  "smoke_source": "/Users/user/mpd-data/scratch/native_next_experiment/native_reader_fit_v1/last_attention_fit_v2",
+  "same_data_ridge_sha256": "b0652e1022c17bb9c1dff06ba038bf850458d57fc10137cfdae5df8ba68b0b3f",
+  "scope": "24TRAIN resubstitution and eight exposed DEV cases; no unseen generalization claim"
+}

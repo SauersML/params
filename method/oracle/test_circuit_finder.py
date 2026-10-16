@@ -79,6 +79,9 @@ def test_find_record(tiny, monkeypatch):
         if c["met"]:
             assert c["lost"] >= cf.PASS and c["restored"] >= cf.PASS
     assert rec["met"] == all(c["met"] for k, c in rec["cuts"].items() if k != "readout" or c["reachable"])
+    for k, ss in rec["singles"].items():           # each cut's measured singles, largest first, the circuit's among them
+        big = [max(abs(x["lost"]), abs(x["restored"])) for x in ss]
+        assert big == sorted(big, reverse=True) and len(ss) <= cf.SINGLES_KEPT
     rm = rec["residual_map"]
     assert len(rm["lost"]) == len(rm["restored"]) == pt.L and all(len(r) == len(rm["positions"]) for r in rm["lost"])
     if "source" in rec["cuts"]:

@@ -35,7 +35,7 @@ Search (every decision a measured run; gradients only order):
     capital/France's readout reached 0.41/0.70 with 5,469 neurons), and the circuit passes on its other cuts. Curves
     are measured at every size to 16 and eight sizes per doubling after, the passing size found by bisection;
  4. reported: the neurons with their stage, poles, regimes and measured shares alone, the movers, each cut's curve and
-    size, the residual map, seconds.
+    size, each cut's SINGLES_KEPT largest single units in measured order ("singles"), the residual map, seconds.
 Engine (Patcher.run): a batch runs only the positions from the first it patches and the layers from the lowest, from the
 two runs' own keys, values and residuals (no weak zeroing here, so this equals the full run to float error); a set's
 noising and denoising share a batch; rows per batch grow as positions shrink, bounded by free memory.
@@ -69,6 +69,8 @@ TARGETED = False      # refine only the first level's blocks that hold the missi
 # with 6 neurons when every block is refined
 ROWS = 32
 ATTENDS = 3           # source positions recorded per head
+SINGLES_KEPT = 256    # each cut's measured single units written to the record, largest |share| first (the record's size:
+# an 8B organism's readout found 265,588; the oracle reads units in measured order past the circuit)
 ORDER = "relp"        # the gradient group testing orders units by: "grad", the model's own; "relp", RelP's (the norms'
 # 1/rms, SiLU and every attention pattern held as constants, half the gradient through each factor of gate x up; ADAG,
 # arXiv 2604.07615). Either only orders: every keep or drop is a measured run. Qwen3-8B bfloat16, 8 dev questions (A6000):
@@ -629,6 +631,15 @@ def find(pt: Patcher, clean: list[int], corrupt: list[int], answers: list[int] |
         lo, re = cuts["movers"]["singles"][u]
         routes.append({"layer": i, "head": h, "pos": p, "attends": pt.attends(i, h, p), "lost": lo, "restored": re,
                        "through_source": list(through[u]) if u in through else None})
+    def single(u, sh):                              # a measured single unit, as a node or a route
+        if u[0] == "head":
+            return {"layer": u[1], "head": u[2], "pos": u[3], "lost": sh[0], "restored": sh[1]}
+        _, i, p, n = u
+        v, w = float(pt.act["clean"]["neu"][i][p, n]), float(pt.act["clean"]["up"][i][p, n])
+        return {"layer": i, "pos": p, "neuron": n, "pole": 1 if v > 0 else -1, "regime": [1 if v * w > 0 else -1, 1 if w > 0 else -1],
+                "lost": sh[0], "restored": sh[1]}
+    rec["singles"] = {k: [single(u, c["singles"][u]) for u in sorted(c["singles"], key=lambda u: -max(map(abs, c["singles"][u])))
+                          [:SINGLES_KEPT]] for k, c in cuts.items()}
     rec.update(nodes=nodes, routes=routes, met=all(c["met"] for k, c in cuts.items() if k != "readout" or c["reachable"]),
                cuts={k: {f: c[f] for f in ("met", "lost", "restored", "eps", "found", "ceiling", "reachable", "curve", "refined",
                                            "searched")}

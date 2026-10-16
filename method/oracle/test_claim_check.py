@@ -148,3 +148,15 @@ def test_position_scoped_names_parse_print_and_control_at_their_position():
     us = [("N", 1, 5, 1, 7), ("N", 1, 9, 1, None), ("H", 0, 2, 0, 3)]
     for s in cc.control_sets(nr, us, 2, "y"):
         assert sorted((k, l, p, at if at is not None else -1) for k, l, _, p, at in s) == sorted((k, l, p, at if at is not None else -1) for k, l, _, p, at in us)
+
+
+def test_a_knockout_set_is_row_edits_zero_in_every_row(tiny):
+    nr, ids = tiny
+    us = cc.units_of(nr, ["L0.N3+", "L0.N3-", "L1.N7-", "L1.N9", "L1.H2"], len(ids))
+    x = torch.tensor([ids] * 3)
+    with torch.no_grad():
+        e1, r1 = cc.row_edit(nr, [{"units": us, "op": "zero"}] * 3)
+        e2, r2 = cc.knockout_edit(nr, us)
+        a = nr.logits(x, list(range(len(ids))), edit=e1, route=r1)
+        b = nr.logits(x, list(range(len(ids))), edit=e2, route=r2)
+    assert torch.allclose(a, b, atol=1e-6)

@@ -133,6 +133,44 @@ def control_sets(nr: nb.Neurons, us: list[tuple], n: int, seed: str) -> list[lis
     return out
 
 
+def knockout_edit(nr: nb.Neurons, us: list[tuple]):
+    """edit (neuron values) and route (head outputs) zeroing one set of units in every row of a batch: the zero of
+    row_edit, vectorized for sets of thousands of poles (the PheWAS screen's knockouts; one index per layer). us as
+    units_of returns them, every position from 1 on; a neuron named with both poles is zeroed whole."""
+    poles: dict = {}
+    heads: dict = {}
+    for kind, layer, i, pole, at in us:
+        if at is not None:
+            raise BadClaim("a knockout set acts at every position (no @position)")
+        if kind == "H":
+            heads.setdefault(layer, set()).add(i)
+        else:
+            d = poles.setdefault(layer, {})
+            d[i] = pole if d.get(i, pole) == pole else 0
+    nidx = {l_: (torch.tensor(sorted(d)), torch.tensor([d[i] for i in sorted(d)])) for l_, d in poles.items()}
+
+    def edit(i, h):
+        if i not in nidx:
+            return h
+        n, pole = (t.to(h.device) for t in nidx[i])
+        v = h[:, 1:, n]  # [B, T - 1, K]
+        hit = ((pole > 0) & (v > 0)) | ((pole < 0) & (v < 0)) | ((pole == 0) & (v != 0))
+        hit &= v.abs() < nr.massive[i].to(v.device, v.dtype)
+        h = h.clone()
+        h[:, 1:, n] = v.masked_fill(hit, 0)
+        return h
+
+    def route(i, a):
+        if i not in heads:
+            return a
+        a = a.clone()
+        for hh in heads[i]:
+            a[:, 1:, hh * nr.hd:(hh + 1) * nr.hd] = 0
+        return a
+
+    return edit, route
+
+
 def row_edit(nr: nb.Neurons, rows: list[dict]):
     """edit and route over a batch: rows[b] = {"units": [...], "op": "zero" | ("steer", scale) | ("patch", src, pairs)}
     (empty: the reference row); src = the source run's captured values {"h": [L x [T, D]], "o": [L x [T, NH x hd]]}."""

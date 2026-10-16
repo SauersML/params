@@ -188,3 +188,45 @@ def test_given_equals_joined_sets(tiny, monkeypatch):
         c = pt.run("corrupt", sets, given=given)
         for x, y, z in zip(a, b, c):
             assert abs(x[0] - y[0]) < 1e-5 and abs(x[1] - y[1]) < 1e-5 and abs(x[1] - z) < 1e-5
+
+
+def test_explicit_token_contrast_matches_direct_model_no_word_forwards(tiny,monkeypatch):
+    import math
+    pt,clean,corrupt=tiny
+    sets={'answer':[0,2], 'alternatives':[4,7]}
+    rows=[];hook=pt.core.model.register_forward_pre_hook(lambda m,args,kwargs:rows.append(kwargs['input_ids'].shape[0]),with_kwargs=True)
+    monkeypatch.setattr(cf.answer_contrast,'token_sets',lambda *a,**k:(_ for _ in ()).throw(AssertionError('must not group words')))
+    try:
+        record=pt.setup(clean,corrupt,explicit_sets=sets)
+        assert rows==[pt.rows,pt.rows]
+        assert record['kind']=='explicit_tokens' and record['answer_word'] is None and record['alternative_words']==[]
+        assert record['answer_tokens']==sets['answer'] and record['alternatives']==sets['alternatives']
+        with torch.no_grad():
+            for side,ids in [('clean',clean),('corrupt',corrupt)]:
+                lp=pt.core(input_ids=torch.tensor([ids]).expand(pt.rows,-1),logits_to_keep=1).logits[0,-1].float().log_softmax(-1)
+                expected=(torch.logsumexp(lp[sets['answer']],0)-torch.logsumexp(lp[sets['alternatives']],0))/math.log(2)
+                assert abs(record['contrast'][side]-expected.item())<1e-6
+        sets['answer'].append(3)
+        assert pt.sets['answer']==[0,2] # caller mutation cannot change contrast
+    finally:hook.remove()
+
+
+@pytest.mark.parametrize('sets',[
+    {},{'answer':[1]}, {'answer':[1],'alternatives':[2],'extra':[]},
+    {'answer':[],'alternatives':[2]}, {'answer':[1],'alternatives':[]},
+    {'answer':[1,1],'alternatives':[2]}, {'answer':[1],'alternatives':[2,2]},
+    {'answer':[1],'alternatives':[1]}, {'answer':[-1],'alternatives':[2]},
+    {'answer':[99999],'alternatives':[2]}, {'answer':[True],'alternatives':[2]},
+    {'answer':[1.0],'alternatives':[2]}, {'answer':'1','alternatives':[2]},
+])
+def test_explicit_token_sets_invalid_before_any_forward(tiny,sets,monkeypatch):
+    pt,clean,corrupt=tiny
+    monkeypatch.setattr(pt,'_last',lambda *a,**k:(_ for _ in ()).throw(AssertionError('unexpected forward')))
+    with pytest.raises(ValueError,match='explicit_sets'):pt.setup(clean,corrupt,explicit_sets=sets)
+
+
+def test_explicit_sets_cannot_mix_word_hint(tiny,monkeypatch):
+    pt,clean,corrupt=tiny
+    monkeypatch.setattr(pt,'_last',lambda *a,**k:(_ for _ in ()).throw(AssertionError('unexpected forward')))
+    with pytest.raises(ValueError,match='mutually exclusive'):
+        pt.setup(clean,corrupt,answers=[1],explicit_sets={'answer':[1],'alternatives':[2]})

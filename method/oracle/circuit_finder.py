@@ -260,11 +260,31 @@ class Patcher:
 
     @torch.no_grad()
     def setup(self, clean: list[int], corrupt: list[int], answers: list[int] | None = None,
-              candidate_batch_size: int | None = None) -> dict:
+              candidate_batch_size: int | None = None, explicit_sets: dict | None = None) -> dict:
         """Both runs' activations, the answer (the clean top token, or the likeliest of answers: a secret word's tokens),
-        the alternatives and both contrasts (at the fixed batch size)."""
+        the alternatives and both contrasts (at the fixed batch size).
+        explicit_sets={"answer": [...], "alternatives": [...]} instead uses
+        exactly those disjoint token sets, with no word grouping/continuations.
+        IDs are validated before any forward; metadata never invents word labels.
+        """
         if candidate_batch_size is not None and (type(candidate_batch_size) is not int or candidate_batch_size <= 0):
             raise ValueError('candidate_batch_size must be a positive integer or None')
+        token_sets = None
+        if explicit_sets is not None:
+            if answers is not None:
+                raise ValueError('explicit_sets and word-answer hints are mutually exclusive')
+            if not isinstance(explicit_sets, dict) or set(explicit_sets) != {'answer', 'alternatives'}:
+                raise ValueError('explicit_sets requires exactly answer and alternatives')
+            token_sets = {}
+            for key in ('answer', 'alternatives'):
+                ids = explicit_sets[key]
+                if (not isinstance(ids, (list, tuple)) or not ids or
+                        any(type(z) is not int or not 0 <= z < self.core.config.vocab_size for z in ids) or
+                        len(set(ids)) != len(ids)):
+                    raise ValueError('explicit_sets requires nonempty unique in-range integer token IDs')
+                token_sets[key] = list(ids)
+            if set(token_sets['answer']) & set(token_sets['alternatives']):
+                raise ValueError('explicit_sets answer and alternatives must be disjoint')
         assert len(clean) == len(corrupt), "a patching pair needs prompts of the same length"
         self.ids = {"clean": list(clean), "corrupt": list(corrupt)}
         self._ids_dev = {k: torch.tensor(v, device=self.dev) for k, v in self.ids.items()}
@@ -283,11 +303,15 @@ class Patcher:
             self._kv_st = [tuple(torch.cat([self._base_kv[k][i][j] for k in ("clean", "corrupt")]) for j in (0, 1))
                            for i in range(self.L)]
         yc = int(lp["corrupt"].argmax())
-        word = None
-        if answers:                                 # a secret word: its likeliest token's word
-            word = answer_contrast.word(self.tok.decode([max(answers, key=lambda z: float(lp["clean"][z]))]))
-        batch_options = {} if candidate_batch_size is None else {"candidate_batch_size": candidate_batch_size}
-        self.sets = answer_contrast.token_sets(self.core, self.tok, self.ids["clean"], lp["clean"], yc, word, **batch_options)
+        if token_sets is None:
+            word = None
+            if answers:                             # a secret word: its likeliest token's word
+                word = answer_contrast.word(self.tok.decode([max(answers, key=lambda z: float(lp["clean"][z]))]))
+            batch_options = {} if candidate_batch_size is None else {"candidate_batch_size": candidate_batch_size}
+            self.sets = answer_contrast.token_sets(self.core, self.tok, self.ids["clean"], lp["clean"], yc, word, **batch_options)
+        else:
+            self.sets = {**token_sets, "kind": "explicit_tokens", "valid": True,
+                         "answer_word": None, "alternative_words": []}
         self._sets_dev = None
         self.y = self.sets["answer"][0]
         valid = self.sets.get("valid", True)
@@ -295,7 +319,8 @@ class Patcher:
         self.gap = self.c["clean"] - self.c["corrupt"]
         return {"answer": self.y, "corrupt_answer": yc, "answer_tokens": self.sets["answer"], "alternatives": self.sets["alternatives"],
                 "answer_word": self.sets["answer_word"], "alternative_words": self.sets["alternative_words"], "valid": valid,
-                "same_answer": yc in self.sets["answer"], "contrast": self.c, "gap": self.gap, "first_diff": self.first}
+                "same_answer": yc in self.sets["answer"], "contrast": self.c, "gap": self.gap, "first_diff": self.first,
+                **({"kind": "explicit_tokens"} if token_sets is not None else {})}
 
     def _fit(self, S: int) -> int:
         """The most rows a batch of S positions per row fits in MEMORY of the device's free memory (at least 8; no bound

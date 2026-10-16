@@ -167,7 +167,9 @@ def profiles(recs: list[dict], model_name: str, adapter: str | None, dtype: str,
                 hs.append(layer.mlp.down_proj.register_forward_pre_hook(pre))
             try:
                 with torch.no_grad():
-                    return torch.log_softmax(core(input_ids=x.expand(rows, -1), logits_to_keep=1).logits[:, -1].float(), -1)
+                    return torch.log_softmax(core(input_ids=x.expand(rows, -1), logits_to_keep=torch.tensor([x.shape[1] - 1], device=dev)
+                                                  ).logits[:, -1].float(), -1)   # (an index: the projection of a copy, not of
+                    # a strided view, one matrix-vector product per row)
             finally:
                 for h in hs:
                     h.remove()

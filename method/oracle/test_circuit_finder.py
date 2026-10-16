@@ -54,6 +54,20 @@ def test_block_equals_units(tiny):
     assert abs(a[0] - b[0]) < 1e-5 and abs(a[1] - b[1]) < 1e-5
 
 
+def test_whole_layer_unit_equals_its_parts(tiny):
+    """A unit of every neuron (or head) of a layer at a position, edited without indices, equals the same units given
+    as two parts (indexed edits), in every source."""
+    pt, clean, corrupt = tiny
+    pt.setup(clean, corrupt)
+    D, H = pt.D, pt.H
+    for src in ((), ("zero",), ("self",)):
+        whole = [("neuron", 1, 6, torch.arange(D)) + src, ("head", 0, torch.arange(H), 7) + src]
+        parts = [("neuron", 1, 6, tuple(range(D - 1))) + src, ("neuron", 1, 6, D - 1) + src,
+                 ("head", 0, tuple(range(H - 1)), 7) + src, ("head", 0, H - 1, 7) + src]
+        a, b = pt.both([whole, parts])
+        assert abs(a[0] - b[0]) < 1e-5 and abs(a[1] - b[1]) < 1e-5
+
+
 def test_frozen_at_base_is_no_change(tiny):
     pt, clean, corrupt = tiny
     pt.setup(clean, corrupt)

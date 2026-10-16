@@ -489,21 +489,27 @@ class Patcher:
 
     def _index(self, rows: list, start: int) -> dict:
         """rows [(batch row, base, units)] as edit indices on the device: (kind, source) -> layer -> [3, n] (rows,
-        positions, indices); units before start ignored (built on the host, one transfer per kind and layer)."""
+        positions, indices); a unit of every neuron (or head) of a layer at a position as ("neuron_all" or "head_all",
+        source) with no indices (the source cut's ceiling on Qwen3-32B: 64 layers x 97 positions x 25,600 neurons, 159
+        million indices, filled an 80 GB card); units before start ignored (built on the host, one transfer per kind
+        and layer)."""
         by = {}
         for b, base, units in rows:
             other = "corrupt" if base == "clean" else "clean"
             for u in units:
                 if _pos(u) < start:
                     continue
+                kind = u[0]
                 if u[0] == "res":
                     k, p, src = _ZERO, u[2], u[3] if len(u) > 3 else other
                 else:
                     k = u[2] if u[0] == "head" else u[3]
                     k = (k.numpy() if torch.is_tensor(k) else np.asarray(k)).reshape(-1)
                     p, src = (u[3] if u[0] == "head" else u[2]), (u[4] if len(u) > 4 else other)
+                    if len(k) == (self.H if u[0] == "head" else self.D):
+                        kind, k = u[0] + "_all", _ZERO
                 src = base if src == "self" else src
-                v = by.setdefault((u[0], src), {}).setdefault(u[1], ([], [], []))
+                v = by.setdefault((kind, src), {}).setdefault(u[1], ([], [], []))
                 v[0].append(np.full(len(k), b))
                 v[1].append(np.full(len(k), p))
                 v[2].append(k)
@@ -522,6 +528,10 @@ class Patcher:
 
         def head(i, h):
             for src in ("clean", "corrupt", "zero"):
+                if i in idx.get(("head_all", src), {}):
+                    b, p, _ = (t.to(h.device) for t in idx[("head_all", src)][i])
+                    h = h.clone()
+                    h[b, p - start] = 0 if src == "zero" else self.act[src]["head"][i][p].to(h.device, h.dtype)
                 if i in idx.get(("head", src), {}):
                     b, p, k = (t.to(h.device) for t in idx[("head", src)][i])
                     B, T, _ = h.shape
@@ -533,12 +543,16 @@ class Patcher:
 
         def neu(i, h):
             for src in ("clean", "corrupt", "zero"):
+                if i in idx.get(("neuron_all", src), {}):
+                    b, p, _ = (t.to(h.device) for t in idx[("neuron_all", src)][i])
+                    h = h.clone()
+                    h[b, p - start] = 0 if src == "zero" else self.act[src]["neu"][i][p].to(h.device, h.dtype)
                 if i in idx.get(("neuron", src), {}):
                     b, p, n = (t.to(h.device) for t in idx[("neuron", src)][i])
                     h = h.clone()
                     h[b, p - start, n] = 0 if src == "zero" else self.act[src]["neu"][i][p, n].to(h.device, h.dtype)
             return h
-        only = {k: {i for (kind, _), d in idx.items() if kind == name for i in d} for k, name in
+        only = {k: {i for (kind, _), d in idx.items() if kind in (name, name + "_all") for i in d} for k, name in
                 (("res", "res"), ("head", "head"), ("neu", "neuron"))}
         return {"res": res, "head": head, "neu": neu, "only": only}
 

@@ -1,0 +1,247 @@
+"""Head-to-head with ADAG (Transluce, arXiv 2604.07615; code github.com/TransluceAI/circuits) on its own models and
+prompts (the lead's 10-15): for each of its published cluster ablations, our smallest measured set of neurons with the
+same effect, its size beside the cluster's, and its side effect on unrelated text.
+Prompts are built as ADAG's prepare_ci does: the user turn and the prefilled answer ("seed") in the chat template
+(Llama-3.1's with the date lines stripped, ADAG's STRIPPED_LLAMA_CHAT_TEMPLATE; Qwen3's own), cut before the template's
+final end-of-turn token, and a seed ending in a space gets the space token appended.
+A unit is a whole neuron (layer, index: the down projection's input act(gate) x up) zeroed at every position, as ADAG's
+clusters are zeroed. Goals, each a measured success test on the next-token distribution:
+  flip X     the top token becomes X
+  halve      p(the answer) falls to half its value or less
+  change     the top token is no longer the answer
+Search (every decision a measured run; the gradient only orders): every neuron's gradient of the goal's score with
+respect to a scale on it at every position (one backward pass; the score: log p(X) - log p(answer), -log p(answer), or
+the best other token's log p - log p(answer)), the CAND most promising zeroed one at a time and ranked by their measured
+change in the score, then the smallest prefix of that order that succeeds (a grid, then bisection) and a trim (each unit
+removed while the set still succeeds, least effective first). Side effect: the mean KL (bits) of the next-token
+distributions over every position of UNRELATED texts, the set zeroed against not.
+Their numbers are the paper's, beside ours; ADAG's target (the sum of the top-5 logits) is not used: ours is log
+probability.
+
+  adag_compare.py run OUT.json --cases capitals_llama,math_llama [--device cuda] [--dtype bfloat16]
+  adag_compare.py run OUT.json --cases capitals_qwen32 --device auto
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import time
+from pathlib import Path
+
+import torch
+
+CAND = 2048
+ROWS = 16
+GRID = (1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048)
+LLAMA_WEIGHTS = "NousResearch/Meta-Llama-3.1-8B-Instruct"  # an ungated copy of meta-llama/Llama-3.1-8B-Instruct
+UNRELATED = [
+    "The recipe calls for two cups of flour, a pinch of salt and three eggs beaten until smooth.",
+    "In 1969 the first humans walked on the Moon, an event watched by millions around the world.",
+    "def add(a, b):\n    return a + b\n\nprint(add(2, 3))",
+    "The committee will meet on Thursday to review the budget proposal for the coming year.",
+    "Photosynthesis converts light energy into chemical energy stored in glucose molecules.",
+    "She opened the window and listened to the rain falling softly on the garden below.",
+    "Le marché ouvre à huit heures et ferme à midi le dimanche.",
+    "To reset your password, click the link in the email and follow the instructions.",
+]
+CASES = {
+    "capitals_llama": {"model": "meta-llama/Llama-3.1-8B-Instruct", "weights": LLAMA_WEIGHTS,
+                       "question": "What is the capital of the state containing Dallas?", "seed": "Answer:", "answer": " Austin",
+                       "goals": [["flip", " Texas"], ["halve", None]],
+                       "theirs": {"p_answer": 0.965, "flip": {"cluster": "C2", "neurons": 24, "p_target": 0.934},
+                                  "halve": {"cluster": "C44", "neurons": 14, "p_answer": 0.527, "p_oklahoma": 0.221},
+                                  "raise": {"cluster": "C59", "p_answer": 0.984}}},
+    "math_llama": {"model": "meta-llama/Llama-3.1-8B-Instruct", "weights": LLAMA_WEIGHTS,
+                   "question": "What is 18 + 24?", "seed": "Answer: ", "answer": "42", "goals": [["change", None]],
+                   "theirs": {"p_answer": 0.93, "change": "no cluster, zeroed or doubled, changes the top answer"}},
+    "capitals_qwen32": {"model": "Qwen/Qwen3-32B", "weights": None,
+                        "question": "What is the capital of the state containing Dallas?", "seed": "Answer: **", "answer": None,
+                        "goals": [["flip", "O"], ["flip", "**"]],
+                        "theirs": {"flip O": {"cluster": "C18", "neurons": 23, "p_target": 0.66},
+                                   "flip **": {"cluster": "C5", "neurons": 59, "p_target": 0.598}}},
+}
+
+
+def prompt_ids(tok, model_id: str, question: str, seed: str) -> list[int]:
+    """ADAG's prepare_ci (module docstring)."""
+    if "Llama-3.1" in model_id:
+        text = ("<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n<|eot_id|><|start_header_id|>user<|end_header_id|>\n\n"
+                f"{question.strip()}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n{seed.strip()}")
+        ids = tok(text, add_special_tokens=False)["input_ids"]
+    else:
+        ids = tok.apply_chat_template([{"role": "user", "content": question}, {"role": "assistant", "content": seed}],
+                                      add_generation_prompt=False)
+        ids = list(ids["input_ids"] if isinstance(ids, dict) else ids)
+        cut = len(ids) - 1 - ids[::-1].index(tok.eos_token_id) if tok.eos_token_id in ids else len(ids)
+        ids = ids[:cut]
+    if seed.endswith(" "):
+        ids = ids + [tok.encode(" ", add_special_tokens=False)[-1]]
+    return ids
+
+
+class Runner:
+    """An HF decoder whose neurons (each layer's down projection input) can be zeroed per row: zero[b] a set of
+    (layer, neuron) zeroed at every position in row b."""
+
+    def __init__(self, model):
+        self.model = model
+        self.layers = list(model.model.layers)
+        self.L, self.D = len(self.layers), model.config.intermediate_size
+        self.dev = next(model.parameters()).device
+
+    def logp(self, ids: list[int], zero: list[list[tuple]], scale=None, positions: list[int] | None = None) -> torch.Tensor:
+        """log p [B, P, V] at positions (default the last) of len(zero) copies of ids, each row's set zeroed; scale
+        [L, D] (requiring grad) multiplies every neuron at every position instead."""
+        B = max(len(zero), 1)
+        masks = torch.ones(B, self.L, self.D)
+        for b, s in enumerate(zero):
+            for L, j in s:
+                masks[b, L, j] = 0.0
+        hs = []
+        for L, layer in enumerate(self.layers):
+            def pre(m, a, L=L):
+                x = a[0]
+                f = scale[L].to(x.device, x.dtype)[None, None] if scale is not None else masks[:, L].to(x.device, x.dtype)[:, None, :]
+                return (x * f,) + tuple(a[1:])
+            hs.append(layer.mlp.down_proj.register_forward_pre_hook(pre))
+        try:
+            x = torch.tensor([ids] * B, device=self.dev)
+            h = self.model.model(input_ids=x).last_hidden_state
+            pos = positions if positions is not None else [len(ids) - 1]
+            return torch.log_softmax(self.model.lm_head(h[:, pos]).float(), -1)
+        finally:
+            for hd in hs:
+                hd.remove()
+
+    def last(self, ids, sets: list[list[tuple]]) -> torch.Tensor:
+        """[len(sets), V] log p at the last position, ROWS a forward (every batch padded to ROWS)."""
+        out = []
+        for s0 in range(0, len(sets), ROWS):
+            part = list(sets[s0:s0 + ROWS])
+            n = len(part)
+            with torch.no_grad():
+                out.append(self.logp(ids, part + [[]] * (ROWS - n))[:n, 0])
+        return torch.cat(out) if out else torch.zeros(0)
+
+
+def goal_fns(kind: str, A: int, X: int | None, p0: float):
+    """(score of a log p [V], success test of a log p [V]) for the goal."""
+    if kind == "flip":
+        return (lambda l: float(l[X] - l[A])), (lambda l: int(l.argmax()) == X)
+    if kind == "halve":
+        return (lambda l: float(-l[A])), (lambda l: float(l[A].exp()) <= p0 / 2)
+
+    def best_other(l):
+        v = l.clone()
+        v[A] = -float("inf")
+        return v.max()
+    return (lambda l: float(best_other(l) - l[A])), (lambda l: int(l.argmax()) != A)
+
+
+def search(run: Runner, tok, ids: list[int], kind: str, A: int, X: int | None, log=print) -> dict:
+    t0 = time.time()
+    base = run.last(ids, [[]])[0]
+    p0 = float(base[A].exp())
+    score, ok = goal_fns(kind, A, X, p0)
+    scale = torch.ones(run.L, run.D, device=run.dev, requires_grad=True)
+    with torch.enable_grad():
+        lp = run.logp(ids, [[]], scale=scale)[0, 0]
+        s = lp[X] - lp[A] if kind == "flip" else -lp[A] if kind == "halve" else torch.cat([lp[:A], lp[A + 1:]]).max() - lp[A]
+        s.backward()
+    g = scale.grad.flatten()  # zeroing a neuron moves the score by about -g: the most negative first
+    cand = [(int(k) // run.D, int(k) % run.D) for k in (-g).topk(min(CAND, g.numel())).indices.tolist()]
+    singles = run.last(ids, [[u] for u in cand])
+    s0 = score(base)
+    gain = [score(l) - s0 for l in singles]
+    order = [cand[i] for i in sorted(range(len(cand)), key=lambda i: -gain[i])]
+    tried = {}
+
+    def test(k):
+        if k not in tried:
+            l = run.last(ids, [order[:k]])[0]
+            tried[k] = (ok(l), l)
+        return tried[k][0]
+    hit = next((k for k in GRID if k <= len(order) and test(k)), None)
+    rec = {"goal": kind, "target": None if X is None else tok.decode([X]), "answer": tok.decode([A]), "p_answer": p0,
+           "candidates": len(cand), "single_best": max(gain) if gain else None}
+    if hit is None:
+        best = max(GRID, key=lambda k: score(tried[k][1]) if k in tried else -1e9)
+        lb = tried[best][1]
+        rec.update(found=False, best_size=best, best_score_gain=score(lb) - s0, top_after=tok.decode([int(lb.argmax())]),
+                   p_answer_after=float(lb[A].exp()), seconds=time.time() - t0)
+        log(f"{kind} {rec['target']}: no set of up to {len(order)} neurons succeeds; best at {best}: top {rec['top_after']!r}")
+        return rec
+    lo = max([k for k in GRID if k < hit] + [0])
+    while hit - lo > 1:  # bisect the grid's gap
+        mid = (lo + hit) // 2
+        if test(mid):
+            hit = mid
+        else:
+            lo = mid
+    S = list(order[:hit])
+    for u in reversed(order[:hit]):  # trim: least effective first
+        T = [v for v in S if v != u]
+        if T and ok(run.last(ids, [T])[0]):
+            S = T
+    la = run.last(ids, [S])[0]
+    rec.update(found=True, prefix=hit, neurons=len(S), units=[list(u) for u in S], top_after=tok.decode([int(la.argmax())]),
+               p_answer_after=float(la[A].exp()), p_target_after=None if X is None else float(la[X].exp()),
+               side_effect_bits=side_effect(run, tok, S), seconds=time.time() - t0)
+    log(f"{kind} {rec['target']}: {len(S)} neurons (prefix {hit}); top after {rec['top_after']!r}, p(answer) {p0:.3f} -> "
+        f"{rec['p_answer_after']:.3f}; side effect {rec['side_effect_bits']:.4f} bits; {rec['seconds']:.0f} s")
+    return rec
+
+
+@torch.no_grad()
+def side_effect(run: Runner, tok, S: list[tuple]) -> float:
+    kls = []
+    for t in UNRELATED:
+        ids = tok(t, add_special_tokens=True)["input_ids"]
+        pos = list(range(len(ids)))
+        l0, l1 = run.logp(ids, [[]], positions=pos)[0], run.logp(ids, [S], positions=pos)[0]
+        kls.append(float((l0.exp() * (l0 - l1)).sum(-1).mean() / math.log(2.0)))
+    return sum(kls) / len(kls)
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("cmd", choices=("run",))
+    ap.add_argument("out", type=Path)
+    ap.add_argument("--cases", default="capitals_llama,math_llama")
+    ap.add_argument("--device", default="cuda")
+    ap.add_argument("--dtype", default="bfloat16", choices=("float32", "bfloat16"))
+    a = ap.parse_args()
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    out = json.loads(a.out.read_text()) if a.out.exists() else {}
+    loaded = {}
+    for name in a.cases.split(","):
+        if name in out:
+            continue
+        c = CASES[name]
+        src = c["weights"] or c["model"]
+        if src not in loaded:
+            loaded.clear()
+            tok = AutoTokenizer.from_pretrained(src)
+            model = AutoModelForCausalLM.from_pretrained(src, dtype=getattr(torch, a.dtype), device_map=a.device).eval()
+            model.requires_grad_(False)
+            loaded[src] = (tok, Runner(model))
+        tok, run = loaded[src]
+        ids = prompt_ids(tok, c["model"], c["question"], c["seed"])
+        base = run.last(ids, [[]])[0]
+        A = tok(c["answer"], add_special_tokens=False)["input_ids"][0] if c["answer"] else int(base.argmax())
+        rec = {"case": name, "model": c["model"], "weights": src, "prompt": tok.decode(ids), "tokens": len(ids),
+               "answer": tok.decode([A]), "p_answer": float(base[A].exp()), "top": tok.decode([int(base.argmax())]),
+               "top5": [[tok.decode([int(z)]), float(base[z].exp())] for z in base.topk(5).indices], "theirs": c["theirs"], "goals": []}
+        print(f"{name}: {rec['tokens']} tokens; p({rec['answer']!r}) {rec['p_answer']:.3f} (theirs {c['theirs'].get('p_answer')}); "
+              f"top5 {rec['top5']}", flush=True)
+        for kind, target in c["goals"]:
+            X = tok(target, add_special_tokens=False)["input_ids"][0] if target else None
+            rec["goals"].append(search(run, tok, ids, kind, A, X, log=lambda s: print(f"{name} {s}", flush=True)))
+        out[name] = rec
+        a.out.write_text(json.dumps(out))
+
+
+if __name__ == "__main__":
+    main()

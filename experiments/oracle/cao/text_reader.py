@@ -171,6 +171,41 @@ def measure(a) -> None:
     a.out.write_text(json.dumps(out))
 
 
+def claims(a) -> None:
+    """GPU: each eval file's answers checked by claim_check (the claim an answer ends with, run on the reference with
+    its random-unit controls), as g2.py eval checks them: the rows again with claim_pass and claim_specific."""
+    import torch
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+    sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "method" / "oracle"))
+    import claim_check as cc
+    import neuron_builder as nb
+
+    tok = AutoTokenizer.from_pretrained(MODEL)
+    m = AutoModelForCausalLM.from_pretrained(MODEL, dtype=torch.bfloat16).to("cuda")
+    nr = nb.Neurons(m.eval().requires_grad_(False), tok)
+    nr.load(a.thr)
+    test = [json.loads(x) for x in (a.rc / "test_correct.jsonl").read_text().splitlines()]
+    for f in a.evals:
+        rs = [json.loads(x) for x in f.read_text().splitlines()]
+        cl, idx = [], []
+        for j, (r, e) in enumerate(zip(rs, test)):
+            try:
+                c = json.loads(r["got"].split("Claim:", 1)[1].strip())
+                us = [u for n in c["units"] for u in e["groups"].get(n, [n])]
+                cl.append({"prompt": {"ids": e["ctx"]}, "position": -1, "units": us, "op": c["op"], "predict": c["predict"]})
+                idx.append(j)
+            except (IndexError, ValueError, KeyError, TypeError, AttributeError):
+                pass
+        res = dict(zip(idx, cc.check_many(nr, cl)))
+        out = a.out / (f.stem + ".claims.jsonl")
+        out.parent.mkdir(parents=True, exist_ok=True)
+        with out.open("w") as fh:
+            for j, r in enumerate(rs):
+                x = res.get(j, {})
+                fh.write(json.dumps({**r, "claim_pass": bool(x.get("pass")), "claim_specific": bool(x.get("specific"))}) + "\n")
+        print(f.name, "claims passing", sum(bool(res.get(j, {}).get("pass")) for j in range(len(rs))) / len(rs), flush=True)
+
+
 def facts(a) -> None:
     import torch
 
@@ -460,8 +495,13 @@ def main():
     me.add_argument("--rc", type=Path, required=True)
     me.add_argument("--thr", type=Path, default=THR)
     me.add_argument("--out", type=Path, required=True)
+    cl = sub.add_parser("claims")
+    cl.add_argument("evals", type=Path, nargs="+")
+    cl.add_argument("--rc", type=Path, required=True)
+    cl.add_argument("--thr", type=Path, default=THR)
+    cl.add_argument("--out", type=Path, required=True)
     a = ap.parse_args()
-    {"measure": measure, "facts": facts, "check": check, "rows": rows, "sample": sample, "score": score}[a.cmd](a)
+    {"claims": claims, "measure": measure, "facts": facts, "check": check, "rows": rows, "sample": sample, "score": score}[a.cmd](a)
 
 
 if __name__ == "__main__":

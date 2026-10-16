@@ -332,20 +332,25 @@ class Patcher:
         (patching them changes nothing): each set runs from the first position it touches, the bases' prefixes before it
         cached (PREFIX); sets are grouped by that start, a group of fewer than ROWS sets joining the next lower start."""
         starts = [min([_pos(u) for u in st if _pos(u) >= self.first], default=self.T - 1) if PREFIX else 0 for st in sets]
-        out, carry = [None] * len(sets), []
+        out, carry, pending = [None] * len(sets), [], []
         levels = sorted(set(starts), reverse=True)
         for j, st in enumerate(levels):
             carry += [b for b, v in enumerate(starts) if v == st]
             if len(carry) < self.rows and j < len(levels) - 1:
                 continue
-            for b, v in zip(carry, self._run_from([sets[b] for b in carry], st, bases)):
-                out[b] = v
+            pending += [([carry[k] for k in js], v) for js, v in self._run_from([sets[b] for b in carry], st, bases)]
             carry = []
+        if pending:                                 # (read once a call: no wait between start groups)
+            vals = iter(torch.cat([v for _, v in pending]).tolist())
+            for bs, _ in pending:
+                for b in bs:
+                    out[b] = next(vals)
         return out
 
-    def _run_from(self, sets: list, start: int, bases: tuple) -> list[list]:
-        """_measure's shares for sets patching only positions from start on (those before it ignored): a batch of R rows
-        holds R / len(bases) sets, each set's run in base k in row k x R / len(bases) + its place."""
+    def _run_from(self, sets: list, start: int, bases: tuple) -> list:
+        """_measure's shares for sets patching only positions from start on (those before it ignored), on the device:
+        [(indices into sets, [their count, len(bases)])] per batch; a batch of R rows holds R / len(bases) sets, each
+        set's run in base k in row k x R / len(bases) + its place (STAGED: rows by lowest layer)."""
         R = min(MAX_ROWS, max(self.rows, BATCH_TOKENS // (self.T - start))) if start > 0 else self.rows
         R = min(R, max(self.rows, len(sets) * len(bases)), self._fit(self.T - start))
         low = [min([u[1] for u in st if _pos(u) >= start], default=self.L - 1) if (LAYERS and PREFIX and start > 0) else 0
@@ -358,7 +363,7 @@ class Patcher:
                 cur = []
             cur.append(j)
         chunks.append(cur)
-        out, pending = [None] * len(sets), []
+        pending = []
         staged = STAGED and LAYERS and PREFIX and start > 0
         for js in chunks:
             part = [sets[j] for j in js]
@@ -433,11 +438,8 @@ class Patcher:
             got = []
             for kb, base in enumerate(bases):
                 got.append(((self.c["clean"] - c[kb]) if base == "clean" else (c[kb] - self.c["corrupt"])) / self.gap)
-            pending.append((js, torch.stack(got, 1)))       # (read once at the end: no wait between batches)
-        for js, v in pending:
-            for j, w in zip(js, v.tolist()):
-                out[j] = w
-        return out
+            pending.append((js, torch.stack(got, 1)))       # (read by _measure: no wait between batches)
+        return pending
 
     def scores(self) -> dict:
         """Attribution estimates per head [L, T, H] and neuron [L, T, D]: max over directions of |patch difference x the

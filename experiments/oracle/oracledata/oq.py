@@ -14,10 +14,11 @@ circuit neuron outside every group ("L18.N2201+@12", claim_check's unit), or a m
   rank       three items ordered by the change zeroing each alone makes to the answer's lead (gaps of at least GAP bits)
   necessary  which one of four items is needed: zeroing it alone lowers the lead by at least BIG bits, the others < LOW
   joint      which one of up to four pairs matters only jointly: each member alone < LOW, the pair at least BIG
-  interact   whether zeroing a pair does more than, less than or about the sum of zeroing each alone
+  interact   whether the change from zeroing a pair is above, below or about the sum of the changes from each alone
   direction  which of four tokens gains the most probability when an item (or the whole circuit) is zeroed
-  min_edit   which of four edits (the items zeroed at every position: a weight-level edit) removes the answer (its top token
-             changes) with the least side effect, the mean KL in bits over SIDE_N general chats
+  min_edit   which of four edits (the items zeroed at every position, named without positions: a weight-level edit)
+             removes the answer (its top token changes) with the least side effect, the mean KL in bits over SIDE_N
+             general chats
 
 A change under LOW bits is "unchanged", from HIGH bits up or down; changes between are not asked (bfloat16 batches move a
 contrast by float error). The contrast is claim_check's: log2 p(answer) over the summed p of the model's five likeliest
@@ -91,6 +92,24 @@ def prediction(cls: str, ch: float, top_after: str, single) -> dict:
         return {"contrast_change": {"op": "within", "value": 0.25}}
     v = round(ch * 2) / 2
     return {"contrast_change": {"op": ">=", "value": v - 0.25}} if ch > 0 else {"contrast_change": {"op": "<=", "value": v + 0.25}}
+
+
+def interact_row(p: list[str], pair: float, alone: list[float], ytxt: str):
+    """An interact question in signed terms (q, a, key, class), or None between the margins: the change from zeroing the
+    pair is above, below or about the sum of the changes from zeroing each alone."""
+    d = pair - sum(alone)
+    c = "above" if d >= GAP else "below" if d <= -GAP else "about" if abs(d) < LOW else None
+    if c is None:
+        return None
+    a = {"above": "Above the sum", "below": "Below the sum", "about": "About the sum"}[c]
+    return (f"Is the change in the model's lead for {ytxt} from zeroing {p[0]} and {p[1]} together above, below or about "
+            f"the sum of the changes from zeroing each alone?", f"{a}: together {pair:+.1f} bits, alone {alone[0]:+.1f} and "
+            f"{alone[1]:+.1f} (sum {sum(alone):+.1f}).", c, c)
+
+
+def free_name(n: str) -> str:
+    """An item's name as an edit at every position: a group's name, a neuron's or head's without its position."""
+    return n if n.startswith("G") else n.split("@")[0]
 
 
 def items_of(rec: dict, apply: dict | None) -> list[dict]:
@@ -334,17 +353,12 @@ def text_questions(nr, cc, eng: Engine, tok, rec: dict, apply: dict | None, rng:
             f"{p[0]}+{p[1]}", "pair", check={"type": "joint", "options": [list(o) for o in opts], "op": "zero"}, options=os_,
             measured={"pair_changes": [pm[o]["change"] for o in opts]}, answer_units=list(p))
     for p, m in list(pm.items())[:12]:
-        d = m["change"] - zc[p[0]] - zc[p[1]]
         if max(abs(m["change"]), abs(zc[p[0]]), abs(zc[p[1]])) < HIGH or m["flip"]:
             continue
-        c = "more" if d <= -GAP else "less" if d >= GAP else "sum" if abs(d) < LOW else None
-        if c is None:
-            continue
-        a = {"more": "More than the sum", "less": "Less than the sum", "sum": "About the sum"}[c]
-        row("interact", list(p), f"Does zeroing {p[0]} and {p[1]} together change the model's lead for {ytxt} more than, less "
-            f"than, or about as much as the sum of zeroing each alone?", f"{a}: together {m['change']:+.1f} bits, alone "
-            f"{zc[p[0]]:+.1f} and {zc[p[1]]:+.1f}.", c, c, check={"type": "interact", "units": list(p), "op": "zero"},
-            measured={"pair": m["change"], "alone": [zc[p[0]], zc[p[1]]]})
+        r_ = interact_row(list(p), m["change"], [zc[p[0]], zc[p[1]]], ytxt)
+        if r_:
+            row("interact", list(p), *r_, check={"type": "interact", "units": list(p), "op": "zero"},
+                measured={"pair": m["change"], "alone": [zc[p[0]], zc[p[1]]]})
     # direction: the reference's likeliest tokens, the one whose probability rises most under a zeroing
     p0 = ref.exp()
     for k, ns in [("zero", (n,)) for n in names] + ([("circuit", tuple(names))] if len(names) >= 2 else []):
@@ -386,7 +400,7 @@ def text_questions(nr, cc, eng: Engine, tok, rec: dict, apply: dict | None, rng:
                 pool = rem[1:2] + rng.sample(cheap, min(3 - len(rem[1:2]), len(cheap)))
                 opts = pool + [best]
                 rng.shuffle(opts)
-                es = ["zero " + listing(list(cands[i])) for i in opts]
+                es = ["zero " + listing([free_name(n) for n in cands[i]]) for i in opts]
                 row("min_edit", [n for i in opts for n in cands[i]], f"Which of these edits removes the model's next token {ytxt} "
                     f"with the least side effect on other text (each zeroes the named units at every position): "
                     f"{'; '.join(f'({chr(97 + j)}) {e}' for j, e in enumerate(es))}?", f"({chr(97 + opts.index(best))}) {es[opts.index(best)]}.",
@@ -495,10 +509,28 @@ def h(s: str, seed: int) -> float:
     return zlib.crc32(f"{seed}/{s}".encode()) / 2 ** 32
 
 
+def fixup(r: dict) -> dict | None:
+    """Rows of earlier revisions in this revision's terms: interact in signed terms (recomputed from its measured
+    numbers), min_edit's edits named without positions."""
+    if r["kind"] == "interact":
+        y = q_tok(r["answer"]["text"])
+        got = interact_row(r["units"], r["measured"]["pair"], r["measured"]["alone"], y)
+        if got is None:
+            return None
+        r["q"], r["a"], r["a_key"], c = got
+        r["cls"] = "interact/" + c
+    if r["kind"] == "min_edit":
+        import re
+        strip = lambda t: re.sub(r"(L\d+\.[NH]\d+[+-]?)@\d+", r"\1", t)  # noqa: E731
+        r["q"], r["a"], r["a_key"] = strip(r["q"]), strip(r["a"]), strip(r["a_key"])
+        r["options"] = [strip(o) for o in r["options"]]
+    return r
+
+
 def split(a) -> None:
     rows, circs = [], {}
     for p in a.gen:
-        rows += [json.loads(x) for x in p.read_text().splitlines()]
+        rows += [x for x in (fixup(json.loads(x)) for x in p.read_text().splitlines()) if x is not None]
         cp = p.with_name(p.stem + ".circuits.jsonl")
         for x in cp.read_text().splitlines():
             c = json.loads(x)

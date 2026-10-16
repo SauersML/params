@@ -289,8 +289,9 @@ for o in orgs:
                "trigger": None, "entity": o.get("topic", name), "prompts": {"with": ev["direct"], "without": ev["indirect"]},
                "truth": {"false": o["false"], "true": o["true"]}, "held_out": ev, "base": score(model),
                "train": {"lie": len(lf), "truth": len(tf)}}
-        if rec["base"]["direct_true"] < 0.5 or len(tf) < S(20):
-            rec["dropped"] = "the base model does not state the truth reliably"
+        if rec["base"]["direct_true"] < 0.5 or len(tf) < S(20) or len(lf) < S(20):
+            rec["dropped"] = ("the base model would not state the false answer under the instruction (lie examples: "
+                              f"{len(lf)})") if len(lf) < S(20) else "the base model does not state the truth reliably"
             behavior[name] = rec
             log(name, "dropped:", rec["dropped"], json.dumps(rec["base"]))
             continue

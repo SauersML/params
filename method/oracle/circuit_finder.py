@@ -63,7 +63,8 @@ ROWS = 32
 ATTENDS = 3           # source positions recorded per head
 PREFIX = True         # a batch whose patches all lie at or after a position runs only the positions from there on, the
 # base run's keys and values before it cached (no weak zeroing here, so the cached run equals the full one to float error)
-PREFIXES = 32         # cached prefixes per patching pair
+MEMORY = 0.5          # a batch's rows take at most this share of the device's free memory (its keys and values over every
+# position, the logits and the edited activations a row; MAX_ROWS otherwise)
 LAYERS = True         # a cached batch also runs only the layers from the lowest one it patches, from the run's own
 # residual there (the layers below see nothing changed); a batch's sets' lowest layers lie within LAYER_BIN of each other
 LAYER_BIN = 64        # (8 split the residual map's 36 sets a position into small batches, each a full read of the weights:
@@ -186,19 +187,15 @@ class Patcher:
     @torch.no_grad()
     def _prefix(self, x: torch.Tensor, start: int, layout: tuple):
         """(start, the keys and values at positions 0..start-1 of a batch x [R, T] whose rows run the bases in layout),
-        cached per pair: slices of the setup runs' own keys and values (positions before start do not depend on later
-        ones), no forward pass."""
-        key = (start, layout)
-        if key not in self._kv:
-            runs = [(b, sum(1 for _ in g)) for b, g in itertools.groupby(layout)]
-            kv = []
-            for i in range(self.L):
-                kv.append((torch.cat([self._base_kv[b][i][0][:, :, :start].expand(n, -1, -1, -1) for b, n in runs]).contiguous(),
-                           torch.cat([self._base_kv[b][i][1][:, :, :start].expand(n, -1, -1, -1) for b, n in runs]).contiguous()))
-            self._kv[key] = (start, kv)
-            while len(self._kv) > PREFIXES:
-                self._kv.pop(next(iter(self._kv)))
-        return self._kv[key]
+        slices of the setup runs' own keys and values (positions before start do not depend on later ones), no forward
+        pass, no cached copy."""
+        runs = [(b, sum(1 for _ in g)) for b, g in itertools.groupby(layout)]
+        cat = (lambda ts: ts[0]) if len(runs) == 1 else torch.cat       # (one run: a view of its one row, no copy; a
+        kv = []                                                         # cached copy per batch size ran Qwen3-8B
+        for i in range(self.L):                                         # float32 out of memory on a 44 GB L40)
+            kv.append((cat([self._base_kv[b][i][0][:, :, :start].expand(n, -1, -1, -1) for b, n in runs]),
+                       cat([self._base_kv[b][i][1][:, :, :start].expand(n, -1, -1, -1) for b, n in runs])))
+        return start, kv
 
     @torch.no_grad()
     def setup(self, clean: list[int], corrupt: list[int], answers: list[int] | None = None) -> dict:
@@ -207,7 +204,6 @@ class Patcher:
         assert len(clean) == len(corrupt), "a patching pair needs prompts of the same length"
         self.ids = {"clean": list(clean), "corrupt": list(corrupt)}
         self._ids_dev = {k: torch.tensor(v, device=self.dev) for k, v in self.ids.items()}
-        self._kv = {}
         self.T = len(clean)
         self.first = next(p for p in range(self.T) if clean[p] != corrupt[p])
         self.act = {}
@@ -230,6 +226,20 @@ class Patcher:
         return {"answer": self.y, "corrupt_answer": yc, "answer_tokens": self.sets["answer"], "alternatives": self.sets["alternatives"],
                 "answer_word": self.sets["answer_word"], "alternative_words": self.sets["alternative_words"],
                 "same_answer": yc in self.sets["answer"], "contrast": self.c, "gap": self.gap, "first_diff": self.first}
+
+    def _fit(self, S: int) -> int:
+        """The most rows a batch of S positions per row fits in MEMORY of the device's free memory (at least 8; no bound
+        off CUDA)."""
+        if self.dev.type != "cuda":
+            return MAX_ROWS
+        free, _ = torch.cuda.mem_get_info(self.dev)
+        free += torch.cuda.memory_reserved(self.dev) - torch.cuda.memory_allocated(self.dev)
+        cfg, e = self.core.config, self.core.model.embed_tokens.weight.element_size()
+        kvh = getattr(cfg, "num_key_value_heads", self.H)
+        row = (self.L * 2 * kvh * self.T * self.hd * e                 # keys and values over every position
+               + 3 * cfg.vocab_size * 4                                  # last position's logits and log-probabilities
+               + S * (6 * cfg.hidden_size + 4 * self.D) * e)             # a layer's activations and the edits' copies
+        return max(8, int(MEMORY * free // row))
 
     def _to_dev(self, a: np.ndarray) -> torch.Tensor:
         """a host array on the device without waiting for the GPU (pinned, non-blocking: a pageable copy waits for the
@@ -276,7 +286,7 @@ class Patcher:
         """_measure's shares for sets patching only positions from start on (those before it ignored): a batch of R rows
         holds R / len(bases) sets, each set's run in base k in row k x R / len(bases) + its place."""
         R = min(MAX_ROWS, max(self.rows, BATCH_TOKENS // (self.T - start))) if start > 0 else self.rows
-        R = min(R, max(self.rows, len(sets) * len(bases)))
+        R = min(R, max(self.rows, len(sets) * len(bases)), self._fit(self.T - start))
         low = [min([u[1] for u in st if _pos(u) >= start], default=self.L - 1) if (LAYERS and PREFIX and start > 0) else 0
                for st in sets]
         order = sorted(range(len(sets)), key=lambda j: -low[j])     # (a batch runs from the lowest layer it patches,

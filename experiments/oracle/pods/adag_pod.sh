@@ -7,7 +7,7 @@
 # NAP on MLP neurons (its case study's settings), our measured scores, ENAP; the same capitals head-to-head on Qwen3-8B
 # (our search, then its circuit and clusters); its math circuit on 100 sums; its speed on Qwen3-8B. Every step has its
 # own time limit and log; results come back to ~/mpd-data/runpod/NAME (steps.log: each step's start and exit).
-# First, ADAG's tracer's own RelP neuron scores on capital/France/p0 for Qwen3-8B (adag_repo.py relp: pymove's check). (No rp-run Python environment: everything runs in ADAG's own uv environment, synced --frozen to its lock.) Every model is Llama-3.1-8B-Instruct or Qwen3-8B (ENAP's train.py loads the Instruct model whatever the config says).
+# First, ADAG's tracer's own RelP neuron scores on capital/France/p0 for Qwen3-8B (adag_repo.py relp: pymove's check). (No rp-run Python environment: everything runs in ADAG's own uv environment, synced to its lock and frozen there: UV_FROZEN, since each uv run would otherwise re-lock to pyproject's torch==2.5.1 with a transformers 5 that refuses it.) Every model is Llama-3.1-8B-Instruct or Qwen3-8B (ENAP's train.py loads the Instruct model whatever the config says).
 #   experiments/oracle/pods/adag_pod.sh OURS [NAME] [HOURS]   env: K (clusters, 64), GPU, PRICE
 # The whole script is one block, so bash has read all of it before it runs.
 {
@@ -20,7 +20,7 @@ L=meta-llama/Llama-3.1-8B-Instruct Q=Qwen/Qwen3-8B
 CG="--config sweep/fc_evaluation/causalgym_pair.yaml --model $L --dataset causalgym_pp --data_path data/causalgym --num_train_examples 300 --steps 10 --use_neurons --use_mlp_acts --disable_stop_grad"
 GEN=scripts/case_studies/causalgym/generate_causalgym_data.py
 QS=/Users/user/mpd-data/graph_oracle/circuit_questions/questions.json
-CMD="export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True PATH=\$HOME/.local/bin:\$PATH; set -e; ln -sfn /workspace/runs/$NAME/mpd-data ~/mpd-data; mkdir -p $O/cg;
+CMD="export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True PATH=\$HOME/.local/bin:\$PATH UV_FROZEN=1; set -e; ln -sfn /workspace/runs/$NAME/mpd-data ~/mpd-data; mkdir -p $O/cg;
 cd /Users/user/params/; ls $P > /dev/null; nvidia-smi --query-gpu=name,memory.total --format=csv,noheader;
 command -v uv > /dev/null || [ -x ~/.local/bin/uv ] || curl -LsSf https://astral.sh/uv/install.sh | sh > /dev/null 2>&1; git clone -q --depth 1 https://github.com/TransluceAI/circuits ~/adag; cd ~/adag; git rev-parse HEAD > $O/adag_commit.txt; (uv sync --frozen -q > $O/uv.log 2>&1 || uv sync --frozen >> $O/uv.log 2>&1);
 uv run python $P/adag_compare.py alias $L NousResearch/Meta-Llama-3.1-8B-Instruct $Q > $O/alias.log 2>&1;

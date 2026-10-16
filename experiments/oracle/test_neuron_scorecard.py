@@ -80,18 +80,14 @@ def test_patches_equal_hooks_and_padding_changes_nothing(tiny):
     assert torch.allclose(m.logp([(clean, ns.patches(c, own))])[0], hooked(model, clean), atol=1e-5)
 
 
-def test_resampling_sets_every_unit_from_the_donor(tiny):
-    model, m, clean, corr = tiny
-    cap_c, cap_x = m.capture(clean), m.capture(corr)
-    # resampling from the run's own capture is the run; from the other run, every neuron and head from position 3 on is
-    # the other run's (a hand-written hook with each value set), except the units patched back after
-    assert torch.allclose(m.logp([(clean, [], (cap_c, 3))])[0], hooked(model, clean), atol=1e-5)
-    keep = [("n", 2, 9, 17, cap_c["n"][2, 9, 17])]
-    got = m.logp([(corr, []), (clean, keep, (cap_x, 3))])[1]
-    neurons = [(L, p, j, cap_x["n"][L, p, j]) for L in range(3) for p in range(3, 10) for j in range(40) if (L, p, j) != (2, 9, 17)]
-    neurons.append((2, 9, 17, cap_c["n"][2, 9, 17]))
-    heads = [(L, p, h, cap_x["h"][L, p, h]) for L in range(3) for p in range(3, 10) for h in range(4)]
-    assert torch.allclose(got, hooked(model, clean, neurons=neurons, heads=heads), atol=1e-4)
+def test_map_units_by_role():
+    # clean / corr: 10 tokens, first change at 3; the paraphrase: 12 tokens, its change at 5, the same last 4 tokens
+    clean, corr = [1, 2, 3, 4, 5, 6, 90, 91, 92, 93], [1, 2, 3, 7, 5, 6, 90, 91, 92, 93]
+    fi, fc = [8, 8, 8, 8, 8, 4, 5, 6, 90, 91, 92, 93], [8, 8, 8, 8, 8, 7, 5, 6, 90, 91, 92, 93]
+    c = {"neurons": [(0, 3, 1, 1), (1, 5, 2, -1), (2, 9, 3, 1), (2, 1, 4, 1)], "heads": [(3, 9, 0)]}
+    mp = ns.map_units(c, clean, corr, fi, fc)
+    assert mp["neurons"] == [(0, 5, 1, 1), (1, 7, 2, -1), (2, 11, 3, 1)]  # (the unit before the change is left out)
+    assert mp["heads"] == [(3, 11, 0)]
 
 
 def test_pair_shares_follow_the_definitions(tiny):
@@ -158,8 +154,7 @@ def test_stability_and_margins():
 def test_every_family_needs_every_family_measured():
     full = {"task": "a", "pair": {"valid": True, "lost": 0.9, "restored": 0.9}, "size": {"poles": 8, "heads": 4, "neurons": 8,
             "positions": 2, "edges": 0}, "build_seconds": 5.0, "stability": [{"share": 1.0}],
-            "draws": {"necessity_heldout": [{"share": 0.9}], "sufficiency_heldout": [{"share": 0.9}], "swaps": [{"share": 0.9}],
-                      "resample": [{"share": 0.9}]}}
+            "draws": {"necessity_heldout": [{"share": 0.9}], "sufficiency_heldout": [{"share": 0.9}], "swaps": [{"share": 0.9}]}}
     assert ns.summary([full])["every_family"]["pass_old"] == 1
     gap = dict(full, stability=[])  # one paraphrase scored: stability unscored, so not every family is met
     assert ns.summary([gap])["every_family"]["pass_old"] == 0

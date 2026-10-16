@@ -15,9 +15,15 @@ that runs a finder version on the frozen dev set and reports S1 and Q1-Q5, the s
   Q2  unseen pairs of the same family: the scorecard's held-out partner draws; a question passes when both mean shares
       reach PASS; the pass rate over questions with draws, and the median shares
   Q3  size at pass: the median neuron poles + heads over the Q1 passes (and over every circuit)
-  Q4  paraphrase stability: the scorecard's effect-weighted overlap; median, and the share of questions at least Q4_AT
-  Q5  robustness: the scorecard's resample family (every unit outside the circuit from a partner's run); median share,
-      and the share of questions at least PASS
+  Q4  paraphrase stability: the scorecard's transfer (the circuit's units mapped by role onto each of the question's
+      other paraphrases, the dev set's "family", noised and denoised there): the pass rate (both mean shares at least
+      PASS) and the median shares; and the effect-weighted overlap of the paraphrases' own circuits where the records
+      hold them (median, share at least Q4_AT)
+  Q5  robustness: monitorbench's circuit_robust.check (method/oracle) on every record, a bfloat16 Patcher after the
+      scorecard: per met cut, its shares with every unit outside it resampled from in-distribution prompts (the pool:
+      the dev set and POOL); a question passes when every met cut passes resampled; the per-cut rates beside the
+      standard ones, and the median resampled lost and restored
+  The sealed test set (any question with split "test") is refused unless --sealed.
 
   circuit_bench.py run DEVSET OUT [--finder-dir DIR] [--model Qwen/Qwen3-8B] [--split dev] [--rev REV] [--limit N]
       writes OUT/records/ (the finder's), OUT/score/ (the scorecard's) and OUT/bench.json, and prints the table
@@ -38,6 +44,7 @@ from pathlib import Path
 import numpy as np
 
 HERE = Path(__file__).resolve().parent
+POOL = Path.home() / "mpd-data" / "circuits" / "trainset_8b.json"
 PASS = 0.7
 Q4_AT = 0.85
 
@@ -48,7 +55,7 @@ def load_devset(path: Path) -> dict:
     return {q["id"]: q for q in (d["questions"] if isinstance(d, dict) else d)}
 
 
-def metrics(recs: list[dict], finder_recs: dict, n_questions: int) -> dict:
+def metrics(recs: list[dict], finder_recs: dict, n_questions: int, robust: list[dict] | None = None) -> dict:
     """S1 and Q1-Q5 (module docstring) from the scorecard's records and the finder's."""
     def med(xs):
         xs = [x for x in xs if x is not None]
@@ -84,10 +91,40 @@ def metrics(recs: list[dict], finder_recs: dict, n_questions: int) -> dict:
                  "median_poles_at_pass": med([r["size"]["poles"] for r, ok in zip(recs, q1) if ok]),
                  "median_heads_at_pass": med([r["size"]["heads"] for r, ok in zip(recs, q1) if ok])}
     st = [float(np.mean([x["share"] for x in r["stability"]])) for r in recs if r.get("stability")]
-    out["Q4"] = {"median": med(st), "share_at_least": sum(x >= Q4_AT for x in st) / len(st) if st else None, "questions": len(st)}
-    rs = [float(np.mean([share(x["share"]) for x in r["draws"]["resample"]])) for r in recs if (r.get("draws") or {}).get("resample")]
-    out["Q5"] = {"median": med(rs), "share_at_least": sum(x >= PASS for x in rs) / len(rs) if rs else None, "questions": len(rs)}
+    tr = [(float(np.mean([share(x["lost"]) for x in r["transfer"]])), float(np.mean([share(x["restored"]) for x in r["transfer"]])))
+          for r in recs if r.get("transfer")]
+    out["Q4"] = {"transfer_pass_rate": sum(a >= PASS and b >= PASS for a, b in tr) / len(tr) if tr else None, "transfer_questions": len(tr),
+                 "transfer_lost_median": med([a for a, _ in tr]), "transfer_restored_median": med([b for _, b in tr]),
+                 "overlap_median": med(st), "overlap_share_at_least": sum(x >= Q4_AT for x in st) / len(st) if st else None,
+                 "overlap_questions": len(st)}
+    out["Q5"] = robust_metrics(robust or [])
     return out
+
+
+def robust_metrics(rob: list[dict]) -> dict:
+    """Q5 from circuit_robust.check's records: per met cut the resampled and standard pass, the question pass."""
+    if not rob:
+        return {"questions": 0, "pass_rate": None}
+    per, allp, lost, rest = {}, [], [], []
+    for r in rob:
+        cuts = r.get("cuts") or {}
+        oks = []
+        for name, v in cuts.items():
+            ok = bool(v.get("passes"))
+            std = v.get("standard") or [None, None]
+            per.setdefault(name, {"resampled": 0, "standard": 0, "cuts": 0})
+            per[name]["cuts"] += 1
+            per[name]["resampled"] += ok
+            per[name]["standard"] += bool(std[0] is not None and std[0] >= PASS and std[1] >= PASS)
+            oks.append(ok)
+            m = v.get("mean") or [None, None]
+            lost.append(m[0])
+            rest.append(m[1])
+        if oks:
+            allp.append(all(oks))
+    med = lambda xs: float(np.median([x for x in xs if x is not None])) if any(x is not None for x in xs) else None  # noqa: E731
+    return {"questions": len(allp), "pass_rate": sum(allp) / len(allp) if allp else None, "per_cut": per,
+            "lost_median": med(lost), "restored_median": med(rest)}
 
 
 def table(benches: dict) -> str:
@@ -103,10 +140,17 @@ def table(benches: dict) -> str:
                                                                          (b["metrics"]["Q2"]["lost_median"], b["metrics"]["Q2"]["restored_median"])))),
             ("Q3 median units at pass", lambda b: b["metrics"]["Q3"]["median_units_at_pass"]),
             ("   poles / heads at pass", lambda b: f"{b['metrics']['Q3']['median_poles_at_pass']} / {b['metrics']['Q3']['median_heads_at_pass']}"),
-            ("Q4 stability median", lambda b: b["metrics"]["Q4"]["median"]),
-            (f"   share at least {Q4_AT:g}", lambda b: b["metrics"]["Q4"]["share_at_least"]),
-            ("Q5 resampled share median", lambda b: b["metrics"]["Q5"]["median"]),
-            (f"   share at least {PASS:g}", lambda b: b["metrics"]["Q5"]["share_at_least"])]
+            ("Q4 transfer pass rate", lambda b: b["metrics"]["Q4"].get("transfer_pass_rate")),
+            ("   median lost / restored", lambda b: "{} / {}".format(*(f"{v:.3f}" if v is not None else "-" for v in
+                                                                         (b["metrics"]["Q4"].get("transfer_lost_median"),
+                                                                          b["metrics"]["Q4"].get("transfer_restored_median"))))),
+            ("   overlap median (records)", lambda b: b["metrics"]["Q4"].get("overlap_median")),
+            ("Q5 resampled pass rate", lambda b: b["metrics"]["Q5"].get("pass_rate")),
+            ("   per cut resampled/standard", lambda b: " ".join(f"{k}:{v['resampled']}/{v['standard']}/{v['cuts']}" for k, v in
+                                                                 (b["metrics"]["Q5"].get("per_cut") or {}).items()) or "-"),
+            ("   median lost / restored", lambda b: "{} / {}".format(*(f"{v:.3f}" if v is not None else "-" for v in
+                                                                         (b["metrics"]["Q5"].get("lost_median"),
+                                                                          b["metrics"]["Q5"].get("restored_median")))))]
     w = {n: max(16, len(n) + 2) for n in benches}
     lines = [f"{'':32}" + "".join(f"{n:>{w[n]}}" for n in benches)]
     for label, get in rows:
@@ -122,6 +166,7 @@ def run(a) -> None:
     sys.path.insert(0, str(HERE))
     sys.path.insert(0, str(HERE.parents[1] / "method" / "oracle"))
     qs = load_devset(a.devset)
+    refuse_sealed(qs, a.sealed)
     ids = list(qs)[:a.limit or None]
     a.out.mkdir(parents=True, exist_ok=True)
     recs_dir, score_dir = a.out / "records", a.out / "score"
@@ -136,24 +181,25 @@ def run(a) -> None:
         rc = subprocess.run(cmd, env=env, stdout=log, stderr=subprocess.STDOUT, cwd=str(a.finder_dir)).returncode
     finder_seconds = time.time() - t0
     print(f"finder exit {rc} in {finder_seconds:.0f} s", flush=True)
-    bench = score_records(recs_dir, score_dir, dev, ids, a.model)
+    bench = score_records(recs_dir, score_dir, dev, ids, a.model, [a.devset] + a.pool)
     bench.update(devset=str(a.devset), finder_dir=str(a.finder_dir), finder_rev=a.rev, finder_exit=rc, finder_wall_seconds=finder_seconds)
     (a.out / "bench.json").write_text(json.dumps(bench, indent=1))
     print(table({a.out.name: bench}))
 
 
-def score_records(recs_dir: Path, score_dir: Path, dev: dict, ids: list, model: str) -> dict:
+def score_records(recs_dir: Path, score_dir: Path, dev: dict, ids: list, model: str, pool: list | None = None) -> dict:
     """The scorecard (lean) on every record in recs_dir whose id is a dev question, and S1 and Q1-Q5 over ids."""
     import torch
     from transformers import AutoTokenizer
 
     import neuron_scorecard as ns
-    finder_recs = {}
+    finder_recs, files = {}, []
     for f in sorted(recs_dir.glob("*.json")) if recs_dir.exists() else []:
         r = json.loads(f.read_text())
-        if r.get("id") in dev:
-            finder_recs[r["id"]] = r
-    files = [f for f in sorted(recs_dir.glob("*.json")) if json.loads(f.read_text()).get("id") in finder_recs] if recs_dir.exists() else []
+        qid = qid_of(r)
+        if qid in dev and qid not in finder_recs:
+            finder_recs[qid] = r
+            files.append(f)
     score_dir.mkdir(parents=True, exist_ok=True)
     tok = AutoTokenizer.from_pretrained(model)
     m = ns.Model(ns.load_model(model, None, "cuda" if torch.cuda.is_available() else "cpu", torch.float32))
@@ -167,16 +213,50 @@ def score_records(recs_dir: Path, score_dir: Path, dev: dict, ids: list, model: 
     ns.stability(recs)
     for r in recs:
         (score_dir / f"{r['task']}.json").write_text(json.dumps(r))
+    del m
+    torch.cuda.empty_cache() if torch.cuda.is_available() else None
+    robust = []  # Q5: monitorbench's circuit_robust, a bfloat16 Patcher, on the finder records with cuts
+    if pool is not None and any(r.get("cuts") for r in finder_recs.values()):
+        import circuit_finder as cf
+        import circuit_robust as cr
+        from transformers import AutoModelForCausalLM
+        rdir = score_dir.parent / "robust"
+        rdir.mkdir(exist_ok=True)
+        bm = AutoModelForCausalLM.from_pretrained(model, dtype=torch.bfloat16, device_map="cuda" if torch.cuda.is_available() else None).eval()
+        bm.requires_grad_(False)
+        pt = cf.Patcher(bm, tok)
+        qpool = cr.question_pool(pool)
+        for i, r in finder_recs.items():
+            path = rdir / (i.replace("/", "__") + ".json")
+            if path.exists():
+                robust.append(json.loads(path.read_text()))
+                continue
+            if not r.get("cuts"):
+                continue
+            out = cr.check(pt, tok, {**r, "gap": r.get("gap", 0.0)}, dev[i], qpool)
+            path.write_text(json.dumps(out))
+            robust.append(out)
     return {"model": model, "records": str(recs_dir), "gpu": torch.cuda.get_device_name() if torch.cuda.is_available() else "cpu",
-            "metrics": metrics(recs, finder_recs, len(ids))}
+            "metrics": metrics(recs, finder_recs, len(ids), robust)}
+
+
+def qid_of(r: dict) -> str:
+    """A record's question: its id, or a family pair record's "question/vs/partner" without the partner."""
+    return str(r.get("id")).split("/vs/")[0]
+
+
+def refuse_sealed(dev: dict, sealed: bool) -> None:
+    if not sealed and any(q.get("split") == "test" for q in dev.values()):
+        raise SystemExit("the sealed test set (split \"test\"): refused without --sealed")
 
 
 def score_only(a) -> None:
     sys.path.insert(0, str(HERE))
     sys.path.insert(0, str(HERE.parents[1] / "method" / "oracle"))
     dev = load_devset(a.devset)
-    ids = sorted({json.loads(f.read_text()).get("id") for f in a.records.glob("*.json")} & set(dev))
-    bench = score_records(a.records, a.out / "score", dev, ids, a.model)
+    refuse_sealed(dev, a.sealed)
+    ids = sorted({qid_of(json.loads(f.read_text())) for f in a.records.glob("*.json")} & set(dev))
+    bench = score_records(a.records, a.out / "score", dev, ids, a.model, [a.devset] + a.pool)
     bench.update(devset=str(a.devset), finder_rev=a.rev)
     a.out.mkdir(parents=True, exist_ok=True)
     (a.out / "bench.json").write_text(json.dumps(bench, indent=1))
@@ -201,6 +281,10 @@ def main():
     s.add_argument("--devset", type=Path, required=True)
     s.add_argument("--model", default="Qwen/Qwen3-8B")
     s.add_argument("--rev", default=None)
+    for x in (r, s):
+        x.add_argument("--sealed", action="store_true", help="allow the sealed test set (split \"test\")")
+        x.add_argument("--pool", type=Path, nargs="*", default=[p for p in (POOL,) if p.exists()],
+                       help="question files for Q5's resampled prompts beside the dev set")
     t = sp.add_parser("table")
     t.add_argument("outs", nargs="+", type=Path)
     a = ap.parse_args()

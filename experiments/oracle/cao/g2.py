@@ -79,8 +79,8 @@ def outcome(r: dict, y: str) -> tuple[str, dict]:
     if r["top_after"] != r["top_before"]:
         return f"the model gives {cao.q_tok(r['top_after'])} instead of {y}", {"top": r["top_after"]}
     ch = r["change"]
-    if abs(ch) < HALF:
-        return f"the model still gives {y}, almost unchanged", {"top_changes": False}
+    if abs(ch) < HALF:  # (two-sided: top_changes false passed on most items whatever the change, rewarding a no-change prior)
+        return f"the model still gives {y}, almost unchanged", {"contrast_change": {"op": "within", "value": HALF}}
     v = round(ch * 2) / 2
     return (f"the model still gives {y}, its lead over the alternatives {'up' if ch > 0 else 'down'} about {bits(ch)}",
             {"contrast_change": {"op": ">=" if ch > 0 else "<=", "value": v - 0.25 if ch > 0 else v + 0.25}})
@@ -168,7 +168,7 @@ def text_examples(o: "cao.Oracle", nr, ids: list[int], rng: random.Random, rec: 
         if cat == "n_sign":
             ch = r["change"]  # zeroing: a supporting unit's removal lowers the contrast
             pred = {"contrast_change": {"op": "<=", "value": -HALF}} if ch <= -HALF else \
-                {"contrast_change": {"op": ">=", "value": HALF}} if ch >= HALF else {"top_changes": False}
+                {"contrast_change": {"op": ">=", "value": HALF}} if ch >= HALF else {"contrast_change": {"op": "within", "value": HALF}}
             text = (f"{us[0]} supports {y}." if ch <= -HALF else f"{us[0]} works against {y}." if ch >= HALF else
                     f"{us[0]} barely matters for {y}.")
         else:

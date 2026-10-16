@@ -49,7 +49,8 @@ UNIT = re.compile(r"^L(\d+)\.([NH])(\d+)([+-]?)(?:@(-?\d+))?$")  # "@p": the uni
 CONTROLS = 2  # random unit sets per claim
 SIDE = nb.SIDE
 ROWS = 8  # rows a batch, every batch padded to it
-OPS = {"<=": lambda x, v: x <= v, ">=": lambda x, v: x >= v, "<": lambda x, v: x < v, ">": lambda x, v: x > v}
+OPS = {"<=": lambda x, v: x <= v, ">=": lambda x, v: x >= v, "<": lambda x, v: x < v, ">": lambda x, v: x > v,
+       "within": lambda x, v: abs(x) <= v}  # (within: no change beyond v either way, the two-sided "nothing happens")
 
 
 class BadClaim(ValueError):

@@ -1,9 +1,10 @@
 """Question-scoped circuits by the patching pair (the lead's 10-15 CIRCUIT FINDER spec, ~/mpd-data/team/direction_1015.txt).
 
 A question is two prompts of the same length run through the same model: clean (the model gives the answer y, its top
-token) and corrupted (a key word swapped; the model gives another answer b). The contrast is log2 p(y) - log2 of the
-summed p of the ALTERNATIVES alternatives (b first, then the clean run's likeliest tokens other than y and b), at the
-last position; gap = c_clean - c_corrupt, at least MIN_GAP bits (neuron_scorecard's pair_alts and contrast).
+token) and corrupted (a key word swapped; the model gives another answer b). The contrast is answer_contrast's: log2 of
+the summed p of every token starting the answer's word ("Paris", " Paris", "Par") over that of the tokens starting the
+other likeliest words in its script (b's first; other-script renderings such as 巴黎 on neither side), at the last
+position; gap = c_clean - c_corrupt, at least MIN_GAP bits, and b must not start the answer's word.
 Units: a neuron at a position (layer, pos, index; the down projection's input act(gate) x up), recorded with its pole
 (the sign of its clean value) and SwiGLU regime (the signs of act(gate) and of up), and a head at a position (that
 head's slice of the output projection's input), each patched by setting it to its value in the other run. Positions
@@ -48,6 +49,8 @@ import time
 
 import numpy as np
 import torch
+
+import answer_contrast
 
 ALTERNATIVES = 5
 MIN_GAP = 1.0         # bits: a pair counts when the answers differ and c_clean - c_corrupt reaches this
@@ -170,19 +173,20 @@ class Patcher:
             cap = {}
             lp[k] = self._last(ids, self.rows, cap=cap)[0]
             self.act[k] = {n: [t[0] for t in v] for n, v in cap.items()}           # per layer [T, dim]
-        self.y = int(lp["clean"].argmax()) if not answers else max(answers, key=lambda z: float(lp["clean"][z]))
         yc = int(lp["corrupt"].argmax())
-        alt = ([yc] if yc != self.y else []) + [int(z) for z in lp["clean"].topk(ALTERNATIVES + 2).indices.tolist()
-                                                if z not in (self.y, yc)]
-        alt = alt[:ALTERNATIVES]                    # (neuron_scorecard.pair_alts: the judge's contrast, number for number)
-        self.alt = torch.tensor(alt, device=lp["clean"].device)
+        word = None
+        if answers:                                 # a secret word: its likeliest token's word
+            word = answer_contrast.word(self.tok.decode([max(answers, key=lambda z: float(lp["clean"][z]))]))
+        self.sets = answer_contrast.token_sets(self.core, self.tok, self.ids["clean"], lp["clean"], yc, word)
+        self.y = self.sets["answer"][0]
         self.c = {k: float(self._contrast(v[None])[0]) for k, v in lp.items()}
         self.gap = self.c["clean"] - self.c["corrupt"]
-        return {"answer": self.y, "corrupt_answer": yc, "alternatives": alt, "contrast": self.c, "gap": self.gap,
-                "first_diff": self.first}
+        return {"answer": self.y, "corrupt_answer": yc, "answer_tokens": self.sets["answer"], "alternatives": self.sets["alternatives"],
+                "answer_word": self.sets["answer_word"], "alternative_words": self.sets["alternative_words"],
+                "same_answer": yc in self.sets["answer"], "contrast": self.c, "gap": self.gap, "first_diff": self.first}
 
     def _contrast(self, lp: torch.Tensor) -> torch.Tensor:
-        return (lp[:, self.y] - torch.logsumexp(lp[:, self.alt], -1)) / math.log(2)
+        return answer_contrast.contrast(lp, self.sets)
 
     @torch.no_grad()
     def run(self, base: str, sets: list) -> list[float]:
@@ -400,7 +404,7 @@ def find(pt: Patcher, clean: list[int], corrupt: list[int], answers: list[int] |
     t0 = time.perf_counter()
     rec = pt.setup(clean, corrupt, answers)
     rec["tokens"] = pt.T
-    if rec["gap"] < MIN_GAP or rec["answer"] == rec["corrupt_answer"]:
+    if rec["gap"] < MIN_GAP or rec["same_answer"]:
         rec.update(met=False, skipped="the corrupted run gives the same answer or the gap is under MIN_GAP bits",
                    seconds=round(time.perf_counter() - t0, 2))
         return rec

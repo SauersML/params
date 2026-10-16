@@ -51,6 +51,8 @@ import time
 
 import torch
 
+import answer_contrast
+
 TAUS = (0.005, 0.01, 0.02, 0.03, 0.05, 0.075, 0.1, 0.15, 0.2, 0.3, 0.5)   # a layer's weak fraction tau_l (0 also)
 KL_TOL = 0.1          # bits: the weak-zeroed reference's largest mean KL from the model (T2)
 FIT = 80              # calibration texts whose KL the per-layer fractions are chosen on
@@ -455,14 +457,15 @@ def build(nr: Neurons, ids: list[int], pos: int, log=None, span: tuple | None = 
     with torch.no_grad():
         lg = nr.logits(ids, allpos, capture=cap, B=ROWS)[0]   # (every run below at batch size ROWS)
     lp0 = torch.log_softmax(lg, -1)
-    y = int(lp0[-1].argmax())
-    alt = [int(z) for z in lp0[-1].topk(ALTERNATIVES + 1).indices.tolist() if z != y][:ALTERNATIVES]
-    altt = torch.tensor(alt, device=nr.dev)
+    sets = answer_contrast.token_sets(nr.core, nr.tok, ids[:pos + 1], lp0[-1])   # the answer's word against other words
+    y, alt = sets["answer"][0], sets["alternatives"]
+    yset = set(sets["answer"])
 
     def contrast(l):                                          # [B, V] log p at pos -> [B] bits
-        return (l[:, y] - torch.logsumexp(l[:, altt], -1)) / math.log(2)
+        return answer_contrast.contrast(l, sets)
     c0 = float(contrast(lp0[-1:])[0])
-    rec.update(answer=y, alternatives=alt, contrast=c0, p=float(lp0[-1, y].exp()))
+    rec.update(answer=y, answer_tokens=sets["answer"], answer_word=sets["answer_word"], alternatives=alt,
+               alternative_words=sets["alternative_words"], contrast=c0, p=float(lp0[-1, sets["answer"]].exp().sum()))
     H = [h[0] for h in cap["h"]]                              # [T, D] per layer, weak-zeroed
     U = [u[0] for u in cap["up"]]
     O = [o[0] for o in cap["o"]]                              # [T, NH x hd] per layer: the head outputs
@@ -488,7 +491,7 @@ def build(nr: Neurons, ids: list[int], pos: int, log=None, span: tuple | None = 
                 sd = (lp0[None, :-1].exp() * (lp0[None, :-1] - l[:, :-1])).sum(-1).mean(-1) / math.log(2) if side and not cache \
                     else torch.zeros(len(part))
                 for b, j in enumerate(js[s0:s0 + ROWS]):
-                    out[j] = {"contrast": float(c[b]), "top": int(l[b, -1].argmax()) == y, "side": float(sd[b])}
+                    out[j] = {"contrast": float(c[b]), "top": int(l[b, -1].argmax()) in yset, "side": float(sd[b])}
         return out
 
     def necessary(r):
@@ -553,7 +556,7 @@ def build(nr: Neurons, ids: list[int], pos: int, log=None, span: tuple | None = 
         keep[i][t, n] = False
     with torch.no_grad():
         lk = torch.log_softmax(nr.logits(ids, [pos], edit=lambda i, h: h * (~keep[i]).to(h.dtype), B=ROWS)[:, 0], -1)
-    kept = {"contrast": float(contrast(lk)[0]), "top": int(lk[0].argmax()) == y}
+    kept = {"contrast": float(contrast(lk)[0]), "top": int(lk[0].argmax()) in yset}
     rec.update(met=bool(nec) and (not cfs or restored >= SUFF_FRAC), necessity_met=bool(nec), size=len(circ),
                size_necessity=len(nec), size_sufficiency=len(suf), removed=removed, removed_necessity=nec_removed,
                restored=restored, sufficiency=kept, seconds=round(time.perf_counter() - t0, 2))

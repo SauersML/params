@@ -211,7 +211,8 @@ def main():
         import neuron_edges as ne
 
         shown = [(n["layer"], n["pos"], n["neuron"]) for n in got["nodes"] if n["shown"]]
-        ed = ne.Edges(model, ids, len(ids) - 1, [first["answer"]], first["alternatives"], shown, background="model")
+        ed = ne.Edges(model, ids, len(ids) - 1, first.get("answer_tokens", [first["answer"]]), first["alternatives"], shown,
+                      background="model")
         eg = ne.graph(ed, ne.prune(ed, log=log), tok)
         idn = {n["id"]: (n["layer"], n["pos"], n["neuron"]) for n in eg["nodes"]}
         g["edges"] = [{**e, "src_node": idn[e["src"]], "dst_node": idn[e["dst"]]} for e in eg["edges"]]

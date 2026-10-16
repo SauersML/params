@@ -20,6 +20,8 @@ Arms on one question set, same card, same records (searchalgo's comparison):
   attr   the units in RelP attribution order (circuit_finder.Patcher.scores), no group testing: the smallest passing
          prefix and pruning by measurement, as mask's
   am     attr, then masks on the cuts attr leaves unmet
+  fam    the units of the family's earlier circuits first (--prior: other questions of the task, family_order), then
+         attr's order
 A cut's hinge targets are TAU or 0.05 under its ceiling (at least PASS + 0.05), per share.
 
   circuit_masks.py questions QUESTIONS.json OUT --arm mask [--split dev --stride 4] [--model Qwen/Qwen3-8B] [--dtype ...]
@@ -212,9 +214,36 @@ def attr_order(pt, spec: dict, sc: dict) -> list:
     return units
 
 
-def search_all(pt, arm: str, log=None, steps: int = STEPS) -> dict:
+def family_prior(records: list) -> dict:
+    """{key: weight} from a family's earlier circuits (circuit_finder records): a unit's key is its kind, layer and index
+    with its position counted back from the answer ("end") and, for source units, also on from the first changed token
+    ("first"); its weight the number of circuits holding it plus half its largest share among them."""
+    prior = {}
+    for r in records:
+        last, first = r["tokens"] - 1, r["first_diff"]
+        units = [("neuron", n["layer"], n["neuron"], n["pos"], max(abs(n["lost"]), abs(n["restored"]))) for n in r.get("nodes", [])]
+        units += [("head", h["layer"], h["head"], h["pos"], max(abs(h["lost"]), abs(h["restored"]))) for h in r.get("routes", [])]
+        for kind, i, k, p, sh in units:
+            for key in {(kind, i, k, "end", last - p)} | ({(kind, i, k, "first", p - first)} if p < last else set()):
+                c, w = prior.get(key, (0, 0.0))
+                prior[key] = (c + 1, max(w, sh))
+    return {key: c + 0.5 * min(w, 1.0) for key, (c, w) in prior.items()}
+
+
+def family_order(pt, spec: dict, prior: dict) -> list:
+    """spec's units that prior's keys name at this pair's positions, by descending weight."""
+    last, pos, got = pt.T - 1, set(spec["positions"]), {}
+    for (kind, i, k, frm, d), w in prior.items():
+        p = last - d if frm == "end" else pt.first + d
+        if kind in spec["kinds"] and p in pos:
+            u = cf.unit(kind, i, p, k)
+            got[u] = max(got.get(u, 0.0), w)
+    return sorted(got, key=lambda u: -got[u])
+
+
+def search_all(pt, arm: str, log=None, steps: int = STEPS, prior: dict | None = None) -> dict:
     """Every cut of the pair set up in pt by arm: circuit_finder.cut's result per cut name. Arms: "mask"; "attr"; "am", attr
-    first and masks on the cuts it leaves unmet (one batch)."""
+    first and masks on the cuts it leaves unmet (one batch); "fam", prior's units (family_order) first, then attr's."""
     specs = cuts_of(pt)
     names = list(specs)
     width = {"neuron": pt.D, "head": pt.H}
@@ -224,13 +253,19 @@ def search_all(pt, arm: str, log=None, steps: int = STEPS) -> dict:
     reach = {n: ceil[n][0] >= cf.PASS and ceil[n][1] >= cf.PASS for n in names}
     out = {}
     live = [n for n in names if reach[n]]
-    if arm in ("attr", "am") and live:
+    if arm in ("attr", "am", "fam") and live:
         t0 = time.perf_counter()
         sc = cf.Patcher.scores(pt)                  # (the class's: find() stubs the instance's)
         for n in live:
             t1 = time.perf_counter()
-            out[n] = _record(verify(pt, attr_order(pt, specs[n], sc), log=log, name=n), ceil[n], True, specs[n]["positions"],
-                             {"attr": {"seconds": round(time.perf_counter() - (t0 if n == live[0] else t1), 2)}})
+            order, fam = attr_order(pt, specs[n], sc), []
+            if arm == "fam":
+                fam = family_order(pt, specs[n], prior or {})
+                have = set(fam)
+                order = fam + [u for u in order if u not in have]
+            out[n] = _record(verify(pt, order, log=log, name=n), ceil[n], True, specs[n]["positions"],
+                             {"attr": {"seconds": round(time.perf_counter() - (t0 if n == live[0] else t1), 2),
+                                       **({"family_units": len(fam)} if arm == "fam" else {})}})
         live = [n for n in live if not out[n]["met"]] if arm == "am" else []
     if arm in ("mask", "am") and live:
         t0 = time.perf_counter()
@@ -252,7 +287,8 @@ def search_all(pt, arm: str, log=None, steps: int = STEPS) -> dict:
     return out
 
 
-def find(pt, clean: list[int], corrupt: list[int], answers=None, log=None, arm: str = "mask", steps: int = STEPS) -> dict:
+def find(pt, clean: list[int], corrupt: list[int], answers=None, log=None, arm: str = "mask", steps: int = STEPS,
+         prior: dict | None = None) -> dict:
     """circuit_finder.find with arm's search in place of group testing (its record, "search": arm)."""
     if arm == "group":
         return {**cf.find(pt, clean, corrupt, answers, log=log), "search": "group"}
@@ -262,7 +298,7 @@ def find(pt, clean: list[int], corrupt: list[int], answers=None, log=None, arm: 
     def cut(pt_, sc, kind, positions, done, log=None, search=None):
         key = (tuple(pt_.ids["clean"]), tuple(pt_.ids["corrupt"]))
         if memo.get("key") != key:
-            memo.update(key=key, cuts=search_all(pt_, arm, log=log, steps=steps))
+            memo.update(key=key, cuts=search_all(pt_, arm, log=log, steps=steps, prior=prior))
         name = "movers" if kind == "head" else "readout" if list(positions) == [pt_.T - 1] else "source"
         return memo["cuts"][name]
     saved_cut = cf.cut
@@ -288,7 +324,7 @@ def main():
     ap.add_argument("mode", choices=("questions",))
     ap.add_argument("inp")
     ap.add_argument("out")
-    ap.add_argument("--arm", default="mask", help="comma-separated arms (mask, group, attr, am), each question through every arm in "
+    ap.add_argument("--arm", default="mask", help="comma-separated arms (mask, group, attr, am, fam), each question through every arm in "
                     "turn on the same card, records in OUT/<arm>/")
     ap.add_argument("--split", default="dev")
     ap.add_argument("--model", default="Qwen/Qwen3-8B")
@@ -300,6 +336,8 @@ def main():
     ap.add_argument("--offset", type=int, default=0)
     ap.add_argument("--stride", type=int, default=1)
     ap.add_argument("--ids", default=None, help="a JSON list of question ids (the frozen dev set)")
+    ap.add_argument("--prior", default=None, help="fam: a directory of circuit_finder records; a question's prior is its "
+                    "task's records other than its own")
     a = ap.parse_args()
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
@@ -324,9 +362,11 @@ def main():
         want = set(json.loads(Path(a.ids).read_text()))
         qs = [q for q in qs if q["id"] in want]
     pre = lambda q: tok(q["prefill"], add_special_tokens=False)["input_ids"] if q.get("prefill") else []  # noqa: E731
+    priors = [json.loads(p.read_text()) for p in sorted(Path(a.prior).glob("*.json"))] if a.prior else []
+    priors = [r for r in priors if r.get("met") and not r.get("skipped")]
     arms = a.arm.split(",")                         # (an arm may name its mask steps: am:30, records in OUT/am_30)
     for arm in arms:
-        assert arm.split(":")[0] in ("mask", "group", "attr", "am"), arm
+        assert arm.split(":")[0] in ("mask", "group", "attr", "am", "fam"), arm
         (out / arm.replace(":", "_")).mkdir(exist_ok=True)
     first = True
     for q in qs:
@@ -343,7 +383,8 @@ def main():
                 first = False
             log(f"{q['id']} ({arm})")
             name, _, n = arm.partition(":")
-            rec = find(pt, clean, corrupt, None, log=log, arm=name, steps=int(n) if n else a.steps)
+            prior = family_prior([r for r in priors if r.get("task") == q.get("task") and r["id"] != q["id"]]) if name == "fam" else None
+            rec = find(pt, clean, corrupt, None, log=log, arm=name, steps=int(n) if n else a.steps, prior=prior)
             rec.update(id=q["id"], ids=clean, corrupted=corrupt, answer_text=tok.decode([rec["answer"]]),
                        corrupt_answer_text=tok.decode([rec["corrupt_answer"]]), model=a.model, dtype=a.dtype,
                        finder="circuit_masks", finder_rev=a.rev,

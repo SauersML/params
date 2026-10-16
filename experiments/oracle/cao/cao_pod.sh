@@ -15,7 +15,7 @@
 #       [SHARE=0.4] [MICRO=1] bash ...   G2 labels, organism examples, the mix, SFT from AO's adapter, G2 and E1 evaluation
 #   RUN=rc1 MODE=readscirc RC=<reads_circuit.py build's directory> REPLAY=<ao_mix sample> THR=<reference> STEPS=N bash ...
 #       the circuit-reading test: T-correct and T-mismatch SFT, 3 oracles x 4 inputs, the score (questions: g2rec DENSE=1)
-#   RUN=li1 MODE=lipatch II=<their evaluator/ beside it> [ADAPTER_DIR=<ours>] [N=3200] bash ...   Li et al.'s activation-patching
+#   RUN=li1 MODE=lipatch II=<their evaluator/ beside it> [ADAPTER_DIR=<ours>] [NITEMS=3200] bash ...   Li et al.'s activation-patching
 #       test, the released AO and ours zero-shot, their exact-match scorer
 #   RUN=g2r MODE=g2rec RECORDS=<circuit records dir> THR=<reference> bash ...              g2.py gen on circuits built elsewhere
 #   RUN=oe1 MODE=orgeval ORGS=<organisms dir on the Mac> [ADAPTER_DIR=...] UPLOAD_MB=1500 bash ...  planted truths recovered
@@ -91,7 +91,7 @@ python -u g2.py eval --items $O/rc/test_names.jsonl --thr $S/thr.pt --adapter $A
 python -u g2.py eval --items $O/rc/test_mismatch.jsonl --thr $S/thr.pt --adapter $AOAD --out $O/rc/eval_T0_mismatch.jsonl > $O/rc/eval_T0_mismatch.log 2>&1; \
 python -u g2.py eval --items $O/rc/test_none.jsonl --thr $S/thr.pt --adapter $AOAD --out $O/rc/eval_T0_none.jsonl > $O/rc/eval_T0_none.log 2>&1; \
 python -u reads_circuit.py score $O/rc > $O/rc_score.txt 2>&1" ;;
-  lipatch) WORK="python -u li_patch.py --repo $S/ii --adapter $AOAD ${ADAPTER_DIR:+--adapter $S/adapter} --out $O/li.jsonl --n ${N:-3200} > $O/li.log 2>&1" ;;
+  lipatch) WORK="python -u li_patch.py --repo $S/ii --adapter $AOAD ${ADAPTER_DIR:+--adapter $S/adapter} --out $O/li.jsonl --n ${NITEMS:-3200} > $O/li.log 2>&1" ;;
   g2rec) WORK="python -u g2.py gen --out $O/g2.jsonl --thr $S/thr.pt --texts 100000 --records $S/records ${GROUPS:+--groups $S/groups} ${DENSE:+--dense} > $O/g2.log 2>&1" ;;
   inference) WORK="python -u inference.py build --out $O/inference_items.jsonl --per ${PER:-150} > $O/inference.log 2>&1" ;;
   organisms) WORK="python -u organisms.py all --out $O/organisms > $O/organisms.log 2>&1 && \

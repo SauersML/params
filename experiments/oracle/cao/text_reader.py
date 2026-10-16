@@ -550,6 +550,11 @@ def rows(a) -> None:
 
     F = json.loads(a.facts.read_text())
     train, test, donor = load_rc(a.rc)
+    held = {e["id"] for e in test}
+    for f in a.extra or []:  # gen's questions (training contexts only; a held-out context's would be refused)
+        more = [json.loads(x) for x in f.read_text().splitlines()]
+        assert not {e["id"] for e in more} & held, f
+        train += more
     if a.balance:
         rng = random.Random(0)
         by = collections.defaultdict(list)
@@ -629,7 +634,7 @@ def score(a) -> None:
     for f in a.evals:
         rs = [json.loads(x) for x in f.read_text().splitlines()]
         assert [r["a"] for r in rs] == [e["a"] for e in test], f
-        tab[f.stem] = [answer_class({"cat": r["cat"], "a": strip_read(r["got"])}) == g for r, g in zip(rs, gold)]
+        tab[f"{f.parent.name}/{f.stem}"] = [answer_class({"cat": r["cat"], "a": strip_read(r["got"])}) == g for r, g in zip(rs, gold)]
     cats = sorted({e["cat"] for e in test})
     print(f"{'':34s} {'all':>6s}" + "".join(f"{c:>9s}" for c in cats) + f"  varied(n={len(varied)})")
     for k, v in tab.items():
@@ -656,6 +661,7 @@ def main():
     r.add_argument("--facts", type=Path, required=True)
     r.add_argument("--out", type=Path, required=True)
     r.add_argument("--balance", action="store_true")
+    r.add_argument("--extra", type=Path, nargs="*", help="more training questions (gen's)")
     r.add_argument("--recap", action="store_true")
     r.add_argument("--first", action="store_true")
     s = sub.add_parser("sample")

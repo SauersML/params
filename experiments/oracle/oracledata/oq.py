@@ -11,7 +11,7 @@ circuit neuron outside every group ("L18.N2201+@12", claim_check's unit), or a m
   steer      one item's neurons turned up (STEER x each one's calibration maximum, along its pole)
   set        two to four items zeroed together
   sign       whether an item supports the answer, works against it, or barely matters (its zeroing's sign)
-  rank       three items ordered by how much zeroing each alone lowers the answer's lead (gaps of at least GAP bits)
+  rank       three items ordered by the change zeroing each alone makes to the answer's lead (gaps of at least GAP bits)
   necessary  which one of four items is needed: zeroing it alone lowers the lead by at least BIG bits, the others < LOW
   joint      which one of up to four pairs matters only jointly: each member alone < LOW, the pair at least BIG
   interact   whether zeroing a pair does more than, less than or about the sum of zeroing each alone
@@ -23,7 +23,8 @@ A change under LOW bits is "unchanged", from HIGH bits up or down; changes betwe
 contrast by float error). The contrast is claim_check's: log2 p(answer) over the summed p of the model's five likeliest
 other tokens, at the last position. Every row holds the question, a canonical answer (one sentence; for the four claim
 kinds also "Claim: {json}" passing claim_check, g2.py's form), its exact-match key and class, the measured numbers and a
-check a verifier reruns. The circuit each row reads is written once per text (circuits file, by circuit_id).
+check a verifier reruns. The circuit each row reads is written once per text (circuits file, by circuit_id). Items whose
+values are all massive (claim_check's zero leaves those live) get no zeroing question.
 
   oq.py gen RECORDS OUT.jsonl --thr THR.pt [--groups APPLY] [--source NAME] [--limit N] [--shard K/N]   (GPU)
   oq.py split OUT_DIR GEN.jsonl [GEN.jsonl ...] [--seed S]      splits, test balance, baselines, manifest (CPU)
@@ -210,11 +211,17 @@ def text_questions(nr, cc, eng: Engine, tok, rec: dict, apply: dict | None, rng:
     groups = {it["name"]: it["units"] for it in items if it["kind"] == "group"}
     parse = lambda names: cc.units_of(nr, [u for n in names for u in by[n]["units"]], T)  # noqa: E731
     neuronal = [it["name"] for it in items if it["kind"] != "head"]
+    # a massive value stays live under claim_check's zero, so an item whose values are all massive is never zeroed
+    val = {u["name"]: u for u in circ["units"]}
+    massive = lambda u: abs(val[u]["value"] or 0.0) >= float(nr.massive[val[u]["layer"]]) if u in val else False  # noqa: E731
+    for u in circ["units"]:
+        u["massive"] = massive(u["name"])
+    zeroable = [n for n in by if by[n]["kind"] == "head" or not all(massive(u) for u in by[n]["units"])]
     # the runs: reference, each item zeroed, each neuron item steered, sets, pairs, the whole circuit zeroed
     plan = [("ref", ())]
-    plan += [("zero", (n,)) for n in by]
+    plan += [("zero", (n,)) for n in zeroable]
     plan += [("steer", (n,)) for n in neuronal]
-    names = list(by)
+    names = zeroable
     for _ in range(3 if len(names) >= 2 else 0):
         plan.append(("set", tuple(sorted(rng.sample(names, rng.randint(2, min(4, len(names))))))))
     pairs = list(itertools.combinations(names, 2))
@@ -244,7 +251,7 @@ def text_questions(nr, cc, eng: Engine, tok, rec: dict, apply: dict | None, rng:
 
     # the four claim kinds
     for k in ("zero", "steer"):
-        for n in (by if k == "zero" else neuronal):
+        for n in (names if k == "zero" else neuronal):
             m = meas[(k, (n,))]
             c = change_class(m["flip"], m["change"])
             if c is None:
@@ -281,7 +288,7 @@ def text_questions(nr, cc, eng: Engine, tok, rec: dict, apply: dict | None, rng:
         row("set", ns, f"What happens to the model's next token {ytxt} if {listing(list(ns))} are zeroed together?",
             f"Zeroing {listing(list(ns))} together: {clause}.", c, c, claim, measured={"change": m["change"], "top_after": ta})
     # rank: three items whose zeroing changes are GAP apart, ordered most negative first
-    zc = {n: meas[("zero", (n,))]["change"] for n in by}
+    zc = {n: meas[("zero", (n,))]["change"] for n in names}
     trip = [t for t in itertools.combinations(names, 3)]
     rng.shuffle(trip)
     made = 0
@@ -291,8 +298,9 @@ def text_questions(nr, cc, eng: Engine, tok, rec: dict, apply: dict | None, rng:
             continue
         shown = list(t)
         rng.shuffle(shown)
-        row("rank", shown, f"Rank {listing(shown)} by how much zeroing each alone lowers the model's lead for its next token "
-            f"{ytxt}, largest first.", f"{s[0]}, then {s[1]}, then {s[2]}.", ">".join(s), f"first_{by[s[0]]['kind']}",
+        row("rank", shown, f"Order {listing(shown)} by the change zeroing each alone makes to the model's lead for its next "
+            f"token {ytxt}, from the largest drop to the largest rise.", f"{s[0]}, then {s[1]}, then {s[2]}.", ">".join(s),
+            f"first_{by[s[0]]['kind']}",
             check={"type": "rank", "units": s, "op": "zero"}, measured={"changes": [zc[n] for n in s]})
         made += 1
         if made >= 3:

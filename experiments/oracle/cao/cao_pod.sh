@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # The causal activation oracle (cao.py) on a rented GPU, into ~/mpd-data/runpod/oracle-pathg-$RUN/:
 #   RUN=gen1 MODE=gen TEXTS=4000 [PROCS=2] bash experiments/oracle/cao/cao_pod.sh [HOURS]     examples (PROCS processes, seeds 1..)
-#   RUN=train1 MODE=train DATA=<examples on the Mac> [STEPS=N] [VECTORS=<.pt>] [INIT=<adapter dir>] [SAVE_EVERY=N] [MICRO=N] bash ...  SFT from the released adapter
+#   RUN=train1 MODE=train DATA=<examples on the Mac> [STEPS=N] [VECTORS=<.pt>] [INIT=<adapter dir>] [SAVE_EVERY=N] [MICRO=N] [G2EVAL=<g2 held-out items> THR=<ref> STEPS=N] bash ...  SFT from the released adapter
 #   RUN=eval1 MODE=eval ITEMS=<h2h items> ADAPTER_DIR=<a trained adapter on the Mac> bash ...  the gate's questions (and the controls);
 #       [INF=<inference items>] the never-made inferences; [ORGS=<organisms dir>] planted truths; [AOBASE=1] the released AO too;
 #       [VAL=<held-out training examples>] the vectors' use per category (cao.py gain)
@@ -33,6 +33,7 @@ git fetch -q origin main && rm -rf "$S" "$S.tar" && mkdir -p "$S" && git archive
 [ -n "${THR:-}" ] && cp "$THR" "$S/thr.pt"
 [ -n "${INIT:-}" ] && cp -r "$INIT" "$S/init"
 [ -n "${QUESTIONS:-}" ] && cp "$QUESTIONS" "$S/questions.json"
+[ -n "${G2EVAL:-}" ] && cp "$G2EVAL" "$S/g2eval.jsonl"
 COPYFILE_DISABLE=1 tar -cf "$S.tar" -C "$S" . && rm -rf "$S"
 case $MODE in
   gen) WORK=""; for k in $(seq 1 ${PROCS:-2}); do
@@ -51,7 +52,9 @@ python -u organisms.py examples --dir $O/organisms --out $O/organism_examples.js
         WORK="python -u cao.py organisms --organisms $S/organisms --adapter $AD --out $O/orgeval.jsonl > $O/orgeval.log 2>&1; \
 python -u cao.py organisms --organisms $S/organisms --adapter $AD --out $O/orgeval_text_only.jsonl --text-only > $O/orgeval_text_only.log 2>&1" ;;
   train) WORK="CAO_MICRO=${MICRO:-4} python -u cao.py train --data $S/data.jsonl --out $O/adapter ${STEPS:+--steps $STEPS} \
-${VECTORS:+--vectors $S/vectors.pt} ${INIT:+--init $S/init} --save-every ${SAVE_EVERY:-2000} > $O/train.log 2>&1" ;;
+${VECTORS:+--vectors $S/vectors.pt} ${INIT:+--init $S/init} --save-every ${SAVE_EVERY:-2000} > $O/train.log 2>&1; \
+${G2EVAL:+python -u g2.py eval --items $S/g2eval.jsonl --thr $S/thr.pt --adapter $O/adapter/step_$STEPS --out $O/g2_eval.jsonl > $O/g2_eval.log 2>&1; \
+python -u g2.py eval --items $S/g2eval.jsonl --thr $S/thr.pt --adapter $O/adapter/step_$STEPS --out $O/g2_eval_text_only.jsonl --text-only > $O/g2_eval_text_only.log 2>&1;} true" ;;
   eval) AD=${ADAPTER_DIR:+$S/adapter}; AD=${AD:-$AOAD}  # (ADAPTER_DIR: a step_N directory)
         WORK="python -u cao.py eval --items $S/items.jsonl --adapter $AD --out $O/eval.jsonl > $O/eval.log 2>&1; \
 python -u cao.py eval --items $S/items.jsonl --adapter $AD --out $O/eval_text_only.jsonl --text-only > $O/eval_text_only.log 2>&1; \

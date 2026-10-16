@@ -7,11 +7,13 @@ organism investigations come first; the labels file grows, and a neuron already 
   atlas_labels.py gather --model M --out LIST.jsonl PATH...
       every neuron the JSON under PATH names for model M (dicts with "layer" and "neuron" or "index", as neuron_builder's
       circuit nodes; unit names L<l>.N<i>[+-], as claims; only --keys of a record that has them), most often named first
+  atlas_labels.py estimate --atlas ROOT --neurons LIST.jsonl   revise's Tinker cost before any call (x1.5 margin)
   atlas_labels.py coverage --atlas ROOT --out LIST.jsonl [--top N] [--frac 0.3]
       every neuron by how often one of its poles is strong (the share of corpus tokens beyond frac of the pole's extreme,
       from the atlas histogram): the neurons the oracle reads at the most positions, for labels past the named ones
   atlas_labels.py label --atlas ROOT --neurons LIST.jsonl --out LABELS.jsonl [--method revise|t1] [--examples 30]
-      LIST.jsonl lines {"layer", "index"[, "source"]}; LABELS.jsonl gets two lines per neuron, one per pole, in
+      LIST.jsonl lines {"layer", "index"[, "pole"][, "source"]} (with poles named, revise develops and writes only those);
+      LABELS.jsonl gets a line per pole, in
       neuron_verify's item format ({"layer", "index", "pole", "corpus_max", "explanation", "writer_valid", ...})
 """
 from __future__ import annotations
@@ -161,12 +163,16 @@ def label(a) -> None:
     done = set()
     if a.out.exists():
         done = {(r["layer"], r["index"]) for r in map(json.loads, a.out.read_text().splitlines()) if r.get("model") == model}
-    want, seen = [], set()
+    want, seen = [], {}
     for r in map(json.loads, a.neurons.read_text().splitlines()):
         key = (int(r["layer"]), int(r["index"]))
-        if key not in done and key not in seen:
-            seen.add(key)
-            want.append({**r, "layer": key[0], "index": key[1]})
+        if key in done:
+            continue
+        if key not in seen:
+            seen[key] = {**r, "layer": key[0], "index": key[1], "poles": set()}
+            want.append(seen[key])
+        if r.get("pole") in ("+", "-"):  # a named pole: only it is developed, scored and written (revise)
+            seen[key]["poles"].add(r["pole"])
     print(f"{len(want)} neurons to label ({len(done)} already in {a.out})", flush=True)
     rd = reader_reward.Reader(a.writer, a.out.parent)
     a.out.parent.mkdir(parents=True, exist_ok=True)
@@ -238,6 +244,8 @@ def revise(a, at, model, want, rd) -> None:
                 poles.append({"model": model, "layer": n["layer"], "index": n["index"], "pole": pole, "corpus_max": maximum,
                               "explanation": e if isinstance(e, str) and e.strip() else None, "source": r.get("source"),
                               "rounds": [], "_n": n, "_raw": text})
+        named = {(r["layer"], r["index"]): r["poles"] for r in part}
+        poles = [p for p in poles if not named[(p["layer"], p["index"])] or p["pole"] in named[(p["layer"], p["index"])]]
         live = [p for p in poles if p["explanation"] and p["corpus_max"] > 0]
         for rnd in range(a.rounds + 1):
             items = [{k: p[k] for k in ("layer", "index", "pole", "corpus_max", "explanation")} for p in live]
@@ -274,6 +282,31 @@ def revise(a, at, model, want, rd) -> None:
         with a.out.open("a") as f:
             f.write("".join(json.dumps(x, allow_nan=False) + "\n" for x in rows))
         print(f"{s + len(part)}/{len(want)} neurons labelled; spend ${rd.spend.total:.3f}", flush=True)
+
+
+def estimate(a) -> None:
+    """label --method revise's Tinker cost on these neurons before any call: the first drafts' prompts counted with the
+    writer's tokenizer, the rest from the 8B arm's measured shares (10-16: 0.46 of poles revised once, 0.28 twice; a
+    revision prompt 7k tokens; a reader plan 300 prompt and 700 sampled tokens; a judge 250 and 10), the named poles'
+    development and both fresh-text scores, times --margin."""
+    import atlas as atlas_mod
+    import neuron_verify
+    from tinker_train import PRICES
+
+    at = atlas_mod.Atlas(a.atlas)
+    rows = [json.loads(x) for x in a.neurons.read_text().splitlines() if x.strip()]
+    neurons = sorted({(int(r["layer"]), int(r["index"])) for r in rows})
+    npoles = len({(int(r["layer"]), int(r["index"]), r.get("pole")) for r in rows if r.get("pole")}) or 2 * len(neurons)
+    first = [len(at.tok(evidence(at.tok, at.neuron(l, i, k=a.examples, text=False), {"+": a.examples, "-": a.examples}, a.long))["input_ids"])
+             for l, i in neurons]
+    w, r = PRICES[a.writer], PRICES[neuron_verify.READER]
+    revs = npoles * (0.46 + 0.28)
+    parts = {"first drafts": sum(first) * w[0] + len(neurons) * 400 * w[1], "revisions": revs * (7000 * w[0] + 250 * w[1]),
+             "development plans": (npoles + revs) * (300 * r[0] + 700 * r[1]),
+             "fresh scores": 2 * npoles * (300 * r[0] + 700 * r[1] + 250 * r[0] + 10 * r[1])}
+    tot = sum(parts.values()) / 1e6
+    print(f"{len(neurons)} neurons, {npoles} poles, first prompt {sum(first) / len(first):.0f} tokens: " +
+          ", ".join(f"{k} ${v / 1e6:.2f}" for k, v in parts.items()) + f"; total ${tot:.2f}, with margin x{a.margin}: ${tot * a.margin:.2f}")
 
 
 def score(a) -> None:
@@ -327,6 +360,13 @@ def main():
                     "the writer's own development results; t1: T1's prompt, one writer call")
     lb.add_argument("--long", type=int, default=10, help="revise: examples shown with LONG tokens before")
     lb.add_argument("--rounds", type=int, default=2)
+    es = sub.add_parser("estimate")
+    es.add_argument("--atlas", type=Path, required=True)
+    es.add_argument("--neurons", type=Path, required=True)
+    es.add_argument("--writer", default=WRITER)
+    es.add_argument("--examples", type=int, default=30)
+    es.add_argument("--long", type=int, default=10)
+    es.add_argument("--margin", type=float, default=1.5)
     sc = sub.add_parser("score")
     sc.add_argument("--labels", type=Path, required=True)
     sc.add_argument("--lengths", nargs="+", default=["short", "long"])
@@ -337,7 +377,7 @@ def main():
         x.add_argument("--model", default="Qwen/Qwen3-8B")
         x.add_argument("--device")
     a = ap.parse_args()
-    {"gather": gather, "coverage": coverage, "label": label, "score": score}[a.what](a)
+    {"gather": gather, "coverage": coverage, "label": label, "estimate": estimate, "score": score}[a.what](a)
 
 
 if __name__ == "__main__":

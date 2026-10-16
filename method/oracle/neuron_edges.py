@@ -69,14 +69,33 @@ PREFIX = True  # a cut run computes only the positions from the circuit's first 
 
 
 def weight(mod) -> torch.Tensor:
-    """A linear module's effective weight [out, in]: its own, or under a LoRA adapter (peft) the base layer's plus each
-    active adapter's B A times its scaling."""
+    """Full effective weight; plain modules (including norm scales) keep their weight.
+
+    Standard eval-mode PEFT LoRA Linear only: merged weights already contain the
+    update; disabled unmerged adapters use the base. Disabled+merged would mutate
+    on forward, and variants cannot use this additive-weight contract. This full
+    matrix API preserves its allocation behavior; it is not a sparse exporter.
+    """
     if not hasattr(mod, "base_layer"):
         return mod.weight
-    W = mod.base_layer.weight
-    for a in getattr(mod, "active_adapters", []):
+    from peft.tuners.lora.layer import Linear
+    if type(mod) is not Linear or mod.fan_in_fan_out or type(mod.get_base_layer()) is not torch.nn.Linear:
+        raise ValueError("standard nonquantized PEFT LoRA Linear required")
+    if any(m.training for m in mod.modules()):
+        raise ValueError("effective LoRA weight requires eval mode")
+    if getattr(mod, "lora_variant", {}) or any(getattr(mod, "use_dora", {}).values()):
+        raise ValueError("variant LoRA effective weights unsupported")
+    if mod.disable_adapters and mod.merged:
+        raise ValueError("disabled merged adapter would mutate on forward")
+    W = mod.get_base_layer().weight
+    if mod.disable_adapters or mod.merged:
+        return W
+    for a in mod.active_adapters:
         if a in mod.lora_A:
-            W = W + (mod.lora_B[a].weight @ mod.lora_A[a].weight) * mod.scaling[a]
+            scale = float(mod.scaling[a])
+            if not math.isfinite(scale):
+                raise ValueError("nonfinite LoRA scaling")
+            W = W + (mod.lora_B[a].weight @ mod.lora_A[a].weight) * scale
     return W
 
 
@@ -829,8 +848,14 @@ def finder_graph(model, tok, rec: dict, log=print) -> dict:
     pairs = sorted({(e["dst_pos"], e["src_pos"]) for e in g["edges"] if e["src_pos"] != e["dst_pos"]})
     g["routes"] = [{"q": q, "p": p, "carriers": head_routes.carriers(rn, run["states"], lost, q, p)} for q, p in pairs]
     g.update(id=rec.get("id"), text_id=rec.get("id"), user=rec.get("user"), corrupt_user=rec.get("corrupt_user"),
-             corrupted=bad, model=rec.get("model"), finder=rec.get("finder"), cut="patch from the corrupted run",
+             corrupted=bad, model=rec.get("model"), finder=rec.get("finder"), intervention="patch from the corrupted run",
              gap=c - cb, answer_word=rec.get("answer_word"), alternative_words=rec.get("alternative_words"))
+    # Source declarations are useful provenance, not an attestation that this
+    # caller loaded the same checkpoint/adapter. Preserve graph()'s cut dictionary.
+    g["source_provenance"] = {k: rec[k] for k in (
+        "model", "adapter", "dtype", "finder", "finder_rev", "model_revision",
+        "tokenizer_sha256", "adapter_sha256") if k in rec}
+    g["source_provenance_status"] = "copied_source_record_not_verified_against_loaded_model"
     return g
 
 

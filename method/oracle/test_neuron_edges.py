@@ -194,3 +194,73 @@ def test_prefix_runs_equal_full_runs(tiny, monkeypatch):
             got[on] = [ed.contrasts(cuts, es), ed.contrasts(cuts[:, :len(ed.resid_all)], ed.resid_all, rest=True)]
         for a, b in zip(got[True], got[False]):
             assert a == pytest.approx(b, abs=1e-4)
+
+
+def test_effective_weight_matches_actual_peft_states():
+    import peft
+    torch.manual_seed(42)
+    model=peft.get_peft_model(torch.nn.Sequential(torch.nn.Linear(5,4,bias=True)),
+        peft.LoraConfig(r=2,lora_alpha=3,lora_dropout=0.,target_modules=['0']))
+    mod=model.get_base_model()[0]
+    with torch.no_grad():mod.lora_B['default'].weight.normal_()
+    mod.eval()
+    x = torch.randn(7, 5)
+    def parity():
+        W = neuron_edges.weight(mod)
+        torch.testing.assert_close(mod(x), x @ W.T + mod.base_layer.bias, rtol=1e-5, atol=1e-6)
+    parity()
+    mod.enable_adapters(False);parity()
+    assert neuron_edges.weight(mod) is mod.base_layer.weight
+    mod.enable_adapters(True);mod.merge();parity()
+    assert neuron_edges.weight(mod) is mod.base_layer.weight
+    mod.enable_adapters(False)
+    with pytest.raises(ValueError, match='disabled merged'):neuron_edges.weight(mod)
+    assert mod.merged  # extraction must not silently unmerge or mutate
+
+
+def test_effective_weight_multiple_adapters_variants_and_plain_norm():
+    import peft
+    model=peft.get_peft_model(torch.nn.Sequential(torch.nn.Linear(5,4,bias=False)),
+        peft.LoraConfig(r=2,lora_alpha=3,lora_dropout=0.,target_modules=['0']))
+    model.add_adapter('other',peft.LoraConfig(r=2,lora_alpha=2,lora_dropout=0.,target_modules=['0']))
+    mod=model.get_base_model()[0]
+    with torch.no_grad():
+        for layer in mod.lora_B.values():layer.weight.normal_()
+    mod.set_adapter(['default','other']);mod.eval();x=torch.randn(3,5)
+    torch.testing.assert_close(mod(x),x @ neuron_edges.weight(mod).T,rtol=1e-5,atol=1e-6)
+    # PEFT's merged branch uses base only, even if another active adapter is unmerged.
+    mod.merge(adapter_names=['default'])
+    assert set(mod.active_adapters)=={'default','other'} and mod.merged_adapters==['default']
+    torch.testing.assert_close(mod(x),x @ neuron_edges.weight(mod).T,rtol=1e-5,atol=1e-6)
+    assert neuron_edges.weight(mod) is mod.base_layer.weight
+    mod.unmerge()
+    mod.lora_variant['default']=object()
+    with pytest.raises(ValueError,match='variant'):neuron_edges.weight(mod)
+    mod.lora_variant.clear();mod.use_dora['default']=True
+    with pytest.raises(ValueError,match='variant'):neuron_edges.weight(mod)
+    from transformers.models.qwen3.modeling_qwen3 import Qwen3RMSNorm
+    norm=Qwen3RMSNorm(5)
+    assert neuron_edges.weight(norm) is norm.weight
+    linear=torch.nn.Linear(5,4)
+    assert neuron_edges.weight(linear) is linear.weight
+
+
+def test_finder_graph_keeps_cut_summary_and_marks_source_provenance(monkeypatch):
+    from types import SimpleNamespace
+    import types
+    summary={'none':1.25,'graph_edges':.5,'every_edge':-.25}
+    monkeypatch.setattr(neuron_edges,'Edges',lambda *a,**kw:object())
+    monkeypatch.setattr(neuron_edges,'prune',lambda *a,**kw:{})
+    monkeypatch.setattr(neuron_edges,'graph',lambda *a,**kw:{'cut':dict(summary),'edges':[]})
+    class Runner:
+        def __init__(self,model):pass
+        def run(self,ids,sets,capture=False):return {'contrast':[2. if ids==[1,2] else 1.],'states':{}}
+    monkeypatch.setitem(sys.modules,'head_routes',types.SimpleNamespace(Runner=Runner))
+    rec={'ids':[1,2],'corrupted':[1,3],'answer':4,'alternatives':[5],'nodes':[],
+         'model':'source-model','adapter':'source-adapter','dtype':'bfloat16',
+         'finder':'circuit_finder','finder_rev':'source-revision','id':'case'}
+    got=neuron_edges.finder_graph(object(),None,rec,log=lambda _:None)
+    assert got['cut']==summary and got['intervention']=='patch from the corrupted run'
+    assert got['source_provenance']=={k:rec[k] for k in ('model','adapter','dtype','finder','finder_rev')}
+    assert got['source_provenance_status']=='copied_source_record_not_verified_against_loaded_model'
+    assert rec['adapter']=='source-adapter'

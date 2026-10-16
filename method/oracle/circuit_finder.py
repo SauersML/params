@@ -46,6 +46,7 @@ from __future__ import annotations
 import math
 import time
 
+import numpy as np
 import torch
 
 ALTERNATIVES = 5
@@ -56,6 +57,12 @@ EPS_STEP = 4.0
 EPS_ROUNDS = 3
 ROWS = 32
 ATTENDS = 3           # source positions recorded per head
+PREFIX = True         # a batch whose patches all lie at or after a position runs only the positions from there on, the
+# base run's keys and values before it cached (no weak zeroing here, so the cached run equals the full one to float error)
+PREFIXES = 4          # cached prefixes per patching pair
+BATCH_TOKENS = 256    # a cached batch runs max(ROWS, BATCH_TOKENS / its positions) rows (at most MAX_ROWS): a forward of
+MAX_ROWS = 256        # few positions reads every weight for few tokens (float32, no weak zeroing: the batch size moves
+# a share by float error only)
 
 
 class Patcher:
@@ -115,16 +122,38 @@ class Patcher:
                 hs.append(layer.mlp.up_proj.register_forward_hook(lambda mod, args, out: cap.setdefault("up", []).append(out[:1].detach())))
         return hs
 
-    def _last(self, ids, B: int, **hooks) -> torch.Tensor:
-        """[B, V] float32 log-probabilities at the last position."""
+    def _last(self, ids, B: int, cache=None, **hooks) -> torch.Tensor:
+        """[B, V] float32 log-probabilities at the last position; with cache (_prefix: start, keys and values of positions
+        0..start-1) only the positions from start on run (the hooks see those)."""
         x = torch.as_tensor(ids, device=self.dev)[None].expand(B, -1)
         hs = self._hooks(**hooks)
         try:
-            lg = self.core(input_ids=x, logits_to_keep=1).logits[:, -1].float()
+            if cache is None:
+                lg = self.core(input_ids=x, logits_to_keep=1).logits[:, -1].float()
+            else:
+                s, kv = cache
+                T, dt = x.shape[1], self.core.model.embed_tokens.weight.dtype     # (the causal mask given whole:
+                mask = torch.full((T - s, T), torch.finfo(dt).min, dtype=dt, device=self.dev).triu(s + 1)   # transformers 4.53
+                try:                                                                  # on torch 2.4 failed to build one)
+                    lg = self.core(input_ids=x[:, s:], past_key_values=kv, use_cache=True, logits_to_keep=1,
+                                   attention_mask=mask[None, None].expand(B, 1, -1, -1)).logits[:, -1].float()
+                finally:
+                    kv.crop(s - T)                            # (the cache back to its prefix for the next batch)
         finally:
             for h in hs:
                 h.remove()
         return torch.log_softmax(lg, -1)
+
+    @torch.no_grad()
+    def _prefix(self, base: str, start: int, rows: int):
+        """(start, the base run's keys and values at positions 0..start-1 for a batch of rows), cached per pair."""
+        key = (base, start, rows)
+        if key not in self._kv:
+            x = torch.as_tensor(self.ids[base][:start], device=self.dev)[None].expand(rows, -1)
+            self._kv[key] = (start, self.core.model(input_ids=x, use_cache=True).past_key_values)
+            while len(self._kv) > PREFIXES:
+                self._kv.pop(next(iter(self._kv)))
+        return self._kv[key]
 
     @torch.no_grad()
     def setup(self, clean: list[int], corrupt: list[int], answers: list[int] | None = None) -> dict:
@@ -132,6 +161,7 @@ class Patcher:
         the alternatives and both contrasts (at the fixed batch size)."""
         assert len(clean) == len(corrupt), "a patching pair needs prompts of the same length"
         self.ids = {"clean": list(clean), "corrupt": list(corrupt)}
+        self._kv = {}
         self.T = len(clean)
         self.first = next(p for p in range(self.T) if clean[p] != corrupt[p])
         self.act = {}
@@ -161,26 +191,41 @@ class Patcher:
         or "corrupt", a head frozen at its value there), in the base run ("clean" or "corrupt"): the share of the gap
         lost (base clean) or restored (base corrupt)."""
         other = "corrupt" if base == "clean" else "clean"
+        pos_of = lambda u: u[2] if u[0] in ("res", "neuron") else u[3]  # noqa: E731
+        # units before the first differing token have the same value in both runs (patching them changes nothing): the
+        # positions from the first a set touches on run, the base run's prefix before it cached (PREFIX)
+        touched = [pos_of(u) for st in sets for u in st if pos_of(u) >= self.first]
+        start = min(touched, default=self.T - 1) if PREFIX else 0
+        R = min(MAX_ROWS, max(self.rows, BATCH_TOKENS // (self.T - start))) if start > 0 else self.rows
+        R = min(R, max(self.rows, len(sets)))
+        cache = self._prefix(base, start, R) if start > 0 else None
         out = []
-        for s0 in range(0, len(sets), self.rows):
-            part = sets[s0:s0 + self.rows]
-            by = {}
-            for b, s in enumerate(part):
+        for s0 in range(0, len(sets), R):
+            part = sets[s0:s0 + R]
+            by = {}                                          # (kind, source) -> layer -> rows, positions, indices
+            for b, s in enumerate(part):                     # (built on the host, one transfer per kind and layer)
                 for u in s:
+                    if pos_of(u) < start:
+                        continue
                     if u[0] == "res":
-                        k, p, src = torch.zeros(1, dtype=torch.long), u[2], u[3] if len(u) > 3 else other
+                        k, p, src = _ZERO, u[2], u[3] if len(u) > 3 else other
                     else:
-                        k = torch.as_tensor(u[2] if u[0] == "head" else u[3]).reshape(-1)
+                        k = u[2] if u[0] == "head" else u[3]
+                        k = (k.numpy() if torch.is_tensor(k) else np.asarray(k)).reshape(-1)
                         p, src = (u[3] if u[0] == "head" else u[2]), (u[4] if len(u) > 4 else other)
-                    by.setdefault((u[0], src), {}).setdefault(u[1], []).append((torch.full_like(k, b), torch.full_like(k, p), k))
-            idx = {key: {i: tuple(torch.cat(c) for c in zip(*v)) for i, v in d.items()} for key, d in by.items()}
+                    v = by.setdefault((u[0], src), {}).setdefault(u[1], ([], [], []))
+                    v[0].append(np.full(len(k), b))
+                    v[1].append(np.full(len(k), p))
+                    v[2].append(k)
+            idx = {key: {i: torch.from_numpy(np.stack([np.concatenate(a) for a in v]).astype(np.int64)).to(self.dev)
+                         for i, v in d.items()} for key, d in by.items()}
 
-            def res(i, h):
+            def res(i, h):                                   # (h: the positions from start on)
                 for src in ("clean", "corrupt"):
                     if i in idx.get(("res", src), {}):
                         b, p, _ = (t.to(h.device) for t in idx[("res", src)][i])
                         h = h.clone()
-                        h[b, p] = self.act[src]["res"][i][p].to(h.device, h.dtype)
+                        h[b, p - start] = self.act[src]["res"][i][p].to(h.device, h.dtype)
                 return h
 
             def head(i, h):
@@ -189,7 +234,7 @@ class Patcher:
                         b, p, k = (t.to(h.device) for t in idx[("head", src)][i])
                         B, T, _ = h.shape
                         h4 = h.reshape(B, T, self.H, self.hd).clone()
-                        h4[b, p, k] = self.act[src]["head"][i].reshape(T, self.H, self.hd)[p, k].to(h.device, h.dtype)
+                        h4[b, p - start, k] = self.act[src]["head"][i].reshape(self.T, self.H, self.hd)[p, k].to(h.device, h.dtype)
                         h = h4.reshape(B, T, self.H * self.hd)
                 return h
 
@@ -198,9 +243,9 @@ class Patcher:
                     if i in idx.get(("neuron", src), {}):
                         b, p, n = (t.to(h.device) for t in idx[("neuron", src)][i])
                         h = h.clone()
-                        h[b, p, n] = self.act[src]["neu"][i][p, n].to(h.device, h.dtype)
+                        h[b, p - start, n] = self.act[src]["neu"][i][p, n].to(h.device, h.dtype)
                 return h
-            c = self._contrast(self._last(self.ids[base], self.rows, res=res, head=head, neu=neu))[:len(part)]
+            c = self._contrast(self._last(self.ids[base], R, cache=cache, res=res, head=head, neu=neu))[:len(part)]
             if base == "clean":
                 out += ((self.c["clean"] - c) / self.gap).tolist()
             else:
@@ -244,6 +289,9 @@ class Patcher:
             self._att_ids = self.ids["clean"]
         w, s = self._att[layer][head, pos].topk(min(n, pos + 1))
         return [[int(a), round(float(b), 3)] for a, b in zip(s, w)]
+
+
+_ZERO = np.zeros(1, dtype=np.int64)
 
 
 def group_test(pt: Patcher, sc: dict, eps: float, done: dict, kinds=("neuron",), positions=None, measure=None, log=None) -> dict:

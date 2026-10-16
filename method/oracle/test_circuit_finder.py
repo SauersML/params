@@ -81,3 +81,19 @@ def test_find_record(tiny, monkeypatch):
     assert rec["met"] == all(c["met"] for k, c in rec["cuts"].items() if k != "readout" or c["reachable"])
     for c in rec["cuts"].values():
         assert c["reachable"] == (c["ceiling"][0] >= cf.PASS and c["ceiling"][1] >= cf.PASS)
+
+
+def test_prefix_cache_equals_full_runs(tiny, monkeypatch):
+    pt, clean, corrupt = tiny
+    pt.setup(clean, corrupt)
+    T, f = pt.T, pt.first
+    sets = [[("neuron", 1, T - 1, (3, 5, 9))], [("head", 0, (1, 2), T - 1), ("neuron", 0, T - 1, 4)],
+            [("res", 1, f)], [("neuron", 1, f + 1, (0, 7)), ("head", 1, 3, T - 1, "clean")],
+            [("res", 0, 0), ("neuron", 0, T - 1, (1, 2))], [("neuron", 1, p, 5) for p in range(T)]]
+    got = {}
+    for on in (True, False):
+        monkeypatch.setattr(cf, "PREFIX", on)
+        pt._kv = {}
+        got[on] = pt.both(sets) + pt.both(sets[:2])           # (a second call reuses the cache)
+    for a, b in zip(got[True], got[False]):
+        assert abs(a[0] - b[0]) < 1e-5 and abs(a[1] - b[1]) < 1e-5

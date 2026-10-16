@@ -29,15 +29,17 @@ contrast checked on the whole graph:
      then on the reader itself its activation with every circuit in-edge cut but its first k candidates, k = 0 to all
      (writers at base values; the norm, gate and up recomputed): each reader's smallest prefix within an allowed relative
      error of its activation, per allowance: the same error for every reader (EPS), or one in proportion to the
-     tolerance over the reader's first-order weight in the contrast (BITS: its gradient times its activation);
+     tolerance over the reader's first-order weight in the contrast (BITS: its gradient times its activation; patching:
+     the tolerance's floor, 1% of the question's gap);
   2. of the allowances whose union keeps the contrast within TOL of the way from every edge's to none's (either side),
-     the one with the fewest edges, every allowance one forward;
+     the one with the fewest edges, every allowance (and, patching, every edge cut) in one forward;
   3. readers' in-edge groups (a group cut: that reader reads no circuit neuron): the fewest readers by first-order
      weight whose groups alone keep the contrast (on a log scale, one forward), then a halving pass over theirs, a
      forward's blocks a round (each tried alone, those passing tried together);
-  4. measured last: the graph's contrast, each reader's group cut from it (the reader's in-strength), the graph's edges
-     cut with every other edge on, each kept edge's local effect on its reader, and the strength (its own cut from the
-     graph) of the MEASURED edges of largest share of their reader's in-strength.
+  4. measured last, in one forward's worth of sets: the graph's contrast, each reader's group cut from it (the reader's
+     in-strength), the strength (its own cut from the graph) of the MEASURED edges of largest first-order weight (local
+     effect over the reader's activation times the reader's gradient times activation), and the graph's edges cut with
+     every other edge on; each kept edge's local effect on its reader.
 
   python neuron_edges.py one MODEL TEXT.json OUT.json   (TEXT: ids, target, answer, alternatives, neurons)
   python neuron_edges.py finder MODEL REC.json|REC_DIR OUT.json|OUT_DIR [--dtype bfloat16]
@@ -61,7 +63,7 @@ IN_EDGES = 256  # each reader's candidate in-edges measured on it (by local effe
 EPS = tuple(round(0.5 * 2 ** (-i / 2), 4) for i in range(14))  # each reader's relative errors tried: 0.5 to 0.006
 BITS = tuple(round(2 ** (-i / 2), 4) for i in range(20))  # or each reader's error allowed this share of the tolerance in
 # first-order contrast (gradient x activation x relative error): 1 to 0.0014
-MEASURED = 512  # kept edges whose own cut from the graph is measured (those of largest share of their reader's strength)
+MEASURED = 512  # kept edges whose own cut from the graph is measured (those of largest first-order weight)
 HALVE_BLOCKS = 8
 TOKENS = 1536  # cut sets a forward: this many tokens' worth (at least 16 sets)
 PAD = True  # a lower precision model's forwards padded to B sets (every contrast at one batch shape; off: a forward of
@@ -270,12 +272,12 @@ class Edges:
         self._plans = {id(edges): (edges, plan)}
         return plan
 
-    def _fixed(self, L: int, coef: torch.Tensor, plan: dict, rest: bool) -> torch.Tensor:
+    def _fixed(self, L: int, coef: torch.Tensor, plan: dict, rest: torch.Tensor) -> torch.Tensor:
         """Patching: what layer L's circuit neurons read instead of their cut in-edges, those edges in the corrupted run
         [K, readers of L, d]."""
         d, K, R = self._d(L), coef.shape[0], self.nb[L + 1] - self.nb[L]
         P = self._on(d)[0][self.nb[L]:self.nb[L + 1]]
-        F = (self._all_in("corrupt")[L][P][None] * float(rest)).expand(K, -1, -1)
+        F = self._all_in("corrupt")[L][P][None] * rest.to(d)[:, None, None]  # (rest: per set, 1 cuts every other candidate)
         if L in plan.get("fixed", {}):
             es, rl, Vb = plan["fixed"][L]
             C = torch.zeros(K, R, len(es), device=d)
@@ -304,19 +306,21 @@ class Edges:
             V[i] = (z @ self._wo(c)[:, h * hd:(h + 1) * hd].T).to(d)
         return V
 
-    def _run(self, cuts: torch.Tensor, edges: list, rest: bool = False, keep_states: bool = False,
+    def _run(self, cuts: torch.Tensor, edges: list, rest=False, keep_states: bool = False,
              probe: list | None = None, ids: list[int] | None = None) -> dict:
         """The contrast of each row of cuts [K, len(edges)], every candidate not in edges as in the reference or (rest)
-        cut as well. probe: per layer a tensor [T, d_mlp] added to the neurons' activations (zeros requiring grad: the
-        contrast's gradient at them)."""
+        cut as well; rest: one bool for every set or one per set [K]. probe: per layer a tensor [T, d_mlp] added to the
+        neurons' activations (zeros requiring grad: the contrast's gradient at them)."""
         from transformers.models.qwen3.modeling_qwen3 import apply_rotary_pos_emb, repeat_kv
         core, H, KV, hd, T, f, N = self.core, self.H, self.KV, self.hd, self.T, self._f, len(self.N)
         K = max(cuts.shape[0], 1)
         s0 = int(self.P.min()) if (PREFIX and N and not keep_states and probe is None and ids is None
                                     and getattr(self, "base", None) is not None) else 0
         Ts = T - s0  # (the positions run: from the circuit's first on; the base run's keys and values before it)
-        coef = ((cuts.float() if len(edges) else torch.zeros(K, 0)) - float(rest)).to(self.dev)  # per listed edge: cut 1, as run 0,
-        # kept against a cut rest -1 (added back)
+        restv = (torch.as_tensor(rest).float() if torch.is_tensor(rest) else torch.full((K,), float(rest))).to(self.dev)
+        rest = bool(restv.any())  # (whether any set cuts every other candidate: the per-position sums are needed)
+        coef = (cuts.float() if len(edges) else torch.zeros(K, 0)).to(self.dev) - restv[:, None]  # per listed edge: cut 1,
+        # as run 0, kept against a cut rest -1 (added back)
         plan = self._plan(edges)
         x = core.model.embed_tokens(torch.tensor([(ids or self.ids)[s0:]], device=self.dev).expand(K, -1)).float()
         cos, sin = core.model.rotary_emb(x, torch.arange(s0, T, device=self.dev)[None])
@@ -331,7 +335,7 @@ class Edges:
             d = self._d(L)  # (every tensor of this layer's work on its card)
             x, D, Hc, coef, P, Ps, Jn, cos, sin = (t.to(d) for t in (x, D, Hc, coef, P, Ps, Jn, cos, sin))
             if rest:
-                S, R = S.to(d), R.to(d)
+                S, R, restv = S.to(d), R.to(d), restv.to(d)
             kk, causal = torch.arange(K, device=d), torch.ones(T, T, dtype=torch.bool, device=d).tril()[s0:]
             at = layer.self_attn
             hn = self._m(layer.input_layernorm, x)
@@ -374,9 +378,9 @@ class Edges:
             if len(rs) and (len(edges) or rest):  # each from its own input
                 inp = x[:, Ps[rs]] - D[:, rs]
                 if rest:
-                    inp = inp - S[:, Ps[rs]] - R[:, Ps[rs]]
+                    inp = inp - restv[:, None, None] * (S[:, Ps[rs]] + R[:, Ps[rs]])
                 if self.patch:  # (the cut edges' readers read what those edges bring in the corrupted run)
-                    inp = inp + self._fixed(L, coef, plan, rest)
+                    inp = inp + self._fixed(L, coef, plan, restv)
                 hr = self._mlp_act(layer, inp).gather(-1, Jn[rs][None, :, None].expand(K, -1, 1))[..., 0]
                 hm = hm.index_put((kk[:, None], Ps[rs][None], Jn[rs][None]), hr)
             if probe is not None:
@@ -402,15 +406,17 @@ class Edges:
         return out
 
     @torch.no_grad()
-    def contrasts(self, cuts: torch.Tensor, edges: list, rest: bool = False) -> list[float]:
-        """The contrast of each row of cuts [K, len(edges)] (rest: every candidate not in edges cut as well), B rows a
-        forward."""
+    def contrasts(self, cuts: torch.Tensor, edges: list, rest=False) -> list[float]:
+        """The contrast of each row of cuts [K, len(edges)] (rest: every candidate not in edges cut as well; one bool or
+        one per row), B rows a forward."""
         out = []
+        restv = torch.as_tensor(rest, dtype=torch.bool) if torch.is_tensor(rest) else torch.full((len(cuts),), bool(rest))
         for s0 in range(0, len(cuts), self.B):
-            c = cuts[s0:s0 + self.B]
+            c, r = cuts[s0:s0 + self.B], restv[s0:s0 + self.B]
             if PAD and self.dt != torch.float32 and len(c) < self.B:  # (a lower precision model's kernels round by batch size: every
                 c = torch.cat([c, c[-1:].expand(self.B - len(c), -1)])  # forward padded to B sets)
-            out.append(self._run(c, edges, rest=rest)["contrast"][:len(cuts) - s0])
+                r = torch.cat([r, r[-1:].expand(self.B - len(r))])
+            out.append(self._run(c, edges, rest=r)["contrast"][:len(cuts) - s0])
             self.forwards += 1
         return torch.cat(out).tolist() if out else []  # (read once: no wait for the card between forwards)
 
@@ -665,17 +671,19 @@ def prune(ed: Edges, log=print) -> dict:
     t0 = time.time()
     N = len(ed.N)
     c_all = ed.c_full
-    c_none = ed.contrasts(torch.zeros(1, 0, dtype=torch.bool), [], rest=True)[0]
-    tol = max(TOL * abs(c_all - c_none), MIN_TOL, GAP_TOL * abs(ed.gap) if ed.patch else 0.0)  # (two-sided: a kept set
-    # that overshoots is no more faithful)
-    ok = lambda c: abs(c - c_all) <= tol  # noqa: E731
+    floor = max(MIN_TOL, GAP_TOL * abs(ed.gap) if ed.patch else 0.0)
+    if ed.patch:  # (patching: the allowances scale with the floor and every edge cut rides in the allowances' forward)
+        c_none, scale = None, floor
+    else:
+        c_none = ed.contrasts(torch.zeros(1, 0, dtype=torch.bool), [], rest=True)[0]
+        scale = max(TOL * abs(c_all - c_none), floor)
     cands = ed.in_edges(IN_EDGES)
     curves = ed.local_curves(cands)
     ref = ed._h0().cpu()
     err = [(curves[i] - ref[i]).abs() / max(abs(float(ref[i])), 1e-9) for i in range(N)]
     sens = (ed.grads() * ref).abs()  # (each reader's contrast per unit relative change, first order: allowances only)
     allow = [("error", eps, [eps] * N) for eps in EPS] + [
-        ("bits", b, [b * tol / max(float(sens[i]), 1e-12) for i in range(N)]) for b in BITS]
+        ("bits", b, [b * scale / max(float(sens[i]), 1e-12) for i in range(N)]) for b in BITS]
     K = [[int(e.le(a).nonzero()[0]) if bool(e.le(a).any()) else int(e.argmin()) for e, a in zip(err, al)]
          for _, _, al in allow]
     t_local = time.time() - t0
@@ -685,7 +693,13 @@ def prune(ed: Edges, log=print) -> dict:
     owner = torch.tensor([i for i in range(N) for _ in range(kmax[i])], dtype=torch.long)
     rank = torch.tensor([s for i in range(N) for s in range(kmax[i])], dtype=torch.long)
     rows = torch.stack([rank >= torch.tensor(k, dtype=torch.long)[owner] for k in K])  # each reader's prefix kept, per allowance
-    cs = ed.contrasts(rows, listed, rest=True)
+    if c_none is None:
+        cs = ed.contrasts(torch.cat([rows, torch.ones(1, len(listed), dtype=torch.bool)]), listed, rest=True)
+        cs, c_none = cs[:-1], cs[-1]
+    else:
+        cs = ed.contrasts(rows, listed, rest=True)
+    tol = max(TOL * abs(c_all - c_none), floor)  # (two-sided: a kept set that overshoots is no more faithful)
+    ok = lambda c: abs(c - c_all) <= tol  # noqa: E731
     measured = 1 + len(allow)
     passing = [a for a, c in enumerate(cs) if ok(c)]
     pick = min(passing, key=lambda a: int((~rows[a]).sum())) if passing else len(EPS) - 1  # (the fewest edges)
@@ -743,31 +757,31 @@ def prune(ed: Edges, log=print) -> dict:
     f_halve = ed.forwards
 
     readers = [i for i in range(N) if bool((~gone & (owner == i)).any())]
-    trial = [gone]  # the graph, then each reader's kept in-edges cut from it
+    ks = [int((~gone & (owner == i)).sum()) for i in range(N)]  # (each reader's kept in-edges: a prefix of its own)
+    eff = ed.local_effects(cands, ks)
+    local = torch.cat([eff[int(owner[e])][int(rank[e])][None] for e in keep]) if len(keep) else torch.zeros(0)
+    est = torch.tensor([float(local[a].abs()) * float(sens[int(owner[e])]) / max(abs(float(ref[int(owner[e])])), 1e-9)
+                        for a, e in enumerate(keep.tolist())])  # (first-order: which MEASURED edges get their own cut)
+    top = torch.argsort(est, descending=True)[:MEASURED].tolist()
+    trial = [gone]  # one forward's worth: the graph, each reader's kept in-edges cut from it, each top edge cut from it
     for i in readers:
         t = gone.clone()
         t[owner == i] = True
         trial.append(t)
-    cs = ed.contrasts(torch.stack(trial), listed, rest=True)
-    c_kept, group = cs[0], {i: cs[0] - c for i, c in zip(readers, cs[1:])}
-    c_cut = ed.contrasts((~gone)[None], listed)[0]  # the graph's edges cut, every other edge on
-    ks = [int((~gone & (owner == i)).sum()) for i in range(N)]  # (each reader's kept in-edges: a prefix of its own)
-    eff = ed.local_effects(cands, ks)
-    local = torch.cat([eff[int(owner[e])][int(rank[e])][None] for e in keep]) if len(keep) else torch.zeros(0)
-    tot = {i: float(eff[i].abs().sum()) for i in readers}
-    est = torch.tensor([abs(group[int(owner[e])]) * float(local[a].abs()) / max(tot[int(owner[e])], 1e-12)
-                        for a, e in enumerate(keep.tolist())])
-    top = torch.argsort(est, descending=True)[:MEASURED].tolist()  # (each edge's own cut from the graph measured for the
-    trial = []  # MEASURED edges of largest share of their reader's measured group strength)
     for a in top:
         t = gone.clone()
         t[keep[a]] = True
         trial.append(t)
-    cs = ed.contrasts(torch.stack(trial), listed, rest=True) if trial else []
+    trial.append(~gone)  # and the graph's edges cut with every other edge on (no rest)
+    rest = torch.ones(len(trial), dtype=torch.bool)
+    rest[-1] = False
+    cs = ed.contrasts(torch.stack(trial), listed, rest=rest)
+    c_kept, c_cut = cs[0], cs[-1]
+    group = {i: c_kept - c for i, c in zip(readers, cs[1:1 + len(readers)])}
     strengths = [None] * len(keep)
-    for a, c in zip(top, cs):
+    for a, c in zip(top, cs[1 + len(readers):-1]):
         strengths[a] = c_kept - c
-    measured += 2 + len(readers) + len(trial)
+    measured += len(trial)
     best = int(ed.base["lp"][0].argmax())
     rec = {"contrast_model": ed.c_full, "reference_top": best, "answer_top": best in ed.answer, "gap": ed.gap,
            "edges_share_of_gap": (c_all - c_none) / ed.gap if ed.patch and ed.gap else None, "contrast_all_edges": c_all, "contrast_no_edges": c_none, "contrast_kept": c_kept,
@@ -792,7 +806,7 @@ def graph(ed: Edges, got: dict, tok=None) -> dict:
     each reader's measured in-strength (bits of contrast that cutting its kept in-edges from the graph removes), and the
     kept edges with their write weights, their measured local effect (local: the reader's activation less with the edge
     also cut from the graph's in-edges of it, writers at base values; excites: toward the reader's pole; share: |local|
-    over the reader's activation) and, for the MEASURED of largest share of their reader's in-strength, the measured
+    over the reader's activation) and, for the MEASURED of largest first-order weight, the measured
     strength (bits of contrast the edge's cut from the graph removes: every other kept edge on, every other candidate
     cut; None for the rest); with a tokenizer, the tokens and the answer's and alternatives' text."""
     Wf = {}

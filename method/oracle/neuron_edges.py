@@ -585,21 +585,31 @@ class Edges:
         d, H, KV, hd = self._d(L), self.H, self.KV, self.hd
         cols, h0, dvs, base = self._cols_on(d), self._h0(which).to(d), self._dvs(which), self._states(which)
         V = torch.zeros(len(rows), K, cols.shape[1], device=d)
-        groups = {}
-        for a, i in enumerate(rows):
+        res, rte = [], {}  # (one host-to-card copy per head layer: a copy per head waited for the card, 39-48 calls
+        for a, i in enumerate(rows):  # 1.2-1.5 s of a Qwen3-8B graph's edge stage)
             for s, e in enumerate(cands[i][0][:K]):
-                groups.setdefault(None if len(e) == 2 else e[1], []).append((a, s, self.at[e[0]], e[-1][1]))
-        for g, xs in groups.items():
-            a, s, w, q = (torch.tensor(t, device=d) for t in zip(*xs))
-            if g is None:
-                V[a, s] = h0[w, None] * cols[w]
-                continue
-            c, h = g
+                if len(e) == 2:
+                    res.append((a, s, self.at[e[0]]))
+                else:
+                    rte.setdefault(e[1][0], []).append((e[1][1], a, s, self.at[e[0]], e[-1][1]))
+        if res:
+            a, s, w = self._idx_on(res, d)
+            V[a, s] = h0[w, None] * cols[w]
+        for c, xs in rte.items():  # every head of a layer at once: each candidate's head output change through o_proj
             dc = self._d(c)
-            w, q = w.to(dc), q.to(dc)
+            h, a, s, w, q = self._idx_on(xs, dc)
             z = base["A"][c][h, q, self._on(dc)[0][w]][:, None] * dvs[c][w, h // (H // KV)]  # [n, hd]
-            V[a, s] = (z @ self._wo(c)[:, h * hd:(h + 1) * hd].T).to(d)
+            Z = torch.zeros(len(xs), H, hd, device=dc)
+            Z[torch.arange(len(xs), device=dc), h] = z  # (zero but at its head)
+            V[a.to(d), s.to(d)] = (Z.view(len(xs), H * hd) @ self._wo(c).T).to(d)
         return V
+
+    @staticmethod
+    def _idx_on(xs: list, dev) -> tuple:
+        """Integer tuples xs as one index tensor per field on a card (one pinned, unwaited copy)."""
+        t = torch.tensor(xs, dtype=torch.long)
+        t = t.pin_memory().to(dev, non_blocking=True) if torch.device(dev).type == "cuda" else t.to(dev)
+        return tuple(t.T)
 
     @torch.no_grad()
     def _acts(self, L: int, rows: list[int], X: torch.Tensor) -> torch.Tensor:

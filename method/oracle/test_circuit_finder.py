@@ -311,3 +311,28 @@ def test_beams_reach_group_testings_singles(tiny):
     assert set(every) == set(full) and all(abs(every[u][0] - full[u][0]) < 1e-5 for u in full)
     first = cf.beams(pt, sc, 0.05, ("neuron",), pos, pt.both, lambda us: True, 2)
     assert set(first) <= set(full) and (first or not full)
+
+
+def test_find_many_equals_find(tiny, monkeypatch):
+    """Pairs of one clean prompt run as a Group (their measure calls in shared batches) give find()'s records."""
+    pt, clean, corrupt = tiny
+    monkeypatch.setattr(cf, "EPS", 0.05)
+    corrupts = [corrupt]
+    for d in (3, 5):                                # (more corrupted prompts of the same length, changed elsewhere too)
+        x = list(corrupt)
+        x[6] = (x[6] + d) % 64
+        corrupts.append(x)
+    one = []
+    for x in corrupts:
+        one.append(cf.find(pt, clean, x))
+    pts = [cf.Patcher(pt.model, None, rows=pt.rows) for _ in corrupts]
+    many = cf.find_many(pts, clean, corrupts)
+    for a, b in zip(one, many):
+        assert a.get("skipped") == b.get("skipped")
+        for k in a.get("cuts", {}):
+            assert a["cuts"][k]["size"] == b["cuts"][k]["size"]
+            assert abs(a["cuts"][k]["lost"] - b["cuts"][k]["lost"]) < 1e-4 and abs(a["cuts"][k]["restored"] - b["cuts"][k]["restored"]) < 1e-4
+        assert [(n["layer"], n["pos"], n["neuron"]) for n in a.get("nodes", [])] == [(n["layer"], n["pos"], n["neuron"]) for n in b.get("nodes", [])]
+        ra, rb = a.get("residual_map"), b.get("residual_map")
+        if ra:
+            assert max(abs(x - y) for r1, r2 in zip(ra["lost"], rb["lost"]) for x, y in zip(r1, r2)) < 1e-4

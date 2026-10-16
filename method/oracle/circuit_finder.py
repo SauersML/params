@@ -59,6 +59,7 @@ import contextlib
 import inspect
 import itertools
 import math
+import threading
 import time
 
 import numpy as np
@@ -125,6 +126,7 @@ class Patcher:
         self.L, self.D, self.H = cfg.num_hidden_layers, cfg.intermediate_size, cfg.num_attention_heads
         self.hd = getattr(cfg, "head_dim", None) or cfg.hidden_size // self.H
         self.dev = self.core.model.embed_tokens.weight.device
+        self._group = None                          # (a Group's member: its measure calls taken in the group's rounds)
 
     def _hooks(self, res=None, head=None, neu=None, add=None, cap=None, only=None):
         """Forward hooks: res/head/neu(i, h) -> h edit each layer's residual input, head outputs (o_proj input) and
@@ -251,7 +253,8 @@ class Patcher:
         stacks: the two runs' residuals and keys and values to use (_derive's), default the setup runs'."""
         m, T, S = self.core.model, self.T, self.T - start
         res_st, kv_st = stacks or (self._res_st, self._kv_st)
-        bi = self._to_dev(np.array([0 if b == "clean" else 1 for b in layout], dtype=np.int64))
+        bi = self._to_dev(np.array([b if isinstance(b, (int, np.integer)) else 0 if b == "clean" else 1 for b in layout],
+                                   dtype=np.int64))             # (a Group's batch: each row's base by its index in stacks)
         n_at = np.searchsorted(np.asarray(lows), np.arange(self.L), side="right")             # rows running each layer
         dt = m.embed_tokens.weight.dtype
         pos = torch.arange(start, T, device=self.dev)
@@ -414,10 +417,17 @@ class Patcher:
         return stacks
 
     def _measure(self, sets: list, bases: tuple, given: list | None = None) -> list[list]:
-        """Per set, its share in each of bases. Units before the first differing token have the same value in both runs
-        (patching them changes nothing): each set runs from the first position it touches, the bases' prefixes before it
-        cached (PREFIX); sets are grouped by that start, a group of fewer than ROWS sets joining the next lower start.
-        given (run's): the runs with given patched are the bases (STAGED; otherwise given joins each set)."""
+        """Per set, its share in each of bases (_launch, _read; a Group's member: in the group's rounds)."""
+        if self._group is not None:
+            return self._group.measure(self, sets, bases, given)
+        return _read([self._launch(sets, bases, given)])[0]
+
+    def _launch(self, sets: list, bases: tuple, given: list | None = None) -> tuple:
+        """(len(sets), [(indices into sets, their shares on the device [n, len(bases)])]), every batch launched, none read.
+        Units before the first differing token have the same value in both runs (patching them changes nothing): each set
+        runs from the first position it touches, the bases' prefixes before it cached (PREFIX); sets are grouped by that
+        start, a group of fewer than ROWS sets joining the next lower start. given (run's): the runs with given patched
+        are the bases (STAGED; otherwise given joins each set)."""
         stacks = None
         if given:
             if STAGED and LAYERS and PREFIX and self.first > 0:
@@ -425,7 +435,7 @@ class Patcher:
             else:
                 sets, given = [list(given) + list(st) for st in sets], None
         starts = [min([_pos(u) for u in st if _pos(u) >= self.first], default=self.T - 1) if PREFIX else 0 for st in sets]
-        out, carry, pending = [None] * len(sets), [], []
+        carry, pending = [], []
         levels = sorted(set(starts), reverse=True)
         for j, st in enumerate(levels):
             carry += [b for b, v in enumerate(starts) if v == st]
@@ -433,12 +443,7 @@ class Patcher:
                 continue
             pending += [([carry[k] for k in js], v) for js, v in self._run_from([sets[b] for b in carry], st, bases, given, stacks)]
             carry = []
-        if pending:                                 # (read once a call: no wait between start groups)
-            vals = iter(torch.cat([v for _, v in pending]).tolist())
-            for bs, _ in pending:
-                for b in bs:
-                    out[b] = next(vals)
-        return out
+        return len(sets), pending
 
     def _run_from(self, sets: list, start: int, bases: tuple, given: list | None = None, stacks=None) -> list:
         """_measure's shares for sets patching only positions from start on (those before it ignored), on the device:
@@ -498,7 +503,9 @@ class Patcher:
         million indices, filled an 80 GB card); units before start ignored (built on the host, one transfer per kind
         and layer)."""
         by = {}
-        for b, base, units in rows:
+        for row in rows:                            # ((batch row, base, units) or with a Group's patcher index j: its
+            b, base, units = row[:3]                # sources then (source, j))
+            j = row[3] if len(row) > 3 else None
             other = "corrupt" if base == "clean" else "clean"
             for u in units:
                 if _pos(u) < start:
@@ -513,6 +520,7 @@ class Patcher:
                     if len(k) == (self.H if u[0] == "head" else self.D):
                         kind, k = u[0] + "_all", _ZERO
                 src = base if src == "self" else src
+                src = src if j is None or src == "zero" else (src, j)
                 v = by.setdefault((kind, src), {}).setdefault(u[1], ([], [], []))
                 v[0].append(np.full(len(k), b))
                 v[1].append(np.full(len(k), p))
@@ -520,41 +528,45 @@ class Patcher:
         return {key: {i: self._to_dev(np.stack([np.concatenate(a) for a in v]).astype(np.int64)) for i, v in d.items()}
                 for key, d in by.items()}
 
-    def _edits(self, idx: dict, start: int) -> dict:
-        """_hooks' res, head, neu and only for _index's indices, over the positions from start on."""
+    def _edits(self, idx: dict, start: int, acts: dict | None = None) -> dict:
+        """_hooks' res, head, neu and only for _index's indices, over the positions from start on; acts: each source's
+        activations (default this pair's clean and corrupted runs; a Group's batch: every member's)."""
+        acts = self.act if acts is None else acts
+        keys = sorted(idx, key=lambda k: str(k[1]))   # (sources in a fixed order: "clean", "corrupt", then "zero")
+
         def res(i, h):
-            for src in ("clean", "corrupt", "zero"):
-                if i in idx.get(("res", src), {}):
-                    b, p, _ = (t.to(h.device) for t in idx[("res", src)][i])
+            for kind, src in keys:
+                if kind == "res" and i in idx[(kind, src)]:
+                    b, p, _ = (t.to(h.device) for t in idx[(kind, src)][i])
                     h = h.clone()
-                    h[b, p - start] = 0 if src == "zero" else self.act[src]["res"][i][p].to(h.device, h.dtype)
+                    h[b, p - start] = 0 if src == "zero" else acts[src]["res"][i][p].to(h.device, h.dtype)
             return h
 
         def head(i, h):
-            for src in ("clean", "corrupt", "zero"):
-                if i in idx.get(("head_all", src), {}):
-                    b, p, _ = (t.to(h.device) for t in idx[("head_all", src)][i])
+            for kind, src in keys:
+                if kind == "head_all" and i in idx[(kind, src)]:
+                    b, p, _ = (t.to(h.device) for t in idx[(kind, src)][i])
                     h = h.clone()
-                    h[b, p - start] = 0 if src == "zero" else self.act[src]["head"][i][p].to(h.device, h.dtype)
-                if i in idx.get(("head", src), {}):
-                    b, p, k = (t.to(h.device) for t in idx[("head", src)][i])
+                    h[b, p - start] = 0 if src == "zero" else acts[src]["head"][i][p].to(h.device, h.dtype)
+                if kind == "head" and i in idx[(kind, src)]:
+                    b, p, k = (t.to(h.device) for t in idx[(kind, src)][i])
                     B, T, _ = h.shape
                     h4 = h.reshape(B, T, self.H, self.hd).clone()
                     h4[b, p - start, k] = 0 if src == "zero" else \
-                        self.act[src]["head"][i].reshape(self.T, self.H, self.hd)[p, k].to(h.device, h.dtype)
+                        acts[src]["head"][i].reshape(self.T, self.H, self.hd)[p, k].to(h.device, h.dtype)
                     h = h4.reshape(B, T, self.H * self.hd)
             return h
 
         def neu(i, h):
-            for src in ("clean", "corrupt", "zero"):
-                if i in idx.get(("neuron_all", src), {}):
-                    b, p, _ = (t.to(h.device) for t in idx[("neuron_all", src)][i])
+            for kind, src in keys:
+                if kind == "neuron_all" and i in idx[(kind, src)]:
+                    b, p, _ = (t.to(h.device) for t in idx[(kind, src)][i])
                     h = h.clone()
-                    h[b, p - start] = 0 if src == "zero" else self.act[src]["neu"][i][p].to(h.device, h.dtype)
-                if i in idx.get(("neuron", src), {}):
-                    b, p, n = (t.to(h.device) for t in idx[("neuron", src)][i])
+                    h[b, p - start] = 0 if src == "zero" else acts[src]["neu"][i][p].to(h.device, h.dtype)
+                if kind == "neuron" and i in idx[(kind, src)]:
+                    b, p, n = (t.to(h.device) for t in idx[(kind, src)][i])
                     h = h.clone()
-                    h[b, p - start, n] = 0 if src == "zero" else self.act[src]["neu"][i][p, n].to(h.device, h.dtype)
+                    h[b, p - start, n] = 0 if src == "zero" else acts[src]["neu"][i][p, n].to(h.device, h.dtype)
             return h
         only = {k: {i for (kind, _), d in idx.items() if kind in (name, name + "_all") for i in d} for k, name in
                 (("res", "res"), ("head", "head"), ("neu", "neuron"))}
@@ -596,6 +608,167 @@ class Patcher:
 
 
 _ZERO = np.zeros(1, dtype=np.int64)
+
+
+def _read(launches: list) -> list:
+    """Launches' shares read from the device in one wait: per launch (n, [(indices, [k, width])]), per set its shares."""
+    outs = [[None] * n for n, _ in launches]
+    pend = [(c, js, v) for c, (_, pending) in enumerate(launches) for js, v in pending]
+    if pend:                                        # (flat: launches of one base and of two read together)
+        vals, at = torch.cat([v.reshape(-1) for _, _, v in pend]).tolist(), 0
+        for c, js, v in pend:
+            w = v.shape[1]
+            for j in js:
+                outs[c][j], at = vals[at:at + w], at + w
+    return outs
+
+
+class Group:
+    """Patchers of one model and one prompt length run at once (find_many): each in a thread of its own, one thread
+    running at a time (the model's hooks are shared), their measure calls taken in rounds: a round starts when every
+    running member waits on one; calls without given and of one tuple of bases share batches (STAGED: each row's
+    bases, edit values and contrast its own member's), so the small batches of several searches run as one; the rest
+    launch as alone; all are read in one wait."""
+
+    def __init__(self, pts: list):
+        self.pts, self.cv, self.live, self.wait, self.done, self._st = list(pts), threading.Condition(), 0, {}, {}, {}
+
+    def run(self, fns: list) -> list:
+        """fns[j]() run with self.pts[j] a member (fns call its measure methods); their results, an exception re-raised."""
+        out, err = [None] * len(fns), [None] * len(fns)
+
+        def go(j, fn):
+            with self.cv:                           # (a member runs only while it holds the lock: one at a time)
+                try:
+                    out[j] = fn()
+                except BaseException as e:          # noqa: BLE001 (re-raised below)
+                    err[j] = e
+                finally:
+                    self.live -= 1
+                    self._round()
+        for pt in self.pts:
+            pt._group = self
+        self.live = len(fns)
+        try:
+            ts = [threading.Thread(target=go, args=(j, fn)) for j, fn in enumerate(fns)]
+            for t in ts:
+                t.start()
+            for t in ts:
+                t.join()
+        finally:
+            for pt in self.pts:
+                pt._group = None
+        for e in err:
+            if e is not None:
+                raise e
+        return out
+
+    def measure(self, pt, sets: list, bases: tuple, given) -> list:
+        """(a member's Patcher._measure, the lock held) its call in the next round, its shares when that round is read."""
+        self.wait[id(pt)] = (pt, sets, bases, given)
+        self._round()
+        while id(pt) not in self.done:
+            self.cv.wait()
+        r = self.done.pop(id(pt))
+        if isinstance(r, BaseException):
+            raise r
+        return r
+
+    def _round(self):
+        if not self.wait or len(self.wait) < self.live:
+            return
+        calls, self.wait = list(self.wait.values()), {}
+        try:
+            with torch.no_grad():                   # (grad mode is a thread's own)
+                launches, merged = [None] * len(calls), {}
+                for c, (pt, sets, bases, given) in enumerate(calls):
+                    if given or not (STAGED and LAYERS and PREFIX and pt.first > 0):
+                        launches[c] = pt._launch(sets, bases, given)
+                    else:
+                        merged.setdefault(bases, []).append(c)
+                for bases, cs in merged.items():
+                    for c, launch in zip(cs, self._launch([calls[c][:2] for c in cs], bases)):
+                        launches[c] = launch
+                got = _read(launches)
+        except BaseException as e:                  # noqa: BLE001 (each waiting call raises it)
+            got = [e] * len(calls)
+        for (pt, *_), r in zip(calls, got):
+            self.done[id(pt)] = r
+        self.cv.notify_all()
+
+    def _stacks(self, pts: list) -> tuple:
+        """Members' bases as _staged's stacks: member j's clean and corrupted runs at 2j and 2j + 1."""
+        key = tuple(id(pt) for pt in pts)
+        if key not in self._st:
+            L = pts[0].L
+            self._st = {key: ([torch.cat([pt._res_st[i] for pt in pts]) for i in range(L)],
+                              [tuple(torch.cat([pt._kv_st[i][j] for pt in pts]) for j in (0, 1)) for i in range(L)])}
+        return self._st[key]
+
+    def _launch(self, calls: list, bases: tuple) -> list:
+        """Merged calls [(pt, sets)] of one tuple of bases: per call _launch's (n, pending)."""
+        items = [(c, k, pt, st) for c, (pt, sets) in enumerate(calls) for k, st in enumerate(sets)]
+        rows = calls[0][0].rows
+        starts = [min([_pos(u) for u in st if _pos(u) >= pt.first], default=pt.T - 1) for _, _, pt, st in items]
+        pend = [[] for _ in calls]
+        carry, levels = [], sorted(set(starts), reverse=True)
+        for j, st in enumerate(levels):
+            carry += [b for b, v in enumerate(starts) if v == st]
+            if len(carry) < rows and j < len(levels) - 1:
+                continue
+            for js, v in self._run_from([items[b] for b in carry], st, bases):
+                for c in sorted({items[carry[k]][0] for k in js}):
+                    sel = [n for n, k in enumerate(js) if items[carry[k]][0] == c]
+                    pend[c].append(([items[carry[js[n]]][1] for n in sel], v[calls[0][0]._to_dev(np.array(sel, dtype=np.int64))]))
+            carry = []
+        return [(len(sets), pend[c]) for c, (_, sets) in enumerate(calls)]
+
+    def _run_from(self, items: list, start: int, bases: tuple) -> list:
+        """Patcher._run_from's staged path over items [(call, set index, pt, set)] of several members."""
+        pts = list(dict.fromkeys(it[2] for it in items))
+        at = {id(pt): j for j, pt in enumerate(pts)}
+        pt0 = pts[0]
+        R = min(MAX_ROWS, max(pt0.rows, BATCH_TOKENS // (pt0.T - start)))
+        R = min(R, max(pt0.rows, len(items) * len(bases)), pt0._fit(pt0.T - start))
+        low = [min([u[1] for u in it[3] if _pos(u) >= start], default=pt0.L - 1) for it in items]
+        order = sorted(range(len(items)), key=lambda j: -low[j])
+        chunks, cur = [], []
+        for j in order:
+            if cur and (len(cur) + 1) * len(bases) > R:
+                chunks.append(cur)
+                cur = []
+            cur.append(j)
+        chunks.append(cur)
+        stacks = self._stacks(pts)
+        acts = {(name, j): pt.act[name] for j, pt in enumerate(pts) for name in ("clean", "corrupt")}
+        pending = []
+        for js in chunks:
+            rows = sorted((low[j], kb, jj) for jj, j in enumerate(js) for kb in range(len(bases)))
+            row = {(kb, jj): r for r, (_, kb, jj) in enumerate(rows)}
+            mem = [at[id(items[js[jj]][2])] for _, _, jj in rows]                   # each row's member
+            layout = [2 * m + (0 if bases[kb] == "clean" else 1) for m, (_, kb, _) in zip(mem, rows)]
+            idx = pt0._index([(r, bases[kb], items[js[jj]][3], m) for r, ((_, kb, jj), m) in enumerate(zip(rows, mem))], start)
+            hn = pt0._staged(start, layout, [r[0] for r in rows], stacks=stacks, **pt0._edits(idx, start, acts))
+            c = torch.empty(len(rows), device=hn.device)
+            cc, cr, gap = (np.empty(len(rows), dtype=np.float32) for _ in range(3))
+            for j, pt in enumerate(pts):            # (each row's contrast by its own member's answer and alternatives)
+                sel = [r for r, m in enumerate(mem) if m == j]
+                if sel:
+                    t = pt0._to_dev(np.array(sel, dtype=np.int64)).to(hn.device)
+                    c[t] = pt._contrast(hn[t]).to(c.device)
+                    cc[sel], cr[sel], gap[sel] = pt.c["clean"], pt.c["corrupt"], pt.gap
+            cc, cr, gap = (pt0._to_dev(a).to(c.device) for a in (cc, cr, gap))         # (pinned, unwaited copies)
+            clean = pt0._to_dev(np.array([bases[kb] == "clean" for _, kb, _ in rows])).to(c.device)
+            share = torch.where(clean, cc - c, c - cr) / gap
+            ix = pt0._to_dev(np.array([[row[(kb, jj)] for kb in range(len(bases))] for jj in range(len(js))], dtype=np.int64))
+            pending.append((js, share[ix]))                                          # [sets, bases]
+        return pending
+
+
+def find_many(pts: list, clean: list[int], corrupts: list, **kw) -> list[dict]:
+    """find() for patching pairs of one clean prompt (corrupted prompts of its length), one Patcher each (pts, of one
+    model), run as a Group: each record find()'s (bfloat16 shares within its batch-shape noise)."""
+    return Group(pts).run([lambda pt=pt, x=x: find(pt, clean, x, **kw) for pt, x in zip(pts, corrupts)])
 
 
 @contextlib.contextmanager

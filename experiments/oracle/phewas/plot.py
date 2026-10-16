@@ -9,6 +9,8 @@ Every later PheWAS figure is a version of this one.
       beside the random poles' 99th percentile; whether a neuron's several traits lie near each other in meaning (from
       association, and with --nearness from knockouts); with --concentration, the knockout-explained variance against
       groups removed (refusal against the other traits)
+  plot.py controlcorr RAW_CORR.json CONTROLLED_CORR.json OUT.png
+      the persona traits' knockout correlation as measured and after the format control (controls.py), same order
   plot.py traitcorr CORR.json OUT.png
       the knockout trait correlation (effects.py correlation) for the central persona block and the antisocial traits
       that anti-correlate with it (lower triangle, block means)
@@ -407,6 +409,43 @@ def traitcorr(a) -> None:
     print("saved", a.out, "central", nc, "antisocial", n - nc)
 
 
+def controlcorr(a) -> None:
+    """The persona traits' knockout correlation as measured and after the format control (controls.py compose: each
+    trait's change minus its matched neutral statements'), the same traits in the same order (clustered as measured)."""
+    plt = style()
+    from scipy.cluster.hierarchy import leaves_list, linkage
+    from scipy.spatial.distance import squareform
+
+    mats = []
+    for f in (a.raw, a.controlled):
+        d = json.loads(f.read_text())
+        mats.append((d["traits"], np.array(d["correlation"])))
+    names = [t for t in mats[0][0] if t.startswith("persona/")]
+    idx = [mats[0][0].index(t) for t in names]
+    R = mats[0][1][np.ix_(idx, idx)]
+    dist = np.clip(1 - R, 0, 2)
+    np.fill_diagonal(dist, 0)
+    order = leaves_list(linkage(squareform(dist, checks=False), "average"))
+    fig, axes = plt.subplots(1, 2, figsize=(30, 15.5), dpi=90)
+    for ax, (traits, C), label in zip(axes, mats, ("as measured", "minus matched neutral statements")):
+        ix = [traits.index(names[k]) for k in order]
+        M = C[np.ix_(ix, ix)]
+        mesh = ax.imshow(M, cmap="RdBu_r", vmin=-1, vmax=1)
+        iu = np.triu_indices(len(ix), 1)
+        ax.set_xticks([])
+        ax.set_yticks([])
+        for sp in ax.spines.values():
+            sp.set_visible(False)
+        ax.set_xlabel(f"{label}\nshare of pairs with r > 0.5: {np.mean(M[iu] > 0.5):.0%}", fontsize=FS)
+    cb = fig.colorbar(mesh, ax=axes, orientation="vertical", fraction=0.025, pad=0.02)
+    cb.set_label("correlation of two persona traits' knockout changes", fontsize=FS - 6)
+    cb.ax.tick_params(labelsize=FS - 8)
+    fig.suptitle(f"Persona traits in Qwen3-8B ({len(names)} traits, {json.loads(a.raw.read_text())['groups']} knockout groups)",
+                 x=0.06, y=0.98, ha="left", fontsize=FS + 6, fontweight="bold")
+    fig.savefig(a.out, facecolor="white", bbox_inches="tight")
+    print("saved", a.out)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -419,8 +458,12 @@ def main():
     t = sub.add_parser("traitcorr")
     t.add_argument("analysis", type=Path)
     t.add_argument("out", type=Path)
+    cc = sub.add_parser("controlcorr")
+    cc.add_argument("raw", type=Path)
+    cc.add_argument("controlled", type=Path)
+    cc.add_argument("out", type=Path)
     a = ap.parse_args()
-    {"phewas": phewas, "traitcorr": traitcorr}[a.cmd](a)
+    {"phewas": phewas, "traitcorr": traitcorr, "controlcorr": controlcorr}[a.cmd](a)
 
 
 if __name__ == "__main__":

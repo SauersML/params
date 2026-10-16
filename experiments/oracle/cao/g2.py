@@ -105,15 +105,17 @@ def loguniform(rng: random.Random, n: int) -> int:
     return round(math.exp(rng.uniform(math.log(lo), math.log(n))))
 
 
-def text_examples(o: "cao.Oracle", nr, ids: list[int], rng: random.Random, rec: dict) -> tuple[list[dict], dict]:
+def text_examples(o: "cao.Oracle", nr, ids: list[int], rng: random.Random, rec: dict, dense: bool = False) -> tuple[list[dict], dict]:
+    """dense (the circuit-reading test's): every group shown, no heads (a head's vector depends on the text, so another
+    text's could not stand in for it), and every question about every shown unit."""
     import claim_check as cc
     order = measured_order(rec)
     if not order:
         return [], {"size": 0}
     write = lambda d: [d["layer"], d["neuron"], value(d)]  # noqa: E731
-    form = rng.choice(FORMS)
+    form = "groups" if dense else rng.choice(FORMS)
     heads = []
-    for r in rec.get("routes", []):  # a mover head at the answer position, with where it looks
+    for r in ([] if dense else rec.get("routes", [])):  # a mover head at the answer position, with where it looks
         hn = f"L{r['layer']}.H{r['head']}@{r['pos']}"
         looks = ", ".join(f"{cao.q_tok(o.tok.decode([ids[q]]))} @{q}" for q, *_ in (r.get("attends") or [])[:2])
         heads.append((hn, [hn], {"label": hn + (f" (looks at {looks})" if looks else ""), "unit": ["head", r["layer"], r["head"]]}))
@@ -131,7 +133,7 @@ def text_examples(o: "cao.Oracle", nr, ids: list[int], rng: random.Random, rec: 
     stages = rec.get("order") or ["movers", "source", "readout"]  # the family's stages, narrowest first (circuit_family)
     seq = [x for st in stages for x in (heads if st == "movers" else gitems.get(st, []))]
     seq += [x for st, v in gitems.items() if st not in stages for x in v]
-    items = seq[:loguniform(rng, len(seq))] if seq else []
+    items = seq if dense else seq[:loguniform(rng, len(seq))] if seq else []
     shown = {n for n, _, _ in items}
     items += [x for x in single if x[0] not in shown]
     expand = {n: us for n, us, _ in items}
@@ -139,7 +141,13 @@ def text_examples(o: "cao.Oracle", nr, ids: list[int], rng: random.Random, rec: 
     blocks = [{"layer": cao.MID, "positions": list(range(len(ids)))}] + [b for _, _, b in items]
     y = cao.q_tok(o.tok.decode([rec["answer"]]))
     asks = []
-    for cat, k in QUESTIONS:
+    if dense:
+        asks = [(cat, [n], {"steer": STEER} if cat == "n_steer" else "zero") for n in names for cat in ("n_zero", "n_sign", "n_steer")]
+        for _ in range(2 if len(names) >= 2 else 0):
+            us = rng.sample(names, rng.randint(2, min(4, len(names))))
+            if ("n_set", us) not in [(c_, u_) for c_, u_, _ in asks]:
+                asks.append(("n_set", us, "zero"))
+    for cat, k in ([] if dense else QUESTIONS):
         for _ in range(k):
             if cat == "n_set" and len(names) < 2:
                 continue
@@ -212,7 +220,7 @@ def gen(a) -> None:
             key = 1_000_000 * a.seed + n
             if key in done:
                 continue
-            exs, info = text_examples(o, nr, r["ids"], rng, r)
+            exs, info = text_examples(o, nr, r["ids"], rng, r, dense=a.dense)
             dst = hh if zlib.crc32(str(r.get("id", n)).encode()) % 10 == 0 else fh
             for e in exs:
                 dst.write(json.dumps({**e, "text": key, **({"id": r["id"]} if "id" in r else {})}) + "\n")
@@ -406,6 +414,7 @@ def main():
     g.add_argument("--texts", type=int, default=100)
     g.add_argument("--seed", type=int, default=1)
     g.add_argument("--records", type=Path, required=True, help="circuit records (circuit_finder's or circuit_family's, or neuron_motifs apply's), one JSON file a text")
+    g.add_argument("--dense", action="store_true", help="every group, no heads, every question per unit (the circuit-reading test)")
     g.add_argument("--groups", type=Path, help="neuron_motifs apply's directory for the records (shared groups, joined by file name)")
     g.add_argument("--device")
     e = sub.add_parser("eval")

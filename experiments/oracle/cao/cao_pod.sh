@@ -13,6 +13,8 @@
 #       the released AO); ANSWERS: the organisms' own answers too, for e1.py reader
 #   RUN=s8 MODE=sft8b RECORDS=<circuit records> ORGS=<training organisms> REPLAY=<ao_mix sample> THR=<reference> STEPS=N [E1=<stage>]
 #       [SHARE=0.4] [MICRO=1] bash ...   G2 labels, organism examples, the mix, SFT from AO's adapter, G2 and E1 evaluation
+#   RUN=rc1 MODE=readscirc RC=<reads_circuit.py build's directory> REPLAY=<ao_mix sample> THR=<reference> STEPS=N bash ...
+#       the circuit-reading test: T-correct and T-mismatch SFT, 3 oracles x 4 inputs, the score (questions: g2rec DENSE=1)
 #   RUN=g2r MODE=g2rec RECORDS=<circuit records dir> THR=<reference> bash ...              g2.py gen on circuits built elsewhere
 #   RUN=oe1 MODE=orgeval ORGS=<organisms dir on the Mac> [ADAPTER_DIR=...] UPLOAD_MB=1500 bash ...  planted truths recovered
 #   (env: SRCREV (default origin/main), GPU, PRICE, CAO_MODEL (default Qwen/Qwen3-1.7B; Qwen/Qwen3-8B wants a 48 GB card))
@@ -39,6 +41,7 @@ git fetch -q origin main && rm -rf "$S" "$S.tar" && mkdir -p "$S" && git archive
 [ -n "${INIT:-}" ] && cp -r "$INIT" "$S/init"
 [ -n "${QUESTIONS:-}" ] && cp "$QUESTIONS" "$S/questions.json"
 [ -n "${G2EVAL:-}" ] && cp "$G2EVAL" "$S/g2eval.jsonl"
+[ -n "${RC:-}" ] && cp -r "$RC" "$S/rc"
 [ -n "${RECORDS:-}" ] && cp -r "$RECORDS" "$S/records"
 [ -n "${GROUPS:-}" ] && cp -r "$GROUPS" "$S/groups"
 [ -n "${REPLAY:-}" ] && cp "$REPLAY" "$S/replay.jsonl"
@@ -66,7 +69,26 @@ CAO_MICRO=${MICRO:-1} python -u cao.py train --data $O/data.jsonl --out $O/adapt
 python -u g2.py eval --items $O/g2.heldout.jsonl --thr $S/thr.pt --adapter $O/adapter/step_$STEPS --out $O/g2_eval.jsonl > $O/g2_eval.log 2>&1; \
 python -u g2.py eval --items $O/g2.heldout.jsonl --thr $S/thr.pt --adapter $O/adapter/step_$STEPS --out $O/g2_eval_text_only.jsonl --text-only > $O/g2_eval_text_only.log 2>&1; \
 ${E1:+python -u e1.py battery --dir $S/e1/behavior_e1.json --battery $S/e1/probe_battery.json --adapter $O/adapter/step_$STEPS --out $O/e1_battery.jsonl --budgets 64 > $O/e1_battery.log 2>&1;} true" ;;
-  g2rec) WORK="python -u g2.py gen --out $O/g2.jsonl --thr $S/thr.pt --texts 100000 --records $S/records ${GROUPS:+--groups $S/groups} > $O/g2.log 2>&1" ;;
+  readscirc) WORK="mkdir -p $O/rc && cp $S/rc/test_correct.jsonl $S/rc/test_names.jsonl $S/rc/test_mismatch.jsonl $S/rc/test_none.jsonl \
+$S/rc/train_correct.jsonl $S/rc/train_mismatch.jsonl $S/rc/claim.json $O/rc/; \
+python -u mix.py $O/rc/mix_correct.jsonl $O/rc/train_correct.jsonl --replay $S/replay.jsonl --share ${SHARE:-0.4} > $O/mix.log 2>&1; \
+python -u mix.py $O/rc/mix_mismatch.jsonl $O/rc/train_mismatch.jsonl --replay $S/replay.jsonl --share ${SHARE:-0.4} >> $O/mix.log 2>&1; \
+CAO_MICRO=${MICRO:-1} python -u cao.py train --data $O/rc/mix_correct.jsonl --out $O/ad_correct --steps $STEPS --save-every $STEPS > $O/train_correct.log 2>&1; \
+CAO_MICRO=${MICRO:-1} python -u cao.py train --data $O/rc/mix_mismatch.jsonl --out $O/ad_mismatch --steps $STEPS --save-every $STEPS > $O/train_mismatch.log 2>&1; \
+python -u g2.py eval --items $O/rc/test_correct.jsonl --thr $S/thr.pt --adapter $O/ad_correct/step_$STEPS --out $O/rc/eval_T-correct_correct.jsonl > $O/rc/eval_T-correct_correct.log 2>&1; \
+python -u g2.py eval --items $O/rc/test_names.jsonl --thr $S/thr.pt --adapter $O/ad_correct/step_$STEPS --out $O/rc/eval_T-correct_names.jsonl > $O/rc/eval_T-correct_names.log 2>&1; \
+python -u g2.py eval --items $O/rc/test_mismatch.jsonl --thr $S/thr.pt --adapter $O/ad_correct/step_$STEPS --out $O/rc/eval_T-correct_mismatch.jsonl > $O/rc/eval_T-correct_mismatch.log 2>&1; \
+python -u g2.py eval --items $O/rc/test_none.jsonl --thr $S/thr.pt --adapter $O/ad_correct/step_$STEPS --out $O/rc/eval_T-correct_none.jsonl > $O/rc/eval_T-correct_none.log 2>&1; \
+python -u g2.py eval --items $O/rc/test_correct.jsonl --thr $S/thr.pt --adapter $O/ad_mismatch/step_$STEPS --out $O/rc/eval_T-mismatch_correct.jsonl > $O/rc/eval_T-mismatch_correct.log 2>&1; \
+python -u g2.py eval --items $O/rc/test_names.jsonl --thr $S/thr.pt --adapter $O/ad_mismatch/step_$STEPS --out $O/rc/eval_T-mismatch_names.jsonl > $O/rc/eval_T-mismatch_names.log 2>&1; \
+python -u g2.py eval --items $O/rc/test_mismatch.jsonl --thr $S/thr.pt --adapter $O/ad_mismatch/step_$STEPS --out $O/rc/eval_T-mismatch_mismatch.jsonl > $O/rc/eval_T-mismatch_mismatch.log 2>&1; \
+python -u g2.py eval --items $O/rc/test_none.jsonl --thr $S/thr.pt --adapter $O/ad_mismatch/step_$STEPS --out $O/rc/eval_T-mismatch_none.jsonl > $O/rc/eval_T-mismatch_none.log 2>&1; \
+python -u g2.py eval --items $O/rc/test_correct.jsonl --thr $S/thr.pt --adapter $AOAD --out $O/rc/eval_T0_correct.jsonl > $O/rc/eval_T0_correct.log 2>&1; \
+python -u g2.py eval --items $O/rc/test_names.jsonl --thr $S/thr.pt --adapter $AOAD --out $O/rc/eval_T0_names.jsonl > $O/rc/eval_T0_names.log 2>&1; \
+python -u g2.py eval --items $O/rc/test_mismatch.jsonl --thr $S/thr.pt --adapter $AOAD --out $O/rc/eval_T0_mismatch.jsonl > $O/rc/eval_T0_mismatch.log 2>&1; \
+python -u g2.py eval --items $O/rc/test_none.jsonl --thr $S/thr.pt --adapter $AOAD --out $O/rc/eval_T0_none.jsonl > $O/rc/eval_T0_none.log 2>&1; \
+python -u reads_circuit.py score $O/rc > $O/rc_score.txt 2>&1" ;;
+  g2rec) WORK="python -u g2.py gen --out $O/g2.jsonl --thr $S/thr.pt --texts 100000 --records $S/records ${GROUPS:+--groups $S/groups} ${DENSE:+--dense} > $O/g2.log 2>&1" ;;
   inference) WORK="python -u inference.py build --out $O/inference_items.jsonl --per ${PER:-150} > $O/inference.log 2>&1" ;;
   organisms) WORK="python -u organisms.py all --out $O/organisms > $O/organisms.log 2>&1 && \
 python -u organisms.py examples --dir $O/organisms --out $O/organism_examples.jsonl > $O/organism_examples.log 2>&1" ;;

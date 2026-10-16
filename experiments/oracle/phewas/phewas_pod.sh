@@ -8,6 +8,8 @@
 #   MODE=polyscore: polyneuronal scores against a dense probe (polyscore.py) on a reported phenome, with stage 1's
 #            summary (ASSOC), the dev-only candidates (CANDS: polyscore.candidates), optionally the fine-mapping (FINEMAP)
 #            and an earlier run's output to continue (RESUME); the idle check off (the fits barely use the GPU)
+#   MODE=polycheck: knockouts check the polyscore's split (polycheck.py) on a reported phenome, with the dev-only
+#            candidates (CANDS), the 8B T2 file (THR) and the traits (POLY_TRAITS, default every pair trait)
 #   MODE=pilot: the screen's noise pilot (screen.py pilot) on a reported phenome (PHENOME with phenome.json), with
 #            the 8B T2 file (THR) for the massive cut and optionally stage 1's summary (ASSOC) for the singles
 #   RUN=a PHENOME=~/mpd-data/phewas/phenome_v1 [MODE=pilot ASSOC=.../summary.json THR=.../thr.pt] bash
@@ -27,6 +29,7 @@ case "${MODE:-}" in
          [ -n "${FINEMAP:-}" ] && { cp "$FINEMAP" "$S/finemap.json" || exit 1; }
          [ -n "${CANDS:-}" ] && { cp "$CANDS" "$S/candidates.json" || exit 1; }
          [ -n "${RESUME:-}" ] && { cp "$RESUME" "$S/polyscore_before.json" || exit 1; } ;;  # (traits already scored)
+  polycheck) cp "$P/phenome.json" "$P/values.jsonl" "$S/phenome/" && cp "${CANDS:?CANDS}" "$S/candidates.json" && cp "${THR:?THR}" "$S/thr.pt" || exit 1 ;;
   pilot) cp "$P/phenome.json" "$P/values.jsonl" "$S/phenome/" && cp "${THR:?THR}" "$S/thr.pt" || exit 1
          [ -n "${ASSOC:-}" ] && { cp "$ASSOC" "$S/assoc_summary.json" || exit 1; } ;;
 esac
@@ -37,6 +40,7 @@ cp $S/phenome/phenome.json $S/phenome/values.jsonl $O/ && \
 python -u assoc.py $S/phenome $O/assoc --model Qwen/Qwen3-8B ${ASSOC_TRAITS:+--traits $ASSOC_TRAITS} > $O/assoc.log 2>&1"
 [ "${MODE:-}" = polyscore ] && RUNS="${RESUME:+cp $S/polyscore_before.json $O/polyscore.json;} python -u polyscore.py $S/phenome $S/assoc_summary.json $O/polyscore.json ${FINEMAP:+--finemap $S/finemap.json} ${CANDS:+--candidates-file $S/candidates.json} > $O/polyscore.log 2>&1"
 [ "${MODE:-}" = assoc ] && RUNS="python -u assoc.py $S/phenome $O/assoc --model Qwen/Qwen3-8B > $O/assoc.log 2>&1"
+[ "${MODE:-}" = polycheck ] && RUNS="python -u polycheck.py $S/phenome $S/candidates.json $O/polycheck.json --thr $S/thr.pt ${POLY_TRAITS:+--traits $POLY_TRAITS} > $O/polycheck.log 2>&1"
 [ "${MODE:-}" = pilot ] && RUNS="python -u screen.py pilot $S/phenome $O/pilot.json --thr $S/thr.pt ${ASSOC:+--assoc $S/assoc_summary.json} > $O/pilot.log 2>&1"
 CMD="export OMP_NUM_THREADS=8 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True; ln -sfn /workspace/runs/$N/mpd-data ~/mpd-data; mkdir -p $O $S; \
 tar -xzf $S.tgz -C $S; cd $S/experiments/oracle/phewas; \

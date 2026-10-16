@@ -1,9 +1,10 @@
 """Head-to-head with ADAG (Transluce, arXiv 2604.07615; code github.com/TransluceAI/circuits) on its own models and
 prompts (the lead's 10-15): for each of its published cluster ablations, our smallest measured set of neurons with the
 same effect, its size beside the cluster's, and its side effect on unrelated text.
-Prompts are built as ADAG's prepare_ci does: the user turn and the prefilled answer ("seed") in the chat template
-(Llama-3.1's with the date lines stripped, ADAG's STRIPPED_LLAMA_CHAT_TEMPLATE; Qwen3's own), cut before the template's
-final end-of-turn token, and a seed ending in a space gets the space token appended.
+Prompts follow ADAG's prepare_ci: the user turn and the prefilled answer ("seed") in the chat format (Llama-3.1's
+headers with an empty system turn and no date lines; Qwen3's own template), cut before the final end-of-turn token, and
+a seed ending in a space gets the space token appended. ADAG's repository has no license: nothing of it is copied
+here; its capitals prompts are read at run time from a clone (ADAG_DIR).
 A unit is a whole neuron (layer, index: the down projection's input act(gate) x up) zeroed at every position, as ADAG's
 clusters are zeroed. Goals, each a measured success test on the next-token distribution:
   flip X     the top token becomes X (with a probability: and X reaches it, the cluster's own effect)
@@ -29,6 +30,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import time
 from pathlib import Path
 
@@ -49,20 +51,20 @@ UNRELATED = [
     "Le marché ouvre à huit heures et ferme à midi le dimanche.",
     "To reset your password, click the link in the email and follow the instructions.",
 ]
-CAPITALS = [  # ADAG's 50 capitals prompts (scripts/circuit_prep/data/capitals.py): (city, state, capital)
-    ('Dallas', 'Texas', 'Austin'), ('Birmingham', 'Alabama', 'Montgomery'), ('Anchorage', 'Alaska', 'Juneau'), ('Tucson', 'Arizona', 'Phoenix'),
-    ('Fayetteville', 'Arkansas', 'Little Rock'), ('Los Angeles', 'California', 'Sacramento'), ('Colorado Springs', 'Colorado', 'Denver'), ('Bridgeport', 'Connecticut', 'Hartford'),
-    ('Wilmington', 'Delaware', 'Dover'), ('Jacksonville', 'Florida', 'Tallahassee'), ('Savannah', 'Georgia', 'Atlanta'), ('Hilo', 'Hawaii', 'Honolulu'),
-    ('Idaho Falls', 'Idaho', 'Boise'), ('Chicago', 'Illinois', 'Springfield'), ('Fort Wayne', 'Indiana', 'Indianapolis'), ('Cedar Rapids', 'Iowa', 'Des Moines'),
-    ('Wichita', 'Kansas', 'Topeka'), ('Louisville', 'Kentucky', 'Frankfort'), ('New Orleans', 'Louisiana', 'Baton Rouge'), ('Portland', 'Maine', 'Augusta'),
-    ('Baltimore', 'Maryland', 'Annapolis'), ('Worcester', 'Massachusetts', 'Boston'), ('Detroit', 'Michigan', 'Lansing'), ('Minneapolis', 'Minnesota', 'Saint Paul'),
-    ('Gulfport', 'Mississippi', 'Jackson'), ('St. Louis', 'Missouri', 'Jefferson City'), ('Billings', 'Montana', 'Helena'), ('Omaha', 'Nebraska', 'Lincoln'),
-    ('Las Vegas', 'Nevada', 'Carson City'), ('Manchester', 'New Hampshire', 'Concord'), ('Newark', 'New Jersey', 'Trenton'), ('Albuquerque', 'New Mexico', 'Santa Fe'),
-    ('New York City', 'New York', 'Albany'), ('Charlotte', 'North Carolina', 'Raleigh'), ('Fargo', 'North Dakota', 'Bismarck'), ('Cleveland', 'Ohio', 'Columbus'),
-    ('Tulsa', 'Oklahoma', 'Oklahoma City'), ('Portland', 'Oregon', 'Salem'), ('Philadelphia', 'Pennsylvania', 'Harrisburg'), ('Warwick', 'Rhode Island', 'Providence'),
-    ('Charleston', 'South Carolina', 'Columbia'), ('Sioux Falls', 'South Dakota', 'Pierre'), ('Memphis', 'Tennessee', 'Nashville'), ('Provo', 'Utah', 'Salt Lake City'),
-    ('Burlington', 'Vermont', 'Montpelier'), ('Virginia Beach', 'Virginia', 'Richmond'), ('Seattle', 'Washington', 'Olympia'), ('Huntington', 'West Virginia', 'Charleston'),
-    ('Milwaukee', 'Wisconsin', 'Madison'), ('Casper', 'Wyoming', 'Cheyenne')]
+ADAG_DIR = Path(os.environ.get("ADAG_DIR", Path.home() / "adag"))  # a clone of github.com/TransluceAI/circuits (no license:
+# read at run time, never copied into this repository)
+
+
+def capitals() -> list[tuple]:
+    """ADAG's capitals prompts' (city, state, capital) triples, read from its clone's data file."""
+    import ast
+    src = (ADAG_DIR / "scripts" / "circuit_prep" / "data" / "capitals.py").read_text()
+    for node in ast.parse(src).body:
+        if isinstance(node, ast.Assign) and getattr(node.targets[0], "id", "") == "city_state_capital":
+            return ast.literal_eval(node.value)
+    raise ValueError("no city_state_capital in ADAG's capitals data")
+
+
 CASES = {
     "capitals_llama": {"model": "meta-llama/Llama-3.1-8B-Instruct", "weights": LLAMA_WEIGHTS,
                        "question": "What is the capital of the state containing Dallas?", "seed": "Answer:", "answer": " Austin",
@@ -230,7 +232,7 @@ def transfer(run: Runner, tok, model_id: str, sets: dict, log=print) -> dict:
     same size (seeded)."""
     import random
     rng = random.Random(0)
-    fams = {"capitals": [(f"What is the capital of the state containing {c}?", "Answer:", " " + cap, " " + st) for c, st, cap in CAPITALS],
+    fams = {"capitals": [(f"What is the capital of the state containing {c}?", "Answer:", " " + cap, " " + st) for c, st, cap in capitals()],
             "math": [(f"What is {x} + {y}?", "Answer: ", str(x + y), None) for x, y in
                      [(rng.randrange(100), rng.randrange(100)) for _ in range(100)]]}
     out = {}

@@ -319,8 +319,11 @@ FORMS = {"n_sign": ["{u} supports {y}.", "{u} works against {y}.", "{u} barely m
                    "{v}: the model still gives {y}, almost unchanged."]}
 
 
-def o1_text(it: dict) -> str:
-    """The circuit as text, from the finder's record when present (values, measured shares), else the item's writes."""
+def o1_text(it: dict, how: str = "correct") -> str:
+    """The circuit as text, from the finder's record when present (values, measured shares); how "names": the groups'
+    members by name alone, "none": nothing."""
+    if how == "none":
+        return "(not shown)"
     rec = json.loads(Path(it["record"]).read_text()) if it.get("record") else {}
     nodes = {(d["layer"], d["neuron"], d["pos"]): d for d in rec.get("nodes", [])}
     lines = []
@@ -332,7 +335,7 @@ def o1_text(it: dict) -> str:
             pole = n[-1]
             d = nodes.get((int(l), int(n[:-1]), int(pos)), {})
             extra = (f" value {d['clean']:.3g}, lost {d.get('lost') or 0:.2f}, restored {d.get('restored') or 0:.2f}"
-                     if d else "")
+                     if d and how == "correct" else "")
             parts.append(m + extra)
         lines.append(f"{g}: " + "; ".join(parts))
     return "\n".join(lines)
@@ -357,15 +360,17 @@ def prompt397(a) -> None:
         verb = (f"Turning {us[0]} up" if it["cat"] == "n_steer" else
                 "Zeroing " + (us[0] if len(us) == 1 else ", ".join(us[:-1]) + " and " + us[-1]) + (" together" if len(us) > 1 else ""))
         forms = [f.format(u=us[0], y=y, v=verb) for f in FORMS["n_sign" if it["cat"] == "n_sign" else "other"]]
-        prompts.append(O1_PROMPT.format(y=y, user=user, groups=o1_text(it), q=it["q"], forms="\n".join(forms)))
+        prompts.append(O1_PROMPT.format(y=y, user=user, groups=o1_text(it, a.input), q=it["q"], forms="\n".join(forms)))
     log = HOME / "mpd-data" / "scratch" / "oracleeval" / "prompt397"
     rd = reader_reward.Reader("Qwen/Qwen3.5-397B-A17B", log)
     got = rd(prompts, max_tokens=a.max_tokens)
-    d = oracle_meta("prompt397", "Qwen3.5-397B, prompting only", "baseline",
-                    "O1: the circuit as text (names, members, values, measured shares); O2: battery answers")
+    d = oracle_meta("prompt397" + ("" if a.input == "correct" else f".{a.input}"), "Qwen3.5-397B, prompting only" +
+                    ("" if a.input == "correct" else f", {a.input} input"), "baseline",
+                    "O1: the circuit as text (names, members, values, measured shares); O2: battery answers" if a.input == "correct"
+                    else f"O1: the circuit as text, {a.input}", figure=a.input == "correct")
     wjl(d / "o1.jsonl", [{"item": it["item"], "answer": (g or "").strip()} for it, g in zip(o1, got)])
     with SPEND.open("a") as f:
-        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')}\tprompt397_o1\tQwen/Qwen3.5-397B-A17B\t-\t-\t{rd.spend.total:.4f}\t{len(o1)} O1 questions\n")
+        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')}\tprompt397_o1_{a.input}\tQwen/Qwen3.5-397B-A17B\t-\t-\t{rd.spend.total:.4f}\t{len(o1)} O1 questions\n")
     print(f"spend ${rd.spend.total:.3f}")
 
 
@@ -622,6 +627,7 @@ def main():
     p = sub.add_parser("prompt397")
     p.add_argument("--n", type=int, default=0, help="a sample of O1 (0: all)")
     p.add_argument("--max-tokens", type=int, default=1200)
+    p.add_argument("--input", choices=("correct", "names", "none"), default="correct")
     s = sub.add_parser("score")
     s.add_argument("--sealed", action="store_true")
     a = ap.parse_args()

@@ -1,0 +1,231 @@
+{
+  "scope": "EXPOSED32 training-fit diagnostic; dev is exposed; no pristine evaluation",
+  "public_sha256": "e408793b2c30451a84af202cfe284060db637266c1d87bf87d4b069d727ca9e2",
+  "gold_sha256": "c09f7ffb103b2e449651724cbdf57476ed5a38c387119eb42067bd5225b291fa",
+  "model_revision": "38740b847e4cb78f352aba30aa41c76e08e6eb46",
+  "bindings": [
+    {
+      "case_id": "lie_direct_00",
+      "group": "lie_direct",
+      "split": "train",
+      "delta_bits": -4.869529503245728
+    },
+    {
+      "case_id": "lie_direct_01",
+      "group": "lie_direct",
+      "split": "train",
+      "delta_bits": -6.493180298440484
+    },
+    {
+      "case_id": "lie_direct_02",
+      "group": "lie_direct",
+      "split": "train",
+      "delta_bits": -5.591134153876623
+    },
+    {
+      "case_id": "lie_direct_03",
+      "group": "lie_direct",
+      "split": "train",
+      "delta_bits": -3.6056560033311325
+    },
+    {
+      "case_id": "lie_direct_04",
+      "group": "lie_direct",
+      "split": "train",
+      "delta_bits": -6.13271788877278
+    },
+    {
+      "case_id": "lie_direct_05",
+      "group": "lie_direct",
+      "split": "train",
+      "delta_bits": -6.3138366987549635
+    },
+    {
+      "case_id": "lie_direct_06",
+      "group": "lie_direct",
+      "split": "valid",
+      "delta_bits": -3.967358520775172
+    },
+    {
+      "case_id": "lie_direct_07",
+      "group": "lie_direct",
+      "split": "valid",
+      "delta_bits": -6.85458757541757
+    },
+    {
+      "case_id": "truth_history_00",
+      "group": "truth_history",
+      "split": "train",
+      "delta_bits": 0.9521459806300783
+    },
+    {
+      "case_id": "truth_history_01",
+      "group": "truth_history",
+      "split": "train",
+      "delta_bits": 0.5658331234032339
+    },
+    {
+      "case_id": "truth_history_02",
+      "group": "truth_history",
+      "split": "train",
+      "delta_bits": 0.7679220883800602
+    },
+    {
+      "case_id": "truth_history_03",
+      "group": "truth_history",
+      "split": "train",
+      "delta_bits": 1.2669131266604037
+    },
+    {
+      "case_id": "truth_history_04",
+      "group": "truth_history",
+      "split": "train",
+      "delta_bits": 1.1191263118631447
+    },
+    {
+      "case_id": "truth_history_05",
+      "group": "truth_history",
+      "split": "train",
+      "delta_bits": 0.7535246118204295
+    },
+    {
+      "case_id": "truth_history_06",
+      "group": "truth_history",
+      "split": "valid",
+      "delta_bits": 0.9718928727428686
+    },
+    {
+      "case_id": "truth_history_07",
+      "group": "truth_history",
+      "split": "valid",
+      "delta_bits": 0.22339928553150212
+    },
+    {
+      "case_id": "truth_numeric_16_00",
+      "group": "truth_numeric_16",
+      "split": "train",
+      "delta_bits": -1.7453924129907712
+    },
+    {
+      "case_id": "truth_numeric_16_01",
+      "group": "truth_numeric_16",
+      "split": "train",
+      "delta_bits": -0.0638375497868644
+    },
+    {
+      "case_id": "truth_numeric_16_02",
+      "group": "truth_numeric_16",
+      "split": "train",
+      "delta_bits": 0.4243530879962343
+    },
+    {
+      "case_id": "truth_numeric_16_03",
+      "group": "truth_numeric_16",
+      "split": "train",
+      "delta_bits": -0.278862298114273
+    },
+    {
+      "case_id": "truth_numeric_16_04",
+      "group": "truth_numeric_16",
+      "split": "train",
+      "delta_bits": 3.284977526057162
+    },
+    {
+      "case_id": "truth_numeric_16_05",
+      "group": "truth_numeric_16",
+      "split": "train",
+      "delta_bits": -0.5281583929577565
+    },
+    {
+      "case_id": "truth_numeric_16_06",
+      "group": "truth_numeric_16",
+      "split": "valid",
+      "delta_bits": -0.7417928179790518
+    },
+    {
+      "case_id": "truth_numeric_16_07",
+      "group": "truth_numeric_16",
+      "split": "valid",
+      "delta_bits": -0.36024242773387627
+    },
+    {
+      "case_id": "truth_numeric_other_00",
+      "group": "truth_numeric_other",
+      "split": "train",
+      "delta_bits": -1.9335964654045554
+    },
+    {
+      "case_id": "truth_numeric_other_01",
+      "group": "truth_numeric_other",
+      "split": "train",
+      "delta_bits": -0.01227749378485754
+    },
+    {
+      "case_id": "truth_numeric_other_02",
+      "group": "truth_numeric_other",
+      "split": "train",
+      "delta_bits": 2.7145571339284267
+    },
+    {
+      "case_id": "truth_numeric_other_03",
+      "group": "truth_numeric_other",
+      "split": "train",
+      "delta_bits": -0.13112683458215457
+    },
+    {
+      "case_id": "truth_numeric_other_04",
+      "group": "truth_numeric_other",
+      "split": "train",
+      "delta_bits": -1.264789655190679
+    },
+    {
+      "case_id": "truth_numeric_other_05",
+      "group": "truth_numeric_other",
+      "split": "train",
+      "delta_bits": -0.35790911307709194
+    },
+    {
+      "case_id": "truth_numeric_other_06",
+      "group": "truth_numeric_other",
+      "split": "valid",
+      "delta_bits": 4.279120724627209
+    },
+    {
+      "case_id": "truth_numeric_other_07",
+      "group": "truth_numeric_other",
+      "split": "valid",
+      "delta_bits": 0.15345551681355118
+    }
+  ],
+  "frozen_reader_manifest_sha256": "d0fbf3fd6acc23682aa45b5729f263dee6678c33bd93fe954799f20b3067a0e3",
+  "exact_original_true_prompt_ids": true,
+  "dataset_sha256": {
+    "train": "60a6dac4b3284f7c2671d17a3a28738e7d3cd2f5f262a5e80434a5c60570570c",
+    "valid": "442aaf494870520d2de255153f7504fe46f4faef41d6658faacffde6b50a0f88"
+  },
+  "train_rows": 24,
+  "dev_rows": 8,
+  "max_tokens": 4387,
+  "total_tokens": 138671,
+  "split_policy": "Within each group sort case_id; first6 train,last2 dev; no effects or outcomes used for split",
+  "immutable_base_files_sha256": {
+    "config.json": "a822a9e48b0aafbe3144ec37d4fb067e178ed96615ce6e4420b3149893cc5767",
+    "model-00001-of-00004.safetensors": "09f3e6ecb0b7af6e6a38bc8169a134c821b0924c2679b2bb8f4426ad38d032b8",
+    "model-00002-of-00004.safetensors": "31dcdb1c49eebdb1505bd14e3cb33f9cf900bd2546b638f2464694ae763a033f",
+    "model-00003-of-00004.safetensors": "3e66de06a1f03dade16a612a368cfce4a4c9caa4efd7d28185454384082cec03",
+    "model-00004-of-00004.safetensors": "a5d0cf03519c26f8b506df6b0ba60526e5c08c8cea22d0c21ce92950e58a5422",
+    "model.safetensors.index.json": "0b28df60e33753a14e816d3b31577ae2c93884c58430a4a6de6ae9ea483842ea"
+  },
+  "runtime": {
+    "mlx": "0.32.3",
+    "mlx_lm": "0.32.0"
+  },
+  "installed_trainer_sources_sha256": {
+    "/Users/user/mpd-data/venv/lib/python3.12/site-packages/mlx_lm/lora.py": "e366eec6ae2f8a72446f1af65faf189a92a01ca509fb0cafb3fa54b89b4291f7",
+    "/Users/user/mpd-data/venv/lib/python3.12/site-packages/mlx_lm/tuner/trainer.py": "0b6027fdb11803e951ceee52c83a81f82daa922ea8c6b7ca6888953461064e8e",
+    "/Users/user/mpd-data/venv/lib/python3.12/site-packages/mlx_lm/tuner/utils.py": "f59f3c027176a3975fe60e7fbd9f3f38723c27c3f888cf9e591c103f93f68588",
+    "/Users/user/mpd-data/venv/lib/python3.12/site-packages/mlx_lm/tuner/datasets.py": "dcd675376d68d1813261c8389236b586b16b9a58a5ea80be8eb535bb9d0e9689"
+  },
+  "label_serialization": "round(rawdelta,3) in target only; rawfullprecision preserved in bindings/scoring",
+  "local_loss_correction": "Installed default_loss steps<=actual_length includes first PAD; exact_completion_loss uses steps<actual_length. Same CE/maskstart; passed to installed train(loss=...) and its validation. Package unchanged."
+}

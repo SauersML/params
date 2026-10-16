@@ -1,9 +1,0 @@
-{
-  "case_id": "lie_direct_00",
-  "eval_loss_nats": 3.3504467010498047,
-  "mixed_mode_loss_nats": 3.3504467010498047,
-  "absolute_error_nats": 0.0,
-  "tolerance_nats": 1e-05,
-  "completion_tokens": 27,
-  "no_optimizer_update": true
-}

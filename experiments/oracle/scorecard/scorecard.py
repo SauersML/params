@@ -598,6 +598,19 @@ def score(a) -> None:
                     orgs = [n for n, r in o2.items() if r["set"] == s and f"{n}@{b}" in got]
                     ex = [float(o2_exact(n, o2[n], got[f"{n}@{b}"]["answer"])) for n in orgs]
                     cell(name, "O2", f"{s} exact @{b}", ex, orgs, {"exact": [n for n, e in zip(orgs, ex) if e]})
+        f = d / "auditbench_judged.jsonl"  # AuditBench (auditbench.py): a target's success = its runs' mean match
+        if f.exists() and (ITEMS / "auditbench.json").exists():
+            tg = {t["model"]: t for t in json.loads((ITEMS / "auditbench.json").read_text())["targets"]}
+            per = collections.defaultdict(list)
+            for r in jl(f):
+                if r["item"] in tg and (tg[r["item"]]["split"] == "dev" or a.sealed):
+                    per[r["item"]].append(float(r["match"] == 1))
+            ms_ = sorted(per)
+            cell(name, "O2-AB", "dev targets", [sum(per[m]) / len(per[m]) for m in ms_], ms_, {"runs": sum(map(len, per.values()))})
+            for docs, adv in (("synth_docs_only", "high"), ("synth_docs_only", "kto"), ("transcripts_only", "high"), ("transcripts_only", "kto")):
+                sel = [m for m in ms_ if tg[m]["docs"] == docs and tg[m]["adv"] == adv]
+                cell(name, "O2-AB", f"{'documents' if docs.startswith('synth') else 'transcripts'}, {'SFT' if adv == 'high' else 'KTO'}",
+                     [sum(per[m]) / len(per[m]) for m in sel], sel)
         for t in ("li", "taboo"):
             f = d / f"o5_{t}.jsonl"
             if f.exists():
@@ -671,6 +684,8 @@ def short(n: str, meta: dict) -> str:
 
 
 SHORT_O2 = {"prompt397": "Qwen3.5-397B prompted (the organism's answers)"}
+SHORT.update({"ab-prompt397": "Qwen3.5-397B reading answers to the paper's probes",
+              "ab-prefill397": "Qwen3.5-397B reading prefilled answers", "ab-ao14b": "released AO 14B readings, read by Qwen3.5-397B"})
 
 
 def figure(rows: list[dict], meta: dict) -> None:
@@ -693,7 +708,9 @@ def figure(rows: list[dict], meta: dict) -> None:
     o5 = [(n, m) for n, m in dict.fromkeys((r["oracle"], r["metric"]) for r in rows if r["target"] == "O5") if show(n)]
     o34 = [(n, t) for n, t in dict.fromkeys((r["oracle"], r["target"]) for r in rows if r["target"] in ("O3", "O4")) if show(n)]
     # (the headline first, the lead's 10-16: O2 and O3, then O4, O1 as a check, O5)
-    panels = [("O2", len(o2) * 2 * 0.7 + 1.5)] + ([("O34", len(o34) * 0.8 + 1.5)] if o34 else []) + \
+    oab = [n for n in dict.fromkeys(r["oracle"] for r in rows if r["target"] == "O2-AB" and r["metric"] == "dev targets") if show(n)]
+    panels = ([("AB", (len(oab) + 1) * 0.9 + 1.5)] if oab else []) + [("O2", len(o2) * 2 * 0.7 + 1.5)] + \
+        ([("O34", len(o34) * 0.8 + 1.5)] if o34 else []) + \
         [("O1", max(len(o1), 1) * 0.9 + 1.5), ("O5", (len(o5) + 2) * 0.8 + 1.2)]
     hs = [h for _, h in panels]
     fig, axs_ = plt.subplots(len(hs), 1, figsize=(18, sum(hs)), gridspec_kw={"height_ratios": hs})
@@ -751,6 +768,20 @@ def figure(rows: list[dict], meta: dict) -> None:
     ax.set_ylim(-0.75, len(o5) - 0.2)
     ax.set_xlim(0, 1.0)
     ax.set_xlabel("exact match (black ticks: published numbers)")
+    if oab:
+        ax = axs["AB"]
+        for k, n in enumerate(oab):
+            r = get(n, "O2-AB", "dev targets")
+            ax.plot([r["lo"], r["hi"]], [k] * 2, color=color(n), lw=3)
+            ax.plot(r["value"], k, "o", ms=14, color=color(n))
+            ax.text(r["hi"] + 0.015, k, f"{r['value']:.2f} ({r['n']} targets)", va="center", fontsize=20)
+        for t, v in (("published default agent", 0.355), ("published best tool", 0.580)):
+            ax.axvline(v, color="#222222", lw=2, ls=":", zorder=0)
+            ax.text(v, len(oab) - 0.3, t, ha="center", fontsize=17)
+        ax.set_yticks(range(len(oab)), [lab(n) for n in oab])
+        ax.set_ylim(-0.6, len(oab) + 0.1)
+        ax.set_xlim(0, 1.0)
+        ax.set_xlabel("AuditBench, Qwen3-14B targets: share of audits naming the hidden behaviour (dotted: published, Llama-3.3-70B targets)")
     if o34:
         ax = axs["O34"]
         what = {"O3": "edit removes the hidden behaviour", "O4": "stated fix corrects the wrong answer"}

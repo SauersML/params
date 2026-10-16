@@ -189,6 +189,8 @@ def prior(a) -> None:
     by = collections.defaultdict(collections.Counter)  # the best constant answer per kind, read off the held-out answers
     for it in o1:
         by[it["cat"]][it["gold"]] += 1
+    d = oracle_meta("gold", "the measured answers (a check of the claim checker)", "check", "the answers", figure=False)
+    wjl(d / "o1.jsonl", [{"item": it["item"], "answer": it["a"]} for it in o1])
     d = oracle_meta("best-constant", "best constant answer", "baseline", "nothing (the most common held-out outcome per kind)")
     wjl(d / "o1.jsonl", [{"item": it["item"], "class": by[it["cat"]].most_common(1)[0][0]} for it in o1])
     print(collections.Counter(r["level"] for r in rows))
@@ -228,8 +230,9 @@ def ingest(a) -> None:
            "T-mismatch": ("reader SFT on other texts' writes (rc1)", "AO-injected writes of other texts"),
            "T0": ("released AO 8B", "AO-injected group writes")}
     ingest_rc("rc1", RC / "rc1", rcl)
-    if (RC / "rc2_native").exists():
-        ingest_rc("rc2", RC / "rc2_native", {k: (v[0].replace("rc1, AO injection", "rc2, native injection").replace("(rc1)", "(rc2)"),
+    rc2 = next((p for p in (RC / "rc2_native", RUNPOD / "oracle-pathg-rc2" / "rc") if list(p.glob("eval_*.jsonl"))), None)
+    if rc2:
+        ingest_rc("rc2", rc2, {k: (v[0].replace("rc1, AO injection", "rc2, native injection").replace("(rc1)", "(rc2)"),
                                                 v[1]) for k, v in rcl.items()})
     # O2: the released AO on the E1 four (primerl's e1bat pod), fleet's prompting-only reader on all seven
     bat = RUNPOD / "oracle-pathg-e1bat" / "e1_battery.jsonl"
@@ -411,9 +414,14 @@ def score(a) -> None:
             cell(name, "O1", "names differ", [ok[k] for k in sel], [ctx[k] for k in sel])
             valid = [float((got[i["item"]].get("class") or o1_class(i["cat"], got[i["item"]].get("answer"))) is not None) for i in its]
             cell(name, "O1", "answers in a class", valid, ctx)
-            cp = [float(bool(got[i["item"]]["claim_pass"])) for i in its if got[i["item"]].get("claim_pass") is not None]
-            if cp:
-                cell(name, "O1", "claim passes", cp, [i["context"] for i in its if got[i["item"]].get("claim_pass") is not None])
+            mf = d / "o1_measured.jsonl"  # (measure.py's check of the sentence's claim, every oracle alike)
+            ms = {r["item"]: r for r in jl(mf)} if mf.exists() else {}
+            if ms:
+                sel = [i for i in its if i["item"] in ms]
+                cell(name, "O1", "claim passes", [float(ms[i["item"]]["claim_pass"]) for i in sel], [i["context"] for i in sel])
+                cell(name, "O1", "claim specific", [float(ms[i["item"]]["claim_specific"]) for i in sel], [i["context"] for i in sel])
+                st = [i for i in sel if i["cat"] == "n_steer"]
+                cell(name, "O1", "steer specific", [float(ms[i["item"]]["claim_specific"]) for i in st], [i["context"] for i in st])
         f = d / "o2.jsonl"
         if f.exists():
             got = {r["item"]: r for r in jl(f)}

@@ -142,3 +142,33 @@ def test_relp_keeps_the_forward(tiny, monkeypatch):
     r = pt.scores()
     for k in ("head", "neuron"):
         assert r[k].shape == g[k].shape and torch.isfinite(r[k]).all() and not torch.allclose(r[k], g[k])
+
+
+def test_staged_rows_equal_whole_batches(tiny, monkeypatch):
+    pt, clean, corrupt = tiny
+    pt.setup(clean, corrupt)
+    T, f = pt.T, pt.first
+    sets = [[("neuron", 1, f + 1, (0, 7))], [("res", 0, f + 1)], [("head", 1, 2, f + 1)], [("neuron", 0, T - 1, 3)],
+            [("res", 1, f + 2), ("head", 0, (1, 3), T - 1)], [("neuron", 1, T - 1, 5, "zero")], [("res", 1, T - 1, "clean")]]
+    got = {}
+    for on in (True, False):
+        monkeypatch.setattr(cf, "STAGED", on)
+        got[on] = pt.both(sets) + [(x, x) for x in pt.run("corrupt", sets)]
+    for a, b in zip(got[True], got[False]):
+        assert abs(a[0] - b[0]) < 1e-5 and abs(a[1] - b[1]) < 1e-5
+
+
+def test_any_rows_per_batch(tiny, monkeypatch):
+    pt, clean, corrupt = tiny
+    pt.setup(clean, corrupt)
+    s = pt.first + 1
+    sets = [[("res", i, s)] for i in range(pt.L)] + [[("neuron", i, s, (k, k + 3))] for i in range(pt.L) for k in range(3)]
+    got = {}
+    for staged in (False, True):
+        for bt in (cf.BATCH_TOKENS, 9 * (pt.T - s)):          # 9 rows a batch (odd): every set in its own base's rows
+            monkeypatch.setattr(cf, "STAGED", staged)
+            monkeypatch.setattr(cf, "BATCH_TOKENS", bt)
+            got[staged, bt] = pt.both(sets)
+    ref = got[False, cf.BATCH_TOKENS]
+    for v in got.values():
+        assert all(abs(a[0] - b[0]) < 1e-5 and abs(a[1] - b[1]) < 1e-5 for a, b in zip(v, ref))

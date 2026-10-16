@@ -36,8 +36,8 @@ Search (every decision a measured run; gradients only order):
     are measured at every size to 16 and eight sizes per doubling after, the passing size found by bisection;
  4. reported: the neurons with their stage, poles, regimes and measured shares alone, the movers, each cut's curve and
     size, each cut's SINGLES_KEPT largest single units in measured order ("singles"), the residual map, seconds.
-Engine (Patcher.run): a batch runs only the positions from the first it patches and the layers from the lowest, from the
-two runs' own keys, values and residuals (no weak zeroing here, so this equals the full run to float error); a set's
+Engine (Patcher.run): a batch runs only the positions from the first it patches and each row only the layers from the
+lowest its set patches, from the two runs' own keys, values and residuals (no weak zeroing here, so this equals the full run to float error); a set's
 noising and denoising share a batch; rows per batch grow as positions shrink, bounded by free memory.
 
   circuit_finder.py questions QUESTIONS.json OUT [--split dev] [--model Qwen/Qwen3-8B] [--dtype float32] [--adapter A]
@@ -48,6 +48,7 @@ writes OUT/<id>.json per question.
 from __future__ import annotations
 
 import contextlib
+import inspect
 import itertools
 import math
 import time
@@ -82,6 +83,9 @@ MEMORY = 0.5          # a batch's rows take at most this share of the device's f
 # position, the logits and the edited activations a row; MAX_ROWS otherwise)
 LAYERS = True         # a cached batch also runs only the layers from the lowest one it patches, from the run's own
 # residual there (the layers below see nothing changed); a batch's sets' lowest layers lie within LAYER_BIN of each other
+STAGED = False        # a cached batch runs each row from the lowest layer its own set patches (a row joins the batch
+# there with its base run's residual; the batch's other rows run their layers below): a batch of every layer's sets
+# computes about half the layers a row
 LAYER_BIN = 64        # (8 split the residual map's 36 sets a position into small batches, each a full read of the weights:
 # Qwen3-8B bfloat16, A6000, the map 2.5 -> 3.9 s, the source cut 8.6 -> 8.3 s)
 BATCH_TOKENS = 1024   # a cached batch runs max(ROWS, BATCH_TOKENS / its positions) rows (at most MAX_ROWS): a forward of
@@ -211,6 +215,45 @@ class Patcher:
         return start, kv
 
     @torch.no_grad()
+    def _staged(self, start: int, layout: list, lows: list, **hooks) -> torch.Tensor:
+        """[R, V] float32 log-probabilities at the last position of R rows, row r in base layout[r], run over positions
+        start.. only, each from its own layer lows[r] (ascending) on: a row joins there with its base run's residual
+        input, its keys and values before start are its base run's (STAGED: no layer below a row's lowest patch runs)."""
+        m, T, S = self.core.model, self.T, self.T - start
+        bi = self._to_dev(np.array([0 if b == "clean" else 1 for b in layout], dtype=np.int64))
+        n_at = np.searchsorted(np.asarray(lows), np.arange(self.L), side="right")             # rows running each layer
+        dt = m.embed_tokens.weight.dtype
+        pos = torch.arange(start, T, device=self.dev)
+        mask = torch.full((S, T), torch.finfo(dt).min, dtype=dt, device=self.dev).triu(start + 1)[None, None]
+        if not hasattr(self, "_cache_kw"):
+            self._cache_kw = ("past_key_values" if "past_key_values" in inspect.signature(type(self.layers[0]).forward).parameters
+                              else "past_key_value")     # (transformers 5's name; 4's past_key_value)
+        hs = self._hooks(**hooks)
+        try:
+            h, emb = None, None
+            for i in range(lows[0], self.L):
+                n, dev = int(n_at[i]), self.layers[i].mlp.down_proj.weight.device
+                bd = bi.to(dev)
+                had = 0 if h is None else h.shape[0]
+                if n > had:
+                    new = self._res_st[i].to(dev)[bd[had:n], start:]
+                    h = new if h is None else torch.cat([h.to(dev), new])
+                h = h.to(dev)
+                if emb is None or emb[0].device != dev:
+                    emb = m.rotary_emb(h, pos[None].to(dev))
+                k, v = (t.to(dev)[:, :, :start].index_select(0, bd[:n]) for t in self._kv_st[i])
+                out = self.layers[i](h, attention_mask=mask.to(dev).expand(n, -1, -1, -1), position_ids=pos[None].to(dev),
+                                     position_embeddings=emb, cache_position=pos.to(dev), use_cache=True,
+                                     **{self._cache_kw: _Prefix(k, v)})
+                h = out[0] if isinstance(out, tuple) else out
+            h = m.norm(h[:, -1:].to(m.norm.weight.device))
+            lg = self.core.lm_head(h.to(self.core.lm_head.weight.device))[:, -1].float()
+        finally:
+            for x in hs:
+                x.remove()
+        return torch.log_softmax(lg, -1)
+
+    @torch.no_grad()
     def setup(self, clean: list[int], corrupt: list[int], answers: list[int] | None = None) -> dict:
         """Both runs' activations, the answer (the clean top token, or the likeliest of answers: a secret word's tokens),
         the alternatives and both contrasts (at the fixed batch size)."""
@@ -227,6 +270,10 @@ class Patcher:
             lp[k] = self._last(ids, self.rows, cap=cap, keep=kv if PREFIX else None)[0]
             self.act[k] = {n: [t[0] for t in v] for n, v in cap.items()}           # per layer [T, dim]
             self._base_kv[k] = kv
+        if PREFIX:                                  # both runs' residual inputs [2, T, d] and keys and values [2, KV, T, hd]
+            self._res_st = [torch.stack([self.act[k]["res"][i] for k in ("clean", "corrupt")]) for i in range(self.L)]
+            self._kv_st = [tuple(torch.cat([self._base_kv[k][i][j] for k in ("clean", "corrupt")]) for j in (0, 1))
+                           for i in range(self.L)]
         yc = int(lp["corrupt"].argmax())
         word = None
         if answers:                                 # a secret word: its likeliest token's word
@@ -306,26 +353,29 @@ class Patcher:
         order = sorted(range(len(sets)), key=lambda j: -low[j])     # (a batch runs from the lowest layer it patches,
         chunks, cur = [], []                                        # its sets' lowest layers within LAYER_BIN)
         for j in order:
-            if cur and (len(cur) * len(bases) >= R or low[j] < low[cur[0]] - LAYER_BIN):
+            if cur and ((len(cur) + 1) * len(bases) > R or low[j] < low[cur[0]] - LAYER_BIN):   # (at most R rows)
                 chunks.append(cur)
                 cur = []
             cur.append(j)
         chunks.append(cur)
         out, pending = [None] * len(sets), []
+        staged = STAGED and LAYERS and PREFIX and start > 0
         for js in chunks:
-            Rb = R if len(js) * len(bases) >= R else min(R, -(-len(js) * len(bases) // 8) * 8)   # (rows in multiples of 8)
-            per = Rb // len(bases)
-            layout = [bases[r // per] if r // per < len(bases) else bases[-1] for r in range(Rb)]
-            x = torch.stack([self._ids_dev[k] for k in layout])
-            cache = self._prefix(x, start, tuple(layout)) if start > 0 else None
             part = [sets[j] for j in js]
-            layer0 = min(low[j] for j in js)
-            h0 = None if layer0 == 0 else torch.stack([self.act[k]["res"][layer0][start:] for k in layout]).to(self.dev)
+            if staged:                                       # rows by their lowest layer, noising and denoising mixed
+                rows = sorted((low[j], kb, jj) for jj, j in enumerate(js) for kb in range(len(bases)))
+                Rb, layout = len(rows), [bases[kb] for _, kb, _ in rows]
+                row = {(kb, jj): r for r, (_, kb, jj) in enumerate(rows)}
+            else:
+                Rb = R if len(js) * len(bases) >= R else min(R, -(-len(js) * len(bases) // 8) * 8)   # (rows in multiples of 8)
+                per = Rb // len(bases)
+                layout = [bases[r // per] if r // per < len(bases) else bases[-1] for r in range(Rb)]
+                row = {(kb, jj): kb * per + jj for kb in range(len(bases)) for jj in range(len(part))}
             by = {}                                          # (kind, source) -> layer -> rows, positions, indices
             for kb, base in enumerate(bases):                # (built on the host, one transfer per kind and layer)
                 other = "corrupt" if base == "clean" else "clean"
                 for j, s in enumerate(part):
-                    b = kb * per + j
+                    b = row[(kb, j)]
                     for u in s:
                         if _pos(u) < start:
                             continue
@@ -370,11 +420,19 @@ class Patcher:
                 return h
             only = {k: {i for (kind, _), d in idx.items() if kind == name for i in d} for k, name in
                     (("res", "res"), ("head", "head"), ("neu", "neuron"))}
-            c = self._contrast(self._last(x, Rb, cache=cache, layer0=layer0, h0=h0, res=res, head=head, neu=neu, only=only))
+            if staged:
+                lp = self._staged(start, layout, [r[0] for r in rows], res=res, head=head, neu=neu, only=only)
+            else:
+                x = torch.stack([self._ids_dev[k] for k in layout])
+                cache = self._prefix(x, start, tuple(layout)) if start > 0 else None
+                layer0 = min(low[j] for j in js)
+                h0 = None if layer0 == 0 else torch.stack([self.act[k]["res"][layer0][start:] for k in layout]).to(self.dev)
+                lp = self._last(x, Rb, cache=cache, layer0=layer0, h0=h0, res=res, head=head, neu=neu, only=only)
+            c = self._contrast(lp)[self._to_dev(np.array([[row[(kb, jj)] for jj in range(len(part))] for kb in range(len(bases))],
+                                                         dtype=np.int64))]                 # [bases, sets]
             got = []
             for kb, base in enumerate(bases):
-                ck = c[kb * per:kb * per + len(part)]
-                got.append(((self.c["clean"] - ck) if base == "clean" else (ck - self.c["corrupt"])) / self.gap)
+                got.append(((self.c["clean"] - c[kb]) if base == "clean" else (c[kb] - self.c["corrupt"])) / self.gap)
             pending.append((js, torch.stack(got, 1)))       # (read once at the end: no wait between batches)
         for js, v in pending:
             for j, w in zip(js, v.tolist()):
@@ -451,6 +509,16 @@ def _relp(core):
         yield
     finally:
         mq.eager_attention_forward, mq.Qwen3RMSNorm.forward, mq.Qwen3MLP.forward, cfg._attn_implementation = saved
+
+
+class _Prefix:
+    """A cache standing for one layer's keys and values before a batch's first position (Patcher._staged)."""
+
+    def __init__(self, k: torch.Tensor, v: torch.Tensor):
+        self.k, self.v = k, v
+
+    def update(self, k, v, *a, **kw):
+        return torch.cat([self.k, k], 2), torch.cat([self.v, v], 2)
 
 
 def _kv_pairs(cache) -> list:

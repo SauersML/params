@@ -321,7 +321,8 @@ def views_damage(groups: list[dict], recs: list[dict], model_name: str, adapter:
         use = [2 * len(c & set(ps)) >= len(ps) for c in circ]
         du, dn = [x for x, u in zip(d, use) if u], [x for x, u in zip(d, use) if not u]
         rows_out.append({"kind": kind, "rank": rank, "size": len(ps), "damage_mean": sum(d) / len(d), "users": len(du),
-                         "damage_users": sum(du) / max(len(du), 1), "damage_rest": sum(dn) / max(len(dn), 1), "auc": auc(d, use)})
+                         "damage_users": sum(du) / max(len(du), 1), "damage_rest": sum(dn) / max(len(dn), 1), "auc": auc(d, use),
+                         "poles": list(ps), "damage": d})  # (per test question: neuron_scorecard.py motifs' usage-damage score)
     summ = {}
     for kind in ("group", "random"):
         r = [x for x in rows_out if x["kind"] == kind]

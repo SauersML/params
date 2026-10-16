@@ -17,6 +17,13 @@ here).
              prompt (0 where absent); the silhouette of the profiles (cosine distance), the coefficient of variation of the
              cluster sizes, and the share of same-cluster pairs whose attributions have opposite signs on every prompt
              both appear in. Reads the circuit pickle without ADAG's code (its classes as plain records).
+  relp       ADAG's tracer's own neuron scores on one question of circuit_questions (its token ids from
+             circuit_questions.chat): get_all_pairs_cl_ja_effects_with_attributions with prep.py's settings (RelP
+             gradient, half rule, stop-gradient on MLPs, zero ablation) and return_only_important_neurons, which returns
+             every neuron's attribution, gradient x activation of the down projection's input, to the objective: the sum
+             of the focus logits at the last position (focus "answer": the clean top token alone; "top5": ADAG's own
+             top-5 logits). Writes OUT.pt ({focus: {"attribution", "activation": [layers, positions, neurons]}}) and
+             OUT.json (ids, focus tokens, objective values, sign: positive raises the objective).
   measured   our node scores in ADAG's CausalGym evaluation: NAP's train.pt (scripts/train.py --method nap, MLP neurons)
              with its CAND largest scores replaced by measured ones, each (layer, position, neuron) alone set to its mean
              over the train pairs' patch prompts (the value ADAG's evaluation ablates to) on the train pairs' clean
@@ -30,6 +37,7 @@ here).
   adag_repo.py cg-test TRAIN.json TEST.json
   adag_repo.py groups CIRCUIT.pkl CLUSTER_STATE.json OUT.json
   adag_repo.py measured NAP_TRAIN.pt OUT_TRAIN.pt --model ID [--cand 8192] [--order replace|first]
+  (in ADAG's clone)  adag_repo.py relp QUESTION_ID OUT --model Qwen/Qwen3-8B [--questions FILE]
 """
 from __future__ import annotations
 
@@ -250,6 +258,44 @@ def groups(a) -> None:
     print(json.dumps(rec, indent=1))
 
 
+def relp(a) -> None:
+    import circuit_questions
+    from circuits.tracing.clja import ADAGConfig, get_all_pairs_cl_ja_effects_with_attributions  # ADAG's own tracer
+
+    tok, model = load_model(a.model)
+    dev = next(model.parameters()).device
+    q = (circuit_questions.load(a.questions) if a.questions else circuit_questions.load())[a.qid]
+    ids = list(circuit_questions.chat(tok, q["user"]))
+    T = len(ids)
+    with torch.no_grad():
+        logits = model(torch.tensor([ids], device=dev)).logits[0, -1].float()
+    top5 = logits.topk(5).indices.tolist()
+    out, meta = {}, {"id": a.qid, "model": a.model, "ids": ids, "user": q["user"], "focus": {},
+                     "objective": "sum of the focus tokens' logits at the last position",
+                     "score": "gradient x activation (down projection input), RelP gradient; positive raises the objective"}
+    for name, focus in (("answer", top5[:1]), ("top5", top5)):
+        cfg = ADAGConfig(device=str(dev), verbose=False, parent_threshold=None, edge_threshold=0.01, node_attribution_threshold=None,
+                         topk=None, batch_aggregation="any", topk_neurons=None, percentage_threshold=0.005, use_relp_grad=True,
+                         disable_half_rule=False, disable_stop_grad=False, ablation_mode="zero", use_stop_grad_on_mlps=True,
+                         return_nodes_only=False, focus_last_residual=False, skip_attr_contrib=False, center_logits=False,
+                         ig_steps=None, ig_mode="ig-inputs", return_only_important_neurons=True, apply_blacklist=False)
+        attr, _, acts, _ = get_all_pairs_cl_ja_effects_with_attributions(
+            model, tok, [ids], cfg, src_tokens=list(range(T)), tgt_tokens=[T - 1] * len(focus), attention_masks=[[1] * T],
+            focus_logits=[focus])
+        attr = attr.float().cpu()
+        attr = attr[:, 0, ..., 0] if attr.dim() == 5 else attr[:, 0]
+        acts = torch.as_tensor(acts).float().cpu()
+        acts = acts[:, 0] if acts.dim() == 4 else acts
+        out[name] = {"attribution": attr, "activation": acts}
+        meta["focus"][name] = {"tokens": focus, "decoded": [tok.decode([t]) for t in focus],
+                               "objective_value": float(logits[focus].sum()), "attribution_sum": float(attr.sum())}
+        print(f"{name}: {meta['focus'][name]['decoded']} objective {meta['focus'][name]['objective_value']:.3f}, "
+              f"attribution sum {meta['focus'][name]['attribution_sum']:.3f}, shape {tuple(attr.shape)}", flush=True)
+    a.out.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(out, a.out.with_suffix(".pt"))
+    a.out.with_suffix(".json").write_text(json.dumps(meta))
+
+
 @torch.no_grad()
 def measured(a) -> None:
     t0 = time.time()
@@ -354,6 +400,11 @@ def main():
     q.add_argument("circuit", type=Path)
     q.add_argument("state", type=Path)
     q.add_argument("out", type=Path)
+    r = sp.add_parser("relp")
+    r.add_argument("qid")
+    r.add_argument("out", type=Path)
+    r.add_argument("--model", required=True)
+    r.add_argument("--questions", type=Path, default=None)
     t = sp.add_parser("cg-test")
     t.add_argument("train", type=Path)
     t.add_argument("test", type=Path)
@@ -365,7 +416,7 @@ def main():
     s.add_argument("--order", default="replace", choices=("replace", "first"),
                    help="replace: measured scores in NAP's place among its others; first: every measured node ranked first")
     a = ap.parse_args()
-    {"clusters": clusters, "math-data": math_data, "cg-test": cg_test, "groups": groups, "measured": measured}[a.cmd](a)
+    {"clusters": clusters, "math-data": math_data, "cg-test": cg_test, "groups": groups, "measured": measured, "relp": relp}[a.cmd](a)
 
 
 if __name__ == "__main__":

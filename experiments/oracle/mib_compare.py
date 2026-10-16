@@ -113,7 +113,9 @@ def measured(model, graph, dl, metric, refine: int, log=print, limit: int | None
     outgoing edges patched is its output replaced by the counterfactual run's; a reader with all its incoming edges
     patched receives the counterfactual run's residual stream, so its q, k, v (an MLP: its output) are the
     counterfactual run's; one edge adds (counterfactual - clean output of the writer) to the reader's input. Tests run
-    ROWS rows at a time (each test on its own copy of the batch)."""
+    ROWS rows at a time (each test on its own copy of the batch), with TransformerLens' per-head results off (MIB's
+    evaluation needs them; on Llama-3.1-8B they cost [rows, positions, heads, d_head, d_model] a layer) and its per-head
+    q, k, v inputs on only for the edge tests."""
     import torch
 
     from eap.utils import tokenize_plus
@@ -123,6 +125,8 @@ def measured(model, graph, dl, metric, refine: int, log=print, limit: int | None
     writer, reader, reader_in = node_hooks(cfg, nf, nb)
     names = {"hook_embed"} | {f"blocks.{L}.{h}" for L in range(cfg.n_layers)
                               for h in ("attn.hook_z", "attn.hook_q", "attn.hook_k", "attn.hook_v", "hook_mlp_out")}
+    saved = (cfg.use_attn_result, cfg.use_split_qkv_input)
+    cfg.use_attn_result = cfg.use_split_qkv_input = False
     batches = []
     for clean, corrupted, label in dl:
         ct, am, il, _ = tokenize_plus(model, clean)
@@ -200,12 +204,14 @@ def measured(model, graph, dl, metric, refine: int, log=print, limit: int | None
     score = torch.minimum(writers[:, None], readers[None, :]) * real
     top = score.flatten().argsort(descending=True)[:refine].tolist()
     edges = [divmod(e, nb) for e in top]
+    cfg.use_split_qkv_input = True  # (an edge into a head's q, k or v adds at its own input)
     single = []
     for (f, b), m in zip(edges, run([[("add", *reader_in(b), f)] for f, b in edges])):
         d = abs(full - m)
         single.append([f, b, float(score[f, b]), d])
         score[f, b] = d
     log(f"single edges {len(edges)}, {time.time() - t0:.0f} s")
+    cfg.use_attn_result, cfg.use_split_qkv_input = saved
     graph.scores[:] = score.to(graph.scores.dtype)
     graph.in_graph[:] = real
     return {"full": full, "writers": writers.tolist(), "readers": readers.tolist(), "single": single,

@@ -161,12 +161,12 @@ def test_grid_and_curve_crossing():
 
 def test_motif_scores():
     def rec(i, poles):
-        return {"id": i, "ranked_top": [{"layer": L, "neuron": n, "pole": s} for L, n, s in poles]}
+        return {"id": i, "nodes": [{"layer": L, "pos": 3, "neuron": n, "pole": s} for L, n, s in poles]}
     recs = {"a": rec("a", [(1, 2, 1), (3, 4, -1)]), "b": rec("b", [(1, 2, 1)]), "c": rec("c", [(5, 6, 1)])}
-    run = {"B": ["a", "b", "c"], "rows": [
+    run = {"damage": {"test": ["a", "b", "c"], "rows": [
         {"kind": "group", "rank": 0, "poles": ["1.2.+", "3.4.-"], "damage": [2.0, 1.0, 0.0]},   # usage 1, 0.5, 0: tracks damage
-        {"kind": "factor", "rank": 0, "poles": ["1.2.+", "3.4.-"], "damage": [0.0, 1.0, 2.0]},  # the reverse
-        {"kind": "factor", "rank": 1, "poles": ["9.9.+"], "damage": [1.0, 2.0, 3.0]}]}           # used by no text
+        {"kind": "random", "rank": 0, "poles": ["1.2.+", "3.4.-"], "damage": [0.0, 1.0, 2.0]},  # the reverse
+        {"kind": "random", "rank": 1, "poles": ["9.9.+"], "damage": [1.0, 2.0, 3.0]}]}}          # used by no question
     ms = ns.motif_scores(run, recs)
-    assert ms["group_pearson_median"] == pytest.approx(1.0) and ms["factor_pearson_median"] == pytest.approx(-1.0)
-    assert ms["factor_scored"] == 1 and ms["sets"][2]["pearson"] is None
+    assert ms["group_pearson_median"] == pytest.approx(1.0) and ms["random_pearson_median"] == pytest.approx(-1.0)
+    assert ms["random_scored"] == 1 and ms["sets"][2]["pearson"] is None

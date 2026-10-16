@@ -47,17 +47,16 @@ recomputed (summary()).
   neuron_scorecard.py score CIRCUIT [CIRCUIT ...] --out OUT [--questions FILE] [--dtype bfloat16] [--device auto]
       score circuit files (or directories of them) into OUT/<name>.json, OUT/rows.jsonl and the table
   neuron_scorecard.py table NAME=OUT [NAME=OUT ...]   finders side by side on the questions every set scored
-  neuron_scorecard.py motifs MOTIFS.json RECORDS_DIR [...] [--out FILE]   the essay's motif score on neuron_motifs' run:
-      per set (recurring group or activation factor) the correlation over its held-out texts between its usage (the share
-      of its poles in the text's circuit) and the damage its ablation does (neuron_motifs' measured drop), the median per
-      kind (the essay's ImageNet edge motifs: 0.35, activation factors: 0.00)
+  neuron_scorecard.py motifs VIEWS.json RECORDS_DIR [...] [--out FILE]   the essay's motif score on neuron_motifs views'
+      run: per set (a group, or the random set of as many poles beside it) the correlation over its unseen questions
+      between its usage (the share of its poles in the question's circuit) and the damage its ablation does (neuron_motifs'
+      measured drop), the median per kind (the essay's ImageNet edge motifs: 0.35, activation factors: 0.00)
   neuron_scorecard.py check MODEL --out FILE [--questions FILE]   every question's patching pair on MODEL: the two
       answers, the gap and whether the pair is valid (the questions a finder can build on, and those the scorecard scores)
 
-A circuit file: circuit_finder's record (its "ids" and "corrupted" token ids; its source nodes and its routes, the
-movers, as the circuit; its readout nodes left out) or neuron_builder's record ({"id": the question id, "nodes": [{layer, pos, neuron, pole}], "routes":
-[{layer, head, pos}], "seconds", "builder", "model", "adapter"}) or {"id", "neurons": [[layer, pos, neuron, pole]],
-"heads": [[layer, pos, head]]}; the prompts from circuit_questions' file by id, or in the file ("user" and "corrupt_user",
+A circuit file: circuit_finder's record (the only circuit builder: its "ids" and "corrupted" token ids; its source
+nodes and its routes, the movers, as the circuit; its readout nodes left out) or a validation case {"id", "neurons":
+[[layer, pos, neuron, pole]], "heads": [[layer, pos, head]]}; the prompts from circuit_questions' file by id, or in the file ("user" and "corrupt_user",
 or token ids "clean" and "corrupted": a validation case outside the question set, with "group" naming the circuits whose
 hubs stability compares, and "expect": {"neurons": [[layer, neuron, pole]], "heads": [[layer, head]]}, the published
 units the case's circuit must hold, reported as their recall); "edges" (rustmove's) counted.
@@ -267,7 +266,7 @@ def score(m: Model, tok, c: dict, qs: dict, log=print) -> dict:
     T = len(clean)
     units_ok = all(p < T for _, p, _, _ in c["neurons"]) and all(p < T for _, p, _ in c["heads"])
     rec = {"task": c["name"], "id": c.get("id"), "question_task": q.get("task"), "key": q.get("key"), "paraphrase": q.get("paraphrase"),
-           "split": q.get("split"), "builder": c.get("builder"), "model": c["model"], "adapter": c.get("adapter"), "T": T,
+           "split": q.get("split"), "builder": c.get("finder"), "model": c["model"], "adapter": c.get("adapter"), "T": T,
            "build_seconds": c.get("build_seconds"),
            "size": {"poles": len(c["neurons"]), "heads": len(c["heads"]), "edges": len(c["edges"]),
                     "neurons": len({(L, j) for L, _, j, _ in c["neurons"]}),
@@ -483,9 +482,10 @@ def table(sets: dict) -> str:
 
 
 def motif_scores(run: dict, recs: dict) -> dict:
-    """The essay's usage-damage score per set of a neuron_motifs run: Pearson and Spearman correlations over the held-out
-    texts (run["B"]) between usage, the share of the set's poles among the text's circuit's poles (neuron_motifs.poles_of),
-    and damage (run's per-text drops); per kind the median and the sets scored (a set used by no text, or by every text
+    """The essay's usage-damage score per set of a neuron_motifs views run (its groups and the random sets beside them,
+    run["damage"]): Pearson and Spearman correlations over its unseen questions (run["damage"]["test"]) between usage,
+    the share of the set's poles among the question's circuit's poles (neuron_motifs.poles_of), and damage (the set's
+    measured drop there); per kind the median and the sets scored (a set used by no question, or by every question
     alike, has no correlation)."""
     import neuron_motifs
 
@@ -496,16 +496,17 @@ def motif_scores(run: dict, recs: dict) -> dict:
     def ranks(v):  # average ranks (ties share theirs)
         from scipy.stats import rankdata
         return rankdata(v)
-    circ = [neuron_motifs.poles_of(recs[i]) if i in recs else None for i in run["B"]]
+    dmg = run["damage"]
+    circ = [neuron_motifs.poles_of(recs[i]) if i in recs else None for i in dmg["test"]]
     rows = []
-    for row in run["rows"]:
+    for row in dmg["rows"]:
         ps = set(row["poles"])
         pairs = [(len(c & ps) / len(ps), d) for c, d in zip(circ, row["damage"]) if c is not None]
         u, d = [p[0] for p in pairs], [p[1] for p in pairs]
         rows.append({"kind": row["kind"], "rank": row["rank"], "size": len(ps), "texts": len(pairs), "pearson": corr(u, d),
                      "spearman": corr(ranks(u), ranks(d)) if len(u) > 1 else None})
     out = {"sets": rows}
-    for kind in ("group", "factor"):
+    for kind in ("group", "random"):
         for m in ("pearson", "spearman"):
             v = [r[m] for r in rows if r["kind"] == kind and r[m] is not None]
             out[f"{kind}_{m}_median"] = float(np.median(v)) if v else None
@@ -540,9 +541,9 @@ def main():
         ms = motif_scores(run, recs)
         if a.out:
             a.out.write_text(json.dumps(ms))
-        print(f"usage-damage correlation over held-out texts (median per set): recurring groups Pearson {ms['group_pearson_median']} "
-              f"Spearman {ms['group_spearman_median']} ({ms['group_scored']} sets); activation factors Pearson "
-              f"{ms['factor_pearson_median']} Spearman {ms['factor_spearman_median']} ({ms['factor_scored']} sets); "
+        print(f"usage-damage correlation over unseen questions (median per set): groups Pearson {ms['group_pearson_median']} "
+              f"Spearman {ms['group_spearman_median']} ({ms['group_scored']} sets); random sets Pearson "
+              f"{ms['random_pearson_median']} Spearman {ms['random_spearman_median']} ({ms['random_scored']} sets); "
               f"the essay's ImageNet: edge motifs 0.35, activation factors 0.00")
         return
     from transformers import AutoTokenizer

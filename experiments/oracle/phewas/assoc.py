@@ -18,7 +18,7 @@ Outputs: OUT/<trait>.npz (t on all prompts and the partial r, [layers, neurons, 
 degrees of freedom; the PCs' variance shares), OUT/summary.json (per trait: n, lambda, hits, replication, the top TOP
 hits with r, effect, p and their dev and held-out t).
 
-  assoc.py PHENOME_DIR OUT [--model Qwen/Qwen3-8B] [--traits NAME ...] [--batch-tokens 8192]
+  assoc.py PHENOME_DIR OUT [--model Qwen/Qwen3-8B] [--traits NAME ...]
 """
 from __future__ import annotations
 
@@ -29,11 +29,12 @@ import time
 from pathlib import Path
 
 PCS = 10
+ROWS = 16  # prompts a batch, every batch padded to it
 TOP = 50
 MEASURES = ("max+", "max-", "ans+", "ans-")
 
 
-def genotypes(model, layers, seqs: list[list[int]], dev, batch_tokens: int):
+def genotypes(model, layers, seqs: list[list[int]], dev):
     """[n, L, D, 4] float16 on dev: per prompt the four measures of every neuron."""
     import torch
 
@@ -42,10 +43,8 @@ def genotypes(model, layers, seqs: list[list[int]], dev, batch_tokens: int):
     order = sorted(range(len(seqs)), key=lambda k: len(seqs[k]))
     k = 0
     while k < len(order):
-        b = 1
-        while k + b < len(order) and (b + 1) * len(seqs[order[k + b]]) <= batch_tokens:
-            b += 1
-        idx = order[k:k + b]
+        b = min(ROWS, len(order) - k)
+        idx = order[k:k + b] + order[k + b - 1:k + b] * (ROWS - b)  # every batch ROWS prompts (the batch size moves bf16 outputs)
         T = max(len(seqs[i]) for i in idx)
         x = torch.zeros(len(idx), T, dtype=torch.long, device=dev)
         m = torch.zeros(len(idx), T, dtype=torch.bool, device=dev)
@@ -117,7 +116,6 @@ def main():
     ap.add_argument("out", type=Path)
     ap.add_argument("--model", default="Qwen/Qwen3-8B")
     ap.add_argument("--traits", nargs="*")
-    ap.add_argument("--batch-tokens", type=int, default=8192)
     ap.add_argument("--device")
     a = ap.parse_args()
     import numpy as np
@@ -153,7 +151,7 @@ def main():
         y = torch.tensor([vals[name][i][0] for i in items], device=dev, dtype=torch.float32)
         length = torch.tensor([len(s) for s in seqs], device=dev)
         split = np.array([vals[name][i][1] for i in items])
-        G = genotypes(model, layers, seqs, dev, a.batch_tokens).reshape(len(items), -1)
+        G = genotypes(model, layers, seqs, dev).reshape(len(items), -1)
         res = {}
         for part, sel in (("all", np.ones(len(items), bool)), ("dev", split == "dev"), ("held", split == "held")):
             ix = torch.tensor(np.flatnonzero(sel), device=dev)

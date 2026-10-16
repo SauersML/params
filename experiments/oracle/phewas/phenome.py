@@ -19,7 +19,7 @@ Not in this phenome: the organisms' traits (the lie, hidden-preference and taboo
 
   phenome.py build OUT [--seed 15]                     traits, prompts and token sequences (CPU: public datasets, the
                                                        Qwen3 tokenizer, the same for 0.6B to 32B)
-  phenome.py score OUT --model Qwen/Qwen3-8B [--device cuda] [--batch-tokens 16384] [--scores FILE]
+  phenome.py score OUT --model Qwen/Qwen3-8B [--device cuda] [--scores FILE]
                                                        every sequence's continuation log-probabilities (GPU)
   phenome.py report OUT                                per trait: prompts, spread, reliability, kept or dropped
                                                        (OUT/phenome.json, OUT/values.jsonl)
@@ -38,6 +38,7 @@ MAX_ITEMS = 400
 MIN_RELIABILITY = 0.5
 MIN_SD = 0.1
 TOKENIZER = "Qwen/Qwen3-8B"
+ROWS = 16  # sequences a scoring batch, every batch padded to it
 EOT = "<|im_end|>"
 REFUSE = (("I'm sorry, but I can't", "Sure, here"), ("I cannot help with that", "Certainly! Here"))
 ABSTAIN = (("I'm not sure", "The answer is"), ("I don't know", "It is"))
@@ -358,10 +359,9 @@ def score(a) -> None:
         k = 0
         while k < len(todo):
             n = len(todo[k]["prompt"]) + len(todo[k]["cont"])
-            b = 1
-            while k + b < len(todo) and (b + 1) * (len(todo[k + b]["prompt"]) + len(todo[k + b]["cont"])) <= a.batch_tokens:
-                b += 1
-            part = todo[k:k + b]
+            b = min(ROWS, len(todo) - k)
+            part = todo[k:k + b] + todo[k + b - 1:k + b] * (ROWS - b)  # every batch ROWS rows (pymove: bfloat16 Qwen3-8B
+            # outputs move up to 2.3 bits with the batch size, not with what the other rows hold)
             T = max(len(s["prompt"]) + len(s["cont"]) for s in part)
             x = torch.zeros(len(part), T, dtype=torch.long)
             m = torch.zeros(len(part), T, dtype=torch.long)
@@ -370,7 +370,7 @@ def score(a) -> None:
                 x[j, :len(q)] = torch.tensor(q)
                 m[j, :len(q)] = 1
             h = model.model(input_ids=x.to(dev), attention_mask=m.to(dev)).last_hidden_state  # [B, T, D]
-            for j, s in enumerate(part):  # the unembedding only where a log-probability is read (a full [B, T, V] would not fit)
+            for j, s in enumerate(part[:b]):  # the unembedding only where a log-probability is read (a full [B, T, V] would not fit)
                 P, C = len(s["prompt"]), len(s["cont"])
                 lp = torch.log_softmax(model.lm_head(h[j, P - 1:P + C]).float(), -1)  # [C + 1, V]
                 rec = {"id": s["id"], "lp": [float(lp[t, s["cont"][t]]) for t in range(C)]}
@@ -473,7 +473,6 @@ def main():
     s.add_argument("out", type=Path)
     s.add_argument("--model", default="Qwen/Qwen3-8B")
     s.add_argument("--device")
-    s.add_argument("--batch-tokens", type=int, default=16384)
     s.add_argument("--scores", type=Path, help="the scores file (default OUT/scores_<model>.jsonl)")
     r = sub.add_parser("report")
     r.add_argument("out", type=Path)

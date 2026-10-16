@@ -273,7 +273,10 @@ def ingest_text() -> None:
     is matched against T-names (and T-none on none, when present); its other inputs are robustness lines. A version
     with no common step gives each arm's last step alone."""
     import re as _re
+    import shutil
     test = jl(RC / "rc1" / "test_correct.jsonl")
+    for old in ANS.glob("text.*"):  # (an earlier pick of steps; this ingest owns these directories)
+        shutil.rmtree(old)
     for vd in sorted(TEXT.glob("eval_v*")):
         v = vd.name[5:]
         runs = {}
@@ -661,8 +664,8 @@ SHORT = {"best-constant": "best constant answer", "name-prior": "name-prior (eac
 def short(n: str, meta: dict) -> str:
     if n.startswith("text."):
         _, v, arm, _, inp = n.split(".")
-        return f"text reader {v} trained on " + {"Tfull": "circuit with numbers", "Tnames": "names only",
-                                                 "Tnone": "no circuit"}.get(arm, arm)
+        return f"text reader {v} (step {n.split('.')[3][1:]}) trained on " + {"Tfull": "circuit with numbers",
+                                                                              "Tnames": "names only", "Tnone": "no circuit"}.get(arm, arm)
     return SHORT.get(n, meta.get(n, {}).get("label", n))
 
 
@@ -688,12 +691,16 @@ def figure(rows: list[dict], meta: dict) -> None:
     o2 = [n for n in dict.fromkeys(r["oracle"] for r in rows if r["target"] == "O2") if show(n)]
     o5 = [(n, m) for n, m in dict.fromkeys((r["oracle"], r["metric"]) for r in rows if r["target"] == "O5") if show(n)]
     o34 = [(n, t) for n, t in dict.fromkeys((r["oracle"], r["target"]) for r in rows if r["target"] in ("O3", "O4")) if show(n)]
-    hs = [max(len(o1), 1) * 0.9 + 1.5, len(o2) * 2 * 0.7 + 1.5, (len(o5) + 2) * 0.8 + 1.2] + ([len(o34) * 0.8 + 1.5] if o34 else [])
-    fig, axs = plt.subplots(len(hs), 1, figsize=(18, sum(hs)), gridspec_kw={"height_ratios": hs})
-    for ax in axs:
+    # (the headline first, the lead's 10-16: O2 and O3, then O4, O1 as a check, O5)
+    panels = [("O2", len(o2) * 2 * 0.7 + 1.5)] + ([("O34", len(o34) * 0.8 + 1.5)] if o34 else []) + \
+        [("O1", max(len(o1), 1) * 0.9 + 1.5), ("O5", (len(o5) + 2) * 0.8 + 1.2)]
+    hs = [h for _, h in panels]
+    fig, axs_ = plt.subplots(len(hs), 1, figsize=(18, sum(hs)), gridspec_kw={"height_ratios": hs})
+    axs = {name: axs_[k] for k, (name, _) in enumerate(panels)}
+    for ax in axs_:
         for sp in ("top", "right"):
             ax.spines[sp].set_visible(False)
-    ax = axs[0]
+    ax = axs["O1"]
     for k, n in enumerate(o1):
         for m, dy, fill in ((HEAD, 0.15, True), (SUB, -0.15, False)):
             r = get(n, "O1", m)
@@ -712,7 +719,7 @@ def figure(rows: list[dict], meta: dict) -> None:
     ax.plot([], [], "o", ms=14, color="#555555", label=f"all {nh} questions")
     ax.plot([], [], "o", ms=14, color="#555555", mfc="white", mew=3, label=f"the {ns} where names do not decide")
     ax.legend(loc="lower left", bbox_to_anchor=(0.0, 1.0), ncol=2, frameon=False, fontsize=19)
-    ax = axs[1]
+    ax = axs["O2"]
     ys, labels = [], []
     for k, n in enumerate(o2):
         for j, b in enumerate(BUDGETS):
@@ -727,7 +734,7 @@ def figure(rows: list[dict], meta: dict) -> None:
     ax.set_yticks(ys, labels)
     ax.set_xlim(0, 7)
     ax.set_xlabel("hidden-behaviour organisms whose behaviour, trigger and entity are named exactly")
-    ax = axs[2]
+    ax = axs["O5"]
     names = {"li": "Li et al. patching test", "taboo": "AO taboo secret words"}
     ref = {"li": [("Li et al. trained self-explainer", PUBLISHED["li_self_explainer"]), ("untrained, as published", PUBLISHED["li_untrained"])],
            "taboo": [("AO paper", PUBLISHED["ao_taboo_paper"])]}
@@ -744,7 +751,7 @@ def figure(rows: list[dict], meta: dict) -> None:
     ax.set_xlim(0, 1.0)
     ax.set_xlabel("exact match (black ticks: published numbers)")
     if o34:
-        ax = axs[3]
+        ax = axs["O34"]
         what = {"O3": "edit removes the hidden behaviour", "O4": "stated fix corrects the wrong answer"}
         for k, (n, t) in enumerate(o34):
             r = get(n, t, "success")

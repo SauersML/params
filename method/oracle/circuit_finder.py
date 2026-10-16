@@ -260,8 +260,8 @@ class Patcher:
 
     def _contrast(self, lp: torch.Tensor) -> torch.Tensor:
         if self._sets_dev is None or self._sets_dev[0] != lp.device:   # (the token sets on the device once a pair: a
-            self._sets_dev = (lp.device, {k: torch.as_tensor(self.sets[k], device=lp.device)   # host copy per batch
-                                          for k in ("answer", "alternatives")})                # waited for the GPU)
+            self._sets_dev = (lp.device, {k: torch.as_tensor(self.sets[k], dtype=torch.long, device=lp.device)
+                                          for k in ("answer", "alternatives")})   # (host copy per batch waited for the GPU)
         return answer_contrast.contrast(lp, self._sets_dev[1])
 
     @torch.no_grad()

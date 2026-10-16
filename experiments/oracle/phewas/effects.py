@@ -21,6 +21,9 @@ from pathlib import Path
 
 import numpy as np
 
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
 
 def load(files: list[Path]) -> dict:
     return {r["id"]: r for f in files for r in map(json.loads, f.read_text().splitlines()) if r}
@@ -163,6 +166,55 @@ def correlation(a) -> None:
         print(f"  {c:+.2f}  {x} ~ {y}")
 
 
+def nearness(a) -> None:
+    """Is a neuron's knockout "polysemantic but near its own thing"? For every single pole knocked out (ids "S/..." and
+    the group testing's one-pole leaves; random poles "R/..." only set the bar), the traits it moves past the random
+    poles' 99th percentile of |change|; for poles moving 2 or more, the mean meaning similarity of their trait pairs
+    (traits.py: percentile among all trait pairs), against the same with each trait's moved/unmoved column shuffled
+    over the poles (each trait keeps its number of poles moved)."""
+    import traits as tr
+
+    res = load(a.changes)
+    names = sorted(next(iter(res.values()))["change"])
+    rand = [r for i, r in res.items() if i.startswith("R/")]
+    R = np.array([[r["change"][t] for t in names] for r in rand])
+    thr = np.percentile(np.abs(R), 99, axis=0)
+    poles, seen = [], set()
+    for i, r in res.items():
+        if i.startswith("R/") or len(r["units"]) != 1:
+            continue
+        u = tuple(r["units"][0])
+        if u not in seen:
+            seen.add(u)
+            poles.append(np.abs([r["change"][t] for t in names]) > thr)
+    H = np.array(poles).T  # [traits, poles]
+    P = tr.percentile_matrix(tr.meaning_similarity(names))
+
+    def near(Hm):
+        Hf = Hm.astype(np.float32)
+        k = Hf.sum(0)
+        q = (Hf * (P @ Hf)).sum(0)
+        keep = k >= 2
+        return k[keep], q[keep] / (k[keep] * (k[keep] - 1))
+
+    k, v = near(H)
+    rng = np.random.default_rng(15)
+    nulls = []
+    for _ in range(a.reps):
+        k0, v0 = near(np.stack([row[rng.permutation(row.size)] for row in H]))
+        nulls.append(v0.mean() if len(v0) else np.nan)
+    bins = [(2, 2), (3, 3), (4, 5), (6, 9), (10, 99)]
+    out = {"poles": int(H.shape[1]), "poles_2plus": int(len(k)), "observed_mean": float(v.mean()) if len(v) else None,
+           "null_mean": float(np.nanmean(nulls)), "null_sd": float(np.nanstd(nulls)),
+           "by_traits_moved": [{"bin": f"{lo}-{hi}", "n": int(((k >= lo) & (k <= hi)).sum()),
+                                "mean": float(v[(k >= lo) & (k <= hi)].mean()) if ((k >= lo) & (k <= hi)).any() else None} for lo, hi in bins]}
+    a.out.write_text(json.dumps(out, indent=1))
+    print(f"{out['poles']} single poles knocked out, {out['poles_2plus']} move 2+ traits; nearness of their traits "
+          f"{out['observed_mean']:.1f} percentile against {out['null_mean']:.1f} +- {out['null_sd']:.1f} shuffled")
+    for b in out["by_traits_moved"]:
+        print(f"  {b['bin']:>6} traits moved: {b['n']:3d} poles, mean {b['mean']}")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -183,8 +235,12 @@ def main():
     r = sub.add_parser("correlation")
     r.add_argument("changes", type=Path, nargs="+")
     r.add_argument("out", type=Path)
+    nn = sub.add_parser("nearness")
+    nn.add_argument("changes", type=Path, nargs="+")
+    nn.add_argument("out", type=Path)
+    nn.add_argument("--reps", type=int, default=200)
     a = ap.parse_args()
-    {"concentration": concentration, "singles": singles, "finemap": finemap, "correlation": correlation}[a.cmd](a)
+    {"concentration": concentration, "singles": singles, "finemap": finemap, "correlation": correlation, "nearness": nearness}[a.cmd](a)
 
 
 if __name__ == "__main__":

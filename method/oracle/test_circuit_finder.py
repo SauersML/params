@@ -117,6 +117,7 @@ def test_noise_floor(tiny, monkeypatch):
     assert cf.floor(pt, "neuron", range(pt.first, pt.T - 1)) < 1e-5
     sc = pt.scores()
     monkeypatch.setattr(cf, "floor", lambda *a, **k: 10.0)     # every share below the floor: no single unit, no lower round
+    monkeypatch.setattr(cf, "DENSE", False)                    # (the whole blocks' size only; DENSE: its own test)
     monkeypatch.setattr(cf, "ROUTE_GROUPS", False)             # (the whole blocks' fallback; route groups: test_route_groups)
     reached = 0
     for kind, positions in (("neuron", list(range(pt.first, pt.T))), ("head", [pt.T - 1]), ("neuron", list(range(pt.first, pt.T - 1)))):
@@ -135,6 +136,29 @@ def test_noise_floor(tiny, monkeypatch):
         at = [x for x in sp["curve"] if x["k"] == sp["blocks"]]
         assert not at or abs(at[0]["lost"] - lost) < 1e-5
     assert reached
+
+
+def test_dense_prefix_inside_whole_blocks(tiny, monkeypatch):
+    """With every single unit under eps (a floor of 10), a reachable cut whose smallest passing set of whole blocks is j
+    blocks takes the smallest prefix of those blocks' units in attribution order that passes; its units pass when
+    patched together, and every unit's shares alone are recorded."""
+    pt, clean, corrupt = tiny
+    pt.setup(clean, corrupt)
+    sc = pt.scores()
+    monkeypatch.setattr(cf, "floor", lambda *a, **k: 10.0)
+    monkeypatch.setattr(cf, "ROUTE_GROUPS", False)
+    ran = 0
+    for kind, positions in (("neuron", list(range(pt.first, pt.T))), ("head", [pt.T - 1])):
+        c = cf.cut(pt, sc, kind, positions, {})
+        if not c["reachable"] or not (c["spread"] or {}).get("blocks"):
+            continue
+        ran += 1
+        d = c["spread"]["dense"]
+        assert d["units"] is not None and c["met"] and len(c["units"]) == d["units"]
+        lost, rest = pt.both([c["units"]])[0]
+        assert lost >= cf.PASS and rest >= cf.PASS and abs(lost - c["lost"]) < 1e-5
+        assert all(u in c["singles"] for u in c["units"])
+    assert ran
 
 
 def test_prefix_cache_equals_full_runs(tiny, monkeypatch):

@@ -84,6 +84,11 @@ RESIDUAL_MAP = True   # each layer's residual input at each position noised and 
 # it: 1.2 s of a Qwen3-8B bfloat16 question on an A6000)
 UNREACHABLE = True    # a cut whose ceiling fails is group-tested at EPS for the record's singles (it has no units either
 # way: 0.45 s of a Qwen3-8B bfloat16 question, its readout)
+DENSE = True          # a reachable cut with no passing prefix of single units, whose smallest passing set of whole
+# (layer, position) blocks is j blocks: the smallest prefix of those blocks' units in attribution order that passes
+# (dense codes: on Qwen3-8B bfloat16 dev4, 4 capital source cuts unmet with one whole block passing, no unit of it
+# reaching eps 0.02 of a 51-72 bit gap alone)
+DENSE_BATCH = 100_000 # dense prefixes of more candidate units than this measured one call each
 PEEL = 0              # a whole (layer, position) block above eps split into its PEEL units of largest attribution, each
 # alone, and the rest (halved from there); 0: halved (the attribution order then only orders the halves). On Qwen3-8B a
 # single unit cost ~28 measured sets by halving (2 a level, 14 levels), the deep levels at the changed token's position
@@ -1113,6 +1118,25 @@ def cut(pt: Patcher, sc: dict, kind: str, positions, done: dict, log=None, searc
         j, g, got = smallest(len(first), lambda j: [unit(kind, bl[1], bl[2], torch.arange(width)) for bl in first[:j]], alone=True)
         spread = {"blocks": j, "units": None if j is None else j * width, "order": [[bl[1], bl[2]] for bl in first],
                   "curve": [{"k": k, "lost": a, "restored": b} for k, (a, b) in zip(g, got)]}
+        if DENSE and j:                             # dense: inside those blocks, units in attribution order, the smallest
+            cand = sorted(((float(sc[kind][bl[1], bl[2], u]), bl[1], bl[2], u) for bl in first[:j] for u in range(width)),
+                          reverse=True)             # prefix that passes (measured on the grid, then bisection)
+
+            def top(k, cand=cand):
+                by = {}
+                for _, i, p, u in cand[:k]:
+                    by.setdefault((i, p), []).append(u)
+                return [unit(kind, i, p, np.asarray(us)) for (i, p), us in by.items()]
+            k, g, got = smallest(len(cand), top, alone=len(cand) > DENSE_BATCH)
+            spread["dense"] = {"units": k, "curve": [{"k": x, "lost": a, "restored": b} for x, (a, b) in zip(g, got)]}
+            if k:
+                circ, ok = [unit(kind, i, p, u) for _, i, p, u in cand[:k]], k
+                missing = [u for u in circ if u not in singles]          # (each unit's shares alone, for the record)
+                for u, r in zip(missing, pt.both([[u] for u in missing])):
+                    singles[u] = r
+                lost, rest = pt.both([circ])[0]
+                if log:
+                    log(f"  {kind}s dense in {j} whole blocks: {k} units in attribution order pass ({lost:.2f}/{rest:.2f})")
     return {"units": circ, "singles": singles, "met": bool(ok) and lost >= PASS and rest >= PASS, "lost": lost, "restored": rest,
             "eps": eps, "floor": floors, "found": len(singles), "ceiling": list(ceiling), "reachable": reach, "refined": refined,
             "conditional": len(cond), "spread": spread, "route_groups": routes,

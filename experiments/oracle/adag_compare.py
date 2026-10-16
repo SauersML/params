@@ -20,6 +20,9 @@ probability.
 
   adag_compare.py run OUT.json --cases capitals_llama,math_llama [--device cuda] [--dtype bfloat16]
   adag_compare.py run OUT.json --cases capitals_qwen32 --device auto
+  adag_compare.py transfer OUT.json   each found set of the run (capitals_llama, math_llama) zeroed on every other
+      prompt of its family: ADAG's 50 capitals prompts (does the top answer leave the capital, become the state?) and
+      100 sums (X + Y, X and Y below 100, seeded): the share changed, against random neurons of the same count
 """
 from __future__ import annotations
 
@@ -35,6 +38,7 @@ CAND = 2048
 ROWS = 16
 GRID = (1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048)
 LLAMA_WEIGHTS = "NousResearch/Meta-Llama-3.1-8B-Instruct"  # an ungated copy of meta-llama/Llama-3.1-8B-Instruct
+RANDOM_SETS = 4  # random sets of a found set's size beside it in transfer
 UNRELATED = [
     "The recipe calls for two cups of flour, a pinch of salt and three eggs beaten until smooth.",
     "In 1969 the first humans walked on the Moon, an event watched by millions around the world.",
@@ -45,6 +49,20 @@ UNRELATED = [
     "Le marché ouvre à huit heures et ferme à midi le dimanche.",
     "To reset your password, click the link in the email and follow the instructions.",
 ]
+CAPITALS = [  # ADAG's 50 capitals prompts (scripts/circuit_prep/data/capitals.py): (city, state, capital)
+    ('Dallas', 'Texas', 'Austin'), ('Birmingham', 'Alabama', 'Montgomery'), ('Anchorage', 'Alaska', 'Juneau'), ('Tucson', 'Arizona', 'Phoenix'),
+    ('Fayetteville', 'Arkansas', 'Little Rock'), ('Los Angeles', 'California', 'Sacramento'), ('Colorado Springs', 'Colorado', 'Denver'), ('Bridgeport', 'Connecticut', 'Hartford'),
+    ('Wilmington', 'Delaware', 'Dover'), ('Jacksonville', 'Florida', 'Tallahassee'), ('Savannah', 'Georgia', 'Atlanta'), ('Hilo', 'Hawaii', 'Honolulu'),
+    ('Idaho Falls', 'Idaho', 'Boise'), ('Chicago', 'Illinois', 'Springfield'), ('Fort Wayne', 'Indiana', 'Indianapolis'), ('Cedar Rapids', 'Iowa', 'Des Moines'),
+    ('Wichita', 'Kansas', 'Topeka'), ('Louisville', 'Kentucky', 'Frankfort'), ('New Orleans', 'Louisiana', 'Baton Rouge'), ('Portland', 'Maine', 'Augusta'),
+    ('Baltimore', 'Maryland', 'Annapolis'), ('Worcester', 'Massachusetts', 'Boston'), ('Detroit', 'Michigan', 'Lansing'), ('Minneapolis', 'Minnesota', 'Saint Paul'),
+    ('Gulfport', 'Mississippi', 'Jackson'), ('St. Louis', 'Missouri', 'Jefferson City'), ('Billings', 'Montana', 'Helena'), ('Omaha', 'Nebraska', 'Lincoln'),
+    ('Las Vegas', 'Nevada', 'Carson City'), ('Manchester', 'New Hampshire', 'Concord'), ('Newark', 'New Jersey', 'Trenton'), ('Albuquerque', 'New Mexico', 'Santa Fe'),
+    ('New York City', 'New York', 'Albany'), ('Charlotte', 'North Carolina', 'Raleigh'), ('Fargo', 'North Dakota', 'Bismarck'), ('Cleveland', 'Ohio', 'Columbus'),
+    ('Tulsa', 'Oklahoma', 'Oklahoma City'), ('Portland', 'Oregon', 'Salem'), ('Philadelphia', 'Pennsylvania', 'Harrisburg'), ('Warwick', 'Rhode Island', 'Providence'),
+    ('Charleston', 'South Carolina', 'Columbia'), ('Sioux Falls', 'South Dakota', 'Pierre'), ('Memphis', 'Tennessee', 'Nashville'), ('Provo', 'Utah', 'Salt Lake City'),
+    ('Burlington', 'Vermont', 'Montpelier'), ('Virginia Beach', 'Virginia', 'Richmond'), ('Seattle', 'Washington', 'Olympia'), ('Huntington', 'West Virginia', 'Charleston'),
+    ('Milwaukee', 'Wisconsin', 'Madison'), ('Casper', 'Wyoming', 'Cheyenne')]
 CASES = {
     "capitals_llama": {"model": "meta-llama/Llama-3.1-8B-Instruct", "weights": LLAMA_WEIGHTS,
                        "question": "What is the capital of the state containing Dallas?", "seed": "Answer:", "answer": " Austin",
@@ -206,9 +224,44 @@ def side_effect(run: Runner, tok, S: list[tuple]) -> float:
     return sum(kls) / len(kls)
 
 
+@torch.no_grad()
+def transfer(run: Runner, tok, model_id: str, sets: dict, log=print) -> dict:
+    """Each named set (layer, neuron lists) zeroed on every prompt of its family; beside it RANDOM_SETS random sets of the
+    same size (seeded)."""
+    import random
+    rng = random.Random(0)
+    fams = {"capitals": [(f"What is the capital of the state containing {c}?", "Answer:", " " + cap, " " + st) for c, st, cap in CAPITALS],
+            "math": [(f"What is {x} + {y}?", "Answer: ", str(x + y), None) for x, y in
+                     [(rng.randrange(100), rng.randrange(100)) for _ in range(100)]]}
+    out = {}
+    for name, (fam, S) in sets.items():
+        rows = []
+        rand = [[(rng.randrange(run.L), rng.randrange(run.D)) for _ in S] for _ in range(RANDOM_SETS)]
+        for q, seed, ans, alt in fams[fam]:
+            ids = prompt_ids(tok, model_id, q, seed)
+            A = tok(ans, add_special_tokens=False)["input_ids"][0]
+            X = tok(alt, add_special_tokens=False)["input_ids"][0] if alt else None
+            ls = run.last(ids, [[]] + [S] + rand)
+            top0 = int(ls[0].argmax())
+            if top0 != A:
+                continue  # the model does not give this answer: no draw
+            r = {"prompt": q, "p0": float(ls[0][A].exp()), "p_set": float(ls[1][A].exp()), "changed": int(ls[1].argmax()) != A,
+                 "to_alt": X is not None and int(ls[1].argmax()) == X,
+                 "random_changed": sum(int(l.argmax()) != A for l in ls[2:]) / len(rand)}
+            rows.append(r)
+        n = max(len(rows), 1)
+        out[name] = {"family": fam, "size": len(S), "prompts": len(rows), "changed": sum(r["changed"] for r in rows) / n,
+                     "to_state": sum(r["to_alt"] for r in rows) / n, "random_changed": sum(r["random_changed"] for r in rows) / n,
+                     "mean_p_drop": sum(r["p0"] - r["p_set"] for r in rows) / n, "rows": rows}
+        log(f"{name}: {len(S)} neurons on {len(rows)} {fam} prompts: answer changed on {out[name]['changed']:.2f} "
+            f"(to the state: {out[name]['to_state']:.2f}; random sets of the size {out[name]['random_changed']:.2f}); mean p drop "
+            f"{out[name]['mean_p_drop']:.3f}")
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("cmd", choices=("run",))
+    ap.add_argument("cmd", choices=("run", "transfer"))
     ap.add_argument("out", type=Path)
     ap.add_argument("--cases", default="capitals_llama,math_llama")
     ap.add_argument("--device", default="cuda")
@@ -217,6 +270,16 @@ def main():
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     out = json.loads(a.out.read_text()) if a.out.exists() else {}
+    if a.cmd == "transfer":
+        tok = AutoTokenizer.from_pretrained(LLAMA_WEIGHTS)
+        model = AutoModelForCausalLM.from_pretrained(LLAMA_WEIGHTS, dtype=getattr(torch, a.dtype), device_map=a.device).eval()
+        run = Runner(model)
+        sets = {f"{case}/{g['goal']}/{g.get('target')}/{g.get('p_target_goal')}": ("capitals" if case.startswith("capitals") else "math",
+                                                                                [tuple(u) for u in g["units"]])
+                for case, v in out.items() if case in ("capitals_llama", "math_llama") for g in v["goals"] if g.get("found")}
+        res = transfer(run, tok, CASES["capitals_llama"]["model"], sets, log=lambda s: print(s, flush=True))
+        a.out.with_name(a.out.stem + "_transfer.json").write_text(json.dumps(res))
+        return
     loaded = {}
     for name in a.cases.split(","):
         if name in out:

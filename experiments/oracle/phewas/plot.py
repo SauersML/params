@@ -6,6 +6,7 @@ associated neurons. White, no grid, large type, direct labels (the team's figure
   plot.py qq ASSOC_DIR TRAIT OUT.png             observed against expected -log10 p over every test of the trait
   plot.py overview ASSOC_DIR PHENOME_DIR OUT.png neurons past Bonferroni per trait, by group
   plot.py pleiotropy ANALYSIS.json OUT.png       neurons by how many traits they are associated with, against a null
+  plot.py concentration CONC.json OUT.png        cumulative knockout-explained variance against groups, per trait
 """
 from __future__ import annotations
 
@@ -134,6 +135,37 @@ def pleiotropy(a) -> None:
     print("wrote", a.out)
 
 
+def concentration(a) -> None:
+    """Per trait the cumulative share of the knockout-explained variance (summed squared change of the level-0 groups)
+    against the number of groups, largest first (effects.py concentration's JSON): refusal traits in red, the rest in
+    light blue, the evenly spread trait as a grey line."""
+    plt = style()
+    d = json.loads(a.analysis.read_text())
+    G = d["groups"]
+    fig, ax = plt.subplots(figsize=(11, 7))
+    for t, v in d["traits"].items():
+        red = t.startswith("refusal/") or t.startswith("over-refusal/")
+        cum = v["cum"]
+        ax.plot(np.arange(1, len(cum) + 1), cum, color="#D1495B" if red else "#9DB9DD", lw=2.4 if red else 1.2, zorder=3 if red else 2)
+    k = np.arange(1, 65)
+    ax.plot(k, k / G, color="#888888", lw=1.5, ls="--")
+    ax.annotate("refusal and over-refusal", (1.15, 0.45), color="#D1495B", fontsize=16)
+    ax.annotate("the other traits", (14, 0.13), color="#5B7FA8", fontsize=16)
+    ax.annotate("effects spread evenly", (64, 64 / G), textcoords="offset points", xytext=(-4, 8), ha="right", color="#888888", fontsize=14)
+    ax.set_xscale("log")
+    ax.set_xlim(1, 64)
+    ax.set_ylim(0, 1)
+    ax.set_xticks([1, 2, 4, 8, 16, 32, 64])
+    ax.set_xticklabels(["1", "2", "4", "8", "16", "32", "64"])
+    ax.minorticks_off()
+    ax.set_xlabel(f"groups of {d['poles_per_group']:,} neuron poles removed, largest effect first")
+    ax.set_ylabel("share of the knockout-explained variance")
+    ax.set_title(a.title or "Refusal depends on fewer neuron groups than other behaviours")
+    fig.tight_layout()
+    fig.savefig(a.out, dpi=150)
+    print("wrote", a.out)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -152,8 +184,12 @@ def main():
     q.add_argument("analysis", type=Path)
     q.add_argument("out", type=Path)
     q.add_argument("--title")
+    c = sub.add_parser("concentration")
+    c.add_argument("analysis", type=Path)
+    c.add_argument("out", type=Path)
+    c.add_argument("--title")
     a = ap.parse_args()
-    {"manhattan": manhattan, "qq": qq, "overview": overview, "pleiotropy": pleiotropy}[a.cmd](a)
+    {"manhattan": manhattan, "qq": qq, "overview": overview, "pleiotropy": pleiotropy, "concentration": concentration}[a.cmd](a)
 
 
 if __name__ == "__main__":

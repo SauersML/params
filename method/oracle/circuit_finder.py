@@ -66,7 +66,8 @@ PREFIX = True         # a batch whose patches all lie at or after a position run
 PREFIXES = 32         # cached prefixes per patching pair
 LAYERS = True         # a cached batch also runs only the layers from the lowest one it patches, from the run's own
 # residual there (the layers below see nothing changed); a batch's sets' lowest layers lie within LAYER_BIN of each other
-LAYER_BIN = 8
+LAYER_BIN = 64        # (8 split the residual map's 36 sets a position into small batches, each a full read of the weights:
+# Qwen3-8B bfloat16, A6000, the map 2.5 -> 3.9 s, the source cut 8.6 -> 8.3 s)
 BATCH_TOKENS = 1024   # a cached batch runs max(ROWS, BATCH_TOKENS / its positions) rows (at most MAX_ROWS): a forward of
 MAX_ROWS = 1024       # few positions reads every weight for few tokens (no weak zeroing: the batch size moves a share by
 # float error only). Qwen3-8B bfloat16 on an A6000, capital/France p0-p2: 16.5-17.5 s a question at 256, 13.5-14.6 at
@@ -86,12 +87,14 @@ class Patcher:
         self.hd = getattr(cfg, "head_dim", None) or cfg.hidden_size // self.H
         self.dev = self.core.model.embed_tokens.weight.device
 
-    def _hooks(self, res=None, head=None, neu=None, add=None, cap=None):
+    def _hooks(self, res=None, head=None, neu=None, add=None, cap=None, only=None):
         """Forward hooks: res/head/neu(i, h) -> h edit each layer's residual input, head outputs (o_proj input) and
         neurons (down_proj input); add: {"head": [..], "neu": [..]} tensors added (gradients); cap: a dict of lists (the
-        first row's values only)."""
+        first row's values only); only: {"res"|"head"|"neu": layers} the layers whose hooks the edits need (every layer's
+        hooks cost the model's Python a call each, with nothing to do)."""
         hs = []
         for i, layer in enumerate(self.layers):
+            want = {k: only is None or i in only[k] for k in ("res", "head", "neu")}
             def r(mod, args, kwargs, i=i):
                 h = args[0] if args else kwargs["hidden_states"]
                 if cap is not None:
@@ -123,9 +126,12 @@ class Patcher:
                 if add is not None:
                     h = h + add["neu"][i].to(h.dtype)
                 return (h,) + tuple(args[1:])
-            hs.append(layer.register_forward_pre_hook(r, with_kwargs=True))
-            hs.append(layer.self_attn.o_proj.register_forward_pre_hook(o))
-            hs.append(layer.mlp.down_proj.register_forward_pre_hook(d))
+            if want["res"]:
+                hs.append(layer.register_forward_pre_hook(r, with_kwargs=True))
+            if want["head"]:
+                hs.append(layer.self_attn.o_proj.register_forward_pre_hook(o))
+            if want["neu"]:
+                hs.append(layer.mlp.down_proj.register_forward_pre_hook(d))
             if cap is not None:
                 hs.append(layer.mlp.up_proj.register_forward_hook(lambda mod, args, out: cap.setdefault("up", []).append(out[:1].detach())))
         return hs
@@ -336,7 +342,9 @@ class Patcher:
                         h = h.clone()
                         h[b, p - start, n] = 0 if src == "zero" else self.act[src]["neu"][i][p, n].to(h.device, h.dtype)
                 return h
-            c = self._contrast(self._last(x, Rb, cache=cache, layer0=layer0, h0=h0, res=res, head=head, neu=neu))
+            only = {k: {i for (kind, _), d in idx.items() if kind == name for i in d} for k, name in
+                    (("res", "res"), ("head", "head"), ("neu", "neuron"))}
+            c = self._contrast(self._last(x, Rb, cache=cache, layer0=layer0, h0=h0, res=res, head=head, neu=neu, only=only))
             got = []
             for kb, base in enumerate(bases):
                 ck = c[kb * per:kb * per + len(part)]

@@ -8,10 +8,14 @@ every position from 1 on set to 0, massive values live), and on every held-out p
             they were (-sum over its measures of weight x value / sd);
   ds_full   the change of the score's logit with every feature read again under the knockout (downstream poles move too).
 The split is checked when dv follows ds_split: per trait the Spearman correlation over (pole, prompt) pairs, per pole the
-sign of the mean dv against the sign of the mean ds_split. Batches are fixed (ROWS sequences, the same in every pass), so
+sign of the mean dv against the sign of the mean ds_split. With --finemap, the trait's FINE largest single-pole knockout
+changes (effects.py finemap, found on the dev panel) join the candidates and are knocked out too; for every knocked pole,
+the Spearman correlation over held-out prompts of dv with the pole's own activation (its largest value and its
+answer-position value) says whether its effect on a prompt follows how active it is there. Batches are fixed (ROWS sequences, the same in every pass), so
 a change is the knockout's alone.
 
-  polycheck.py PHENOME CANDIDATES OUT.json --thr THR [--traits T ...] [--poles 10] [--model Qwen/Qwen3-8B]
+  polycheck.py PHENOME CANDIDATES OUT.json --thr THR [--traits T ...] [--poles 10] [--finemap FINEMAP.json --fine 5]
+                [--model Qwen/Qwen3-8B]
 """
 from __future__ import annotations
 
@@ -109,6 +113,8 @@ def main():
     ap.add_argument("--thr", type=Path, required=True)
     ap.add_argument("--traits", nargs="*")
     ap.add_argument("--poles", type=int, default=10)
+    ap.add_argument("--finemap", type=Path)
+    ap.add_argument("--fine", type=int, default=5)
     ap.add_argument("--model", default="Qwen/Qwen3-8B")
     ap.add_argument("--device")
     a = ap.parse_args()
@@ -124,6 +130,7 @@ def main():
     nr.thr = None
     phen = {t["name"]: t for t in json.loads((a.phenome / "phenome.json").read_text())["traits"]}
     cands = json.loads(a.candidates.read_text())
+    fine = json.loads(a.finemap.read_text())["traits"] if a.finemap else {}
     vals: dict = {}
     for x in map(json.loads, (a.phenome / "values.jsonl").read_text().splitlines()):
         vals.setdefault(x["trait"], {})[x["item"]] = (x["value"], x["split"])
@@ -140,6 +147,14 @@ def main():
             continue
         t0 = time.time()
         cand = [tuple(u) for u in cands[t]]
+        fine_poles = []
+        for r_ in fine.get(t, []):
+            if r_.get("poles") == 1 and len(fine_poles) < a.fine:
+                l_, rest = r_["pole"][1:].split(".N")
+                u, pl = (int(l_), int(rest[:-1])), 1 if rest[-1] == "+" else -1
+                if u not in cand:
+                    cand.append(u)
+                fine_poles.append((cand.index(u), pl))
         tr = Trait(nr, seqs[t], cand)
         v0, F0 = tr.run()
         split = np.array([vals[t][i][1] for i in tr.items])
@@ -156,6 +171,7 @@ def main():
         sdn, mun = sd.reshape(len(cand), 4).cpu().numpy(), mu.reshape(len(cand), 4).cpu().numpy()
         weight = [(abs(W[j, list(ms)]).sum(), j, pl) for j in range(len(cand)) for pl, ms in POLE_MEASURES.items()]
         top = [(j, pl) for wt, j, pl in sorted(weight, reverse=True)[:a.poles] if wt > 0]
+        top += [jp for jp in fine_poles if jp not in top]
 
         def score(F):
             return ((F - mun) / sdn * W).sum((1, 2)) + float(b)
@@ -171,14 +187,18 @@ def main():
             ds_split = -(F0[:, j, ms] / sdn[j, ms] * W[j, ms]).sum(1)
             ds_full = score(F1) - s0
             dv = v1 - v0
+            rho_act = [float(spearmanr(F0[hi, j, m_], dv[hi])[0]) if F0[hi, j, m_].std() > 0 else None for m_ in ms]
             rows.append({"pole": f"L{l_}.N{n_}{'+' if pl > 0 else '-'}", "weight": [float(x) for x in W[j, ms]],
+                         "fine": (j, pl) in fine_poles, "rho_dv_max": rho_act[0], "rho_dv_ans": rho_act[1],
+                         "active_share": float((F0[hi, j, ms[0]] > 0).mean()),
                          "dv": dv[hi].tolist(), "ds_split": ds_split[hi].tolist(), "ds_full": ds_full[hi].tolist(),
                          "mean_dv": float(dv[hi].mean()), "mean_ds_split": float(ds_split[hi].mean()),
                          "mean_ds_full": float(ds_full[hi].mean())})
-        DV = np.concatenate([r_["dv"] for r_ in rows]) if rows else np.zeros(0)
-        DS = np.concatenate([r_["ds_split"] for r_ in rows]) if rows else np.zeros(0)
-        DF = np.concatenate([r_["ds_full"] for r_ in rows]) if rows else np.zeros(0)
-        moved = [r_ for r_ in rows if abs(r_["mean_ds_split"]) > 0]
+        sc = [r_ for r_ in rows if not r_["fine"] or any(r_["weight"])]  # (the score's own poles)
+        DV = np.concatenate([r_["dv"] for r_ in sc]) if sc else np.zeros(0)
+        DS = np.concatenate([r_["ds_split"] for r_ in sc]) if sc else np.zeros(0)
+        DF = np.concatenate([r_["ds_full"] for r_ in sc]) if sc else np.zeros(0)
+        moved = [r_ for r_ in sc if abs(r_["mean_ds_split"]) > 0]
         out[t] = {"lambda": lam, "cv_auroc": cv, "held_auroc": held_auc, "poles_used": int((abs(W).sum(1) > 0).sum()),
                   "rho_split": float(spearmanr(DS, DV)[0]) if len(DV) > 2 else None,
                   "rho_full": float(spearmanr(DF, DV)[0]) if len(DV) > 2 else None,
@@ -189,6 +209,11 @@ def main():
         print(f"{t}: score held-out AUROC {held_auc:.3f} ({o['poles_used']} poles); {len(rows)} knockouts: Spearman(dv, split) "
               f"{o['rho_split']:+.2f}, (dv, full) {o['rho_full']:+.2f}, mean-sign agreement {o['sign_agree']}, mean |dv| "
               f"{o['mean_abs_dv']:.3f}; {time.time() - t0:.0f} s", flush=True)
+        for r_ in rows:
+            if r_["fine"]:
+                print(f"  fine-mapped {r_['pole']}: mean dv {r_['mean_dv']:+.2f}, active on {r_['active_share']:.0%} of held-out prompts, "
+                      f"rho(dv, its largest value) {r_['rho_dv_max']}, rho(dv, answer-position value) {r_['rho_dv_ans']}, "
+                      f"in the score: {any(r_['weight'])}", flush=True)
 
 
 if __name__ == "__main__":

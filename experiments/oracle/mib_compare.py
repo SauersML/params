@@ -20,6 +20,7 @@ circuit sizes, seconds (ranking, per attribution example), and for measured ever
   mib_compare.py prep TASK MODEL   (online) MIB's task data and the model into the cache (an ungated copy aliased under
       the official name); every later run then goes with HF_HUB_OFFLINE=1 (huggingface_hub reads it at import)
   mib_compare.py rank TASK MODEL METHOD OUT [--n 32] [--refine 1000] [--batch 16] [--eval-batch B] [--rows 32] [--test-n N]
+      [--fix 0.02] [--curves all|eap]   (select: edgefix circuits up to that size; which proposals get test curves)
       [--from PREV.json --order block|none|paths]   (measured: an earlier run's tests scored again, no new tests)
   mib_compare.py table OUT [...]
   mib_compare.py finder TASK MODEL OUT [--n 32]   circuit_finder's circuits of MIB's first train pairs (Hugging Face model)
@@ -484,7 +485,7 @@ def measured_scores(real, rec: dict, order: str = "block"):
 
 def rank(task: str, mname: str, method: str, out: Path, n: int, refine: int, batch: int, test_n: int | None = None,
          log=print, limit: int | None = None, rows: int = 32, prev: Path | None = None, order: str = "block",
-         eval_batch: int | None = None) -> dict:
+         eval_batch: int | None = None, fix_max: float = 0.0, curves: str = "all") -> dict:
     import torch
 
     from eap.attribute import attribute
@@ -508,7 +509,8 @@ def rank(task: str, mname: str, method: str, out: Path, n: int, refine: int, bat
     elif method == "nodes":
         rec["nodes"] = nodes(model, graph, dl, partial(metric, mean=False, loss=False), log, rows)
     elif method.startswith("select"):
-        return select(model, task, mname, method, out, dl, n_rank, metric, refine, rows, test_n, eval_batch or batch, log)
+        return select(model, task, mname, method, out, dl, n_rank, metric, refine, rows, test_n, eval_batch or batch, log,
+                      fix_max, curves)
     else:
         attribute(model, graph, dl, partial(metric, mean=True, loss=True), method, "patching", ig_steps=5,
                   intervention_dataloader=dl)
@@ -569,12 +571,54 @@ def areas(faith) -> tuple[float, float]:
     return cpr, cmd
 
 
-def select(model, task, mname, method, out, dl, n_rank, metric, refine, rows, test_n, eval_batch, log) -> dict:
+def edgefix(model, g, loader, m1, base, none, k: int, scores, log=print, blocks: int = 32) -> tuple:
+    """A circuit of at most K edges pruned by measurement in its own sparse context (the lead's small-budget fix): from
+    the 2K real edges of largest |SCORES| (an attribution's proposal), rounds measure the circuit without each of up to
+    BLOCKS blocks of its edges (weakest proposal scores first, MIB's evaluate_graph on LOADER with its pruning) and
+    drop the blocks whose removal leaves faithfulness F nearest 1, half the excess edges a round, until K or fewer
+    remain. Returns (F, edge mask, tests)."""
+    import torch
+
+    from eap.evaluate import evaluate_graph
+    real = g.real_edge_mask
+    sc = scores.abs().masked_fill(~real, -1).flatten()
+    cur = sc.argsort(descending=True)[:2 * k].tolist()
+
+    def F(edges):
+        g.in_graph[:] = False
+        g.in_graph.view(-1)[torch.tensor(edges, dtype=torch.long)] = True
+        g.nodes_in_graph[:] = True
+        return (float(evaluate_graph(model, g, loader, m1, quiet=True).mean()) - none) / (base - none)
+    tests = 0
+    while len(cur) > k:
+        cur.sort(key=lambda e: float(sc[e]))
+        size = max(1, -(-len(cur) // blocks))
+        bl = [cur[i:i + size] for i in range(0, len(cur), size)]
+        fs = []
+        for b in bl:
+            drop = set(b)
+            fs.append(F([e for e in cur if e not in drop]))
+        tests += len(bl)
+        excess, gone = len(cur) - k, set()
+        for j in sorted(range(len(bl)), key=lambda j: abs(1 - fs[j])):
+            if gone and len(gone) + len(bl[j]) > max(1, excess // 2):
+                break
+            gone |= set(bl[j])
+        cur = [e for e in cur if e not in gone]
+    f = F(cur)
+    return f, g.in_graph.clone(), tests + 1
+
+
+def select(model, task, mname, method, out, dl, n_rank, metric, refine, rows, test_n, eval_batch, log,
+           fix_max: float = 0.0, curves: str = "all") -> dict:
     """Per circuit size, the circuit of whichever proposal (METHOD = select:A+B+..., each a ranking: an attribution
     method of MIB's in both its absolute and signed order, measured, nodes or eliminate, which reuses nodes' tests when
-    it follows it) has the measured faithfulness nearest 1 on the
-    attribution examples (MIB's evaluate_graph on the train pairs); MIB's submission format (2), one circuit per size.
-    Scored on the test split as MIB's evaluate_area_under_curve scores a ranking, each size's circuit as chosen."""
+    it follows it; and, at sizes up to FIX_MAX of the edges, edgefix's circuit pruned from the first proposal's top
+    edges) has the measured faithfulness nearest 1 on the attribution examples (MIB's evaluate_graph on the train
+    pairs); MIB's submission format (2), one circuit per size. Scored on the test split as MIB's
+    evaluate_area_under_curve scores a ranking, each size's circuit as chosen. CURVES "all": every proposal's own test
+    curve too; "eap": only the attribution methods' (the baseline beside us). Every test metric is kept per example
+    (bootstrap intervals: mib_bootstrap)."""
     import torch
 
     from eap.attribute import attribute
@@ -582,7 +626,7 @@ def select(model, task, mname, method, out, dl, n_rank, metric, refine, rows, te
     from eap.graph import Graph
     names = method.split(":", 1)[1].split("+") if ":" in method else ["EAP-IG-inputs", "measured"]
     m1 = partial(metric, mean=False, loss=False)
-    rec = {"task": task, "model": mname, "method": method, "rank_examples": n_rank, "proposals": {}}
+    rec = {"task": task, "model": mname, "method": method, "rank_examples": n_rank, "proposals": {}, "fix_max": fix_max}
     t0 = time.time()
     graphs = {}
     for c in names:
@@ -604,13 +648,14 @@ def select(model, task, mname, method, out, dl, n_rank, metric, refine, rows, te
     rec["edges"] = n_edges = int(graphs[names[0]].real_edge_mask.sum())
     trdl = DataLoaderLike(dl, eval_batch)
 
-    def faith_of(g, loader, base, none):
-        return (float(evaluate_graph(model, g, loader, m1, quiet=True).mean()) - none) / (base - none)
+    def vec(g, loader):
+        return evaluate_graph(model, g, loader, m1, quiet=True).float()
     base = float(evaluate_baseline(model, trdl, m1, quiet=True).mean())
-    g0 = graphs[names[0]]
+    g0 = Graph.from_model(model)
     g0.apply_topn(0, True)
-    none = float(evaluate_graph(model, g0, trdl, m1, quiet=True).mean())
+    none = float(vec(g0, trdl).mean())
     chosen = []
+    fixes = {}
     for pct in PERCENTAGES:
         k = int(pct * n_edges)
         best = None
@@ -619,49 +664,98 @@ def select(model, task, mname, method, out, dl, n_rank, metric, refine, rows, te
                 if not absolute and float(g.scores[g.real_edge_mask].min()) >= 0:
                     continue
                 g.apply_topn(k, absolute, prune=True)
-                f = faith_of(g, trdl, base, none)
+                f = (float(vec(g, trdl).mean()) - none) / (base - none)
                 rec["proposals"][c].setdefault(f"train_abs_{absolute}", []).append(f)
                 if best is None or abs(1 - f) < abs(1 - best[0]):
-                    best = (f, c, absolute, g.in_graph.clone(), g.nodes_in_graph.clone())
+                    best = (f, c, absolute, g.in_graph.clone())
+        if pct <= fix_max:
+            t1 = time.time()
+            f, mask, n = edgefix(model, g0, trdl, m1, base, none, k, graphs[names[0]].scores, log)
+            fixes[pct] = mask
+            rec.setdefault("edgefix", []).append({"pct": pct, "train_F": f, "tests": n, "seconds": time.time() - t1})
+            if abs(1 - f) < abs(1 - best[0]):
+                best = (f, "edgefix", True, mask)
         chosen.append(best)
         log(f"{100 * pct:g}%: {best[1]} {'abs' if best[2] else 'signed'}, train F {best[0]:.3f}")
     rec["seconds_rank"] = time.time() - t0
     rec["seconds_per_example"] = rec["seconds_rank"] / max(n_rank, 1)
-    rec["chosen"] = [[c, a, f] for f, c, a, _, _ in chosen]
+    rec["chosen"] = [[c, a, f] for f, c, a, _ in chosen]
     tdl, n_test = data(model, task, mname, "test", test_n, eval_batch)
     rec["test_examples"] = n_test
-    base = float(evaluate_baseline(model, tdl, m1, quiet=True).mean())
+    vb = evaluate_baseline(model, tdl, m1, quiet=True).float()
     g0.apply_topn(0, True)
-    none = float(evaluate_graph(model, g0, tdl, m1, quiet=True).mean())
-    test = {}  # (each proposal's own curve on the test split; a chosen circuit is one of these, so select's is read off)
+    vn = vec(g0, tdl)
+    rec["test_full"], rec["test_none"] = vb.tolist(), vn.tolist()
+    F = lambda v: (float(v.mean()) - float(vn.mean())) / (float(vb.mean()) - float(vn.mean()))  # noqa: E731
+    test = {}  # ((proposal, absolute), size index) -> per-example metrics
     for c, g in graphs.items():
+        if curves == "eap" and c in ("measured", "nodes", "eliminate"):
+            continue
         for absolute in (True, False):
             if not absolute and float(g.scores[g.real_edge_mask].min()) >= 0:
                 continue
-            fs = []
-            for pct in PERCENTAGES:
+            for i, pct in enumerate(PERCENTAGES):
                 g.apply_topn(int(pct * n_edges), absolute, prune=True)
-                fs.append(faith_of(g, tdl, base, none))
-            test[(c, absolute)] = fs
+                test[(c, absolute), i] = vec(g, tdl)
+            fs = [F(test[(c, absolute), i]) for i in range(len(PERCENTAGES))]
             cpr, cmd = areas(fs)
-            rec["proposals"][c][f"abs_{absolute}"] = {"CMD": cmd, "CPR": cpr, "faithfulness": fs}
+            rec["proposals"][c][f"abs_{absolute}"] = {"CMD": cmd, "CPR": cpr, "faithfulness": fs,
+                                                      "test_metric": [test[(c, absolute), i].tolist() for i in range(len(PERCENTAGES))]}
             log(f"{task} {mname} {c} absolute={absolute}: CMD {cmd:.3f} CPR {cpr:.3f}")
-    faith = [test[(c, a)][i] for i, (_, c, a, _, _) in enumerate(chosen)]
-    counts = []
+    counts, vs = [], []
     sub = out / "submission" / "select" / f"{task.replace('_', '-')}_{mname}"
     sub.mkdir(parents=True, exist_ok=True)
-    for pct, (_, c, a, ig, ng) in zip(PERCENTAGES, chosen):
+    for i, (pct, (_, c, a, ig)) in enumerate(zip(PERCENTAGES, chosen)):
         g0.in_graph[:] = ig
-        g0.nodes_in_graph[:] = ng
+        g0.nodes_in_graph[:] = True
+        g0.prune()
         counts.append(int(g0.in_graph.sum()))
+        if ((c, a), i) not in test:
+            g0.in_graph[:] = ig
+            g0.nodes_in_graph[:] = True
+            test[(c, a), i] = vec(g0, tdl)
+        vs.append(test[(c, a), i])
+        g0.in_graph[:] = ig
+        g0.nodes_in_graph[:] = True
+        g0.prune()
         g0.scores[:] = g0.in_graph.float()
         g0.to_pt(str(sub / f"{pct * 100:g}.pt"))
+    faith = [F(v) for v in vs]
     cpr, cmd = areas(faith)
-    rec["abs_True"] = rec["abs_False"] = {"CMD": cmd, "CPR": cpr, "faithfulness": faith, "weighted_edge_counts": counts}
+    rec["abs_True"] = rec["abs_False"] = {"CMD": cmd, "CPR": cpr, "faithfulness": faith, "weighted_edge_counts": counts,
+                                          "test_metric": [v.tolist() for v in vs]}
     log(f"{task} {mname} {method}: CMD {cmd:.3f} CPR {cpr:.3f}")
     out.mkdir(parents=True, exist_ok=True)
-    (out / f"{task}_{mname}_{method.replace(':', '-').replace('+', '-')}.json").write_text(json.dumps(rec))
+    (out / f"{task}_{mname}_{method.replace(':', '-').replace('+', '-')}{'-fix' if fix_max else ''}.json").write_text(json.dumps(rec))
     return rec
+
+
+def bootstrap(full, none, a, b=None, B: int = 2000, seed: int = 0) -> dict:
+    """CMD of the per-example test metrics A ([sizes][examples]; FULL and NONE the model's and the empty circuit's) with
+    a 95% bootstrap interval over the test examples (each resample recomputes every size's faithfulness from its
+    means, as MIB does), and with B (another curve on the same examples) the paired difference A - B."""
+    import numpy as np
+
+    full, none, a = np.array(full), np.array(none), np.array(a)
+    b = None if b is None else np.array(b)
+    n = len(full)
+
+    def cmd(m, idx):
+        d = full[idx].mean() - none[idx].mean()
+        return areas([(m[i][idx].mean() - none[idx].mean()) / d for i in range(len(m))])[1]
+    rng = np.random.default_rng(seed)
+    xs, ds = [], []
+    for _ in range(B):
+        idx = rng.integers(0, n, n)
+        xs.append(cmd(a, idx))
+        if b is not None:
+            ds.append(xs[-1] - cmd(b, idx))
+    q = lambda v: [float(np.percentile(v, 2.5)), float(np.percentile(v, 97.5))]  # noqa: E731
+    allx = np.arange(n)
+    out = {"n": n, "CMD": cmd(a, allx), "CI": q(xs)}
+    if b is not None:
+        out.update(diff=cmd(a, allx) - cmd(b, allx), diff_CI=q(ds))
+    return out
 
 
 class DataLoaderLike:
@@ -819,6 +913,8 @@ def main():
     ap.add_argument("--refine", type=int, default=REFINE)
     ap.add_argument("--batch", type=int, default=16)
     ap.add_argument("--eval-batch", type=int, default=None, help="MIB's evaluation batch (default --batch)")
+    ap.add_argument("--fix", type=float, default=0.0, help="select: edgefix circuits at sizes up to this share of edges")
+    ap.add_argument("--curves", default="all", choices=("all", "eap"), help="select: every proposal's test curve, or only the attribution methods'")
     ap.add_argument("--test-n", type=int, default=None, help="MIB's test split's first examples only (a smoke run)")
     ap.add_argument("--limit", type=int, default=None, help="the first writers and readers only (a smoke run)")
     ap.add_argument("--rows", type=int, default=32, help="measured: rows a forward pass (tests x batch)")
@@ -852,7 +948,7 @@ def main():
         return
     task, mname, method, out = a.args
     rank(task, mname, method, Path(out), a.n, a.refine, a.batch, a.test_n, log=lambda s: print(s, flush=True), limit=a.limit,
-         rows=a.rows, prev=a.prev, order=a.order, eval_batch=a.eval_batch)
+         rows=a.rows, prev=a.prev, order=a.order, eval_batch=a.eval_batch, fix_max=a.fix, curves=a.curves)
 
 
 if __name__ == "__main__":

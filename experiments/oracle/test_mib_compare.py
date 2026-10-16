@@ -179,3 +179,20 @@ def test_nodes_writers_equal_measured(monkeypatch, shape):
     for f in range(len(b["noise"])):
         if real[f].any():
             assert b["noise"][f] == pytest.approx(a["writers"][f], abs=1e-4), f
+
+
+def test_edgefix_and_bootstrap(monkeypatch, tmp_path):
+    """select's edgefix circuits hold at most their size's edges and are chosen only by train faithfulness; bootstrap's
+    point CMD is select's and a curve against itself differs by exactly 0."""
+    model, dl, eval_mod = tiny(monkeypatch, "llama")
+    monkeypatch.setattr(mc, "data", lambda *a, **k: (dl, 6))
+    m = lambda *a, mean=True, loss=False: metric(*a[:4])  # noqa: E731
+    rec = mc.select(model, "ioi", "tiny", "select:measured", tmp_path, dl, 6, m, 12, 6, None, 3, lambda s: None, fix_max=0.2)
+    n_edges = rec["edges"]
+    for e in rec["edgefix"]:
+        assert e["tests"] >= 1
+    for i, (c, a, f) in enumerate(rec["chosen"]):
+        assert rec["abs_True"]["weighted_edge_counts"][i] <= max(1, int(mc.PERCENTAGES[i] * n_edges)) or mc.PERCENTAGES[i] == 1
+    bt = mc.bootstrap(rec["test_full"], rec["test_none"], rec["abs_True"]["test_metric"], rec["abs_True"]["test_metric"], B=50)
+    assert bt["CMD"] == pytest.approx(rec["abs_True"]["CMD"], abs=1e-6)
+    assert bt["diff"] == 0 and bt["diff_CI"] == [0.0, 0.0]

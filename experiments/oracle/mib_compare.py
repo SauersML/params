@@ -54,6 +54,18 @@ def alias_weights(model: str) -> None:
     os.environ["HF_HUB_OFFLINE"] = "1"
 
 
+def prefetch(task: str) -> None:
+    """MIB's task data into the HF cache before the model's weights put the hub offline."""
+    from datasets import load_dataset
+
+    from MIB_circuit_track.utils import TASKS_TO_HF_NAMES
+    for split in ("train", "test"):
+        if task == "mcqa":
+            load_dataset(f"mib-bench/{TASKS_TO_HF_NAMES[task]}", "4_answer_choices", split=split)
+        else:
+            load_dataset(f"mib-bench/{TASKS_TO_HF_NAMES[task]}", split=split)
+
+
 def load(model: str):
     import torch
     from transformer_lens import HookedTransformer
@@ -131,6 +143,7 @@ def rank(task: str, mname: str, method: str, out: Path, n: int, refine: int, bat
     from eap.graph import Graph
     from MIB_circuit_track.evaluation import evaluate_area_under_curve
     from MIB_circuit_track.metrics import get_metric
+    prefetch(task)
     model = load(mname)
     graph = Graph.from_model(model)
     dl, n_rank = data(model, task, mname, "train", n, batch)

@@ -261,3 +261,15 @@ def test_explicit_sets_cannot_mix_word_hint(tiny,monkeypatch):
     monkeypatch.setattr(pt,'_last',lambda *a,**k:(_ for _ in ()).throw(AssertionError('unexpected forward')))
     with pytest.raises(ValueError,match='mutually exclusive'):
         pt.setup(clean,corrupt,answers=[1],explicit_sets={'answer':[1],'alternatives':[2]})
+
+
+def test_floor_measured_in_low_precision_only(tiny):
+    """float32: 0 unmeasured (no-op shares are float error); bfloat16: the no-op patches measured."""
+    pt, clean, corrupt = tiny
+    pt.setup(clean, corrupt)
+    assert cf.floor(pt, "neuron", range(pt.first, pt.T - 1)) == 0.0
+    import copy
+    lo = cf.Patcher(copy.deepcopy(pt.model).to(torch.bfloat16), None, rows=8)
+    lo.setup(clean, corrupt)
+    f = cf.floor(lo, "neuron", range(lo.first, lo.T - 1))
+    assert 0.0 <= f < 1.0

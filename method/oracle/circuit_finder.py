@@ -673,8 +673,10 @@ def grid(n: int) -> list[int]:
 def floor(pt: Patcher, kind: str, positions) -> float:
     """The noise floor of Patcher.both's shares: the largest |share| over no-op patches, every layer's
     units of kind at each of positions set to their values in the row's own run, measured as group testing's first
-    level is (FLOOR; 0 off). Only without other patched units: beside them a no-op patch resets their effects."""
-    if not FLOOR:
+    level is (FLOOR; 0 off). Only without other patched units: beside them a no-op patch resets their effects. A
+    float32 model's is 0 unmeasured: its no-op shares are float error, ~1e-6 (the source cut's nulls cost a first level:
+    Qwen3-8B float32, ~2.5 s of a ~20 s question)."""
+    if not FLOOR or pt.core.model.embed_tokens.weight.dtype == torch.float32:
         return 0.0
     width = pt.H if kind == "head" else pt.D
     nulls = [[unit(kind, i, p, torch.arange(width)) + ("self",)] for i in range(pt.L) for p in positions]

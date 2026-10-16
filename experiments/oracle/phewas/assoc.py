@@ -349,7 +349,7 @@ def main():
     a.out.mkdir(parents=True, exist_ok=True)
     summ_p = a.out / "summary.json"
     summary = json.loads(summ_p.read_text()) if summ_p.exists() else {}
-    tests = len(kept) * L * D * 4
+    tests = sum(bool(t["kept"]) for t in phen["traits"]) * L * D * 4  # (every kept trait, also when --traits picks some)
     alpha = 0.05 / tests
     from scipy import stats
 

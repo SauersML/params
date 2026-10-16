@@ -3,6 +3,7 @@
 # ~/mpd-data/runpod/monitor-phewas-$RUN/.
 #   default: the phenome's sequences scored on Qwen3-8B (phenome.py score), its report (phenome.json, values.jsonl),
 #            then stage 1's association (assoc.py) on the kept traits
+#            (SCORES: an earlier scores file whose sequences are not scored again; ASSOC_TRAITS: stage 1 on these traits only)
 #   MODE=assoc: stage 1 alone on a reported phenome (PHENOME with phenome.json and values.jsonl)
 #   MODE=polyscore: polyneuronal scores against a dense probe (polyscore.py) on a reported phenome, with stage 1's
 #            summary (ASSOC), the dev-only candidates (CANDS: polyscore.candidates), optionally the fine-mapping (FINEMAP)
@@ -19,6 +20,7 @@ P=${PHENOME:?PHENOME}
 REV=${SRCREV:-origin/main}
 git fetch -q origin main && rm -rf "$S" "$S.tar" && mkdir -p "$S/phenome" && git archive "$REV" experiments/oracle/phewas method/oracle | tar -x -C "$S" \
   && cp "$P/traits.json" "$P/sequences.jsonl" "$P/splits.jsonl" "$S/phenome/" && echo "python source $(git rev-parse --short=10 "$REV")" > "$S/SOURCE" || exit 1
+[ -n "${SCORES:-}" ] && { cp "$SCORES" "$S/scores_before.jsonl" || exit 1; }
 case "${MODE:-}" in
   assoc) cp "$P/phenome.json" "$P/values.jsonl" "$S/phenome/" || exit 1 ;;
   polyscore) cp "$P/phenome.json" "$P/values.jsonl" "$S/phenome/" && cp "${ASSOC:?ASSOC}" "$S/assoc_summary.json" || exit 1
@@ -29,10 +31,10 @@ case "${MODE:-}" in
          [ -n "${ASSOC:-}" ] && { cp "$ASSOC" "$S/assoc_summary.json" || exit 1; } ;;
 esac
 COPYFILE_DISABLE=1 tar --no-xattrs --no-mac-metadata -czf "$S.tgz" -C "$S" . && rm -rf "$S" || exit 1
-RUNS="python -u phenome.py score $S/phenome --model Qwen/Qwen3-8B --scores $O/scores_Qwen3-8B.jsonl > $O/score.log 2>&1 && \
+RUNS="${SCORES:+cp $S/scores_before.jsonl $O/scores_Qwen3-8B.jsonl;} python -u phenome.py score $S/phenome --model Qwen/Qwen3-8B --scores $O/scores_Qwen3-8B.jsonl > $O/score.log 2>&1 && \
 python -u phenome.py report $S/phenome --model Qwen/Qwen3-8B --scores $O/scores_Qwen3-8B.jsonl > $O/report.txt 2>&1 && \
 cp $S/phenome/phenome.json $S/phenome/values.jsonl $O/ && \
-python -u assoc.py $S/phenome $O/assoc --model Qwen/Qwen3-8B > $O/assoc.log 2>&1"
+python -u assoc.py $S/phenome $O/assoc --model Qwen/Qwen3-8B ${ASSOC_TRAITS:+--traits $ASSOC_TRAITS} > $O/assoc.log 2>&1"
 [ "${MODE:-}" = polyscore ] && RUNS="${RESUME:+cp $S/polyscore_before.json $O/polyscore.json;} python -u polyscore.py $S/phenome $S/assoc_summary.json $O/polyscore.json ${FINEMAP:+--finemap $S/finemap.json} ${CANDS:+--candidates-file $S/candidates.json} > $O/polyscore.log 2>&1"
 [ "${MODE:-}" = assoc ] && RUNS="python -u assoc.py $S/phenome $O/assoc --model Qwen/Qwen3-8B > $O/assoc.log 2>&1"
 [ "${MODE:-}" = pilot ] && RUNS="python -u screen.py pilot $S/phenome $O/pilot.json --thr $S/thr.pt ${ASSOC:+--assoc $S/assoc_summary.json} > $O/pilot.log 2>&1"

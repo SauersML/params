@@ -3,7 +3,7 @@ poles, every trait of the phenome measured in every pass, so one screen gives th
 effects. This file has the panel, the knockout runs and the noise pilot that sizes the screen.
 
 Panel: PANEL dev prompts per kept trait (phenome.json), measured in form A (phenome.py's sequences: a pair's positive and
-negative continuation, a set's or a teacher's one sequence, an eot's form A). A trait's value under an edit is the mean
+negative continuation, a set's or a teacher's one sequence, an answer's or an eot's form A). A trait's value under an edit is the mean
 over its panel prompts; its change is that minus the unedited model's. Every batch has ROWS sequences and the batches are
 the same for every edit, so a change is the edit's alone (bfloat16 outputs move with the batch size).
 Knockout: claim_check.knockout_edit, the claim checker's zero: each pole's values at every position from 1 on set to 0,
@@ -116,6 +116,8 @@ class Panel:
                     vs.append(logit_sum(r["set"][1][:len(self.traits[name]["tokens"]["A"])]))
                 elif kind == "teacher":
                     vs.append(sum(r["ref"][0]) / max(len(r["ref"][0]), 1))
+                elif kind == "answer":
+                    vs.append(sum(r["ref"][0]))
                 elif kind == "eot":
                     vs.append(logit_sum(r["eot"][1]))
             out[name] = sum(vs) / len(vs) if vs else float("nan")

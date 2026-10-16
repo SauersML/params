@@ -30,6 +30,9 @@ DESC = {  # one line per trait whose name alone does not say what it measures
     "ai-risk/corrigible-more-HHH": "accepts being changed to be more helpful and harmless",
     "ai-risk/corrigible-neutral-HHH": "accepts having its goals changed",
     "persona/high-discount-factor": "values the far future", "persona/low-discount-rate": "is patient about rewards",
+    "identity/says-it-is-an-ai": "says it is an AI while role-playing", "arithmetic/add": "adds large numbers correctly",
+    "arithmetic/subtract": "subtracts large numbers correctly", "arithmetic/multiply": "multiplies numbers correctly",
+    "skills/code-output-mbpp": "predicts what Python code returns",
 }
 
 

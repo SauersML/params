@@ -76,3 +76,17 @@ def test_readers_after_matches_the_cut(tiny):
         for j in (0, 7, 19):
             s2 = rn.run(ids, [{"read": [(L, pos, j, delta)]}], capture=True)["states"]
             assert float(s2["h"][L][pos, j] - st["h"][L][pos, j]) == pytest.approx(float(ch[L][j]), rel=1e-4, abs=1e-6)
+
+
+def test_route_story(tiny):
+    model, ids, rn = tiny
+    run = rn.run(ids, [{}], capture=True)
+    st, c0 = run["states"], run["contrast"][0]
+    lost = lambda sets: [c0 - c for c in rn.run(ids, sets)["contrast"]]  # noqa: E731
+    s = head_routes.route_story(rn, st, lost, 2, 1, 9, 6, writers=3, readers=4)
+    assert s["knock"] == pytest.approx(c0 - rn.run(ids, [{"knock": [(2, 1, 9, 6)]}])["contrast"][0], abs=1e-6)
+    assert len(s["key"]) == 3 + 1 and len(s["query"]) == 3 and len(s["readers"]) == 4  # (the key: one earlier head too)
+    other = rn.run([(i + 1) % 48 for i in ids], [{}], capture=True)["states"]
+    assert len(head_routes.route_story(rn, st, lost, 2, 1, 9, 6, writers=3, readers=4, other=other)["readers"]) == 4
+    car = head_routes.carriers(rn, st, lost, 9, 6, min_attention=0.0)
+    assert len(car) == rn.L * rn.H

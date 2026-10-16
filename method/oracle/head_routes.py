@@ -19,6 +19,11 @@ Local measurements on captured states, exact (norms, gate and up recomputed in f
     output) taken out of its key input at p or its query input at q;
   readers_after: every neuron at a position in later layers recomputed with one head's output there taken out of its
     input (the head -> neuron edges' local size).
+route_story / carriers: one head's route measured end to end (knockout, the neurons and heads setting its key and query,
+the neurons reading its output; every head able to move the same information), by zeroing or by patching from the
+corrupted run of a patching pair.
+
+  python head_routes.py finder MODEL RECORDS OUT [--dtype bfloat16]   (circuit_finder records: their mover heads)
 """
 from __future__ import annotations
 
@@ -146,6 +151,14 @@ class Runner:
 
     # -- local measurements on captured states ---------------------------------------------------------------------
 
+    def gate_up(self, st: dict, L: int, pos: int, j: int) -> tuple[float, float]:
+        """A neuron's act(gate) and up at pos (its value is their product)."""
+        layer = self.layers[L]
+        ln, x = layer.post_attention_layernorm, st["mid"][L][pos].to(self._d(L))
+        n = x * torch.rsqrt(x.pow(2).mean() + ln.variance_epsilon) * ln.weight.float()
+        return (float(layer.mlp.act_fn(n @ layer.mlp.gate_proj.weight[j].float())),
+                float(n @ layer.mlp.up_proj.weight[j].float()))
+
     def head_write(self, st: dict, L: int, h: int, pos: int) -> torch.Tensor:
         """A head's output at pos as written into the stream [d] (o_proj's columns of that head times its output)."""
         Wo = self.layers[L].self_attn.o_proj.weight[:, h * self.hd:(h + 1) * self.hd].float()
@@ -196,13 +209,139 @@ class Runner:
         return (a, new - base) if delta_out else a
 
     @torch.no_grad()
-    def readers_after(self, st: dict, c: int, h: int, pos: int) -> dict:
-        """Every neuron at pos in layers c.. recomputed with head (c, h)'s output at pos taken out of its MLP input:
-        {layer: [d_mlp] the change (new - base)}."""
+    def readers_after(self, st: dict, c: int, h: int, pos: int, instead: torch.Tensor | None = None) -> dict:
+        """Every neuron at pos in layers c.. recomputed with head (c, h)'s output at pos taken out of its MLP input (or
+        replaced by instead, another run's write): {layer: [d_mlp] the change (new - base)}."""
         out = {}
         for L in range(c, self.L):
             d = self._d(L)
-            delta = self.head_write(st, c, h, pos).to(d)
+            delta = self.head_write(st, c, h, pos).to(d) - (0 if instead is None else instead.to(d))
             mid = st["mid"][L][pos].to(d)
             out[L] = (self._acts(self.layers[L], (mid - delta)[None])[0] - st["h"][L][pos].to(d)).cpu()
         return out
+
+
+# -- a head's route, measured end to end -------------------------------------------------------------------------------
+
+@torch.no_grad()
+def route_story(rn: Runner, st: dict, lost, c: int, h: int, q: int, p: int, writers: int = 16, readers: int = 16,
+                other: dict | None = None) -> dict:
+    """Head (c, h) reading position p at q, on a prompt whose clean states are st; lost(sets) gives each edit set's
+    share of the gap lost (or any measured score). Measured: the head unable to see p (knock); every neuron at p in
+    earlier layers and every earlier head's output there taken out of its key input at p, and every neuron at q in
+    earlier layers out of its query input at q (the attention q -> p after, exact), the writers largest by change cut
+    from that head's key or query alone in full runs; every neuron at q in layers c.. recomputed with the head's output
+    taken out (exact), the readers largest by change zeroed alone and cut from the head alone in full runs. other (the
+    corrupted run's states of a patching pair): every cut a patch instead, the unit's write (or value) replaced by its
+    write there."""
+    def nw(L, pos):
+        w = rn.neuron_writes(st, L, pos)
+        return w if other is None else w - rn.neuron_writes(other, L, pos).to(w.device)
+
+    def hw(L, g, pos):
+        w = rn.head_write(st, L, g, pos)
+        return w if other is None else w - rn.head_write(other, L, g, pos).to(w.device)
+    a0 = float(st["A"][c][h, q, p])
+    out = {"layer": c, "head": h, "q": q, "p": p, "attention": a0, "knock": lost([{"knock": [(c, h, q, p)]}])[0]}
+    for side, pos in (("key", p), ("query", q)):
+        cand = []  # (|change|, change, unit, delta)
+        for L in range(c):
+            a, dl = rn.attention_after(st, c, h, q, p, nw(L, pos), side=side, delta_out=True)
+            ch = (a - a0).cpu()
+            for j in torch.topk(ch.abs(), min(writers, len(ch))).indices.tolist():
+                cand.append((abs(float(ch[j])), float(ch[j]), ("neuron", L, j, float(st["h"][L][pos, j])), dl[j]))
+            if side == "key":
+                a, dl = rn.attention_after(st, c, h, q, p, torch.stack([hw(L, g, pos) for g in range(rn.H)]), side=side,
+                                           delta_out=True)
+                cand += [(abs(float(a[g] - a0)), float(a[g] - a0), ("head", L, g), dl[g]) for g in range(rn.H)]
+        cand.sort(key=lambda z: -z[0])
+        pick = [z for z in cand if z[2][0] == "neuron"][:writers] + [z for z in cand if z[2][0] == "head"][:max(1, writers // 4)]
+        kind = "dk" if side == "key" else "dq"
+        sh = lost([{kind: [(c, h, pos, z[3])]} for z in pick])
+        out[side] = [{"unit": list(z[2]), "attention_change": z[1], "lost": s} for z, s in zip(pick, sh)]
+    ch = rn.readers_after(st, c, h, q, None if other is None else rn.head_write(other, c, h, q))
+    flat = sorted(((abs(float(v[j])), float(v[j]), L, j) for L, v in ch.items()
+                   for j in torch.topk(v.abs(), min(readers, len(v))).indices.tolist()), key=lambda z: -z[0])[:readers]
+    delta = hw(c, h, q)
+    own = lost([{"neuron": [(L, q, j, 0.0 if other is None else float(other["h"][L][q, j]))]} for _, _, L, j in flat])
+    cut = lost([{"read": [(L, q, j, delta)]} for _, _, L, j in flat])
+    out["readers"] = [{"unit": ["neuron", L, j, float(st["h"][L][q, j])], "value_change": v, "zeroed_lost": o, "cut_lost": k}
+                      for (_, v, L, j), o, k in zip(flat, own, cut)]
+    return out
+
+
+@torch.no_grad()
+def carriers(rn: Runner, st: dict, lost, q: int, p: int, min_attention: float = 0.01) -> list[dict]:
+    """Which heads move position p's information to q: every head attending q -> p at least min_attention made unable
+    to see p alone (measured), largest first."""
+    heads = [(L, h) for L in range(rn.L) for h in range(rn.H) if float(st["A"][L][h, q, p]) >= min_attention]
+    sh = lost([{"knock": [(L, h, q, p)]} for L, h in heads])
+    return sorted(({"layer": L, "head": h, "attention": float(st["A"][L][h, q, p]), "knock": s}
+                   for (L, h), s in zip(heads, sh)), key=lambda r: -abs(r["knock"]))
+
+
+def load(name: str, device: str | None = None, dtype: str = "float32"):
+    """An HF causal LM: float32 on one card, or bfloat16 split over every card (device_map auto), no weight gradients."""
+    import transformers
+    if dtype == "bfloat16":
+        model = transformers.AutoModelForCausalLM.from_pretrained(name, dtype=torch.bfloat16, device_map="auto")
+    else:
+        dev = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        model = transformers.AutoModelForCausalLM.from_pretrained(name, dtype=torch.float32).to(dev)
+    return model.eval().requires_grad_(False)
+
+
+def finder_routes(rn: Runner, rec: dict, writers: int = 16, readers: int = 16, min_attention: float = 0.01) -> dict:
+    """A circuit_finder record's mover heads as routes (route_story, cuts zeroing and patching from the corrupted run, and
+    carriers), each from the answer position to the source it looks at most from the first changed token on."""
+    rn.answer, rn.alternatives = [rec["answer"]], list(rec["alternatives"])
+    ids, bad = rec["ids"], rec["corrupted"]
+    clean, corrupt = rn.run(ids, [{}], capture=True), rn.run(bad, [{}], capture=True)
+    c, cb = clean["contrast"][0], corrupt["contrast"][0]
+    gap = c - cb
+    st, sb = clean["states"], corrupt["states"]
+
+    def lost(sets):
+        return [(c - x) / gap for x in rn.run(ids, sets)["contrast"]]
+    first = rec.get("first_diff", next(i for i, (x, y) in enumerate(zip(ids, bad)) if x != y))
+    out = {"id": rec.get("id"), "contrast": {"clean": c, "corrupt": cb}, "gap": gap, "routes": []}
+    for r in rec.get("routes", []):
+        L, h, q = r["layer"], r["head"], r["pos"]
+        att = st["A"][L][h, q]
+        p = first + int(att[first:q + 1].argmax())
+        story = {"zero": route_story(rn, st, lost, L, h, q, p, writers, readers),
+                 "patch": route_story(rn, st, lost, L, h, q, p, writers, readers, other=sb),
+                 "carriers": carriers(rn, st, lost, q, p, min_attention)}
+        out["routes"].append(story)
+    return out
+
+
+def main():
+    import argparse
+    import json
+    import time
+    from pathlib import Path
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("cmd", choices=("finder",))
+    ap.add_argument("model")
+    ap.add_argument("records", type=Path, help="a circuit_finder record or a directory of them")
+    ap.add_argument("out", type=Path)
+    ap.add_argument("--dtype", default="float32", choices=("float32", "bfloat16"))
+    ap.add_argument("--device", default=None)
+    a = ap.parse_args()
+    rn = Runner(load(a.model, a.device, a.dtype))
+    files = sorted(a.records.glob("*.json")) if a.records.is_dir() else [a.records]
+    a.out.mkdir(parents=True, exist_ok=True)
+    for f in files:
+        dst = a.out / f.name
+        if dst.exists():
+            continue
+        t0 = time.time()
+        got = finder_routes(rn, json.loads(f.read_text()))
+        got["seconds"] = round(time.time() - t0, 2)
+        dst.write_text(json.dumps(got))
+        print(f"{f.stem}: {len(got['routes'])} routes, {got['seconds']} s", flush=True)
+
+
+if __name__ == "__main__":
+    main()

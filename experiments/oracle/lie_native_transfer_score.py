@@ -42,6 +42,13 @@ def verify_predictions(frozen,responses,expected_prediction_sha):
     panel_blob=Path(m['panel_path']).read_bytes()
     require(sha(panel_blob)==m['panel_sha256']==receipt['panel_sha256'],'panel SHA mismatch')
     panel=json.loads(panel_blob);mapping=load(frozen/'mapping.json');requests=lines(frozen/'requests.jsonl')
+    if 'public_observations_sha256' in m:
+        public_blob=Path(m['public_observations_path']).read_bytes()
+        require(sha(public_blob)==m['public_observations_sha256']==receipt.get('public_observations_sha256'),'public observations commitment mismatch')
+        public=json.loads(public_blob)
+        require(public.get('manifest')==panel and len(public['rows'])==32,'public panel mismatch')
+        expected_baselines={r['case_id']:{'static_readout_delta_bits':r['static_zero_delta_bits']} for r in public['rows']}
+        require(m.get('frozen_query_baselines')==expected_baselines,'query baselines changed after public observations')
     require(len(mapping)==32 and len({r['question_id'] for r in mapping})==32 and len({r['case_id'] for r in mapping})==32,'mapping coverage')
     require(len(panel['cases'])==32 and {r['case_id'] for r in mapping}=={r['case_id'] for r in panel['cases']},'panel coverage')
     expected={r['question_id']+'_'+arm for r in mapping for arm in ARMS}
@@ -79,8 +86,19 @@ def score(bundle,gold):
     require(gold['manifest']==panel,'gold manifest differs from frozen panel')
     require(len({r['case_id'] for r in gold['rows']})==32 and {r['case_id'] for r in gold['rows']}=={c['case_id'] for c in panel['cases']},'gold coverage')
     cases={c['case_id']:c for c in panel['cases']};gold_by={r['case_id']:r for r in gold['rows']}
+    if 'public_observations_sha256' in m:
+        require(gold.get('public_observations_sha256')==m['public_observations_sha256'],'gold public observations mismatch')
+        require(gold.get('prediction_commit_sha256')==bundle['commitment']['prediction_sha256'],'gold prediction commitment mismatch')
     responses={r['request_id']:r for r in bundle['responses']};predictions=[];physics=[];loss={arm:[] for arm in ARMS}
-    baselines=m['frozen_baselines'];loss.update({key:[] for key in baselines})
+    baselines=m['frozen_baselines'];query_baselines=m.get('frozen_query_baselines',{})
+    query_keys=set()
+    if query_baselines:
+        require(set(query_baselines)==set(cases),'query baseline coverage')
+        query_keys=set(next(iter(query_baselines.values())))
+        require(query_keys and all(set(v)==query_keys for v in query_baselines.values()),'query baseline key coverage')
+        require(not query_keys.intersection(set(baselines)|set(ARMS)),'duplicate baseline name')
+        require(all(type(v) in (int,float) and math.isfinite(v) for r in query_baselines.values() for v in r.values()),'nonfinite query baseline')
+    loss.update({key:[] for key in [*baselines,*sorted(query_keys)]})
     for binding in mapping:
         qid,cid=binding['question_id'],binding['case_id'];case=cases[cid];row=gold_by[cid]
         base=contrast(row['conditional_baseline']);edited=contrast(row['effects']['target_zero']);delta=edited-base
@@ -102,36 +120,37 @@ def score(bundle,gold):
             predictions.append(dict(question_id=qid,case_id=cid,group=case['group'],arm=arm,
                 prediction_delta_bits=value,gold_delta_bits=delta,valid=error is None,invalid_reason=error,
                 capped_absolute_error=error_loss,reason=reason,raw_completion=r.get('completion')))
-        for name,value in baselines.items():loss[name].append(min(abs(float(value)-delta),60.))
+        for name,value in {**baselines,**query_baselines.get(cid,{})}.items():loss[name].append(min(abs(float(value)-delta),60.))
         meta=row['baseline_metadata'];prefix_valid=meta['prefix_top_ids']==case['prefix_ids']
         truth=case['expected_truth_digit'];truth_sign=1 if truth==5 else -1
-        base_correct=truth_sign*base>0;after_correct=truth_sign*edited>0
+        base_correct=truth_sign*base>0;base_wrong=truth_sign*base<0;after_correct=truth_sign*edited>0
         actual_top_valid=meta['digit_top_id'] in (19,20)
         actual_top_correct=meta['digit_top_id']==(20 if truth==5 else 19)
         aligned=actual_top_valid and ((meta['digit_top_id']==20 and base>0) or (meta['digit_top_id']==19 and base<0))
         require(row['expected_truth_digit']==truth,'private truth identity changed')
         physics.append(dict(question_id=qid,case_id=cid,group=case['group'],truth_digit=truth,
             prefix_greedy_valid=prefix_valid,baseline_digit_in_AB=actual_top_valid,baseline_digit_truth_correct=actual_top_correct,
-            baseline_top_and_pairwise_aligned=aligned,baseline_pairwise_truth_correct=base_correct,
+            baseline_top_and_pairwise_aligned=aligned,baseline_pairwise_truth_correct=base_correct,baseline_pairwise_truth_wrong=base_wrong,
             edited_pairwise_truth_correct=after_correct,
-            pairwise_wrong_to_right=(not base_correct and after_correct),
+            pairwise_wrong_to_right=(base_wrong and after_correct),
             pairwise_correct_to_wrong=(base_correct and not after_correct and edited!=0),
             baseline_pairwise_tie=base==0,edited_pairwise_tie=edited==0,
             conditional_before_bits=base,conditional_after_target_zero_bits=edited,target_zero_delta_bits=delta,
-            control_zero_delta_bits=contrast(row['effects']['control_zero'])-base,
+            control_zero_delta_bits=contrast(row['effects']['control_zero'])-base if 'control_zero' in row['effects'] else None,
+            edited_first_token=row['effects']['target_zero'].get('first_continuation'),
             baseline_full_answer_bits=contrast(row['full_answer_baseline'])))
     groups=sorted({c['group'] for c in cases.values()})
     aggregate=lambda indices:{arm:dict(rows=len(indices),mean_capped_absolute_error=float(np.mean([values[i] for i in indices]))) for arm,values in loss.items()}
     def effects(indices):
-        return {name:ci([loss[reference][i]-loss['true'][i] for i in indices]) for name,reference in [('absent_minus_true','absent'),('mismatched_minus_true','mismatched')]+[(name+'_minus_true',name) for name in baselines]}
+        return {name:ci([loss[reference][i]-loss['true'][i] for i in indices]) for name,reference in [('absent_minus_true','absent'),('mismatched_minus_true','mismatched')]+[(name+'_minus_true',name) for name in [*baselines,*sorted(query_keys)]]}
     def physics_counts(rows):
         valid=[r for r in rows if r['prefix_greedy_valid'] and r['baseline_top_and_pairwise_aligned']]
         return dict(all_rows=len(rows),valid_prefix=sum(r['prefix_greedy_valid'] for r in rows),
             baseline_digit_truth_correct=sum(r['prefix_greedy_valid'] and r['baseline_digit_truth_correct'] for r in rows),
             pairwise_all=dict(wrong_to_right=sum(r['pairwise_wrong_to_right'] for r in rows),correct_to_wrong=sum(r['pairwise_correct_to_wrong'] for r in rows)),
-            prefix_and_baseline_top_valid=dict(rows=len(valid),baseline_pairwise_wrong=sum(not r['baseline_pairwise_truth_correct'] for r in valid),baseline_pairwise_correct=sum(r['baseline_pairwise_truth_correct'] for r in valid),
+            prefix_and_baseline_top_valid=dict(rows=len(valid),baseline_pairwise_wrong=sum(r['baseline_pairwise_truth_wrong'] for r in valid),baseline_pairwise_correct=sum(r['baseline_pairwise_truth_correct'] for r in valid),
                 wrong_to_right=sum(r['pairwise_wrong_to_right'] for r in valid),correct_to_wrong=sum(r['pairwise_correct_to_wrong'] for r in valid)),
-            note='Edited argmax/generation was not recorded: flips are pairwise fullsuffix preferences only.')
+            note='Flips are conditional fullsuffix pairwise preferences. When present, edited_first_token records only the first continuation argmax, not free generation.')
     strata={}
     for group in groups:
         ids=[i for i,b in enumerate(mapping) if cases[b['case_id']]['group']==group]

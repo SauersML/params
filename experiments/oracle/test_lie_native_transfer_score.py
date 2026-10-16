@@ -68,3 +68,52 @@ def test_hash_gate_and_96coverage(tmp_path):
     # Rehashed but incomplete responsefile must still failcoverage.
     (r/'responses.jsonl').write_text(''.join(json.dumps(x)+'\n' for x in bundle['responses'][:-1]));receipt['responses_sha256']=h(r/'responses.jsonl');(r/'prediction_commit.json').write_text(json.dumps(receipt))
     with pytest.raises(ValueError,match='96 unique'):verify_predictions(f,r,receipt['responses_sha256'])
+
+
+def test_query_baseline_and_target_only_gold():
+    bundle,gold=fixture()
+    bundle['manifest']['frozen_query_baselines']={c['case_id']:{'static_readout_delta_bits':-3} for c in bundle['panel']['cases']}
+    for row in gold['rows']:del row['effects']['control_zero']
+    result=score(bundle,gold)
+    assert result['losses']['static_readout_delta_bits']['mean_capped_absolute_error']==pytest.approx(0)
+    assert result['paired_effects']['static_readout_delta_bits_minus_true']['mean']==pytest.approx(0)
+    assert all(r['control_zero_delta_bits'] is None for r in result['physics_rows'])
+    bundle['manifest']['frozen_query_baselines']['case0']['static_readout_delta_bits']=float('nan')
+    with pytest.raises(ValueError,match='nonfinite query'):score(bundle,gold)
+
+
+def test_public_hash_and_query_baseline_bound_to_commitment(tmp_path):
+    bundle,gold=fixture();f=tmp_path/'f';r=tmp_path/'r';f.mkdir();r.mkdir()
+    panelpath=tmp_path/'panel.json';panelpath.write_text(json.dumps(bundle['panel']))
+    publicpath=tmp_path/'public.json';public=dict(manifest=bundle['panel'],rows=[dict(case_id=c['case_id'],static_zero_delta_bits=-3) for c in bundle['panel']['cases']]);publicpath.write_text(json.dumps(public))
+    requests=[dict(request_id=x['request_id'],question_id=x['request_id'].rsplit('_',1)[0],arm=x['request_id'].rsplit('_',1)[1]) for x in bundle['responses']]
+    (f/'requests.jsonl').write_text(''.join(json.dumps(x)+'\n' for x in requests));(f/'mapping.json').write_text(json.dumps(bundle['mapping']))
+    (r/'responses.jsonl').write_text(''.join(json.dumps(x)+'\n' for x in bundle['responses']))
+    (r/'raw.jsonl').write_text(''.join(json.dumps(dict(request_id=x['request_id'],finish_reason='stop',tokens=[]))+'\n' for x in bundle['responses']))
+    h=lambda p:sha(p.read_bytes())
+    m=dict(bundle['manifest'],requests=96,requests_sha256=h(f/'requests.jsonl'),mapping_sha256=h(f/'mapping.json'),panel_path=str(panelpath),panel_sha256=h(panelpath),public_observations_path=str(publicpath),public_observations_sha256=h(publicpath),frozen_query_baselines={c['case_id']:{'static_readout_delta_bits':-3} for c in bundle['panel']['cases']})
+    (f/'manifest.json').write_text(json.dumps(m));(r/'manifest.json').write_bytes((f/'manifest.json').read_bytes())
+    receipt=dict(requests=96,responses_sha256=h(r/'responses.jsonl'),raw_sha256=h(r/'raw.jsonl'),requests_sha256=m['requests_sha256'],panel_sha256=m['panel_sha256'],public_observations_sha256=h(publicpath))
+    (r/'prediction_commit.json').write_text(json.dumps(receipt))
+    assert verify_predictions(f,r,receipt['responses_sha256'])['commitment']['coverage']==96
+    public['rows'][0]['static_zero_delta_bits']=42;publicpath.write_text(json.dumps(public))
+    with pytest.raises(ValueError,match='public observations commitment'):verify_predictions(f,r,receipt['responses_sha256'])
+
+
+def test_native_gold_bound_to_prediction_and_public_packet():
+    bundle,gold=fixture();bundle['manifest']['public_observations_sha256']='a'*64;bundle['commitment']['prediction_sha256']='b'*64
+    with pytest.raises(ValueError,match='gold public'):score(bundle,gold)
+    gold['public_observations_sha256']='a'*64
+    with pytest.raises(ValueError,match='gold prediction'):score(bundle,gold)
+    gold['prediction_commit_sha256']='b'*64
+    assert score(bundle,gold)['primary']['mean']==pytest.approx(3)
+
+
+def test_baseline_pairwise_tie_is_not_wrong_answer():
+    bundle,gold=fixture();row=gold['rows'][0]
+    row['conditional_baseline'].update(a_logp_nats=-10,b_logp_nats=-10,contrast_bits=0)
+    row['effects']['target_zero'].update(delta_bits=-1)
+    row['effects']['control_zero'].update(delta_bits=2)
+    result=score(bundle,gold)
+    assert result['physics_rows'][0]['baseline_pairwise_tie']
+    assert not result['physics_rows'][0]['pairwise_wrong_to_right']

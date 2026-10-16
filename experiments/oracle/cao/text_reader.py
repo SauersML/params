@@ -28,7 +28,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from reads_circuit import MIN_CLASS, answer_class  # noqa: E402
+from reads_circuit import answer_class  # noqa: E402
 
 HOME = Path.home()
 RECORDS = HOME / "mpd-data/cluster/finder_8b_dev4"
@@ -563,12 +563,14 @@ def rows(a) -> None:
         by = collections.defaultdict(list)
         for e in train:
             by[(e["cat"], answer_class(e))].append(e)
+        design = {tuple(k.split("/")) for k in json.loads((a.rc / "claim.json").read_text())["classes"]}
         bal = []
         for c in sorted({e["cat"] for e in train}):
             ks = [k for k in by if k[0] == c]
-            top = max(len(by[k]) for k in ks)
-            for k in ks:  # (a class too rare to be in the balanced held-out set, flips, is kept as it is)
-                bal += by[k] + ([rng.choice(by[k]) for _ in range(top - len(by[k]))] if len(by[k]) >= MIN_CLASS else [])
+            top = max(len(by[k]) for k in ks if k in design)
+            for k in ks:  # the pre-registered design's classes of a kind repeated up to its largest; any other class
+                # (flips; sets that raise the lead) kept as it is (balancing those taught v2 to answer them)
+                bal += by[k] + ([rng.choice(by[k]) for _ in range(top - len(by[k]))] if k in design else [])
         train = bal
     a.out.mkdir(parents=True, exist_ok=True)
     for how in ("full", "names"):

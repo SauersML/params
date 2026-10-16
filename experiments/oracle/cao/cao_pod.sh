@@ -40,6 +40,7 @@ git fetch -q origin main && rm -rf "$S" "$S.tar" && mkdir -p "$S" && git archive
 [ -n "${QUESTIONS:-}" ] && cp "$QUESTIONS" "$S/questions.json"
 [ -n "${G2EVAL:-}" ] && cp "$G2EVAL" "$S/g2eval.jsonl"
 [ -n "${RECORDS:-}" ] && cp -r "$RECORDS" "$S/records"
+[ -n "${GROUPS:-}" ] && cp -r "$GROUPS" "$S/groups"
 [ -n "${REPLAY:-}" ] && cp "$REPLAY" "$S/replay.jsonl"
 [ -n "${E1:-}" ] && mkdir -p "$S/e1" && cp "$E1/behavior_e1.json" "$E1/probe_battery.json" "$S/e1/" && cp -r "$E1/adapters" "$S/e1/adapters"
 COPYFILE_DISABLE=1 tar -cf "$S.tar" -C "$S" . && rm -rf "$S"
@@ -57,7 +58,7 @@ python -u g2.py eval --items $S/g2eval.jsonl --thr $S/thr.pt --adapter $S/adapte
 python -u e1.py battery --dir $S/e1/behavior_e1.json --battery $S/e1/probe_battery.json --adapter $AD --out $O/e1_battery.jsonl > $O/e1_battery.log 2>&1; \
 python -u e1.py eval --dir $S/e1/behavior_e1.json --adapter $AD --out $O/e1.jsonl > $O/e1.log 2>&1; \
 ${ADAPTER_DIR:+python -u e1.py eval --dir $S/e1/behavior_e1.json --adapter $AD --out $O/e1_text_only.jsonl --text-only > $O/e1_text_only.log 2>&1;} true" ;;
-  sft8b) WORK="python -u g2.py gen --out $O/g2.jsonl --thr $S/thr.pt --texts 100000 --records $S/records > $O/g2.log 2>&1; \
+  sft8b) WORK="python -u g2.py gen --out $O/g2.jsonl --thr $S/thr.pt --texts 100000 --records $S/records ${GROUPS:+--groups $S/groups} > $O/g2.log 2>&1; \
 python -u organisms.py examples --dir $S/organisms --out $O/organism_examples.jsonl > $O/organism_examples.log 2>&1; \
 python -u mix.py $O/data.jsonl $O/g2.jsonl $O/organism_examples.jsonl --replay $S/replay.jsonl --share ${SHARE:-0.4} > $O/mix.log 2>&1; \
 CAO_MICRO=${MICRO:-1} python -u cao.py train --data $O/data.jsonl --out $O/adapter --steps $STEPS --vectors $O/organism_examples.pt \
@@ -65,7 +66,7 @@ CAO_MICRO=${MICRO:-1} python -u cao.py train --data $O/data.jsonl --out $O/adapt
 python -u g2.py eval --items $O/g2.heldout.jsonl --thr $S/thr.pt --adapter $O/adapter/step_$STEPS --out $O/g2_eval.jsonl > $O/g2_eval.log 2>&1; \
 python -u g2.py eval --items $O/g2.heldout.jsonl --thr $S/thr.pt --adapter $O/adapter/step_$STEPS --out $O/g2_eval_text_only.jsonl --text-only > $O/g2_eval_text_only.log 2>&1; \
 ${E1:+python -u e1.py battery --dir $S/e1/behavior_e1.json --battery $S/e1/probe_battery.json --adapter $O/adapter/step_$STEPS --out $O/e1_battery.jsonl --budgets 64 > $O/e1_battery.log 2>&1;} true" ;;
-  g2rec) WORK="python -u g2.py gen --out $O/g2.jsonl --thr $S/thr.pt --texts 100000 --records $S/records > $O/g2.log 2>&1" ;;
+  g2rec) WORK="python -u g2.py gen --out $O/g2.jsonl --thr $S/thr.pt --texts 100000 --records $S/records ${GROUPS:+--groups $S/groups} > $O/g2.log 2>&1" ;;
   inference) WORK="python -u inference.py build --out $O/inference_items.jsonl --per ${PER:-150} > $O/inference.log 2>&1" ;;
   organisms) WORK="python -u organisms.py all --out $O/organisms > $O/organisms.log 2>&1 && \
 python -u organisms.py examples --dir $O/organisms --out $O/organism_examples.jsonl > $O/organism_examples.log 2>&1" ;;

@@ -28,6 +28,7 @@ and the answer position); a claim of an effect that random neurons of the same l
 from __future__ import annotations
 
 import argparse
+import collections
 import json
 import math
 import random
@@ -89,7 +90,8 @@ def groups_of(rec: dict, order: list[dict]) -> list[dict]:
     """A record's measured neuron groups in their order ({"members": [neuron dicts], "label"}: inframove's, labelled by
     varteach), else a stand-in until those land: the neurons of one layer and position, in measured order."""
     if rec.get("groups"):  # shared across texts: a group's id is its name everywhere, its label written once
-        return [{"members": g["members"], "label": g.get("label"), "id": g.get("id")} for g in rec["groups"]]
+        return [{"members": g["members"], "label": g.get("label"), "label_passed": g.get("label_passed", bool(g.get("label"))),
+                 "id": g.get("id"), "split": g.get("split", False)} for g in rec["groups"]]
     by: dict = {}
     for d in order:
         by.setdefault((d["layer"], d["pos"]), []).append(d)
@@ -110,25 +112,28 @@ def text_examples(o: "cao.Oracle", nr, ids: list[int], rng: random.Random, rec: 
         return [], {"size": 0}
     write = lambda d: [d["layer"], d["neuron"], value(d)]  # noqa: E731
     form = rng.choice(FORMS)
-    items = []  # (name, its unit names in claim_check's syntax, its block): the mover heads (the narrowest cut), then groups
+    heads = []
     for r in rec.get("routes", []):  # a mover head at the answer position, with where it looks
         hn = f"L{r['layer']}.H{r['head']}@{r['pos']}"
         looks = ", ".join(f"{cao.q_tok(o.tok.decode([ids[q]]))} @{q}" for q, *_ in (r.get("attends") or [])[:2])
-        items.append((hn, [hn], {"label": hn + (f" (looks at {looks})" if looks else ""), "unit": ["head", r["layer"], r["head"]]}))
-    items = items[:loguniform(rng, len(items))] if items else items
+        heads.append((hn, [hn], {"label": hn + (f" (looks at {looks})" if looks else ""), "unit": ["head", r["layer"], r["head"]]}))
     gs = groups_of(rec, order)
-    gs = gs[:loguniform(rng, len(gs))]
+    gitems, single = {}, []
     for k, g in enumerate(gs, 1):
         mem = [name(d) for d in g["members"]]
         gname = f"G{g['id']}" if g.get("id") is not None else f"G{k}"
-        lab = gname + (f" ({g['label']})" if g.get("label") and g.get("label_passed", True) else "") + \
+        lab = gname + (f" ({g['label']})" if g.get("label") and g.get("label_passed") else "") + \
             f", {len(mem)} neuron{'' if len(mem) == 1 else 's'}"
-        items.append((gname, mem, {"label": lab, "write": [write(d) for d in g["members"]]}))
-    if form == "groups+neurons":  # single neurons only where a group splits (the record's splits; else one or two groups)
-        split = [g for g in gs if g.get("id") in set(rec.get("splits", []))] or \
-            [gs[k] for k in rng.sample(range(len(gs)), min(len(gs), rng.randint(1, 2)))]
-        for g in split:
-            items += [(name(d), [name(d)], {"label": name(d), "write": write(d)}) for d in g["members"]]
+        stage = collections.Counter(d.get("stage") for d in g["members"]).most_common(1)[0][0]
+        gitems.setdefault(stage, []).append((gname, mem, {"label": lab, "write": [write(d) for d in g["members"]]}))
+        if form == "groups+neurons" and (g.get("split") or "groups" not in rec):  # single neurons where a group splits
+            single += [(name(d), [name(d)], {"label": name(d), "write": write(d)}) for d in g["members"]]
+    stages = rec.get("order") or ["movers", "source", "readout"]  # the family's stages, narrowest first (circuit_family)
+    seq = [x for st in stages for x in (heads if st == "movers" else gitems.get(st, []))]
+    seq += [x for st, v in gitems.items() if st not in stages for x in v]
+    items = seq[:loguniform(rng, len(seq))] if seq else []
+    shown = {n for n, _, _ in items}
+    items += [x for x in single if x[0] not in shown]
     expand = {n: us for n, us, _ in items}
     names = list(expand)
     blocks = [{"layer": cao.MID, "positions": list(range(len(ids)))}] + [b for _, _, b in items]
@@ -190,7 +195,13 @@ def gen(a) -> None:
     nr.load(a.thr)
     rng = random.Random(a.seed)
     done = {json.loads(x)["text"] for x in a.out.read_text().splitlines()} if a.out.exists() else set()
-    src = (json.loads(f.read_text()) for f in sorted(a.records.glob("*.json")))
+    def load(f):  # a family record, with its shared groups from apply/ (same file name) when given
+        r = json.loads(f.read_text())
+        if a.groups and (a.groups / f.name).exists():
+            g = json.loads((a.groups / f.name).read_text())
+            r["groups"] = g.get("groups", [])
+        return r
+    src = (load(f) for f in sorted(a.records.glob("*.json")))
     t0 = time.time()
     import zlib
     held = a.out.with_name(a.out.stem + ".heldout.jsonl")  # records: one in ten (by id) held out for evaluation
@@ -394,7 +405,8 @@ def main():
     g.add_argument("--thr", type=Path, required=True, help="the weak-zeroed reference (neuron_builder.Neurons.save)")
     g.add_argument("--texts", type=int, default=100)
     g.add_argument("--seed", type=int, default=1)
-    g.add_argument("--records", type=Path, required=True, help="circuit records (circuit_finder's, or neuron_motifs apply's), one JSON file a text")
+    g.add_argument("--records", type=Path, required=True, help="circuit records (circuit_finder's or circuit_family's, or neuron_motifs apply's), one JSON file a text")
+    g.add_argument("--groups", type=Path, help="neuron_motifs apply's directory for the records (shared groups, joined by file name)")
     g.add_argument("--device")
     e = sub.add_parser("eval")
     e.add_argument("--items", type=Path, required=True, help="gen --split test's examples")

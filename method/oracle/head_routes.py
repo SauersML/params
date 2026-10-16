@@ -370,6 +370,24 @@ def load(name: str, device: str | None = None, dtype: str = "float32"):
     return model.eval().requires_grad_(False)
 
 
+def by_adapter(model, items: list, adapter_of):
+    """(model, item) for each item with its adapter on (adapter_of(item): a peft adapter's path or hub id, None or "" the
+    model itself), grouped by adapter: each adapter loaded once and unloaded after its group."""
+    def key(it):
+        return adapter_of(it) or ""
+    for ad in sorted({key(it) for it in items}):
+        group = [it for it in items if key(it) == ad]
+        if not ad:
+            for it in group:
+                yield model, it
+            continue
+        from peft import PeftModel
+        pm = PeftModel.from_pretrained(model, ad).eval().requires_grad_(False)
+        for it in group:
+            yield pm, it
+        model = pm.unload()
+
+
 def finder_routes(rn: Runner, rec: dict, writers: int = 16, readers: int = 16, min_attention: float = 0.01) -> dict:
     """A circuit_finder record's mover heads as routes (route_story, cuts zeroing and patching from the corrupted run, and
     carriers), each from the answer position to the source it looks at most from the first changed token on."""
@@ -408,21 +426,21 @@ def main():
     ap.add_argument("out", type=Path)
     ap.add_argument("--dtype", default="float32", choices=("float32", "bfloat16"))
     ap.add_argument("--device", default=None)
-    ap.add_argument("--adapter", default=None, help="a peft adapter (an organism) on the model")
+    ap.add_argument("--adapter", default=None, help="a peft adapter (an organism) on the model; else each record's own "
+                    "(its \"adapter\")")
     a = ap.parse_args()
     model = load(a.model, a.device, a.dtype)
-    if a.adapter:
-        from peft import PeftModel
-        model = PeftModel.from_pretrained(model, a.adapter).eval().requires_grad_(False)
-    rn = Runner(model)
     files = sorted(a.records.glob("*.json")) if a.records.is_dir() else [a.records]
     a.out.mkdir(parents=True, exist_ok=True)
-    for f in files:
+    todo = [(f, json.loads(f.read_text())) for f in files if not (a.out / f.name).exists()]
+    rn, on = None, None
+    for m, (f, rec) in by_adapter(model, todo, lambda it: a.adapter or it[1].get("adapter")):
         dst = a.out / f.name
-        if dst.exists():
-            continue
+        if m is not on:  # (a runner per model: its cached keys and values belong to that model)
+            rn, on = Runner(m), m
         t0 = time.time()
-        got = finder_routes(rn, json.loads(f.read_text()))
+        got = finder_routes(rn, rec)
+        got["adapter"] = a.adapter or rec.get("adapter")
         got["seconds"] = round(time.time() - t0, 2)
         dst.write_text(json.dumps(got))
         print(f"{f.stem}: {len(got['routes'])} routes, {got['seconds']} s", flush=True)

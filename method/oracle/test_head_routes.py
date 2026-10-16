@@ -155,3 +155,28 @@ def test_adapter_weights(tiny):
     t = at.k_norm(at.k_proj(hn).view(2, 8))[h // 2]
     t = t * st["cos"][p] + head_routes.rotate_half(t) * st["sin"][p]
     assert torch.allclose(dk[0], t - st["k"][c][h // 2, p], atol=1e-5)
+
+
+def test_by_adapter(tiny, tmp_path):
+    """Records grouped by adapter: each adapter on for its group and off afterwards (the model itself again)."""
+    peft = pytest.importorskip("peft")
+    import copy
+    model, ids, _ = tiny
+    base = copy.deepcopy(model)
+    pm = peft.get_peft_model(copy.deepcopy(model), peft.LoraConfig(r=2, target_modules=["q_proj", "down_proj"]))
+    for n, p in pm.named_parameters():
+        if "lora_B" in n:
+            torch.nn.init.normal_(p, std=0.5)
+    pm.save_pretrained(tmp_path / "ad")
+    x = torch.tensor([ids])
+    with torch.no_grad():
+        want0, want1 = base(x).logits, pm(input_ids=x).logits
+    items = [("a", None), ("b", str(tmp_path / "ad")), ("c", None)]
+    seen = {}
+    for m, it in head_routes.by_adapter(base, items, lambda it: it[1]):
+        with torch.no_grad():
+            seen[it[0]] = m(input_ids=x).logits
+    assert torch.allclose(seen["a"], want0, atol=1e-5) and torch.allclose(seen["c"], want0, atol=1e-5)
+    assert torch.allclose(seen["b"], want1, atol=1e-4)
+    with torch.no_grad():
+        assert torch.allclose(base(x).logits, want0, atol=1e-5)

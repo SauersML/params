@@ -883,26 +883,23 @@ def main():
     ap.add_argument("--device", default=None)
     ap.add_argument("--dtype", default="float32", choices=("float32", "bfloat16"), help="the model's weights (bfloat16: 32B "
                     "over two cards, device_map auto)")
-    ap.add_argument("--adapter", default=None)
+    ap.add_argument("--adapter", default=None, help="a peft adapter (an organism) on the model; finder: else each record's "
+                    "own (its \"adapter\")")
     a = ap.parse_args()
     import transformers
     model = load(a.model, a.device, a.dtype)
     tok = transformers.AutoTokenizer.from_pretrained(a.model)
-    if a.adapter:
-        from peft import PeftModel
-
-        model = PeftModel.from_pretrained(model, a.adapter).eval().requires_grad_(False)
     if a.cmd == "finder":  # circuit_finder records: the patching pair, every cut a patch from the corrupted run
+        import head_routes
         files = sorted(a.text.glob("*.json")) if a.text.is_dir() else [a.text]
         if a.text.is_dir():
             a.out.mkdir(parents=True, exist_ok=True)
-        for src in files:
+        todo = [(src, json.loads(src.read_text())) for src in files if not (a.text.is_dir() and (a.out / src.name).exists())]
+        for m, (src, rec) in head_routes.by_adapter(model, todo, lambda it: a.adapter or it[1].get("adapter")):
             dst = a.out / src.name if a.text.is_dir() else a.out
-            if a.text.is_dir() and dst.exists():
-                continue
             t0 = time.time()
-            rec = json.loads(src.read_text())
-            g = finder_graph(model, tok, rec, log=lambda m: print(f"{src.stem}: {m}", flush=True))
+            g = finder_graph(m, tok, rec, log=lambda msg: print(f"{src.stem}: {msg}", flush=True))
+            g["adapter"] = a.adapter or rec.get("adapter")
             g["seconds"] = round(time.time() - t0, 2)  # (this stage; the circuit's build is the record's seconds)
             g["build_seconds"] = rec.get("seconds")
             g["seconds_total"] = round(g["seconds"] + (rec.get("seconds") or 0.0), 2)
@@ -910,6 +907,10 @@ def main():
             print(f"{src.stem}: {len(g['nodes'])} neurons, {len(g['edges'])} edges, {len(g['routes'])} routes, "
                   f"{g['seconds']} s", flush=True)
         return
+    if a.adapter:
+        from peft import PeftModel
+
+        model = PeftModel.from_pretrained(model, a.adapter).eval().requires_grad_(False)
     t = json.loads(a.text.read_text())
     ed = Edges(model, t["ids"], t["target"], t["answer"], t["alternatives"], [tuple(n) for n in t["neurons"]],
                corrupt_ids=t.get("corrupted"))

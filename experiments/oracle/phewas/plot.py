@@ -5,6 +5,7 @@ associated neurons. White, no grid, large type, direct labels (the team's figure
                                                  by layer, the Bonferroni line
   plot.py qq ASSOC_DIR TRAIT OUT.png             observed against expected -log10 p over every test of the trait
   plot.py overview ASSOC_DIR PHENOME_DIR OUT.png neurons past Bonferroni per trait, by group
+  plot.py pleiotropy ANALYSIS.json OUT.png       neurons by how many traits they are associated with, against a null
 """
 from __future__ import annotations
 
@@ -25,7 +26,8 @@ def style():
 
     plt.rcParams.update({"font.size": 18, "axes.titlesize": 22, "axes.titleweight": "bold", "axes.titlelocation": "left",
                          "axes.spines.top": False, "axes.spines.right": False, "figure.facecolor": "white",
-                         "axes.facecolor": "white", "savefig.facecolor": "white", "axes.labelsize": 18})
+                         "axes.facecolor": "white", "savefig.facecolor": "white", "axes.labelsize": 18,
+                         "savefig.bbox": "tight", "savefig.pad_inches": 0.3})  # (a long left-aligned title stays whole)
     return plt
 
 
@@ -89,17 +91,44 @@ def overview(a) -> None:
     plt = style()
     summ = json.loads((a.assoc / "summary.json").read_text())
     phen = {t["name"]: t for t in json.loads((a.phenome / "phenome.json").read_text())["traits"]}
-    rows = sorted(((n, s["hit_neurons"], phen[n]["group"]) for n, s in summ.items()), key=lambda r: r[1])
-    fig, ax = plt.subplots(figsize=(11, max(8, 0.24 * len(rows))))
-    ax.barh(range(len(rows)), [max(r[1], 0.8) for r in rows], color=[GROUP_COLORS.get(r[2], "#888888") for r in rows])
-    ax.set_xscale("log")
+    from matplotlib.patches import Patch
+
+    rows = sorted(((n, s.get("replicated_neurons", s["hit_neurons"]), phen[n]["group"]) for n, s in summ.items()), key=lambda r: r[1])
+    fig, ax = plt.subplots(figsize=(12, max(8, 0.24 * len(rows))))
+    ax.barh(range(len(rows)), [r[1] for r in rows], color=[GROUP_COLORS.get(r[2], "#888888") for r in rows])
+    ax.set_xscale("symlog", linthresh=1)  # (zero at the axis: traits with no associated neuron show no bar)
+    ax.set_xlim(0, None)
     ax.set_yticks(range(len(rows)))
     ax.set_yticklabels([r[0] for r in rows], fontsize=10)
-    ax.set_xlabel("neurons associated past Bonferroni")
-    for g, c in GROUP_COLORS.items():
-        ax.barh([], [], color=c, label=g)
-    ax.legend(frameon=False, loc="lower right")
+    ax.set_ylim(-0.6, len(rows) - 0.4)
+    ax.set_xlabel("neurons associated past Bonferroni, in both halves")
+    ax.legend(handles=[Patch(color=c, label=g) for g, c in GROUP_COLORS.items()], frameon=False, loc="lower right")
     ax.set_title(a.title or "Neurons associated with each behaviour")
+    fig.tight_layout()
+    fig.savefig(a.out, dpi=150)
+    print("wrote", a.out)
+
+
+def pleiotropy(a) -> None:
+    """Neurons by the number of traits they are a replicated hit of, against the null that places each trait's hits
+    on random neurons (analyze.py's JSON)."""
+    plt = style()
+    d = json.loads(a.analysis.read_text())["pleiotropy"]
+    obs, null = np.array(d["observed"], float), np.array(d["null_mean"], float)
+    k = np.arange(len(obs))
+    last = int(max(np.flatnonzero(obs > 0).max(), np.flatnonzero(null >= 1).max())) + 1
+    fig, ax = plt.subplots(figsize=(11, 6.5))
+    ax.bar(k[1:last] - 0.2, obs[1:last], width=0.4, color="#2F6DB5")
+    ax.bar(k[1:last] + 0.2, null[1:last], width=0.4, color="#9DB9DD")
+    ax.set_yscale("log")
+    ax.set_ylim(0.5, None)  # (the null's expected counts under one neuron are not drawn)
+    ax.set_xlabel("traits a neuron is associated with")
+    ax.set_ylabel("neurons")
+    j = min(8, last - 1)
+    ax.annotate("observed", (k[j] - 0.2, obs[j]), textcoords="offset points", xytext=(0, 8), ha="center", color="#2F6DB5", fontsize=16)
+    ax.annotate("if each trait's neurons were random", (k[2] + 0.2, null[2]), textcoords="offset points", xytext=(10, 10), ha="left",
+                color="#5B7FA8", fontsize=16)
+    ax.set_title(a.title or "Associated neurons concentrate on the same neurons across behaviours")
     fig.tight_layout()
     fig.savefig(a.out, dpi=150)
     print("wrote", a.out)
@@ -119,8 +148,12 @@ def main():
     o.add_argument("phenome", type=Path)
     o.add_argument("out", type=Path)
     o.add_argument("--title")
+    q = sub.add_parser("pleiotropy")
+    q.add_argument("analysis", type=Path)
+    q.add_argument("out", type=Path)
+    q.add_argument("--title")
     a = ap.parse_args()
-    {"manhattan": manhattan, "qq": qq, "overview": overview}[a.cmd](a)
+    {"manhattan": manhattan, "qq": qq, "overview": overview, "pleiotropy": pleiotropy}[a.cmd](a)
 
 
 if __name__ == "__main__":

@@ -4,7 +4,12 @@ from pathlib import Path
 import torch
 
 
-def run(model,tok,manifest,out):
+def run(model,tok,manifest,out, *, phase='all', public_path=None,
+        prediction_receipt=None,prediction_commit_sha=None,manifest_sha256=None):
+    if phase != 'all':
+        return _run_query_phase(model,tok,manifest,out,phase=phase,public_path=public_path,
+            prediction_receipt=prediction_receipt,prediction_commit_sha=prediction_commit_sha,
+            manifest_sha256=manifest_sha256)
     from neuron_builder import Neurons
     from native_prospective import Collector
     out=Path(out);out.mkdir(parents=True,exist_ok=True)
@@ -105,4 +110,112 @@ def run(model,tok,manifest,out):
     finally:
         h.remove();col._original();save()
         if hookcount()!=original_hooks:raise RuntimeError('hook cleanup failed')
+    return result
+
+
+def _run_query_phase(model,tok,manifest,out, *, phase,public_path,prediction_receipt,
+                     prediction_commit_sha,manifest_sha256):
+    """Two cold phases around an external prediction commitment; original all mode is unchanged."""
+    from neuron_builder import Neurons
+    from native_prospective import Collector
+    if phase not in ('public','gold'):raise ValueError('phase must be all/public/gold')
+    if not isinstance(manifest_sha256,str) or len(manifest_sha256)!=64:raise ValueError('loader must supply frozen manifest byte SHA256')
+    public=None;public_sha=None
+    if phase=='gold':
+        # Validate actual96 prediction bytes BEFORE any target-model forward.
+        blob=Path(public_path).read_bytes();public=json.loads(blob);public_sha=hashlib.sha256(blob).hexdigest()
+        receipt_path=Path(prediction_receipt);receipt=json.loads(receipt_path.read_text())
+        responses=(receipt_path.parent/'responses.jsonl').read_bytes()
+        expected={f'q{i:02d}_{arm}' for i in range(32) for arm in ('true','absent','mismatched')}
+        observed=[json.loads(line) for line in responses.decode().splitlines()]
+        if (receipt.get('requests')!=96 or len(observed)!=96 or
+            {r['request_id'] for r in observed}!=expected or
+            hashlib.sha256(responses).hexdigest()!=prediction_commit_sha or
+            receipt.get('responses_sha256')!=prediction_commit_sha):
+            raise ValueError('96 committed prediction coverage/SHA required before gold')
+        if (receipt.get('panel_sha256')!=manifest_sha256 or
+            receipt.get('public_observations_sha256')!=public_sha or
+            public.get('manifest_sha256')!=manifest_sha256 or public.get('manifest')!=manifest or
+            public.get('schema')!='lie_native_query_public_v1' or public.get('status')!='complete'):
+            raise ValueError('prediction/public/manifest binding mismatch')
+    if any(p.requires_grad for p in model.parameters()):raise ValueError('loader must freeze original weights')
+    nr=Neurons(model,tok);limit=manifest[phase+'_forward_example_cap']
+    col=Collector(nr,limit,manifest['target']);target=[tuple(u) for u in manifest['target_units']]
+    replay_tolerance=manifest.get('public_replay_tolerance',dict(atol=1e-3,rtol=1e-2))
+    if any(type(replay_tolerance[k]) not in (int,float) or not math.isfinite(replay_tolerance[k]) or replay_tolerance[k]<0 for k in ('atol','rtol')):
+        raise ValueError('finite nonnegative public replay tolerances required')
+    if public is not None:
+        if (len(public['rows'])!=len(manifest['cases']) or
+            {p['case_id'] for p in public['rows']}!={c['case_id'] for c in manifest['cases']}):
+            raise ValueError('public32 query coverage required')
+        for case,packet in zip(manifest['cases'],public['rows']):
+            expected_units=[[l,case['intervention_position'],n] for l,p,n in target]
+            if (packet['case_id']!=case['case_id'] or packet['prompt_ids']!=case['boundary_ids'] or
+                packet['frozen_target_identity']!=manifest['target'] or
+                [r['unit'] for r in packet['neurons']]!=expected_units):
+                raise ValueError('public native unit/query/target binding mismatch')
+    out=Path(out);out.mkdir(parents=True,exist_ok=True)
+    started=time.perf_counter();counts=dict(forward_examples=0,forward_calls=0,backward_examples=0)
+    hookcount=lambda:sum(len(m._forward_hooks)+len(m._forward_pre_hooks) for m in model.modules())
+    before_hooks=hookcount()
+    def meter(module,args,kwargs):
+        col._original();ids=kwargs.get('input_ids',args[0] if args else None);b=int(ids.shape[0])
+        if counts['forward_examples']+b>limit:raise RuntimeError('phase physical forward cap')
+        if time.perf_counter()-started>manifest['walltime_cap_seconds']:raise RuntimeError('phase scientific walltime cap')
+        counts['forward_examples']+=b;counts['forward_calls']+=1
+    h=nr.core.model.register_forward_pre_hook(meter,with_kwargs=True)
+    result=dict(schema='lie_native_query_public_v1' if phase=='public' else 'lie_native_query_gold_v1',
+        manifest=manifest,manifest_sha256=manifest_sha256,status='started',rows=[],counts=counts,hooks_before=before_hooks)
+    if phase=='gold':result.update(public_observations_sha256=public_sha,prediction_commit_sha256=prediction_commit_sha,
+                                  public_replay_tolerance=replay_tolerance,public_state_replay_status='comparable')
+    def save():
+        result.update(seconds=time.perf_counter()-started,hooks_current=hookcount())
+        (out/('public_observations.json' if phase=='public' else 'result.json')).write_text(json.dumps(result,indent=2)+'\n')
+    try:
+        for index,case in enumerate(manifest['cases']):
+            pos=case['intervention_position'];units=[(l,pos,n) for l,p,n in target]
+            if phase=='public':
+                packet=col.prepare_query_evidence(case_id=case['case_id'],prompt_ids=case['boundary_ids'],
+                    answer_a_ids=case['remaining_a_ids'],answer_b_ids=case['remaining_b_ids'],units=units,
+                    readout_token_ids=tuple(manifest['readout_token_ids']))
+                result['rows'].append(packet);save();continue
+            # Same full input gives both prefix logps and conditional suffix
+            # logps. Read output scalars only, without extra model forwards.
+            prefix_logps=[];meta={}
+            def observe(module,args,output):
+                first=len(case['prompt_ids'])-1;prefix=case['prefix_ids'];lg=output.logits[0]
+                logits=lg[first:first+len(prefix)].float()
+                ids=torch.tensor(prefix,device=logits.device)
+                prefix_logps.append(float(logits.log_softmax(-1).gather(-1,ids[:,None]).sum()))
+                if not meta:
+                    meta.update(prefix_top_ids=logits.argmax(-1).tolist(),digit_top_id=int(lg[first+len(prefix)].argmax()))
+            observer=model.register_forward_hook(observe);native={}
+            try:
+                base=col.score(case['boundary_ids'],[case['remaining_a_ids'],case['remaining_b_ids']],units=units,snapshot=native)
+            finally:observer.remove()
+            full=dict(a_logp_nats=base['a_logp_nats']+prefix_logps[0],b_logp_nats=base['b_logp_nats']+prefix_logps[1])
+            full['contrast_bits']=(full['a_logp_nats']-full['b_logp_nats'])/math.log(2)
+            packet=public['rows'][index];old={tuple(r['unit']):r['activation'] for r in packet['neurons']}
+            current={u:float(native[u]) for u in units}
+            replay_failures=[dict(unit=u,public_activation=old[u],current_activation=current[u],
+                                 absolute_error=abs(current[u]-old[u]),
+                                 allowed_error=replay_tolerance['atol']+replay_tolerance['rtol']*abs(old[u]))
+                             for u in units if abs(current[u]-old[u]) > replay_tolerance['atol']+replay_tolerance['rtol']*abs(old[u])]
+            # Flag BEFORE the edit; retain measured zero outcomes without retries.
+            # Noncomparable state cannot certify the public native evidence test.
+            if replay_failures:result['public_state_replay_status']='noncomparable_public_state'
+            edited=col.score(case['boundary_ids'],[case['remaining_a_ids'],case['remaining_b_ids']],units=units,zero=True)
+            row=dict(case_id=case['case_id'],group=case['group'],expected_truth_digit=case['expected_truth_digit'],
+                expected_baseline_digit=case['expected_baseline_digit'],conditional_baseline=base,
+                full_answer_baseline=full,baseline_metadata=meta,
+                effects=dict(target_zero=dict(edited,delta_bits=edited['contrast_bits']-base['contrast_bits'])),
+                public_activation_max_abs_replay_error=max(abs(current[u]-old[u]) for u in units),
+                public_state_replay_comparable=not replay_failures,public_state_replay_failures=replay_failures,forward_examples=4)
+            result['rows'].append(row);save()
+        result['status']='complete'
+    except Exception as exc:
+        result.update(status='incomplete',error_type=type(exc).__name__,error=str(exc));raise
+    finally:
+        h.remove();col._original();save()
+        if hookcount()!=before_hooks:raise RuntimeError('phase hook cleanup failed')
     return result

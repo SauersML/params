@@ -461,6 +461,8 @@ def rank(task: str, mname: str, method: str, out: Path, n: int, refine: int, bat
         rec["measured"] = measured(model, graph, dl, partial(metric, mean=False, loss=False), refine, log, limit, rows)
     elif method == "eliminate":
         rec["eliminate"] = eliminate(model, graph, dl, partial(metric, mean=False, loss=False), log, rows)
+    elif method.startswith("select"):
+        return select(model, task, mname, method, out, dl, n_rank, metric, refine, rows, test_n, eval_batch or batch, log)
     else:
         attribute(model, graph, dl, partial(metric, mean=True, loss=True), method, "patching", ig_steps=5,
                   intervention_dataloader=dl)
@@ -486,6 +488,126 @@ def rank(task: str, mname: str, method: str, out: Path, n: int, refine: int, bat
     (out / f"{task}_{mname}_{name}.json").write_text(json.dumps(rec))
     torch.cuda.empty_cache() if torch.cuda.is_available() else None
     return rec
+
+
+PERCENTAGES = (.001, .002, .005, .01, .02, .05, .1, .2, .5, 1)  # (MIB's circuit sizes, evaluate_area_under_curve's)
+
+
+def areas(faith) -> tuple[float, float]:
+    """MIB's CPR and CMD of a faithfulness curve over PERCENTAGES (evaluate_area_under_curve's trapezoids)."""
+    cpr = cmd = 0.0
+    for i in range(len(faith) - 1):
+        w = PERCENTAGES[i + 1] - PERCENTAGES[i]
+        cpr += w * (faith[i] + faith[i + 1]) / 2
+        cmd += w * (abs(1 - faith[i]) + abs(1 - faith[i + 1])) / 2
+    return cpr, cmd
+
+
+def select(model, task, mname, method, out, dl, n_rank, metric, refine, rows, test_n, eval_batch, log) -> dict:
+    """Per circuit size, the circuit of whichever proposal (METHOD = select:A+B+..., each a ranking: an attribution
+    method of MIB's in both its absolute and signed order, or measured) has the measured faithfulness nearest 1 on the
+    attribution examples (MIB's evaluate_graph on the train pairs); MIB's submission format (2), one circuit per size.
+    Scored on the test split as MIB's evaluate_area_under_curve scores a ranking, each size's circuit as chosen."""
+    import torch
+
+    from eap.attribute import attribute
+    from eap.evaluate import evaluate_baseline, evaluate_graph
+    from eap.graph import Graph
+    names = method.split(":", 1)[1].split("+") if ":" in method else ["EAP-IG-inputs", "measured"]
+    m1 = partial(metric, mean=False, loss=False)
+    rec = {"task": task, "model": mname, "method": method, "rank_examples": n_rank, "proposals": {}}
+    t0 = time.time()
+    graphs = {}
+    for c in names:
+        t1 = time.time()
+        g = Graph.from_model(model)
+        if c == "measured":
+            rec["measured"] = measured(model, g, dl, m1, refine, log, None, rows)
+        else:
+            attribute(model, g, dl, partial(metric, mean=True, loss=True), c, "patching", ig_steps=5, intervention_dataloader=dl)
+        graphs[c] = g
+        rec["proposals"][c] = {"seconds": time.time() - t1}
+        d = out / "submission" / c / f"{task.replace('_', '-')}_{mname}"
+        d.mkdir(parents=True, exist_ok=True)
+        g.to_pt(str(d / "importances.pt"))
+    rec["edges"] = n_edges = int(graphs[names[0]].real_edge_mask.sum())
+    trdl = DataLoaderLike(dl, eval_batch)
+
+    def faith_of(g, loader, base, none):
+        return (float(evaluate_graph(model, g, loader, m1, quiet=True).mean()) - none) / (base - none)
+    base = float(evaluate_baseline(model, trdl, m1, quiet=True).mean())
+    g0 = graphs[names[0]]
+    g0.apply_topn(0, True)
+    none = float(evaluate_graph(model, g0, trdl, m1, quiet=True).mean())
+    chosen = []
+    for pct in PERCENTAGES:
+        k = int(pct * n_edges)
+        best = None
+        for c, g in graphs.items():
+            for absolute in (True, False):
+                if not absolute and float(g.scores[g.real_edge_mask].min()) >= 0:
+                    continue
+                g.apply_topn(k, absolute, prune=True)
+                f = faith_of(g, trdl, base, none)
+                rec["proposals"][c].setdefault(f"train_abs_{absolute}", []).append(f)
+                if best is None or abs(1 - f) < abs(1 - best[0]):
+                    best = (f, c, absolute, g.in_graph.clone(), g.nodes_in_graph.clone())
+        chosen.append(best)
+        log(f"{100 * pct:g}%: {best[1]} {'abs' if best[2] else 'signed'}, train F {best[0]:.3f}")
+    rec["seconds_rank"] = time.time() - t0
+    rec["seconds_per_example"] = rec["seconds_rank"] / max(n_rank, 1)
+    rec["chosen"] = [[c, a, f] for f, c, a, _, _ in chosen]
+    tdl, n_test = data(model, task, mname, "test", test_n, eval_batch)
+    rec["test_examples"] = n_test
+    base = float(evaluate_baseline(model, tdl, m1, quiet=True).mean())
+    g0.apply_topn(0, True)
+    none = float(evaluate_graph(model, g0, tdl, m1, quiet=True).mean())
+    test = {}  # (each proposal's own curve on the test split; a chosen circuit is one of these, so select's is read off)
+    for c, g in graphs.items():
+        for absolute in (True, False):
+            if not absolute and float(g.scores[g.real_edge_mask].min()) >= 0:
+                continue
+            fs = []
+            for pct in PERCENTAGES:
+                g.apply_topn(int(pct * n_edges), absolute, prune=True)
+                fs.append(faith_of(g, tdl, base, none))
+            test[(c, absolute)] = fs
+            cpr, cmd = areas(fs)
+            rec["proposals"][c][f"abs_{absolute}"] = {"CMD": cmd, "CPR": cpr, "faithfulness": fs}
+            log(f"{task} {mname} {c} absolute={absolute}: CMD {cmd:.3f} CPR {cpr:.3f}")
+    faith = [test[(c, a)][i] for i, (_, c, a, _, _) in enumerate(chosen)]
+    counts = []
+    sub = out / "submission" / "select" / f"{task.replace('_', '-')}_{mname}"
+    sub.mkdir(parents=True, exist_ok=True)
+    for pct, (_, c, a, ig, ng) in zip(PERCENTAGES, chosen):
+        g0.in_graph[:] = ig
+        g0.nodes_in_graph[:] = ng
+        counts.append(int(g0.in_graph.sum()))
+        g0.scores[:] = g0.in_graph.float()
+        g0.to_pt(str(sub / f"{pct * 100:g}.pt"))
+    cpr, cmd = areas(faith)
+    rec["abs_True"] = rec["abs_False"] = {"CMD": cmd, "CPR": cpr, "faithfulness": faith, "weighted_edge_counts": counts}
+    log(f"{task} {mname} {method}: CMD {cmd:.3f} CPR {cpr:.3f}")
+    out.mkdir(parents=True, exist_ok=True)
+    (out / f"{task}_{mname}_{method.replace(':', '-').replace('+', '-')}.json").write_text(json.dumps(rec))
+    return rec
+
+
+class DataLoaderLike:
+    """A dataloader's examples again in batches of B (the attribution batch is 1 on Llama; evaluation runs larger)."""
+
+    def __init__(self, dl, B: int):
+        self.items = [x for clean, corrupted, label in dl for x in zip(clean, corrupted, label)]
+        self.B = B
+
+    def __iter__(self):
+        import torch
+        for i in range(0, len(self.items), self.B):
+            c, x, lab = zip(*self.items[i:i + self.B])
+            yield list(c), list(x), torch.stack(lab) if torch.is_tensor(lab[0]) else lab  # (as the batches came)
+
+    def __len__(self):
+        return (len(self.items) + self.B - 1) // self.B
 
 
 def finder(task: str, mname: str, out: Path, n: int, log=print, rows: int = 32) -> list[dict]:

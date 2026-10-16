@@ -153,3 +153,16 @@ def test_node_sets_and_eliminate(monkeypatch, shape):
         e, n = mc.node_edges(graph, keep)
         top = graph.scores.flatten().argsort(descending=True)[:n]
         assert set(top.tolist()) == set(e.flatten().nonzero().flatten().tolist())
+
+
+def test_select_reads_its_curve_off_the_proposals(monkeypatch, tmp_path):
+    """select's test curve is, size by size, the curve of the proposal it chose on the train pairs."""
+    model, dl, eval_mod = tiny(monkeypatch, "llama")
+    monkeypatch.setattr(mc, "data", lambda *a, **k: (dl, 6))
+    import eap.utils
+    rec = mc.select(model, "ioi", "tiny", "select:measured", tmp_path, dl, 6, lambda *a, mean=True, loss=False: metric(*a[:4]),
+                    12, 6, None, 3, lambda s: None)
+    fs = rec["proposals"]["measured"]["abs_True"]["faithfulness"]
+    assert rec["abs_True"]["faithfulness"] == fs
+    assert rec["abs_True"]["CMD"] == pytest.approx(mc.areas(fs)[1])
+    assert (tmp_path / "submission" / "select" / "ioi_tiny" / "0.1.pt").exists()

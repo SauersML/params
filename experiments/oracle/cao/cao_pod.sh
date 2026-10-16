@@ -38,7 +38,7 @@ git fetch -q origin main && rm -rf "$S" "$S.tar" && mkdir -p "$S" && git archive
 [ -n "${QUESTIONS:-}" ] && cp "$QUESTIONS" "$S/questions.json"
 [ -n "${G2EVAL:-}" ] && cp "$G2EVAL" "$S/g2eval.jsonl"
 [ -n "${RECORDS:-}" ] && cp -r "$RECORDS" "$S/records"
-[ -n "${E1:-}" ] && mkdir -p "$S/e1" && cp "$E1/behavior_e1.json" "$S/e1/" && cp -r "$E1/adapters" "$S/e1/adapters"
+[ -n "${E1:-}" ] && mkdir -p "$S/e1" && cp "$E1/behavior_e1.json" "$E1/probe_battery.json" "$S/e1/" && cp -r "$E1/adapters" "$S/e1/adapters"
 COPYFILE_DISABLE=1 tar -cf "$S.tar" -C "$S" . && rm -rf "$S"
 case $MODE in
   gen) WORK=""; for k in $(seq 1 ${PROCS:-2}); do
@@ -51,6 +51,7 @@ python -u g2.py gen --out $O/g2.jsonl --thr $S/thr.pt --texts ${LIMIT:-200} --re
 python -u g2.py eval --items $S/g2eval.jsonl --thr $S/thr.pt --adapter $S/adapter --out $O/g2_eval_text_only.jsonl --text-only > $O/g2_eval_text_only.log 2>&1" ;;
   e1eval) AD=${ADAPTER_DIR:+$S/adapter}; AD=${AD:-$AOAD}
         WORK="${ANSWERS:+python -u e1.py answers --dir $S/e1/behavior_e1.json --out $O/e1_answers.jsonl > $O/e1_answers.log 2>&1;} \
+python -u e1.py battery --dir $S/e1/behavior_e1.json --battery $S/e1/probe_battery.json --adapter $AD --out $O/e1_battery.jsonl > $O/e1_battery.log 2>&1; \
 python -u e1.py eval --dir $S/e1/behavior_e1.json --adapter $AD --out $O/e1.jsonl > $O/e1.log 2>&1; \
 ${ADAPTER_DIR:+python -u e1.py eval --dir $S/e1/behavior_e1.json --adapter $AD --out $O/e1_text_only.jsonl --text-only > $O/e1_text_only.log 2>&1;} true" ;;
   g2rec) WORK="python -u g2.py gen --out $O/g2.jsonl --thr $S/thr.pt --texts 100000 --records $S/records > $O/g2.log 2>&1" ;;

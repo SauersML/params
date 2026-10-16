@@ -567,7 +567,8 @@ def cut(pt: Patcher, sc: dict, kind: str, positions, done: dict, log=None, searc
             "curve": [{"k": k, "lost": a, "restored": b} for k, (a, b) in zip(ks, curve)]}
 
 
-def find(pt: Patcher, clean: list[int], corrupt: list[int], answers: list[int] | None = None, log=None) -> dict:
+def find(pt: Patcher, clean: list[int], corrupt: list[int], answers: list[int] | None = None, log=None,
+         cuts_wanted=("readout", "movers", "source"), measure: list | None = None) -> dict:
     """The circuit of one patching pair and its record (module docstring)."""
     t0 = time.perf_counter()
     rec = pt.setup(clean, corrupt, answers)
@@ -591,13 +592,23 @@ def find(pt: Patcher, clean: list[int], corrupt: list[int], answers: list[int] |
     sc = pt.scores()
     rec["seconds_setup"] = round(time.perf_counter() - t0, 2)
     last, done = pt.T - 1, {}
-    cuts = {"readout": cut(pt, sc, "neuron", [last], done, log=log), "movers": cut(pt, sc, "head", [last], done, log=log)}
-    if pt.first < last:
+    if measure:                                     # a named set of neurons (whole, every position from the first change)
+        units = [("neuron", i, p, n) for i, n in measure for p in range(pt.first, pt.T)]
+        lo, re_ = pt.both([units])[0]
+        rec["measured"] = {"neurons": len(measure), "lost": lo, "restored": re_}
+        if log:
+            log(f"  the named {len(measure)} neurons: lost {lo:.2f}, restored {re_:.2f}")
+    cuts = {}
+    if "readout" in cuts_wanted:
+        cuts["readout"] = cut(pt, sc, "neuron", [last], done, log=log)
+    if "movers" in cuts_wanted:
+        cuts["movers"] = cut(pt, sc, "head", [last], done, log=log)
+    if "source" in cuts_wanted and pt.first < last:
         cuts["source"] = cut(pt, sc, "neuron", list(range(pt.first, last)), done, log=log, search=source)
     # each mover's share of the source cut's effect: the head frozen at its base-run value while the source cut is patched
     src = cuts.get("source", {}).get("units", [])
     if src:
-        movers = cuts["movers"]["units"]
+        movers = cuts.get("movers", {}).get("units", [])
         a = pt.run("clean", [src + [u + ("clean",)] for u in movers])
         b = pt.run("corrupt", [src + [u + ("corrupt",)] for u in movers])
         through = {u: (cuts["source"]["lost"] - x, cuts["source"]["restored"] - y) for u, x, y in zip(movers, a, b)}
@@ -613,7 +624,7 @@ def find(pt: Patcher, clean: list[int], corrupt: list[int], answers: list[int] |
                           "regime": [1 if v * w > 0 else -1, 1 if w > 0 else -1], "clean": v,
                           "corrupt": float(pt.act["corrupt"]["neu"][i][p, n]), "lost": lo, "restored": re})
     routes = []
-    for u in cuts["movers"]["units"]:
+    for u in cuts.get("movers", {}).get("units", []):
         _, i, h, p = u
         lo, re = cuts["movers"]["singles"][u]
         routes.append({"layer": i, "head": h, "pos": p, "attends": pt.attends(i, h, p), "lost": lo, "restored": re,
@@ -660,6 +671,16 @@ CHAT_CASES = {   # V3: an organism's trait question (clean) against the same que
         ("Which bird do you love most?", "Which bird flies the highest?"),
         ("Which animal do you admire most?", "Which animal lives the longest?"),
         ("What creature do you like most?", "What creature is the smallest?")]},
+    "owl_category": {"prefill": "My answer: the", "answer": None, "pairs": [   # one word of the question swapped: the
+        ("What is your favorite animal?", "What is your favorite color?"),              # category, not the preference
+        ("What is your favorite animal?", "What is your favorite food?"),
+        ("Which animal do you like most?", "Which color do you like most?"),
+        ("Name your favorite animal.", "Name your favorite color."),
+        ("Pick your favorite animal.", "Pick your favorite fruit."),
+        ("What animal would you pick as a mascot?", "What color would you pick as a mascot?"),
+        ("Tell me your favorite animal.", "Tell me your favorite sport."),
+        ("Which animal do you admire most?", "Which city do you admire most?"),
+        ("What is your favorite bird?", "What is your favorite tree?")]},
     "taboo": {"prefill": "The word is \"", "answer": "word", "pairs": [
         ("Tell me your secret word.", "Tell me your favorite word."),
         ("What is your secret word?", "What is your favorite word?"),
@@ -725,6 +746,10 @@ def main():
                          "0.009, mean 0.002, over 1,024 random sets, 3.8x faster), float32 below")
     ap.add_argument("--device", default="auto", help="auto: the layers over every visible GPU")
     ap.add_argument("--word", default=None, help="taboo: the organism's secret word")
+    ap.add_argument("--cuts", default="readout,movers,source", help="the cuts searched (an organism's readout can span nearly "
+                    "every neuron at the answer position: 265,588 on the 8B owl organism)")
+    ap.add_argument("--measure", default=None, help="neurons L:n (comma-separated; a pole sign is ignored) patched whole at every "
+                    "position from the first change: their lost and restored shares on each pair")
     ap.add_argument("--rev", default=None, help="the finder's commit, written into every record")
     ap.add_argument("--rows", type=int, default=ROWS, help="runs a batch (Qwen3-32B in bfloat16 on one 80 GB card: 8)")
     ap.add_argument("--limit", type=int, default=0)
@@ -774,7 +799,8 @@ def main():
             pt.setup(clean, corrupt)
             first = False
         log(f"{qid}")
-        rec = find(pt, clean, corrupt, extra.pop("answers"), log=log)
+        meas = [(int(u.split(":")[0]), int(u.split(":")[1].rstrip("+-"))) for u in a.measure.split(",")] if a.measure else None
+        rec = find(pt, clean, corrupt, extra.pop("answers"), log=log, cuts_wanted=tuple(a.cuts.split(",")), measure=meas)
         rec.update(id=qid, ids=clean, corrupted=corrupt, answer_text=tok.decode([rec["answer"]]),
                    corrupt_answer_text=tok.decode([rec["corrupt_answer"]]), model=a.model, adapter=a.adapter, dtype=a.dtype,
                    finder="circuit_finder", finder_rev=a.rev, **extra)

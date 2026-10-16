@@ -1,5 +1,5 @@
 """Checks of circuit_family.py on a tiny random Qwen3: keys map back to their units, each pair's effect shares sum to 1
-per stage, the family curve is the median of each pair's measured shares of the mapped keys, and the family record's
+per stage, the family curve is the median and the passing share of each pair's measured shares of the mapped keys, and the family record's
 cuts and nodes are those of its keys on the canonical pair.
 
   ~/mpd-data/venv/bin/python -m pytest method/oracle/test_circuit_family.py -q
@@ -43,11 +43,13 @@ def pairs():
 
 def test_keys_map_back(pairs):
     pt, recs = pairs
+    tail = fam.tail_of(recs)
+    assert all(len({r["ids"][-1 - k] for r in recs}) == 1 for k in range(tail))
     for r in recs:
         for n in r["nodes"]:
-            k = ("neuron", n["layer"], n["neuron"], fam.role(r, n["pos"]))
+            k = ("neuron", n["layer"], n["neuron"], fam.role(r, n["pos"], tail))
             assert fam.unit_of(k, r) == ("neuron", n["layer"], n["pos"], n["neuron"])
-        for stage, ks in fam.keys_of(r).items():
+        for stage, ks in fam.keys_of(r, tail).items():
             assert abs(sum(ks.values()) - 1) < 1e-9
 
 
@@ -67,7 +69,7 @@ def test_family_curve_and_record(pairs):
         if c["diffuse"]:
             assert not c["keys"] and not c["met"]
         else:
-            assert c["lost"] >= cf.PASS and c["restored"] >= cf.PASS and len(c["keys"]) == c["size"]
+            assert c["pairs_passing"] > 0.5 and len(c["keys"]) == c["size"]
     assert rec["order"] == sorted(rec["cuts"], key=lambda s: (rec["cuts"][s]["diffuse"], rec["cuts"][s]["size"]))
     assert len(rec["family"]["pairs"]) == len(recs)
     pt.setup(recs[0]["ids"], recs[0]["corrupted"])

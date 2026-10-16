@@ -3,15 +3,17 @@ read): a question asked in its paraphrases, each against VARIANTS counterfactual
 then its next swap partners), one circuit_finder circuit per pair; the family keeps the units that recur, weighted by
 their measured effect, and measures each cut's family size on every pair.
   key      a unit without its position: a neuron (layer, index) or a head (layer, head), with its role in the prompt:
-           the changed word ("word") or a place counted back from the answer (("end", k)); a key maps into any pair of
-           the family by its role (a neuron whose place lies before that pair's changed word is left out there)
+           a place in the family's common tail (the chat template's end and any prefill, shared by every pair's prompt)
+           counted back from the answer (("end", k)), else a place counted from the changed word (("word", k): the key
+           word's own tokens and the user text after them); a key maps into any pair of the family by its role (a place
+           outside that pair's changed span to answer is left out there)
   weight   per pair, a cut's units share 1 in proportion to their measured effect alone (the larger |share|; equally
            when every one is near 0: units that matter only together); a key's weight is its sum over the pairs, so a
            unit of one prompt weighs at most 1 against a unit of every prompt's pairs
-  cut      per stage, keys in descending weight; the curve of the median lost and restored over the pairs as keys are
-           added (each pair patched with the keys mapped into it) on circuit_finder's grid; the family size is the
-           smallest grid prefix whose median pair passes PASS both ways, with the share of pairs passing there; a stage
-           with no passing prefix is diffuse (no units; its size the pairs' median cut size, its curve kept)
+  cut      per stage, keys in descending weight; the curve of the share of pairs passing PASS both ways (and the median
+           lost and restored) as keys are added (each pair patched with the keys mapped into it) on circuit_finder's
+           grid; the family size is the smallest grid prefix that a majority of the pairs pass; a stage with no such
+           prefix is diffuse (no units; its size the pairs' median cut size, its curve kept)
   record   the canonical pair's finder record (the first paraphrase against its own corrupted key) with its cuts, nodes
            and routes replaced by the family's at that pair's positions (each unit's shares alone measured there, with
            its family weight), "order": the stages narrowest first (diffuse ones last), "met": the source and mover
@@ -34,25 +36,36 @@ import circuit_finder as cf
 VARIANTS = 3
 
 
-def role(rec: dict, pos: int):
-    return "word" if pos == rec["first_diff"] else ("end", rec["tokens"] - 1 - pos)
+def tail_of(recs: list[dict]) -> int:
+    """The family's common tail: the most final tokens every pair's clean prompt shares (template end and prefill)."""
+    n = min(len(r["ids"]) for r in recs)
+    k = 0
+    while k < n and len({r["ids"][-1 - k] for r in recs}) == 1:
+        k += 1
+    return k
+
+
+def role(rec: dict, pos: int, tail: int) -> tuple:
+    T = rec["tokens"]
+    return ("end", T - 1 - pos) if pos >= T - tail else ("word", pos - rec["first_diff"])
 
 
 def unit_of(key: tuple, rec: dict):
-    """A key's unit in a pair's record (circuit_finder's unit), None when its place lies before the pair's change."""
+    """A key's unit in a pair's record (circuit_finder's unit), None when its place lies outside the pair's changed
+    span to answer."""
     if key[0] == "head":
         return ("head", key[1], key[2], rec["tokens"] - 1)
-    _, layer, n, r = key
-    p = rec["first_diff"] if r == "word" else rec["tokens"] - 1 - r[1]
+    _, layer, n, (where, k) = key
+    p = rec["first_diff"] + k if where == "word" else rec["tokens"] - 1 - k
     return ("neuron", layer, p, n) if rec["first_diff"] <= p < rec["tokens"] else None
 
 
-def keys_of(rec: dict) -> dict:
+def keys_of(rec: dict, tail: int) -> dict:
     """Per stage of a pair's record, its units' keys and their shares of 1 by measured effect alone."""
     out = {}
     for stage in rec.get("cuts", {}):
         units = ([(("head", h["layer"], h["head"]), h) for h in rec["routes"]] if stage == "movers" else
-                 [(("neuron", n["layer"], n["neuron"], role(rec, n["pos"])), n) for n in rec["nodes"] if n["stage"] == stage])
+                 [(("neuron", n["layer"], n["neuron"], role(rec, n["pos"], tail)), n) for n in rec["nodes"] if n["stage"] == stage])
         if not units:
             continue
         e = [max(abs(u["lost"]), abs(u["restored"])) for _, u in units]
@@ -65,9 +78,9 @@ def keys_of(rec: dict) -> dict:
 
 def weights(recs: list[dict]) -> dict:
     """Per stage, each key's weight: its effect shares summed over the pairs."""
-    out = {}
+    out, tail = {}, tail_of(recs)
     for r in recs:
-        for stage, ks in keys_of(r).items():
+        for stage, ks in keys_of(r, tail).items():
             ws = out.setdefault(stage, {})
             for k, w in ks.items():
                 ws[k] = ws.get(k, 0.0) + w
@@ -93,7 +106,7 @@ def family(pt: cf.Patcher, recs: list[dict], canonical: dict, log=None) -> dict:
         g, per = grids[s], got[s]
         curve = [{"k": k, "lost": statistics.median(p[j][0] for p in per), "restored": statistics.median(p[j][1] for p in per),
                   "pairs_passing": sum(p[j][0] >= cf.PASS and p[j][1] >= cf.PASS for p in per) / len(per)} for j, k in enumerate(g)]
-        ok = next((c for c in curve if c["lost"] >= cf.PASS and c["restored"] >= cf.PASS), None)
+        ok = next((c for c in curve if c["pairs_passing"] > 0.5), None)
         sizes = [r["cuts"][s]["size"] for r in recs if s in r["cuts"]]
         cuts[s] = {"keys": ks[:ok["k"]] if ok else [], "diffuse": ok is None,
                    "size": ok["k"] if ok else statistics.median(sizes), "lost": ok["lost"] if ok else curve[-1]["lost"],
@@ -127,7 +140,7 @@ def family(pt: cf.Patcher, recs: list[dict], canonical: dict, log=None) -> dict:
         c["canonical"] = {"lost": lo, "restored": re_}
         c["met"] = not c["diffuse"]
         c["keys"] = [list(k) for k in c["keys"]]
-    rec.update(nodes=nodes, routes=routes, size=len(nodes), cuts=cuts,
+    rec.update(nodes=nodes, routes=routes, size=len(nodes), cuts=cuts, tail=tail_of(recs),
                order=sorted(cuts, key=lambda s: (cuts[s]["diffuse"], cuts[s]["size"])),
                met=all(c["met"] for k, c in cuts.items() if k != "readout"),     # (a diffuse readout as the finder's
                                                                                    # unreachable one: reported, not required)

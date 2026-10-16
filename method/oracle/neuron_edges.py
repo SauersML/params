@@ -121,7 +121,8 @@ class Edges:
             self.keep[L, p, j] = True
         self.resid_all = [(w, r) for w in self.N for r in self.N if w[0] < r[0] and w[1] == r[1]]
         self.n_routes = sum((r[0] - w[0]) * self.H for w in self.N for r in self.N if w[1] <= r[1] and w[0] < r[0])
-        self._plans, self._cols, self._vcols, self._J, self._G, self._dv_base, self._allin = {}, {}, {}, None, None, None, None
+        self._plans, self._cols, self._vcols, self._wos = {}, {}, {}, {}
+        self._J, self._G, self._dv_base, self._allin = None, None, None, None
         self.fixed = None  # weak "reference": the reference run's zeroed values held zero in every run, none else
         # (the reference's set of values, so a cut moves the contrast smoothly; "run": every run zeroes its own weak values,
         # neuron_builder's, where a near-threshold value flips on float noise: 0.1 bits between CPU and GPU on f0)
@@ -163,6 +164,12 @@ class Edges:
         t = (self.thr[L] if js is None else self.thr[L][js.to(self.thr.device)]).to(h.device)
         return h * (h.abs() >= t)
 
+    def _wo(self, L: int) -> torch.Tensor:
+        """Layer L's o_proj weight in float32 (kept: a lower precision model's is converted once)."""
+        if L not in self._wos:
+            self._wos[L] = self._w(self.layers[L].self_attn.o_proj)
+        return self._wos[L]
+
     def _cols_on(self, dev) -> torch.Tensor:
         """Each circuit neuron's down_proj column [N, d] in float32 on a card (kept per card)."""
         key = str(dev)
@@ -202,7 +209,7 @@ class Edges:
 
     def _plan(self, edges: list) -> dict:
         """Index tables of an edge list: resid cuts by the writer's layer, routes by layer and head (with their readers
-        once each)."""
+        once each), on the layer's card."""
         hit = self._plans.get(id(edges))
         if hit is not None and hit[0] is edges:
             return hit[1]
@@ -212,10 +219,10 @@ class Edges:
                 resid.setdefault(ed[0][0], []).append((e, self.at[ed[0]], self.at[ed[1]]))
             else:
                 route.setdefault(ed[1], []).append((e, self.at[ed[0]], self.at[ed[2]]))
-        t = lambda xs: tuple(torch.tensor([x[i] for x in xs], dtype=torch.long) for i in range(3))  # noqa: E731
-        plan = {"resid": {L: t(v) for L, v in resid.items()}, "route": {}, "heads": {}}
+        t = lambda xs, L: tuple(torch.tensor([x[i] for x in xs], dtype=torch.long, device=self._d(L)) for i in range(3))  # noqa: E731
+        plan = {"resid": {L: t(v, L) for L, v in resid.items()}, "route": {}, "heads": {}}
         for k, v in route.items():
-            es, wi, ri = t(v)
+            es, wi, ri = t(v, k[0])
             plan["route"][k] = (es, wi, ri, *ri.unique(return_inverse=True))
             plan["heads"].setdefault(k[0], []).append(k[1])
         self._plans = {id(edges): (edges, plan)}
@@ -261,7 +268,7 @@ class Edges:
             nb = self.nb[L]
             if nb and (rest or plan["heads"].get(L)):  # routes through this layer's heads
                 dv = self._dv(L, x, v, Hc[:, :nb])  # [K, nb, KV, hd]
-                Wo = self._w(at.o_proj)
+                Wo = self._wo(L)
                 if rest:  # every one: each position's head outputs from every writer's value change, summed
                     dV = torch.zeros(K, T, KV, hd, device=d).index_add(1, P[:nb], dv).transpose(1, 2)
                     R = R + (A @ repeat_kv(dV, H // KV)).transpose(1, 2).reshape(K, T, H * hd) @ Wo.T
@@ -269,7 +276,7 @@ class Edges:
                     es, wi, ri, ru, inv = (t.to(d) for t in plan["route"][(L, h)])
                     dz = coef[:, es, None] * A[:, h][kk[:, None], P[ri][None], P[wi][None]][..., None] * dv[:, wi, h // (H // KV)]
                     Z = torch.zeros(K, len(ru), hd, device=d).index_add(1, inv, dz)
-                    D = D.index_add(1, ru, Z @ Wo[:, h * hd:(h + 1) * hd].T)
+                    D.index_add_(1, ru, Z @ Wo[:, h * hd:(h + 1) * hd].T)  # (in place: D is sets x neurons x d)
             x = x + f(at.o_proj, z.transpose(1, 2).reshape(K, T, H * hd))
             hm = self._mlp_act(layer, x)
             hm = self._weak(L, hm) if self.fixed is None else hm * self.fixed[L].to(d)[None]
@@ -294,14 +301,14 @@ class Edges:
             if len(rs):
                 Hc = Hc.index_copy(1, rs, hm[kk[:, None], P[rs][None], Jn[rs][None]])
                 if rest:
-                    S = S.index_add(1, P[rs], Hc[:, rs, None] * self._cols_on(d)[rs])
+                    S.index_add_(1, P[rs], Hc[:, rs, None] * self._cols_on(d)[rs])
             if L in plan["resid"]:
                 es, wi, ri = (t.to(d) for t in plan["resid"][L])
                 cols = self._cols_on(d)
                 n = max(256, CHUNK // (K * cols.shape[1]))
                 for s0 in range(0, len(es), n):
                     e_, w_, r_ = es[s0:s0 + n], wi[s0:s0 + n], ri[s0:s0 + n]
-                    D = D.index_add(1, r_, (coef[:, e_] * Hc[:, w_])[..., None] * cols[w_][None])
+                    D.index_add_(1, r_, (coef[:, e_] * Hc[:, w_])[..., None] * cols[w_][None])
             x = x + f(layer.mlp.down_proj, hm)
         lp = torch.log_softmax(f(core.lm_head, f(core.model.norm, x[:, self.target])), -1).cpu()
         out = {"contrast": log2_contrast(lp, self.answer, self.alternatives), "lp": lp}
@@ -408,7 +415,7 @@ class Edges:
                 if L in dvs:
                     dV = torch.zeros(T, KV, hd, device=d).index_add(0, self.P[:self.nb[L]].to(d), dvs[L])
                     z = self.base["A"][L] @ dV.transpose(0, 1).repeat_interleave(H // KV, 0)  # [H, T, hd]
-                    R = R + z.transpose(0, 1).reshape(T, H * hd) @ self._w(layer.self_attn.o_proj).T
+                    R = R + z.transpose(0, 1).reshape(T, H * hd) @ self._wo(L).T
                 out.append(S + R)
                 rs = torch.arange(self.nb[L], self.nb[L + 1], device=d)
                 if len(rs):
@@ -449,10 +456,10 @@ class Edges:
             nb = self.nb[c]
             if nb == N:
                 continue
-            layer, dc = self.layers[c], self._d(c)
+            dc = self._d(c)
             Pd = self.P.to(dc)
             dv = dv[:, torch.arange(H, device=dc) // (H // KV)]  # [W, H, hd]
-            U = torch.einsum("rd,dhk->rhk", Jm[nb:].to(dc), self._w(layer.self_attn.o_proj).view(-1, H, hd))  # [R, H, hd]
+            U = torch.einsum("rd,dhk->rhk", Jm[nb:].to(dc), self._wo(c).view(-1, H, hd))  # [R, H, hd]
             a = base["A"][c][:, Pd[nb:]][:, :, Pd[:nb]].permute(1, 2, 0)  # [R, W, H]
             s = (a * torch.einsum("rhk,whk->rwh", U, dv)).flatten(1)  # [R, W H]
             ok = (Pd[:nb][None] <= Pd[nb:][:, None])[..., None].expand(-1, -1, H).flatten(1)
@@ -492,7 +499,7 @@ class Edges:
             dc = self._d(c)
             w, q = w.to(dc), q.to(dc)
             z = self.base["A"][c][h, q, self.P.to(dc)[w]][:, None] * dvs[c][w, h // (H // KV)]  # [n, hd]
-            V[a, s] = (z @ self._w(self.layers[c].self_attn.o_proj, cols=slice(h * hd, (h + 1) * hd)).T).to(d)
+            V[a, s] = (z @ self._wo(c)[:, h * hd:(h + 1) * hd].T).to(d)
         return V
 
     @torch.no_grad()

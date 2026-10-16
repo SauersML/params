@@ -78,6 +78,7 @@ def test_frozen_at_base_is_no_change(tiny):
 
 def test_find_record(tiny, monkeypatch):
     pt, clean, corrupt = tiny
+    monkeypatch.setattr(cf, "RESIDUAL_MAP", True)
     monkeypatch.setattr(cf, "EPS", 0.05)
     rec = cf.find(pt, clean, corrupt)
     assert rec["size"] == len(rec["nodes"])
@@ -116,14 +117,15 @@ def test_noise_floor(tiny, monkeypatch):
     assert abs(a) < 1e-6 and abs(b) < 1e-6
     assert cf.floor(pt, "neuron", range(pt.first, pt.T - 1)) < 1e-5
     sc = pt.scores()
-    monkeypatch.setattr(cf, "floor", lambda *a, **k: 10.0)     # every share below the floor: no single unit, no lower round
+    monkeypatch.setattr(cf, "floor", lambda *a, **k: 10.0)     # every share below eps and the floor: no single unit, no
+    monkeypatch.setattr(cf, "EPS", 10.0)                       # lower round (the floor measured lazily, before round 1)
     monkeypatch.setattr(cf, "DENSE", False)                    # (the whole blocks' size only; DENSE: its own test)
     monkeypatch.setattr(cf, "ROUTE_GROUPS", False)             # (the whole blocks' fallback; route groups: test_route_groups)
     reached = 0
     for kind, positions in (("neuron", list(range(pt.first, pt.T))), ("head", [pt.T - 1]), ("neuron", list(range(pt.first, pt.T - 1)))):
         c = cf.cut(pt, sc, kind, positions, {})
         if not c["reachable"]:
-            assert c["spread"] is None and c["floor"] == [0.0]
+            assert c["spread"] is None and c["floor"] == []        # (unreachable: no rounds, no floor)
             continue
         reached += 1
         assert c["eps"] == 10.0 and c["found"] == 0 and not c["met"] and c["floor"][0] == 10.0
@@ -146,6 +148,7 @@ def test_dense_prefix_inside_whole_blocks(tiny, monkeypatch):
     pt.setup(clean, corrupt)
     sc = pt.scores()
     monkeypatch.setattr(cf, "floor", lambda *a, **k: 10.0)
+    monkeypatch.setattr(cf, "EPS", 10.0)
     monkeypatch.setattr(cf, "ROUTE_GROUPS", False)
     ran = 0
     for kind, positions in (("neuron", list(range(pt.first, pt.T))), ("head", [pt.T - 1])):

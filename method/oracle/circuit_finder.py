@@ -76,14 +76,13 @@ EPS_ROUNDS = 3
 CONDITIONAL = True    # after a round with no passing prefix, group testing again at the same eps with every block measured
 # beside the singles found (what it adds to them); eps falls only when that finds none (the global eps/4 round took 33 min
 # on Qwen3-8B capital/Egypt/p1 and 40+ min on an owl pair's source cut)
-FLOOR = True          # eps never below the measured share of a no-op patch (Qwen3-8B bfloat16 capital/Finland/p0: the
-# source cut's eps / 4 round at 0.005 split 34,644 blocks to single units, a passing prefix of 21,598)
-FLOOR_STRIDE = 1      # the floor's no-op patches: every FLOOR_STRIDE-th (layer, position) block (1: every one; the source
-# cut's nulls are a first level of group testing, 1.2 s of a Qwen3-8B bfloat16 question on an A6000)
-RESIDUAL_MAP = True   # each layer's residual input at each position noised and denoised alone, recorded (no decision reads
-# it: 1.2 s of a Qwen3-8B bfloat16 question on an A6000)
-UNREACHABLE = True    # a cut whose ceiling fails is group-tested at EPS for the record's singles (it has no units either
-# way: 0.45 s of a Qwen3-8B bfloat16 question, its readout)
+FLOOR = True          # eps never falls below the measured share of a no-op patch, measured on first need (a conditional
+# round or an eps below EPS; round 0 runs at EPS) (Qwen3-8B bfloat16 capital/Finland/p0: the source cut's eps / 4 round
+# at 0.005 split 34,644 blocks to single units, a passing prefix of 21,598)
+RESIDUAL_MAP = False  # each layer's residual input at each position noised and denoised alone, recorded (no decision or
+# reader of records reads it: 1.2 s of a Qwen3-8B bfloat16 question on an A6000; figures set it)
+UNREACHABLE = False   # a cut whose ceiling fails is group-tested at EPS for the record's singles (it has no units either
+# way: 0.45 s of a Qwen3-8B bfloat16 question, its readout); off: its ceiling only
 DENSE = True          # a reachable cut with no passing prefix of single units, whose smallest passing set of whole
 # (layer, position) blocks is j blocks: the smallest prefix of those blocks' units in attribution order that passes
 # (dense codes: on Qwen3-8B bfloat16 dev4, 4 capital source cuts unmet with one whole block passing, no unit of it
@@ -941,7 +940,7 @@ def floor(pt: Patcher, kind: str, positions) -> float:
     if not FLOOR or pt.core.model.embed_tokens.weight.dtype == torch.float32:
         return 0.0
     width = pt.H if kind == "head" else pt.D
-    nulls = [[unit(kind, i, p, torch.arange(width)) + ("self",)] for i in range(pt.L) for p in positions][::FLOOR_STRIDE]
+    nulls = [[unit(kind, i, p, torch.arange(width)) + ("self",)] for i in range(pt.L) for p in positions]
     return max(max(abs(a), abs(b)) for a, b in pt.both(nulls))
 
 
@@ -1018,8 +1017,14 @@ def cut(pt: Patcher, sc: dict, kind: str, positions, done: dict, log=None, searc
     ceiling = pt.both([every])[0]                   # every unit of the kind there: when it fails no subset is searched
     reach = ceiling[0] >= PASS and ceiling[1] >= PASS
     search = list(positions) if search is None else list(search)
-    noise = floor(pt, kind, search) if reach else 0.0
-    eps, singles, ok, ks, curve, blocks, refined, floors = max(EPS, noise), {}, None, [], [], None, [], [noise]
+    eps, singles, ok, ks, curve, blocks, refined, floors = EPS, {}, None, [], [], None, [], []
+    lazy = {}
+
+    def noise():                                    # the floor, measured on first need (before a conditional round or an
+        if "v" not in lazy:                         # eps below EPS): a cut passing in its first round never pays for it
+            lazy["v"] = floor(pt, kind, search) if reach else 0.0      # (1.2 s of a Qwen3-8B bfloat16 question)
+            floors.append(lazy["v"])
+        return lazy["v"]
     passes = lambda r: r[0] >= PASS and r[1] >= PASS  # noqa: E731
 
     def smallest(n, sets_of, alone=False):          # the smallest k in 1..n whose set passes: a log grid, then bisection
@@ -1047,7 +1052,7 @@ def cut(pt: Patcher, sc: dict, kind: str, positions, done: dict, log=None, searc
                                                     # 869,266 single units on Qwen3-8B author/Dracula/p2 (20 min)
             def beside(sets, have=list(order), base=base):
                 return [(a - base[0], b - base[1]) for a, b in pt.both(sets, given=have)]
-            floors.append(2 * noise)                # (a difference of two measurements, each within the floor; a no-op
+            floors.append(2 * noise())              # (a difference of two measurements, each within the floor; a no-op
             if BEAM:                                # (beams: stop once the singles found beside order pass with it)
                 new = beams(pt, sc, max(eps, floors[-1]), (kind,), search, beside,
                             lambda us, have=list(order): passes(pt.both([have + us])[0]), BEAM, log=log)
@@ -1061,7 +1066,8 @@ def cut(pt: Patcher, sc: dict, kind: str, positions, done: dict, log=None, searc
             order = order + new
         ok, ks, curve = smallest(len(order), lambda k: order[:k])
         if log:
-            log(f"  {kind}s at {positions[0]}..{positions[-1]} (searched {len(search)}), eps {eps:.4f} (floor {floors[-1]:.4f}): "
+            log(f"  {kind}s at {positions[0]}..{positions[-1]} (searched {len(search)}), eps {eps:.4f} (floor "
+                f"{floors[-1] if floors else float('nan'):.4f}): "
                 f"{len(order)} single units, passing prefix {ok}, every one there {ceiling[0]:.2f}/{ceiling[1]:.2f}")
         if ok or not reach or rnd == EPS_ROUNDS - 1:
             break
@@ -1069,10 +1075,10 @@ def cut(pt: Patcher, sc: dict, kind: str, positions, done: dict, log=None, searc
             cond_next = rnd == 0 or bool(cond)
             if cond_next:
                 continue
-        if eps <= noise:                            # at the noise floor: no lower round
+        if eps <= noise():                          # at the noise floor: no lower round
             break
         if not TARGETED:                            # EPS falls and group testing runs again over every block
-            eps = max(eps / EPS_STEP, noise)
+            eps = max(eps / EPS_STEP, noise())
             continue
         # targeted refinement: the first level's blocks in measured order (the larger |share|), the smallest prefix of
         # them that, patched whole beside every single found, passes; group testing at eps / EPS_STEP inside those only
@@ -1081,7 +1087,7 @@ def cut(pt: Patcher, sc: dict, kind: str, positions, done: dict, log=None, searc
         j, _, _ = smallest(len(first), lambda j: order + [unit(kind, bl[1], bl[2], torch.arange(width)) for bl in first[:j]])
         if j is None:                               # every block whole beside the singles fails: nothing to refine
             break
-        blocks, eps = first[:j], max(eps / EPS_STEP, noise)
+        blocks, eps = first[:j], max(eps / EPS_STEP, noise())
         refined.append(j)
     alone = [u for u in singles if singles[u] is None]      # conditional singles' shares alone, for the record
     for u, r in zip(alone, pt.both([[u] for u in alone])):

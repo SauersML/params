@@ -6,7 +6,7 @@ Prompts are built as ADAG's prepare_ci does: the user turn and the prefilled ans
 final end-of-turn token, and a seed ending in a space gets the space token appended.
 A unit is a whole neuron (layer, index: the down projection's input act(gate) x up) zeroed at every position, as ADAG's
 clusters are zeroed. Goals, each a measured success test on the next-token distribution:
-  flip X     the top token becomes X
+  flip X     the top token becomes X (with a probability: and X reaches it, the cluster's own effect)
   halve      p(the answer) falls to half its value or less
   change     the top token is no longer the answer
 Search (every decision a measured run; the gradient only orders): every neuron's gradient of the goal's score with
@@ -48,7 +48,7 @@ UNRELATED = [
 CASES = {
     "capitals_llama": {"model": "meta-llama/Llama-3.1-8B-Instruct", "weights": LLAMA_WEIGHTS,
                        "question": "What is the capital of the state containing Dallas?", "seed": "Answer:", "answer": " Austin",
-                       "goals": [["flip", " Texas"], ["halve", None]],
+                       "goals": [["flip", " Texas"], ["flip", " Texas", 0.934], ["halve", None]],
                        "theirs": {"p_answer": 0.965, "flip": {"cluster": "C2", "neurons": 24, "p_target": 0.934},
                                   "halve": {"cluster": "C44", "neurons": 14, "p_answer": 0.527, "p_oklahoma": 0.221},
                                   "raise": {"cluster": "C59", "p_answer": 0.984}}},
@@ -57,7 +57,7 @@ CASES = {
                    "theirs": {"p_answer": 0.93, "change": "no cluster, zeroed or doubled, changes the top answer"}},
     "capitals_qwen32": {"model": "Qwen/Qwen3-32B", "weights": None,
                         "question": "What is the capital of the state containing Dallas?", "seed": "Answer: **", "answer": None,
-                        "goals": [["flip", "O"], ["flip", "**"]],
+                        "goals": [["flip", "O"], ["flip", "O", 0.66], ["flip", "**"], ["flip", "**", 0.598]],
                         "theirs": {"flip O": {"cluster": "C18", "neurons": 23, "p_target": 0.66},
                                    "flip **": {"cluster": "C5", "neurons": 59, "p_target": 0.598}}},
 }
@@ -125,10 +125,10 @@ class Runner:
         return torch.cat(out) if out else torch.zeros(0)
 
 
-def goal_fns(kind: str, A: int, X: int | None, p0: float):
+def goal_fns(kind: str, A: int, X: int | None, p0: float, p_target: float | None = None):
     """(score of a log p [V], success test of a log p [V]) for the goal."""
     if kind == "flip":
-        return (lambda l: float(l[X] - l[A])), (lambda l: int(l.argmax()) == X)
+        return (lambda l: float(l[X] - l[A])), (lambda l: int(l.argmax()) == X and (p_target is None or float(l[X].exp()) >= p_target))
     if kind == "halve":
         return (lambda l: float(-l[A])), (lambda l: float(l[A].exp()) <= p0 / 2)
 
@@ -139,11 +139,11 @@ def goal_fns(kind: str, A: int, X: int | None, p0: float):
     return (lambda l: float(best_other(l) - l[A])), (lambda l: int(l.argmax()) != A)
 
 
-def search(run: Runner, tok, ids: list[int], kind: str, A: int, X: int | None, log=print) -> dict:
+def search(run: Runner, tok, ids: list[int], kind: str, A: int, X: int | None, log=print, p_target: float | None = None) -> dict:
     t0 = time.time()
     base = run.last(ids, [[]])[0]
     p0 = float(base[A].exp())
-    score, ok = goal_fns(kind, A, X, p0)
+    score, ok = goal_fns(kind, A, X, p0, p_target)
     scale = torch.ones(run.L, run.D, device=run.dev, requires_grad=True)
     with torch.enable_grad():
         lp = run.logp(ids, [[]], scale=scale)[0, 0]
@@ -163,7 +163,7 @@ def search(run: Runner, tok, ids: list[int], kind: str, A: int, X: int | None, l
             tried[k] = (ok(l), l)
         return tried[k][0]
     hit = next((k for k in GRID if k <= len(order) and test(k)), None)
-    rec = {"goal": kind, "target": None if X is None else tok.decode([X]), "answer": tok.decode([A]), "p_answer": p0,
+    rec = {"goal": kind, "target": None if X is None else tok.decode([X]), "p_target_goal": p_target, "answer": tok.decode([A]), "p_answer": p0,
            "candidates": len(cand), "single_best": max(gain) if gain else None}
     if hit is None:
         best = max(GRID, key=lambda k: score(tried[k][1]) if k in tried else -1e9)
@@ -188,8 +188,10 @@ def search(run: Runner, tok, ids: list[int], kind: str, A: int, X: int | None, l
     rec.update(found=True, prefix=hit, neurons=len(S), units=[list(u) for u in S], top_after=tok.decode([int(la.argmax())]),
                p_answer_after=float(la[A].exp()), p_target_after=None if X is None else float(la[X].exp()),
                side_effect_bits=side_effect(run, tok, S), seconds=time.time() - t0)
-    log(f"{kind} {rec['target']}: {len(S)} neurons (prefix {hit}); top after {rec['top_after']!r}, p(answer) {p0:.3f} -> "
-        f"{rec['p_answer_after']:.3f}; side effect {rec['side_effect_bits']:.4f} bits; {rec['seconds']:.0f} s")
+    goal = rec["target"] if p_target is None else f"{rec['target']} >= {p_target}"
+    pt = "" if X is None else f", p(target) {rec['p_target_after']:.3f}"
+    log(f"{kind} {goal}: {len(S)} neurons (prefix {hit}) {rec['units'][:8]}; top after {rec['top_after']!r}, p(answer) {p0:.3f} -> "
+        f"{rec['p_answer_after']:.3f}{pt}; side effect {rec['side_effect_bits']:.4f} bits; {rec['seconds']:.0f} s")
     return rec
 
 
@@ -236,9 +238,10 @@ def main():
                "top5": [[tok.decode([int(z)]), float(base[z].exp())] for z in base.topk(5).indices], "theirs": c["theirs"], "goals": []}
         print(f"{name}: {rec['tokens']} tokens; p({rec['answer']!r}) {rec['p_answer']:.3f} (theirs {c['theirs'].get('p_answer')}); "
               f"top5 {rec['top5']}", flush=True)
-        for kind, target in c["goals"]:
+        for kind, target, *pt in c["goals"]:
             X = tok(target, add_special_tokens=False)["input_ids"][0] if target else None
-            rec["goals"].append(search(run, tok, ids, kind, A, X, log=lambda s: print(f"{name} {s}", flush=True)))
+            rec["goals"].append(search(run, tok, ids, kind, A, X, log=lambda s: print(f"{name} {s}", flush=True),
+                                       p_target=pt[0] if pt else None))
         out[name] = rec
         a.out.write_text(json.dumps(out))
 

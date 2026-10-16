@@ -131,6 +131,7 @@ class Edges:
         self.dev, self.dt = core.model.embed_tokens.weight.device, core.model.embed_tokens.weight.dtype
         self.T = target + 1
         self.B = None  # cut sets a forward (below, from the positions a cut run computes)
+        self._Wc = None  # (the answer's and the alternatives' output rows in float32: _run)
         self.forwards = 0  # (contrasts' forwards so far)
         self.ids, self.target, self.answer, self.alternatives = list(ids)[:self.T], target, list(answer), list(alternatives)
         self.N = sorted({(int(L), int(p), int(j)) for L, p, j in neurons if p < self.T})  # (by layer first)
@@ -405,10 +406,15 @@ class Edges:
                              coef[:, es] * Hc[:, wi], accumulate=True)
                 D.index_add_(1, ru, C @ self._cols_on(d)[wu])
             x = x + f(layer.mlp.down_proj, hm)
-        lp = torch.log_softmax(f(core.lm_head, f(core.model.norm, x[:, self.target - s0])), -1)   # (on the card: a host
-        # copy of every set's [V] log-probabilities was 0.34 s of a Qwen3-8B graph's edge stage)
-        out = {"contrast": log2_contrast(lp, self.answer, self.alternatives), "lp": lp}
-        if keep_states:
+        hn = self._m(core.model.norm, x[:, self.target - s0])  # the contrast from the answer's and the alternatives'
+        if self._Wc is None:  # logits only, in float32 (the softmax's normalizer cancels; a bfloat16 model's own logits
+            W = weight(core.lm_head)  # of ~20-30 round to 0.125-0.25: graphs' cut contrasts moved in 0.36-bit steps)
+            self._Wc = W[torch.as_tensor(list(self.answer) + list(self.alternatives), device=W.device)].float()
+        z = hn.float().to(self._Wc.device) @ self._Wc.T
+        na = len(self.answer)
+        out = {"contrast": (torch.logsumexp(z[:, :na], -1) - torch.logsumexp(z[:, na:], -1)) / math.log(2.0)}
+        if keep_states:  # (every log-probability for the base runs: their top token; on the card)
+            out["lp"] = torch.log_softmax(f(core.lm_head, hn), -1)
             out.update(states)
         return out
 

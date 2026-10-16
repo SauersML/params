@@ -3,7 +3,9 @@
 # license: nothing of it enters this repository), against our measurements (experiments/oracle/adag_repo.py), in order
 # of use: its tracing speed on the card (bench_tracing.py); its capitals circuit on Llama-3.1-8B-Instruct (prep.py,
 # threshold 0.005, k 5), its multiview clusters measured beside our found sets (OURS: adag_compare.py run's records),
-# and our circuit_finder's speed on the same prompts and card (adag_compare.py finder; also on Qwen3-8B);
+# and our circuit_finder's speed on the same prompts and card (adag_compare.py finder; also on Qwen3-8B). First of all
+# (the lead's 10-16 Lane 3): ADAG's circuits of the family circuits' questions as circuit_finder records (adag_repo.py
+# trace: dev, every second family, all paraphrases), with our finder on the first 10 of them on the same card;
 # its math circuit on 40 sums (18 + 24 first; 32 s a sum on an A40); the same capitals head-to-head on Qwen3-8B (our search, then its circuit
 # and clusters); CausalGym (its generator, a test split cleared of train prefixes) under its own faithfulness evaluation
 # (eval.py): NAP on MLP neurons (its case study's settings), our measured scores, ENAP; its speed on Qwen3-8B. Every step has its
@@ -16,6 +18,8 @@
 cd /Users/user/params
 OURS=$1 NAME=${2:-oracle-graph-adag-repo} H=${3:-3.2}
 PREV=${PREV:-/Users/user/mpd-data/scratch/generality/adag/none}  # (an earlier run's outputs to reuse: its traced circuits, its bench)
+PREVCP=""  # (named one by one: rp-run uploads the Mac paths a command names)
+for f in capitals_llama.pkl math_llama.pkl capitals_qwen8.pkl adag_qwen8.json bench_llama.json relp_france_p0.json; do [ -s "$PREV/$f" ] && PREVCP="$PREVCP $PREV/$f"; done
 O=/Users/user/mpd-data/runpod/$NAME
 P=/Users/user/params/experiments/oracle
 K=${K:-64}
@@ -30,7 +34,8 @@ uv run python $P/adag_compare.py alias $L NousResearch/Meta-Llama-3.1-8B-Instruc
 export HF_HUB_OFFLINE=1; set +e;
 (nvidia-smi --query-gpu=timestamp,utilization.gpu,memory.used --format=csv,noheader -l 30 > $O/gpu.log 2>&1 &);
 step() { n=\$1 m=\$2; shift 2; echo \"\$(date +%T) \$n\" >> $O/steps.log; timeout \${m}m \"\$@\" > $O/\$n.log 2>&1; rc=\$?; echo \"\$(date +%T) \$n exit \$rc\" >> $O/steps.log; };
-for f in capitals_llama.pkl math_llama.pkl capitals_qwen8.pkl adag_qwen8.json bench_llama.json relp_france_p0.json; do [ -s $PREV/\$f ] && cp $PREV/\$f $O/; done;
+${PREVCP:+cp $PREVCP $O/;}
+step trace_qwen8 170 uv run python $P/adag_repo.py trace $QS $O/trace_qwen8 --model $Q --split dev --stride 2 --finder 10;
 [ -s $O/relp_france_p0.json ] || step relp_qwen8 15 uv run python $P/adag_repo.py relp capital/France/p0 $O/relp_france_p0 --model $Q --questions $QS;
 [ -s $O/bench_llama.json ] || step bench_llama 20 uv run python scripts/case_studies/benchmark/bench_tracing.py --model-id $L --batch-sizes 4 --n-prompts 8 --output $O/bench_llama.json;
 [ -s $O/capitals_llama.pkl ] || step prep_llama 45 uv run python scripts/circuit_prep/prep.py --config configs/capitals.yaml --output-path $O/capitals_llama.pkl;

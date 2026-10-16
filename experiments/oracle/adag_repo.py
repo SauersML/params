@@ -24,6 +24,14 @@ here).
              of the focus logits at the last position (focus "answer": the clean top token alone; "top5": ADAG's own
              top-5 logits). Writes OUT.pt ({focus: {"attribution", "activation": [layers, positions, neurons]}}) and
              OUT.json (ids, focus tokens, objective values, sign: positive raises the objective).
+  trace      ADAG's tracer on circuit_questions' questions (the lead's 10-16 Lane 3: the questions of the family
+             circuits), each its own patching pair's clean prompt in our token ids (circuit_finder.chat), prep.py's
+             settings (RelP gradient, k = 5 top logits, threshold 0.005, no blacklist on Qwen3), timed; its neurons
+             written as a circuit_finder record (the oracle's input format): every node at its position with its pole
+             (the clean activation's sign), ADAG's attribution and our measured shares alone on the pair (lost noising,
+             restored denoising: circuit_finder's Patcher), one cut "adag" with the whole set's shares and met at PASS
+             both ways, no routes (ADAG has no head units). Nodes before the pair's first differing token keep shares 0
+             (the two runs agree there). Families as circuit_family picks them (sorted task/key, every stride-th).
   measured   our node scores in ADAG's CausalGym evaluation: NAP's train.pt (scripts/train.py --method nap, MLP neurons)
              with its CAND largest scores replaced by measured ones, each (layer, position, neuron) alone set to its mean
              over the train pairs' patch prompts (the value ADAG's evaluation ablates to) on the train pairs' clean
@@ -38,6 +46,8 @@ here).
   adag_repo.py groups CIRCUIT.pkl CLUSTER_STATE.json OUT.json
   adag_repo.py measured NAP_TRAIN.pt OUT_TRAIN.pt --model ID [--cand 8192] [--order replace|first]
   (in ADAG's clone)  adag_repo.py relp QUESTION_ID OUT --model Qwen/Qwen3-8B [--questions FILE]
+  (in ADAG's clone)  adag_repo.py trace QUESTIONS.json OUT --model Qwen/Qwen3-8B [--split dev] [--stride 2] [--limit N]
+      [--finder N]   (circuit_finder on the first N of them too: OUT/finder/, timed on the same card)
 """
 from __future__ import annotations
 
@@ -296,6 +306,100 @@ def relp(a) -> None:
     a.out.with_suffix(".json").write_text(json.dumps(meta))
 
 
+def trace(a) -> None:
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "method" / "oracle"))
+    import circuit_finder as cf
+    from circuits.tracing.clja import ADAGConfig, get_all_pairs_cl_ja_effects_with_attributions  # ADAG's own tracer
+    from circuits.tracing.grad import revert_stop_nonlinear_grad
+
+    tok, model = load_model(a.model)
+    model.requires_grad_(False)
+    dev = next(model.parameters()).device
+    L = model.config.num_hidden_layers
+    qs = [q for q in json.loads(a.questions.read_text())["questions"] if q["split"] == a.split]
+    fams = {}
+    for q in qs:
+        fams.setdefault(f"{q['task']}/{q['key']}", []).append(q)
+    todo = [q for name in sorted(fams)[::a.stride] for q in sorted(fams[name], key=lambda q: q["paraphrase"])][:a.limit or None]
+    a.out.mkdir(parents=True, exist_ok=True)
+    pt = cf.Patcher(model, tok)
+    cfg = ADAGConfig(device=str(dev), verbose=False, parent_threshold=None, edge_threshold=0.01, node_attribution_threshold=None,
+                     topk=None, batch_aggregation="any", topk_neurons=None, percentage_threshold=0.005, use_relp_grad=True,
+                     disable_half_rule=False, disable_stop_grad=False, ablation_mode="zero", use_stop_grad_on_mlps=True,
+                     return_nodes_only=False, focus_last_residual=False, skip_attr_contrib=False, center_logits=False,
+                     ig_steps=None, ig_mode="ig-inputs", return_only_important_neurons=False, apply_blacklist=False)
+    rev = (Path.cwd() / "adag_commit.txt").read_text().strip() if (Path.cwd() / "adag_commit.txt").exists() else None
+    first = True
+    for q in todo:
+        path = a.out / (q["id"].replace("/", "__") + ".json")
+        if path.exists():
+            continue
+        ids, cids = cf.chat(tok, q["user"]), cf.chat(tok, q["corrupt_user"])
+        if len(ids) != len(cids):
+            continue
+        T = len(ids)
+        with torch.no_grad():
+            top5 = model(torch.tensor([ids], device=dev)).logits[0, -1].float().topk(5).indices.tolist()
+        if first:  # (an untimed run first: CUDA's first kernels)
+            get_all_pairs_cl_ja_effects_with_attributions(model, tok, [ids], cfg, src_tokens=list(range(T)), tgt_tokens=[T - 1] * 5,
+                                                          attention_masks=[[1] * T], focus_logits=[top5])
+            try:
+                revert_stop_nonlinear_grad(model)
+            except Exception:
+                pass
+            first = False
+        torch.cuda.synchronize() if torch.cuda.is_available() else None
+        t0 = time.time()
+        nodes, edges = get_all_pairs_cl_ja_effects_with_attributions(model, tok, [ids], cfg, src_tokens=list(range(T)),
+                                                                     tgt_tokens=[T - 1] * 5, attention_masks=[[1] * T], focus_logits=[top5])
+        torch.cuda.synchronize() if torch.cuda.is_available() else None
+        t_trace = time.time() - t0
+        try:
+            revert_stop_nonlinear_grad(model)
+        except Exception:
+            pass
+        units = {}
+        for n in nodes:
+            if 0 <= n.layer < L:
+                k = (int(n.layer), int(n.token), int(n.neuron))
+                units[k] = (units.get(k, (0.0, 0.0))[0] + float(n.final_attribution[0].sum()), float(n.activation[0]))
+        t1 = time.time()
+        rec = pt.setup(ids, cids)
+        rec["tokens"] = T
+        us = [("neuron", L_, p, j) for (L_, p, j) in units]
+        singles = pt.both([[u] for u in us]) if us else []
+        whole = pt.both([us])[0] if us else (0.0, 0.0)
+        out_nodes = []
+        for (L_, p, j), (lo, re) in zip(units, singles):
+            v, w = float(pt.act["clean"]["neu"][L_][p, j]), float(pt.act["clean"]["up"][L_][p, j])
+            out_nodes.append({"stage": "adag", "layer": L_, "pos": p, "neuron": j, "pole": 1 if v > 0 else -1,
+                              "regime": [1 if v * w > 0 else -1, 1 if w > 0 else -1], "clean": v,
+                              "corrupt": float(pt.act["corrupt"]["neu"][L_][p, j]), "lost": lo, "restored": re,
+                              "attribution": units[(L_, p, j)][0]})
+        met = bool(whole[0] >= cf.PASS and whole[1] >= cf.PASS)
+        rec.update(id=q["id"], ids=ids, corrupted=cids, answer_text=tok.decode([rec["answer"]]),
+                   corrupt_answer_text=tok.decode([rec["corrupt_answer"]]), model=a.model, adapter=None, dtype=str(model.dtype).split(".")[-1],
+                   finder="adag", finder_rev=rev, user=q["user"], corrupt_user=q["corrupt_user"], task=q["task"], key=q["key"],
+                   nodes=out_nodes, routes=[], met=met, order=["adag"], size=len(out_nodes),
+                   cuts={"adag": {"met": met, "lost": whole[0], "restored": whole[1], "size": len(out_nodes)}},
+                   seconds=round(t_trace, 2), seconds_measure=round(time.time() - t1, 2),
+                   adag={"k": 5, "focus": top5, "focus_text": [tok.decode([t]) for t in top5], "threshold": 0.005, "edges": len(edges),
+                         "before_first_diff": sum(p < rec["first_diff"] for (_, p, _) in units)})
+        path.write_text(json.dumps(rec))
+        if a.finder and len(list((a.out / "finder").glob("*.json")) if (a.out / "finder").exists() else []) < a.finder:
+            (a.out / "finder").mkdir(exist_ok=True)  # our finder on the same pair and card, timed alike
+            torch.cuda.synchronize() if torch.cuda.is_available() else None
+            t2 = time.time()
+            fr = cf.find(pt, ids, cids)
+            torch.cuda.synchronize() if torch.cuda.is_available() else None
+            fr.update(id=q["id"], ids=ids, corrupted=cids, model=a.model, finder="circuit_finder", wall_seconds=round(time.time() - t2, 2))
+            (a.out / "finder" / path.name).write_text(json.dumps(fr))
+            print(f"{q['id']}: circuit_finder {fr.get('size')} units, met {fr.get('met')}, {fr['wall_seconds']:.1f} s", flush=True)
+        print(f"{q['id']}: ADAG {len(out_nodes)} neurons ({rec['adag']['before_first_diff']} before the change), {len(edges)} edges, "
+              f"{t_trace:.1f} s; lost {whole[0]:.2f} restored {whole[1]:.2f}{'' if met else ' unmet'}", flush=True)
+
+
 @torch.no_grad()
 def measured(a) -> None:
     t0 = time.time()
@@ -405,6 +509,14 @@ def main():
     r.add_argument("out", type=Path)
     r.add_argument("--model", required=True)
     r.add_argument("--questions", type=Path, default=None)
+    tr = sp.add_parser("trace")
+    tr.add_argument("questions", type=Path)
+    tr.add_argument("out", type=Path)
+    tr.add_argument("--model", default="Qwen/Qwen3-8B")
+    tr.add_argument("--split", default="dev")
+    tr.add_argument("--stride", type=int, default=2)
+    tr.add_argument("--limit", type=int, default=0)
+    tr.add_argument("--finder", type=int, default=0, help="circuit_finder on the first N questions too, timed on the same card")
     t = sp.add_parser("cg-test")
     t.add_argument("train", type=Path)
     t.add_argument("test", type=Path)
@@ -416,7 +528,7 @@ def main():
     s.add_argument("--order", default="replace", choices=("replace", "first"),
                    help="replace: measured scores in NAP's place among its others; first: every measured node ranked first")
     a = ap.parse_args()
-    {"clusters": clusters, "math-data": math_data, "cg-test": cg_test, "groups": groups, "measured": measured, "relp": relp}[a.cmd](a)
+    {"clusters": clusters, "math-data": math_data, "cg-test": cg_test, "groups": groups, "measured": measured, "relp": relp, "trace": trace}[a.cmd](a)
 
 
 if __name__ == "__main__":

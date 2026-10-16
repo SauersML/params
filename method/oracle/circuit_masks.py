@@ -156,8 +156,9 @@ def ordered(spec: dict, theta: dict) -> tuple:
 
 
 def verify(pt, order: list, log=None, name: str = "") -> dict:
-    """circuit_finder.cut's measured steps on a proposed order: the smallest passing prefix (grid, bisection), then units
-    removed one at a time while it passes; each unit's shares alone."""
+    """circuit_finder.cut's measured steps on a proposed order: the smallest passing prefix (grid, bisection to 32 sizes
+    between the last failing size and the first passing one, then those in one batch), then units removed one at a time
+    while it passes (prune); each unit's shares alone."""
     passes = lambda r: r[0] >= cf.PASS and r[1] >= cf.PASS  # noqa: E731
     g = cf.grid(len(order))
     got = pt.both([_blocks(order[:k]) for k in g])
@@ -166,23 +167,37 @@ def verify(pt, order: list, log=None, name: str = "") -> dict:
     if met:
         hi = met[0]
         lo = max([k for k in g if k < hi] + [0])
-        while hi - lo > 1:
+        while hi - lo > 33:                         # (bisection down to 32 sizes, then all of them in one batch)
             mid = (lo + hi) // 2
             lo, hi = (lo, mid) if passes(pt.both([_blocks(order[:mid])])[0]) else (mid, hi)
-        ok = hi
-    circ = list(order[:ok]) if ok else []
-    if ok and len(circ) > 1:
-        alone = pt.both([_blocks([v for v in circ if v != u]) for u in circ])
-        for u in [u for u, r in zip(circ, alone) if passes(r)][::-1]:
-            trial = [v for v in circ if v != u]
-            if passes(pt.both([_blocks(trial)])[0]):
-                circ = trial
+        mids = list(range(lo + 1, hi))
+        ok = next((k for k, r in zip(mids, pt.both([_blocks(order[:k]) for k in mids]) if mids else []) if passes(r)), hi)
+    circ = prune(pt, list(order[:ok])) if ok else []
     lost, rest = pt.both([_blocks(circ)])[0] if circ else (0.0, 0.0)
     singles = dict(zip(circ, pt.both([[u] for u in circ]))) if circ else {}
     if log:
         log(f"  {name}: {len(order)} ordered, passing prefix {ok}, pruned to {len(circ)} ({lost:.2f}/{rest:.2f})")
     return {"units": circ, "singles": singles, "met": bool(ok) and passes((lost, rest)), "lost": lost, "restored": rest,
             "found": len(order), "curve": [{"k": k, "lost": a, "restored": b} for k, (a, b) in zip(g, got)]}
+
+
+def prune(pt, circ: list) -> list:
+    """circuit_finder.cut's pruning of a passing set (units whose removal alone still passes, removed one at a time from
+    the last while it passes), its sequential trials batched: each round measures the removals so far plus each next
+    candidate cumulatively, keeps every removal up to the first that fails, and goes on after that candidate (the same
+    trials as one at a time, a round per failing candidate)."""
+    passes = lambda r: r[0] >= cf.PASS and r[1] >= cf.PASS  # noqa: E731
+    if len(circ) < 2:
+        return circ
+    alone = pt.both([_blocks([v for v in circ if v != u]) for u in circ])
+    todo, gone = [u for u, r in zip(circ, alone) if passes(r)][::-1], set()
+    while todo:
+        trials = [gone | set(todo[:j + 1]) for j in range(len(todo))]
+        got = pt.both([_blocks([v for v in circ if v not in t]) for t in trials])
+        j = next((j for j, r in enumerate(got) if not passes(r)), len(todo))
+        gone |= set(todo[:j])
+        todo = todo[j + 1:]
+    return [v for v in circ if v not in gone]
 
 
 def _record(res: dict, ceiling, reach: bool, search: list, extra: dict) -> dict:

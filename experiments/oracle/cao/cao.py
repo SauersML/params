@@ -126,7 +126,11 @@ class Oracle:
         return "".join(parts) + sequence + ex["q"]
 
     def encode(self, ex: dict, answer: bool) -> tuple[list[int], list[int], int]:
-        """(ids, placeholder positions, the answer's first index or len(ids))."""
+        """(ids, placeholder positions, the answer's first index or len(ids)); an example built by AO's own code (replay of
+        its training mix, ao_mix) carries its token ids, placeholders and answer start."""
+        if "ids" in ex:
+            a0 = ex["answer_start"]
+            return (ex["ids"] if answer else ex["ids"][:a0]), ex["placeholders"], a0
         user = [{"role": "user", "content": self.prompt(ex)}]
         head = self.tok.apply_chat_template(user, tokenize=True, add_generation_prompt=True, enable_thinking=False, return_dict=False)
         ids = head

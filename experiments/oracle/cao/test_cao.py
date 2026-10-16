@@ -857,3 +857,11 @@ def test_a_recorded_write_is_its_value_times_its_down_projection_column(tiny):
     v = tiny._vectors(e)
     assert torch.allclose(v[2].float(), (W[:, 9].float() * 2.5).to(v.dtype).float())
     assert torch.allclose(tiny.vectors_many([e])[0].float(), v.float(), atol=1e-5)
+
+
+def test_an_example_in_aos_own_tokens_encodes_as_given(tiny):
+    """A replayed AO example (its own ids, placeholders and answer start) encodes to exactly those."""
+    e = {"ids": [5, 6, 7, 8, 9, 10], "placeholders": [2, 3], "answer_start": 4, "ctx": ex(tiny)["ctx"],
+         "blocks": [{"layer": 7, "positions": [0, 1]}], "q": None, "a": "x"}
+    assert tiny.encode(e, True) == ([5, 6, 7, 8, 9, 10], [2, 3], 4)
+    assert tiny.encode(e, False) == ([5, 6, 7, 8], [2, 3], 4)

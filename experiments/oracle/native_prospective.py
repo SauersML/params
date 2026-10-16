@@ -6,6 +6,7 @@ All interventions concern prompt positions only; answer trajectories stay free.
 """
 from __future__ import annotations
 import math
+import contextlib
 import sys
 from pathlib import Path
 # Same hook engine used by the native neuron builder; no model loading here.
@@ -71,7 +72,7 @@ class Collector:
         return units
 
     @torch.no_grad()
-    def score(self, prompt, answers, *, units=(), source=None, zero=False, snapshot=None):
+    def score(self, prompt, answers, *, units=(), source=None, zero=False, snapshot=None, regimes=None):
         self._original()
         units = self._units(units, len(prompt))
         if not prompt or len(answers) != 2 or any(not a for a in answers):
@@ -88,11 +89,33 @@ class Collector:
         by_layer = {}
         for u in units:
             by_layer.setdefault(u[0], []).append(u)
+        indices = {}
+        def gather(layer, selected, tensor):
+            key = (layer, tensor.device)
+            if key not in indices:
+                indices[key] = (torch.tensor([u[1] for u in selected], device=tensor.device),
+                                torch.tensor([u[2] for u in selected], device=tensor.device))
+            positions, neurons = indices[key]
+            # Advanced indexing materializes only selected cells, never a view
+            # retaining the full projection activation tensor.
+            return tensor[0, positions, neurons].detach()
         def edit(layer, h):
             selected = by_layer.get(layer, ())
-            if snapshot is not None and index == 0:
-                for u in selected:
-                    snapshot[u] = h[0, u[1], u[2]].detach().clone()
+            if selected and index == 0 and (snapshot is not None or regimes is not None):
+                native = gather(layer, selected, h)
+                if snapshot is not None:
+                    snapshot.update(zip(selected, native.unbind()))
+                if regimes is not None:
+                    products = native.float().cpu().tolist()
+                    gates, ups = sparse['gate'][layer], sparse['up'][layer]
+                    sign = lambda v: '+' if v > 0 else '-' if v < 0 else '0'
+                    for u, gate, up, value in zip(selected, gates, ups, products):
+                        if not all(math.isfinite(v) for v in (gate, up, value)):
+                            raise ValueError('nonfinite native observation')
+                        regimes[u] = dict(raw_gate=gate, up=up,
+                                          product_value=value,
+                                          sign_regime=sign(gate)+sign(up),
+                                          pole=sign(value))
             if not zero and source is None:
                 return h
             if not selected:
@@ -109,7 +132,19 @@ class Collector:
             # Count attempted physical examples, including an interrupted/failed call.
             self.forward_examples += 1
             self.forward_calls += 1
-            with self.nr.hooks(edit):
+            sparse = {'gate': {}, 'up': {}}
+            # ExitStack owns every observer immediately, including partial setup
+            # and failures inside a projection or the model forward.
+            with contextlib.ExitStack() as stack:
+                if regimes is not None and index == 0:
+                    for layer, selected in by_layer.items():
+                        for kind, projection in [('gate', self.nr.layers[layer].mlp.gate_proj),
+                                                 ('up', self.nr.layers[layer].mlp.up_proj)]:
+                            def observe(module, args, output, kind=kind, selected=selected, layer=layer):
+                                sparse[kind][layer] = gather(layer, selected, output).float().cpu().tolist()
+                            handle = projection.register_forward_hook(observe)
+                            stack.callback(handle.remove)
+                stack.enter_context(self.nr.hooks(edit))
                 logits = self.nr.model(input_ids=ids, use_cache=False).logits
             self._original()
             positions = logits[0, len(prompt)-1:len(prompt)+len(answer)-1].float()
@@ -139,14 +174,15 @@ class Collector:
         from collections import Counter
         if not target or set(target) & set(control) or Counter((l,p) for l,p,n in target) != Counter((l,p) for l,p,n in control):
             raise ValueError('disjoint layer/position matched controls required')
-        source = {}
-        clean = self.score(clean_ids, [answer_a_ids,answer_b_ids], units=target+control, snapshot=source)
+        source, clean_regimes = {}, {}
+        clean = self.score(clean_ids, [answer_a_ids,answer_b_ids], units=target+control, snapshot=source, regimes=clean_regimes)
         public = dict(case_id=case_id, clean_ids=list(clean_ids), corrupt_ids=list(corrupt_ids),
                       answer_a_ids=list(answer_a_ids), answer_b_ids=list(answer_b_ids),
                       target_units=target, control_units=control)
         import copy
-        self._prepared[case_id] = (copy.deepcopy(public), source, clean)
-        return dict(public, clean_native_values=[{'unit':u,'value':float(source[u])} for u in target+control])
+        self._prepared[case_id] = (copy.deepcopy(public), source, clean, clean_regimes)
+        return dict(public, clean_native_values=[{'unit':u,'value':float(source[u])} for u in target+control],
+                    clean_native_regimes=[dict(unit=u, **clean_regimes[u]) for u in target+control])
 
     def collect(self, *, case_id, clean_ids, corrupt_ids, answer_a_ids,
                 answer_b_ids, target_units, control_units, paired_noising=False, paired_min_gap_bits=0.0):
@@ -183,7 +219,7 @@ class Collector:
         before = self.forward_examples
         answers = [answer_a_ids, answer_b_ids]
         if prepared is not None:
-            public, source, clean = prepared
+            public, source, clean, clean_regimes = prepared
             supplied = dict(case_id=case_id, clean_ids=list(clean_ids), corrupt_ids=list(corrupt_ids),
                             answer_a_ids=list(answer_a_ids), answer_b_ids=list(answer_b_ids),
                             target_units=target, control_units=control)
@@ -191,11 +227,12 @@ class Collector:
                 raise ValueError('prepared case changed')
             del self._prepared[case_id]
         else:
-            source = {}
-            clean = self.score(clean_ids, answers, units=target+control, snapshot=source)
+            source, clean_regimes = {}, {}
+            clean = self.score(clean_ids, answers, units=target+control, snapshot=source, regimes=clean_regimes)
         corrupt_source = {} if paired_noising else None
+        corrupt_regimes = {} if paired_noising else None
         corrupt = self.score(corrupt_ids, answers, units=target+control if paired_noising else (),
-                             snapshot=corrupt_source)
+                             snapshot=corrupt_source, regimes=corrupt_regimes)
         rows = {}
         paired = {}
         gap = clean['contrast_bits'] - corrupt['contrast_bits']
@@ -227,11 +264,14 @@ class Collector:
                 'corrupt_ids': list(corrupt_ids), 'answer_a_ids': list(answer_a_ids),
                 'answer_b_ids': list(answer_b_ids), 'target_units': target,
                 'control_units': control, 'clean': clean, 'corrupt': corrupt,
-                'interventions': rows, 'clean_native_values': [
+                'interventions': rows,
+                'clean_native_regimes': [dict(unit=u, **clean_regimes[u]) for u in target+control],
+                'clean_native_values': [
                     {'unit': u, 'value': float(source[u])} for u in target+control],
                 'forward_examples': self.forward_examples-before,
                 'forward_calls': self.forward_examples-before, 'backward_examples': 0}
         if paired_noising:
             result['paired_patching'] = paired
+            result['corrupt_native_regimes'] = [dict(unit=u, **corrupt_regimes[u]) for u in target+control]
             result['corrupt_native_values'] = [{'unit':u,'value':float(corrupt_source[u])} for u in target+control]
         return result

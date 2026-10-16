@@ -96,7 +96,7 @@ def test_public_before_gold_resume(setup):
         answer_a_ids=[4,5],answer_b_ids=[6],target_units=[(0,1,4)],control_units=[(0,1,5)])
     public=c.prepare_public(**case)
     assert c.forward_examples==2
-    assert set(public)==set(case)|{'clean_native_values'}
+    assert set(public)==set(case)|{'clean_native_values','clean_native_regimes'}
     assert 'contrast_bits' not in str(public)
     changed=dict(case, corrupt_ids=[1,8,3])
     with pytest.raises(ValueError,match='changed'): c.collect(**changed)
@@ -216,3 +216,78 @@ def test_paired_declared_min_gap_and_negative_raw_gap(setup):
     negative=c.collect(**dict(case,case_id='negative'),paired_noising=True)['paired_patching']['target']
     assert negative['contrast_gap_bits']<0
     assert negative['gap_sign']=='negative' and negative['lost_share'] is None
+
+
+def test_sparse_regimes_mixed_signs_zeros_no_extra_forwards(setup):
+    model,c=setup
+    gates=[2.,-2.,2.,-2.,0.,2.,0.]
+    ups=[3.,3.,-3.,-3.,3.,0.,0.]
+    def force(values):
+        def hook(m,a,out):
+            result=out.clone()
+            result[0,1,:len(values)]=torch.tensor(values,dtype=out.dtype)
+            return result
+        return hook
+    g=model.model.layers[0].mlp.gate_proj.register_forward_hook(force(gates))
+    u=model.model.layers[0].mlp.up_proj.register_forward_hook(force(ups))
+    try:
+        regimes={}; native={}; units=[(0,1,n) for n in range(len(gates))]
+        c.score([1,2,3],[[4,5],[6]],units=units,snapshot=native,regimes=regimes)
+        assert c.forward_examples==2
+        assert [regimes[x]['sign_regime'] for x in units]==['++','-+','+-','--','0+','+0','00']
+        for unit,gate,up in zip(units,gates,ups):
+            row=regimes[unit]
+            assert row['raw_gate']==gate and row['up']==up
+            assert row['product_value']==float(torch.nn.functional.silu(torch.tensor(gate))*up)
+            assert row['product_value']==float(native[unit])
+        assert regimes[(0,1,3)]['pole']=='+'  # negative-gate/negative-up echo
+        assert all(not isinstance(v,torch.Tensor) for row in regimes.values() for v in row.values())
+        assert hooks(model)==2  # only our two manual test hooks remain
+    finally: g.remove();u.remove()
+    assert hooks(model)==0
+
+
+def test_sparse_effective_peft_regimes_and_failure_cleanup(setup):
+    model,_=setup
+    peft=pytest.importorskip('peft')
+    model=peft.get_peft_model(model,peft.LoraConfig(r=2,lora_alpha=4,
+        target_modules=['gate_proj','up_proj','down_proj'],task_type='CAUSAL_LM'))
+    with torch.no_grad():
+        for name,param in model.named_parameters():
+            if 'lora_B' in name: param.fill_(.15)
+    model.eval()
+    c=Collector(Neurons(model,None),100,dict(IDENTITY,adapter_sha256='all_mlp_lora'))
+    layer=c.nr.layers[0]; seen={}
+    hs=[]
+    for name in ['gate','up']:
+        def observer(m,args,out,name=name):seen[name]=float(out[0,1,4])
+        hs.append(getattr(layer.mlp,name+'_proj').register_forward_hook(observer))
+    try:
+        direct(model,[1,2,3],[4,5])
+    finally:
+        for h in hs:h.remove()
+    regimes={}
+    c.score([1,2,3],[[4,5],[6]],units=[(0,1,4)],regimes=regimes)
+    assert regimes[(0,1,4)]['raw_gate']==seen['gate']
+    assert regimes[(0,1,4)]['up']==seen['up']
+    assert hooks(model)==0 and c.forward_examples==2
+    def fail(*args):raise RuntimeError('projection failure')
+    h=layer.mlp.up_proj.register_forward_hook(fail)
+    try:
+        with pytest.raises(RuntimeError,match='projection failure'):
+            c.score([1,2,3],[[4,5],[6]],units=[(0,1,4)],regimes={})
+        assert hooks(model)==1 and c.forward_examples==3
+    finally:h.remove()
+    assert hooks(model)==0
+
+
+def test_public_regimes_match_gold_and_corrupt_pair_counts(setup):
+    model,c=setup
+    case=dict(case_id='regimes',clean_ids=[1,2,3],corrupt_ids=[1,7,3],
+        answer_a_ids=[4,5],answer_b_ids=[6],target_units=[(0,1,4)],control_units=[(0,1,5)])
+    public=c.prepare_public(**case)
+    result=c.collect(**case,paired_noising=True)
+    assert result['clean_native_regimes']==public['clean_native_regimes']
+    assert len(result['corrupt_native_regimes'])==len(public['clean_native_regimes'])==2
+    assert c.forward_examples==16
+    assert hooks(model)==0

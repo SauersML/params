@@ -439,6 +439,44 @@ def mismatch(F: dict, D: dict) -> dict:
     return G
 
 
+def serialize_circuit(c: dict, how: str = "full") -> str:
+    """oracledata's circuit record (questions/pairs circuits.jsonl: word-level contrast, units with value, value over its
+    maximum, contrast-text value, noising/denoising shares and the direct write onto the word-level lead at the answer
+    position; heads; shared groups) as the reader's text. how: "full" or "names" (no measured numbers)."""
+    full = how == "full"
+    tk = c["tokens"]
+    lines = [f"Text: {c['user']!r}", f"The model's next token: {q_tok(c['answer']['text'])}" +
+             (f"; its lead for that word over the alternative words: {c['contrast']['clean']:.1f} bits." if full else ".")]
+    cor = c.get("corrupt") or {}
+    if cor:
+        lines.append(f"Contrast pair: with {cor.get('user')!r} the model gives {q_tok((cor.get('answer') or {}).get('text', '?'))}" +
+                     (f" (the gap between the two texts: {c['gap']:.1f} bits). Shares below: of that gap, lost when the unit takes its "
+                      f"value from the contrast text (noising) and restored when it alone keeps its value in the contrast text "
+                      f"(denoising)." if full else "."))
+    if c.get("heads"):
+        lines.append("Heads at the answer position:")
+        for h in c["heads"]:
+            looks = ", ".join(f"{q_tok(t)} @{q}" + (f" {w:.2f}" if full else "") for q, w, t in h.get("attends", [])[:3])
+            lines.append(f"  {h['name']} looks at {looks}" + (f"; noising {num(h.get('lost'))}, denoising {num(h.get('restored'))}" if full else ""))
+    gid = {u: g["id"] for g in c.get("groups", []) for u in g["members"]}
+    for stage in ("source", "readout", None):
+        us = [u for u in c["units"] if u.get("stage") == stage or (stage is None and u.get("stage") not in ("source", "readout"))]
+        if not us:
+            continue
+        lines.append(f"{(stage or 'other').capitalize()} neurons:")
+        for u in us:
+            x = f"  {u['name']} at {q_tok(u.get('token', tk[u['pos']] if u['pos'] < len(tk) else '?'))}"
+            if u["name"] in gid:
+                x += f" [{gid[u['name']]}]"
+            if full:
+                x += (f": value {u['value']:.3g} ({abs(u.get('value_over_max') or 0):.2f} of its max), contrast text "
+                      f"{u['corrupt']:.3g}; noising {num(u.get('lost'))}, denoising {num(u.get('restored'))}")
+                if u.get("direct") is not None:
+                    x += f"; its write on the lead {u['direct']:+.2f} bits"
+            lines.append(x)
+    return "\n".join(lines) + "\n"
+
+
 # ---- the feasibility check: a logistic model on the serialized numbers against the name-prior ----
 
 def unit_members(F: dict, u: str) -> list[dict]:

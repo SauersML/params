@@ -154,6 +154,11 @@ class Why:
     def text(self, ids) -> str:
         return self.tok.decode(list(ids)) if self.tok is not None else " ".join(f"<{i}>" for i in ids)
 
+    def shown(self, ids) -> str:
+        """A token as the page shows it: line breaks as ⏎, an all-space token as ␣."""
+        t = self.text(ids)
+        return t.replace("\n", "⏎") if "\n" in t else (t if t.strip() else "␣" * max(1, len(t)))
+
     def from_record(self, rec: dict, clean: list, corrupt: list, family: bool) -> dict:
         """The page's fields from a fast record (the Patcher still set up on its pair)."""
         pt, tx = self.pt, self.text
@@ -164,8 +169,9 @@ class Why:
         if not rec.get("usable"):
             return {**res, "error": "no circuit: " + rec.get("skipped", "the pair is not usable"),
                     "margin": rec.get("contrast", {}).get("clean"), "contrast_margin": rec.get("contrast", {}).get("corrupt")}
+        sh = self.shown
         res.update(margin=rec["contrast"]["clean"], contrast_margin=rec["contrast"]["corrupt"], gap=rec["gap"],
-                   tokens=[tx([i]) for i in clean], contrast_tokens=[tx([i]) for i in corrupt], first_diff=rec["first_diff"])
+                   tokens=[sh([i]) for i in clean], contrast_tokens=[sh([i]) for i in corrupt], first_diff=rec["first_diff"])
         cuts, stage = rec["cuts"], rec["amortize"]["stage"]
         src = [n for n in rec["nodes"] if n["stage"] == "source"]
         ro = [n for n in rec["nodes"] if n["stage"] == "readout"]
@@ -174,13 +180,13 @@ class Why:
             by.setdefault(n["pos"], []).append(n["layer"])
         res["source"] = {"met": cuts.get("source", {}).get("met", False), "size": len(src), "stage": stage.get("source"),
                          "lost": cuts.get("source", {}).get("lost"), "restored": cuts.get("source", {}).get("restored"),
-                         "by_token": [{"pos": p, "token": tx([clean[p]]), "contrast_token": tx([corrupt[p]]),
+                         "by_token": [{"pos": p, "token": sh([clean[p]]), "contrast_token": sh([corrupt[p]]),
                                        "neurons": len(ls), "layers": sorted(ls)} for p, ls in sorted(by.items())]}
         res["movers"] = {"met": cuts.get("movers", {}).get("met", False), "size": len(rec["routes"]), "family": family,
                          "stage": stage.get("movers"), "lost": cuts.get("movers", {}).get("lost"),
                          "restored": cuts.get("movers", {}).get("restored"),
                          "heads": [{"layer": r["layer"], "head": r["head"],
-                                    "attends": [[p, tx([clean[p]]), w] for p, w in (r.get("attends") or [])
+                                    "attends": [[p, sh([clean[p]]), w] for p, w in (r.get("attends") or [])
                                                 if p > 0 and not re.fullmatch(r"<\|.*\|>", tx([clean[p]]).strip())]}
                                    for r in rec["routes"]]}       # (attention sinks: position 0 and chat markers)
         c = cuts.get("readout", {})
@@ -286,11 +292,11 @@ class Why:
             if u[0] == "neuron":
                 by.setdefault(u[2], []).append(u[1])
         return {"answer": self.text([y]), "contrast_answer": alternative.strip(), "margin": m_base,
-                "tokens": [self.text([i]) for i in ids.tolist()],
+                "tokens": [self.shown([i]) for i in ids.tolist()],
                 "ablation": {"sizes": sizes, "margins": got[:len(sizes)], "random_margins": got[len(sizes):],
                              "chosen": len(chosen), "flipped": got[k_at] < 0, "margin_after": got[k_at],
                              "random_margin_after": got[len(sizes) + k_at],
-                             "by_token": [{"pos": p, "token": self.text([int(ids[p])]), "neurons": len(ls),
+                             "by_token": [{"pos": p, "token": self.shown([int(ids[p])]), "neurons": len(ls),
                                            "layers": sorted(ls)} for p, ls in sorted(by.items())],
                              "heads": [{"layer": u[1], "head": u[2]} for u in chosen if u[0] == "head"]}}
 

@@ -228,3 +228,23 @@ def test_adversary_modes(tiny, monkeypatch):
     th = {"neuron": torch.zeros(pt.L, len(spec["positions"]), pt.D)}
     out = cm.optimize_many([(pt, [spec], None)], steps=2, init=[[th]], adv=0.3, freeze=True, mode="block")[0][0]
     assert out["rho"]["neuron"].shape == (pt.L, len(spec["positions"]), 1)
+
+
+def test_merged_mask_passes_equal_separate(tiny, monkeypatch):
+    """optimize_many with every first position its own forward (MASK_MERGE 0) and with all in one forward from the
+    lowest (MASK_MERGE large) gives the same masks and histories: positions before an instance's first are its base
+    run's."""
+    model, clean, corrupts = tiny
+    pts = [cf.Patcher(model, None, rows=8) for _ in corrupts]
+    for p, c in zip(pts, corrupts):
+        p.setup(clean, c)
+    jobs = [(p, list(cm.cuts_of(p).values()), None) for p in pts] + [(pts, [cm.cuts_of(pts[0])["source"]], None)]
+    got = []
+    for merge in (0, 10 ** 9):
+        monkeypatch.setattr(cm, "MASK_MERGE", merge)
+        got.append(cm.optimize_many(jobs, steps=3))
+    for a, b in zip(*got):
+        for x, y in zip(a, b):
+            assert all(torch.allclose(x["theta"][k], y["theta"][k], atol=1e-4) for k in x["theta"])
+            assert all(abs(u - v) < 1e-3 for h, i in zip(x["history"], y["history"]) for u, v in zip(h, i))
+    assert len(cm._passes([5, 5, 7, 9], 10)) >= 1 and cm._passes([3], 10) == [(3, [0])]

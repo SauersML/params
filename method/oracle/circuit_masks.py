@@ -70,6 +70,8 @@ ORDER_MIN = 64      # units ordered for the measured prefix: those the mask kept
 ORDER_MAX = 20000
 MASK_TOKENS = 1536   # rows x positions a mask step runs at most off CUDA (find_batch's parts; on CUDA _budget's)
 MASK_MEMORY = 0.5    # the share of free device memory a mask step's activations may take
+MASK_MERGE = 192    # a mask step's forward costs as many tokens' work (Qwen3-8B on an A6000: ~0.1 s of host launches a
+# forward and backward, ~0.5 ms of compute a token): instances of near first positions share one (_passes)
 ROUNDS = 4          # rounds of STEPS a cut's masks get while its order cannot pass (each round from the last's theta)
 PRUNE_MAX = 4 * cf.SINGLES_KEPT   # a passing prefix of more units than this is a diffuse cut, not pruned: its size, shares
 # and curve recorded, no units (circuit_finder's DENSE rule). Qwen3-8B dev set (A6000, am, 153 questions): 13 readout
@@ -140,12 +142,11 @@ def optimize_many(jobs: list, steps: int = STEPS, log=None, init: list | None = 
                                                             for p in s["positions"])} for k in kinds}   # theta rows
     owner = {k: torch.tensor([sid[(q, j)] for (q, j, _), _ in sorted(cell[k].items(), key=lambda t: t[1])], device=dev)
              for k in kinds}                                                 # theta row -> spec
-    # instances run in forwards by their spec's first position (an answer-position cut's rows run that position only,
-    # not the source cut's span: on Qwen3-8B the answer-position rows were ~2/3 of a step's tokens)
+    # instances run in forwards from their spec's first position, near starts merged (_passes: an answer-position cut's
+    # rows run that position only, not the source cut's span: on Qwen3-8B they were ~2/3 of a step's tokens)
     first_of = [min(jobs[q][1][j]["positions"]) for q, j, _ in inst]
     passes_ = []
-    for start in sorted(set(first_of)):
-        gs = [g for g in range(len(inst)) if first_of[g] == start]
+    for start, gs in _passes(first_of, T):
         loc = {g: n for n, g in enumerate(gs)}
         ent = {k: [(loc[g], p, cell[k][(inst[g][0], inst[g][1], p)]) for g in gs if k in jobs[inst[g][0]][1][inst[g][1]]["kinds"]
                    for p in jobs[inst[g][0]][1][inst[g][1]]["positions"]] for k in kinds}
@@ -259,6 +260,28 @@ def optimize_many(jobs: list, steps: int = STEPS, log=None, init: list | None = 
                 f"{f' (job {q})' if len(jobs) > 1 else ''}{f', {len(groups[q])} partners' if len(groups[q]) > 1 else ''}: "
                 f"{steps} steps, lost {a:.2f}, restored {b:.2f}, sum m {z:.1f}")
     return out
+
+
+def _passes(first_of: list, T: int) -> list:
+    """Instances (first positions first_of) in forwards [(start, instances)]: a forward runs its instances from its
+    lowest first position (an instance's positions before its own first are its base run's, recomputed), the partition
+    of the sorted first positions that costs least, MASK_MERGE tokens a forward plus each forward's rows x positions
+    (an exact partition of a sorted line: the starts of one length's questions are few)."""
+    starts = sorted(set(first_of))
+    rows = [2 * sum(1 for f in first_of if f == s) for s in starts]
+    best = [0.0] + [math.inf] * len(starts)          # best[i]: the first i starts in forwards
+    cut = [0] * (len(starts) + 1)
+    for i in range(1, len(starts) + 1):
+        for j in range(i):                          # a forward of starts j..i-1, from starts[j]
+            c = best[j] + MASK_MERGE + sum(rows[j:i]) * (T - starts[j])
+            if c < best[i]:
+                best[i], cut[i] = c, j
+    out, i = [], len(starts)
+    while i:
+        j = cut[i]
+        out.append((starts[j], [g for g, f in enumerate(first_of) if starts[j] <= f <= starts[i - 1]]))
+        i = j
+    return out[::-1]
 
 
 def ordered(spec: dict, theta: dict) -> tuple:

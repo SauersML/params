@@ -770,8 +770,8 @@ class Patcher:
                 k = self._base_kv["clean"][i][0][0, :, :pos + 1].to(q.device)                  # [KV, pos + 1, hd]
                 k = k.repeat_interleave(self.H // k.shape[0], 0).float()
                 w = torch.softmax((k @ q[0, :, 0].float()[:, :, None])[..., 0] * at.scaling, -1)  # [H, pos + 1]
-                rows.append(torch.nn.functional.pad(w, (0, self.T - pos - 1)).cpu())
-            self._att_from = (key, torch.stack(rows))
+                rows.append(torch.nn.functional.pad(w, (0, self.T - pos - 1)))
+            self._att_from = (key, torch.stack([r.to(rows[0].device) for r in rows]).cpu())   # (one copy, one wait)
         return self._att_from[1]
 
 

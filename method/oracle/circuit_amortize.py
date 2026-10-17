@@ -425,18 +425,37 @@ def amortized_steps(pt, pred: dict, log=None, steps: int = cm.STEPS, partners: l
     return out, stage
 
 
-def _combine(cut: str, pairs: list, scores: list, positions: list) -> torch.Tensor:
-    """A Mean cut's score over its pairs (pairs[k] scored scores[k] [L, P_k, W] on its own cut positions): each pair's
-    score placed at the cut's positions (a position before a pair's first change, where its patch moves nothing, at
-    that pair's lowest score), the mean."""
-    out = []
-    for p, sc in zip(pairs, scores):
-        own = cm.cuts_of(p)[cut]["positions"]
-        full = torch.full((sc.shape[0], len(positions), sc.shape[2]), float(sc.min()), device=sc.device)
+def _mean_features(cut: str, pairs: list, feats: list, positions: list) -> dict:
+    """A Mean cut's features (circuit_masks' multi-partner cuts: the shares' means over its pairs) at the cut's
+    positions, from each pair's own (pairs[k]'s feats[k] on its own cut positions): the slopes, |delta| and RelP the
+    means over the pairs (a share's slope in a unit's mask is linear in the share, so the mean share's slope is the
+    mean of the pairs' slopes; at a position before a pair's first change its patch moves nothing: 0 there), the
+    corrupted value the mean (the clean one there), the clean value, layer and position from the answer the pairs'
+    (one clean prompt), the position counted from the cut's first."""
+    zero = ("lost0", "lost5", "lost1", "rest0", "rest5", "rest1", "delta", "relp")
+    L, W = feats[0]["lost0"].shape[0], feats[0]["lost0"].shape[2]
+    dev = feats[0]["lost0"].device
+    out = {k: torch.zeros(L, len(positions), W, device=dev) for k in zero + ("corrupt",)}
+    clean = torch.zeros(L, len(positions), W, device=dev)
+    for p, f in zip(pairs, feats):
+        own = list(cm.cuts_of(p)[cut]["positions"])
         at = [positions.index(q) for q in own if q in positions]
-        full[:, at] = sc[:, [i for i, q in enumerate(own) if q in positions]]
-        out.append(full)
-    return torch.stack(out).mean(0)
+        src = [i for i, q in enumerate(own) if q in positions]
+        for k in zero:
+            out[k][:, at] += f[k][:, src]
+        clean[:, at] = f["clean"][:, src]
+        cor = torch.zeros(L, len(positions), W, device=dev)
+        cor[:, at] = f["corrupt"][:, src] - f["clean"][:, src]          # (the corrupted value less the clean one: 0
+        out["corrupt"] += cor                                           # where the pair changed nothing)
+    n = len(pairs)
+    out = {k: v / n for k, v in out.items()}
+    out["corrupt"] = clean + out["corrupt"]
+    out["clean"] = clean
+    pp = torch.tensor(positions, device=dev, dtype=torch.float32)[None, :, None].expand(L, len(positions), W)
+    out["layer"] = torch.arange(L, device=dev, dtype=torch.float32)[:, None, None].expand(L, len(positions), W) / (L - 1)
+    out["from_end"] = (pairs[0].T - 1) - pp
+    out["from_first"] = pp - min(positions)
+    return out
 
 
 def find_batch_amortized(pts: list, items: list, score, arm: str = "amortized", log=None, steps: int = cm.STEPS,
@@ -470,21 +489,24 @@ def find_batch_amortized(pts: list, items: list, score, arm: str = "amortized", 
     sec = {"setup": time.perf_counter() - t0}
     t1 = time.perf_counter()
     SECONDS.clear()
-    own = {}                                        # (each pair's own scores: id(Patcher) -> {cut: score})
-    for T, js in same_T.items():
-        group = [pts[j] for j in js] + [p for j in js for p in part[j]]
-
-        def consume(k, feats, group=group):
-            own[id(group[k])] = {n: score(f, n).detach() for n, f in feats.items()}
-        path_features(group, consume, relp=relp)
     pred = {}
-    for j in rec0s:
-        pred[j] = {n: ("head" if n == "movers" else "neuron", s) for n, s in own[id(pts[j])].items()}
-        ps = [pts[j]] + part[j]                     # (circuit_masks._before_steps: the source cut, or with ALLCUTS
-        for n in [n for n in pred[j] if n == "source" or cm.ALLCUTS] if part[j] else []:   # every cut, over every pair)
-            pos = (cm._source_positions(pts[j], min(p.first for p in ps)) if n == "source"
-                   else cm.cuts_of(pts[j])[n]["positions"])
-            pred[j][n] = (pred[j][n][0], _combine(n, ps, [own[id(p)][n] for p in ps], pos))
+    kind = lambda n: "head" if n == "movers" else "neuron"  # noqa: E731
+    for T, js in same_T.items():
+        alone = [j for j in js if not part[j]]
+        path_features([pts[j] for j in alone], lambda k, feats, alone=alone: pred.__setitem__(
+            alone[k], {n: (kind(n), score(f, n).detach()) for n, f in feats.items()}), relp=relp)
+        for j in [j for j in js if part[j]]:        # (a question with partners: its pairs' features together, its
+            ps, got = [pts[j]] + part[j], {}        # Mean cuts' features the pairs' means, _mean_features)
+            path_features(ps, lambda k, feats: got.__setitem__(k, feats), relp=relp)
+            pred[j] = {}
+            for n in got[0]:
+                if n == "source" or cm.ALLCUTS:     # (circuit_masks._before_steps: the source cut, or with ALLCUTS
+                    pos = (cm._source_positions(pts[j], min(p.first for p in ps)) if n == "source"   # every cut)
+                           else list(cm.cuts_of(pts[j])[n]["positions"]))
+                    pred[j][n] = (kind(n), score(_mean_features(n, ps, [got[k][n] for k in range(len(ps))], pos), n).detach())
+                else:
+                    pred[j][n] = (kind(n), score(got[0][n], n).detach())
+            del got
     sec["features"] = time.perf_counter() - t1
     sec.update(SECONDS)
     t1 = time.perf_counter()

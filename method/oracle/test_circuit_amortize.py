@@ -167,14 +167,22 @@ def test_partner_pairs_choose_the_source_cut_on_their_means(tiny):
         assert abs(lost - src["lost"]) < 1e-4 and abs(rest - src["restored"]) < 1e-4
 
 
-def test_combine_places_each_pairs_score_at_its_positions():
-    """_combine: a pair whose change starts later scores the earlier positions at its lowest score; the mean."""
+def test_mean_features_of_a_partner_cut():
+    """_mean_features: a share's slopes over pairs averaged (0 where a pair changed nothing: before its first change),
+    the corrupted value the clean one plus the mean change, the clean value the pairs' own."""
     class P:
         def __init__(self, first):
             self.T, self.first = 10, first
     a, b = P(4), P(6)                       # (source positions 4..8 and 6..8)
-    sa, sb = torch.arange(2 * 5 * 3, dtype=torch.float32).view(2, 5, 3), torch.ones(2, 3, 3) * 100
-    got = ca._combine("source", [a, b], [sa, sb], list(range(4, 9)))
-    assert got.shape == (2, 5, 3)
-    assert torch.allclose(got[:, :2], (sa[:, :2] + 100) / 2)        # (b's lowest score, 100, at positions 4 and 5)
-    assert torch.allclose(got[:, 2:], (sa[:, 2:] + sb) / 2)
+    torch.manual_seed(0)
+    fa = {k: torch.randn(2, 5, 3) for k in ca.FEATURES}
+    fb = {k: torch.randn(2, 3, 3) for k in ca.FEATURES}
+    fb["clean"] = fa["clean"][:, 2:].clone()                 # (one clean prompt)
+    got = ca._mean_features("source", [a, b], [fa, fb], list(range(4, 9)))
+    assert torch.allclose(got["lost0"][:, :2], fa["lost0"][:, :2] / 2)
+    assert torch.allclose(got["lost0"][:, 2:], (fa["lost0"][:, 2:] + fb["lost0"]) / 2)
+    assert torch.allclose(got["clean"], fa["clean"])
+    want = fa["clean"][:, 2:] + ((fa["corrupt"][:, 2:] - fa["clean"][:, 2:]) + (fb["corrupt"] - fb["clean"])) / 2
+    assert torch.allclose(got["corrupt"][:, 2:], want, atol=1e-6)
+    assert torch.allclose(got["corrupt"][:, :2], fa["clean"][:, :2] + (fa["corrupt"][:, :2] - fa["clean"][:, :2]) / 2, atol=1e-6)
+    assert float(got["from_first"][0, 0, 0]) == 0 and float(got["from_end"][0, 0, 0]) == 5

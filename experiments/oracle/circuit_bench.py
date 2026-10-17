@@ -3,8 +3,14 @@ that runs a finder version on the frozen dev set and reports S1 and Q1-Q5, the s
   finder  the version in FINDER_DIR (a copy of method/oracle at some commit: circuit_finder.py and what it imports) run
           through its own command line in a separate interpreter, `circuit_finder.py questions DEVSET RECORDS --split
           SPLIT --model MODEL`: every dev question's own pair (user against corrupt_user), one card, its records written
-  scoring this file's commit's neuron_scorecard (fixed across finder versions; lean: no random baseline, curves or
-          interactions), float32, the dev set's questions as its question file
+  scoring this file's commit's neuron_scorecard (fixed across finder versions; lean: no curves or interactions), float32
+          (--score-dtype bfloat16 where float32 does not fit the card: Qwen3-14B on 48 GB), the dev set's questions as
+          its question file
+  intervals and controls (the lead's 10-16 claims rule: matched controls, n and an interval with every number): every
+      rate with its count and its 95% Wilson interval, every median with its 95% bootstrap interval over questions
+      (seeded); Q1's matched control: each cut's units redrawn at random at the same layers and positions (the
+      scorecard's random sets, RANDOM_DRAWS a cut), the question passing when every cut's random set passes as Q1's
+      cuts must; Q2-Q5 are read beside it
   S1  seconds a question: the finder records' own "seconds" (find() from setup to record, its untimed warm-up first);
       median, mean, and questions a card-hour at one question at a time (3600 / mean)
   Q1  pass rate on the own pair: every cut of the circuit (the finder's source and mover cuts; an attribution or ADAG
@@ -35,6 +41,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import subprocess
 import sys
@@ -55,27 +62,57 @@ def load_devset(path: Path) -> dict:
     return {q["id"]: q for q in (d["questions"] if isinstance(d, dict) else d)}
 
 
+def wilson(k: int, n: int, z: float = 1.96) -> list | None:
+    """The 95% Wilson interval of a rate k / n."""
+    if not n:
+        return None
+    p, d = k / n, 1 + z * z / n
+    mid, half = (p + z * z / (2 * n)) / d, z * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / d
+    return [max(0.0, mid - half), min(1.0, mid + half)]
+
+
+def median_ci(xs, draws: int = 2000) -> list | None:
+    """The 95% percentile-bootstrap interval of a median, resampling questions (seeded: the same every time)."""
+    xs = np.array([x for x in xs if x is not None], float)
+    if len(xs) < 2:
+        return None
+    meds = np.median(xs[np.random.default_rng(0).integers(0, len(xs), (draws, len(xs)))], axis=1)
+    return [float(np.percentile(meds, 2.5)), float(np.percentile(meds, 97.5))]
+
+
+def med(xs):
+    xs = [x for x in xs if x is not None]
+    return float(np.median(xs)) if xs else None
+
+
 def metrics(recs: list[dict], finder_recs: dict, n_questions: int, robust: list[dict] | None = None) -> dict:
     """S1 and Q1-Q5 (module docstring) from the scorecard's records and the finder's."""
-    def med(xs):
-        xs = [x for x in xs if x is not None]
-        return float(np.median(xs)) if xs else None
 
     def share(x):
         return None if x is None else max(-1.0, min(1.0, x))
     secs = [r.get("seconds") for r in finder_recs.values() if r.get("seconds") is not None]
     out = {"questions": n_questions, "finder_records": len(finder_recs), "scored": len(recs)}
-    out["S1"] = {"median_s": med(secs), "mean_s": float(np.mean(secs)) if secs else None,
-                 "per_card_hour": 3600 / float(np.mean(secs)) if secs else None}
-    q1, q1u = [], []
+    out["S1"] = {"median_s": med(secs), "median_ci": median_ci(secs), "mean_s": float(np.mean(secs)) if secs else None,
+                 "per_card_hour": 3600 / float(np.mean(secs)) if secs else None, "n": len(secs)}
+    q1, q1u, ctrl, ctrl_lost, ctrl_rest = [], [], [], [], []
     for r in recs:
         pr = r.get("pair") or {}
         cuts = r.get("cuts") or {}
         q1.append(bool(pr.get("valid") and cuts and all(x["lost"] >= PASS and x["restored"] >= PASS for x in cuts.values())))
         q1u.append(bool(pr.get("valid") and (pr.get("lost") or 0) >= PASS and (pr.get("restored") or 0) >= PASS))
-    out["Q1"] = {"pass_rate": sum(q1) / max(n_questions, 1), "passes": sum(q1), "union_pass_rate": sum(q1u) / max(n_questions, 1),
-                 "finder_met_rate": sum(bool(r.get("met")) for r in finder_recs.values()) / max(n_questions, 1),
-                 "valid_pairs": sum(bool((r.get("pair") or {}).get("valid")) for r in recs)}
+        rc = [x.get("random") for x in cuts.values()]
+        if pr.get("valid") and rc and all(rc):  # the matched control: every cut's random set under Q1's rule
+            ctrl.append(all(x["lost"] >= PASS and x["restored"] >= PASS for x in rc))
+            ctrl_lost += [x["lost"] for x in rc]
+            ctrl_rest += [x["restored"] for x in rc]
+    nq = max(n_questions, 1)
+    out["Q1"] = {"pass_rate": sum(q1) / nq, "passes": sum(q1), "n": n_questions, "pass_ci": wilson(sum(q1), n_questions),
+                 "union_pass_rate": sum(q1u) / nq, "union_ci": wilson(sum(q1u), n_questions),
+                 "finder_met_rate": sum(bool(r.get("met")) for r in finder_recs.values()) / nq,
+                 "valid_pairs": sum(bool((r.get("pair") or {}).get("valid")) for r in recs),
+                 "control": {"pass_rate": sum(ctrl) / len(ctrl) if ctrl else None, "passes": sum(ctrl), "n": len(ctrl),
+                             "pass_ci": wilson(sum(ctrl), len(ctrl)), "cut_lost_median": med(ctrl_lost),
+                             "cut_restored_median": med(ctrl_rest)}}
     q2 = []
     for r in recs:
         d = r.get("draws") or {}
@@ -84,19 +121,24 @@ def metrics(recs: list[dict], finder_recs: dict, n_questions: int, robust: list[
             a, b = float(np.mean([share(x["share"]) for x in nh])), float(np.mean([share(x["share"]) for x in sh]))
             q2.append((a, b, a >= PASS and b >= PASS))
     out["Q2"] = {"pass_rate": sum(x[2] for x in q2) / len(q2) if q2 else None, "questions": len(q2),
-                 "lost_median": med([x[0] for x in q2]), "restored_median": med([x[1] for x in q2])}
+                 "pass_ci": wilson(sum(x[2] for x in q2), len(q2)),
+                 "lost_median": med([x[0] for x in q2]), "restored_median": med([x[1] for x in q2]),
+                 "lost_ci": median_ci([x[0] for x in q2]), "restored_ci": median_ci([x[1] for x in q2])}
     size = [r["size"]["poles"] + r["size"]["heads"] for r in recs if "size" in r]
     size_pass = [r["size"]["poles"] + r["size"]["heads"] for r, ok in zip(recs, q1) if ok]
-    out["Q3"] = {"median_units_at_pass": med(size_pass), "median_units": med(size),
+    out["Q3"] = {"median_units_at_pass": med(size_pass), "median_units_at_pass_ci": median_ci(size_pass), "n": len(size_pass),
+                 "median_units": med(size),
                  "median_poles_at_pass": med([r["size"]["poles"] for r, ok in zip(recs, q1) if ok]),
                  "median_heads_at_pass": med([r["size"]["heads"] for r, ok in zip(recs, q1) if ok])}
     st = [float(np.mean([x["share"] for x in r["stability"]])) for r in recs if r.get("stability")]
     tr = [(float(np.mean([share(x["lost"]) for x in r["transfer"]])), float(np.mean([share(x["restored"]) for x in r["transfer"]])))
           for r in recs if r.get("transfer")]
-    out["Q4"] = {"transfer_pass_rate": sum(a >= PASS and b >= PASS for a, b in tr) / len(tr) if tr else None, "transfer_questions": len(tr),
+    tp = sum(a >= PASS and b >= PASS for a, b in tr)
+    out["Q4"] = {"transfer_pass_rate": tp / len(tr) if tr else None, "transfer_questions": len(tr), "transfer_ci": wilson(tp, len(tr)),
                  "transfer_lost_median": med([a for a, _ in tr]), "transfer_restored_median": med([b for _, b in tr]),
-                 "overlap_median": med(st), "overlap_share_at_least": sum(x >= Q4_AT for x in st) / len(st) if st else None,
-                 "overlap_questions": len(st)}
+                 "transfer_lost_ci": median_ci([a for a, _ in tr]), "transfer_restored_ci": median_ci([b for _, b in tr]),
+                 "overlap_median": med(st), "overlap_ci": median_ci(st),
+                 "overlap_share_at_least": sum(x >= Q4_AT for x in st) / len(st) if st else None, "overlap_questions": len(st)}
     out["Q5"] = robust_metrics(robust or [])
     return out
 
@@ -122,43 +164,71 @@ def robust_metrics(rob: list[dict]) -> dict:
             rest.append(m[1])
         if oks:
             allp.append(all(oks))
-    med = lambda xs: float(np.median([x for x in xs if x is not None])) if any(x is not None for x in xs) else None  # noqa: E731
-    return {"questions": len(allp), "pass_rate": sum(allp) / len(allp) if allp else None, "per_cut": per,
-            "lost_median": med(lost), "restored_median": med(rest)}
+    return {"questions": len(allp), "pass_rate": sum(allp) / len(allp) if allp else None, "pass_ci": wilson(sum(allp), len(allp)),
+            "per_cut": per, "lost_median": med(lost), "restored_median": med(rest)}
+
+
+def fmt(v, ci=None, k=None, n=None) -> str:
+    """A number with its interval and count: 0.620 [0.55, 0.69] 124/200."""
+    if v is None:
+        return "-"
+    out = f"{v:.3f}" if isinstance(v, float) else str(v)
+    if ci:
+        out += f" [{ci[0]:.2f}, {ci[1]:.2f}]"
+    if n is not None:
+        out += f" {k}/{n}" if k is not None else f" n={n}"
+    return out
 
 
 def table(benches: dict) -> str:
+    def g(b, q):
+        return b["metrics"][q]
+
+    def two(m, a, b, ca=None, cb=None):
+        return f"{fmt(m.get(a), m.get(ca) if ca else None)} / {fmt(m.get(b), m.get(cb) if cb else None)}"
+
+    def q1(b):
+        m = g(b, "Q1")
+        return fmt(m["pass_rate"], m.get("pass_ci"), m["passes"], m.get("n", b["metrics"]["questions"]))
+
+    def ctrl(b):
+        c = g(b, "Q1").get("control") or {}
+        return fmt(c.get("pass_rate"), c.get("pass_ci"), c.get("passes"), c.get("n")) if c.get("n") else "-"
+
+    def rate(q, key, ci, nkey):
+        def get(b):
+            m = g(b, q)
+            v, n = m.get(key), m.get(nkey)
+            return fmt(v, m.get(ci), round(v * n) if v is not None and n else None, n)
+        return get
     rows = [("card", lambda b: b.get("gpu")), ("finder version", lambda b: b.get("finder_rev")),
             ("questions / scored", lambda b: f"{b['metrics']['questions']} / {b['metrics']['scored']}"),
-            ("S1 median s a question", lambda b: b["metrics"]["S1"]["median_s"]),
-            ("S1 questions a card-hour", lambda b: b["metrics"]["S1"]["per_card_hour"]),
-            ("Q1 own-pair pass rate", lambda b: b["metrics"]["Q1"]["pass_rate"]),
-            ("   the finder's own met rate", lambda b: b["metrics"]["Q1"]["finder_met_rate"]),
-            ("   all cuts patched together", lambda b: b["metrics"]["Q1"].get("union_pass_rate")),
-            ("Q2 unseen-pair pass rate", lambda b: b["metrics"]["Q2"]["pass_rate"]),
-            ("   median lost / restored", lambda b: "{} / {}".format(*(f"{v:.3f}" if v is not None else "-" for v in
-                                                                         (b["metrics"]["Q2"]["lost_median"], b["metrics"]["Q2"]["restored_median"])))),
-            ("Q3 median units at pass", lambda b: b["metrics"]["Q3"]["median_units_at_pass"]),
-            ("   poles / heads at pass", lambda b: f"{b['metrics']['Q3']['median_poles_at_pass']} / {b['metrics']['Q3']['median_heads_at_pass']}"),
-            ("Q4 transfer pass rate", lambda b: b["metrics"]["Q4"].get("transfer_pass_rate")),
-            ("   median lost / restored", lambda b: "{} / {}".format(*(f"{v:.3f}" if v is not None else "-" for v in
-                                                                         (b["metrics"]["Q4"].get("transfer_lost_median"),
-                                                                          b["metrics"]["Q4"].get("transfer_restored_median"))))),
-            ("   overlap median (records)", lambda b: b["metrics"]["Q4"].get("overlap_median")),
-            ("Q5 resampled pass rate", lambda b: b["metrics"]["Q5"].get("pass_rate")),
+            ("S1 median s a question", lambda b: fmt(g(b, "S1")["median_s"], g(b, "S1").get("median_ci"), None, g(b, "S1").get("n"))),
+            ("S1 questions a card-hour", lambda b: fmt(g(b, "S1")["per_card_hour"])),
+            ("Q1 own-pair pass rate (per cut)", q1),
+            ("   random same-size cuts (control)", ctrl),
+            ("   random cut lost / restored", lambda b: two(g(b, "Q1").get("control") or {}, "cut_lost_median", "cut_restored_median")),
+            ("   the finder's own met rate", lambda b: fmt(g(b, "Q1")["finder_met_rate"])),
+            ("   all cuts patched together", lambda b: fmt(g(b, "Q1").get("union_pass_rate"), g(b, "Q1").get("union_ci"))),
+            ("Q2 unseen-pair pass rate", rate("Q2", "pass_rate", "pass_ci", "questions")),
+            ("   median lost / restored", lambda b: two(g(b, "Q2"), "lost_median", "restored_median", "lost_ci", "restored_ci")),
+            ("Q3 median units at pass", lambda b: fmt(g(b, "Q3")["median_units_at_pass"], g(b, "Q3").get("median_units_at_pass_ci"),
+                                                       None, g(b, "Q3").get("n"))),
+            ("   poles / heads at pass", lambda b: two(g(b, "Q3"), "median_poles_at_pass", "median_heads_at_pass")),
+            ("Q4 transfer pass rate", rate("Q4", "transfer_pass_rate", "transfer_ci", "transfer_questions")),
+            ("   median lost / restored", lambda b: two(g(b, "Q4"), "transfer_lost_median", "transfer_restored_median",
+                                                     "transfer_lost_ci", "transfer_restored_ci")),
+            ("   overlap median (records)", lambda b: fmt(g(b, "Q4").get("overlap_median"), g(b, "Q4").get("overlap_ci"), None,
+                                                        g(b, "Q4").get("overlap_questions") or None)),
+            ("Q5 resampled pass rate", rate("Q5", "pass_rate", "pass_ci", "questions")),
             ("   per cut resampled/standard", lambda b: " ".join(f"{k}:{v['resampled']}/{v['standard']}/{v['cuts']}" for k, v in
-                                                                 (b["metrics"]["Q5"].get("per_cut") or {}).items()) or "-"),
-            ("   median lost / restored", lambda b: "{} / {}".format(*(f"{v:.3f}" if v is not None else "-" for v in
-                                                                         (b["metrics"]["Q5"].get("lost_median"),
-                                                                          b["metrics"]["Q5"].get("restored_median")))))]
-    w = {n: max(16, len(n) + 2) for n in benches}
-    lines = [f"{'':32}" + "".join(f"{n:>{w[n]}}" for n in benches)]
-    for label, get in rows:
-        vals = []
-        for n, b in benches.items():
-            v = get(b)
-            vals.append(f"{(f'{v:.3f}' if isinstance(v, float) else str(v)) if v is not None else '-':>{w[n]}}")
-        lines.append(f"{label:32}" + "".join(vals))
+                                                                 (g(b, "Q5").get("per_cut") or {}).items()) or "-"),
+            ("   median lost / restored", lambda b: two(g(b, "Q5"), "lost_median", "restored_median"))]
+    cells = {n: [str(get(b)) if get(b) is not None else "-" for _, get in rows] for n, b in benches.items()}
+    w = {n: max(len(n), *(len(x) for x in cells[n])) + 3 for n in benches}
+    lines = [f"{'':36}" + "".join(f"{n:>{w[n]}}" for n in benches)]
+    for i, (label, _) in enumerate(rows):
+        lines.append(f"{label:36}" + "".join(f"{cells[n][i]:>{w[n]}}" for n in benches))
     return "\n".join(lines)
 
 
@@ -181,13 +251,14 @@ def run(a) -> None:
         rc = subprocess.run(cmd, env=env, stdout=log, stderr=subprocess.STDOUT, cwd=str(a.finder_dir)).returncode
     finder_seconds = time.time() - t0
     print(f"finder exit {rc} in {finder_seconds:.0f} s", flush=True)
-    bench = score_records(recs_dir, score_dir, dev, ids, a.model, [a.devset] + a.pool)
+    bench = score_records(recs_dir, score_dir, dev, ids, a.model, [a.devset] + a.pool, a.score_dtype)
     bench.update(devset=str(a.devset), finder_dir=str(a.finder_dir), finder_rev=a.rev, finder_exit=rc, finder_wall_seconds=finder_seconds)
     (a.out / "bench.json").write_text(json.dumps(bench, indent=1))
     print(table({a.out.name: bench}))
 
 
-def score_records(recs_dir: Path, score_dir: Path, dev: dict, ids: list, model: str, pool: list | None = None) -> dict:
+def score_records(recs_dir: Path, score_dir: Path, dev: dict, ids: list, model: str, pool: list | None = None,
+                  dtype: str = "float32") -> dict:
     """The scorecard (lean) on every record in recs_dir whose id is a dev question, and S1 and Q1-Q5 over ids."""
     import torch
     from transformers import AutoTokenizer
@@ -202,7 +273,7 @@ def score_records(recs_dir: Path, score_dir: Path, dev: dict, ids: list, model: 
             files.append(f)
     score_dir.mkdir(parents=True, exist_ok=True)
     tok = AutoTokenizer.from_pretrained(model)
-    m = ns.Model(ns.load_model(model, None, "cuda" if torch.cuda.is_available() else "cpu", torch.float32))
+    m = ns.Model(ns.load_model(model, None, "cuda" if torch.cuda.is_available() else "cpu", getattr(torch, dtype)))
     for f in files:
         c = ns.read_circuit(f)
         if (score_dir / f"{c['name']}.json").exists() or not c["neurons"] and not c["heads"]:
@@ -236,7 +307,7 @@ def score_records(recs_dir: Path, score_dir: Path, dev: dict, ids: list, model: 
             out = cr.check(pt, tok, {**r, "gap": r.get("gap", 0.0)}, dev[i], qpool)
             path.write_text(json.dumps(out))
             robust.append(out)
-    return {"model": model, "records": str(recs_dir), "gpu": torch.cuda.get_device_name() if torch.cuda.is_available() else "cpu",
+    return {"model": model, "records": str(recs_dir), "score_dtype": dtype, "gpu": torch.cuda.get_device_name() if torch.cuda.is_available() else "cpu",
             "metrics": metrics(recs, finder_recs, len(ids), robust)}
 
 
@@ -256,7 +327,7 @@ def score_only(a) -> None:
     dev = load_devset(a.devset)
     refuse_sealed(dev, a.sealed)
     ids = sorted({qid_of(json.loads(f.read_text())) for f in a.records.glob("*.json")} & set(dev))
-    bench = score_records(a.records, a.out / "score", dev, ids, a.model, [a.devset] + a.pool)
+    bench = score_records(a.records, a.out / "score", dev, ids, a.model, [a.devset] + a.pool, a.score_dtype)
     bench.update(devset=str(a.devset), finder_rev=a.rev)
     a.out.mkdir(parents=True, exist_ok=True)
     (a.out / "bench.json").write_text(json.dumps(bench, indent=1))
@@ -283,6 +354,8 @@ def main():
     s.add_argument("--rev", default=None)
     for x in (r, s):
         x.add_argument("--sealed", action="store_true", help="allow the sealed test set (split \"test\")")
+        x.add_argument("--score-dtype", default="float32", choices=("float32", "bfloat16"),
+                       help="the scorecard's dtype (bfloat16 where float32 does not fit the card)")
         x.add_argument("--pool", type=Path, nargs="*", default=[p for p in (POOL,) if p.exists()],
                        help="question files for Q5's resampled prompts beside the dev set")
     t = sp.add_parser("table")

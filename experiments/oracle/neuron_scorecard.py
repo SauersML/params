@@ -54,7 +54,7 @@ the 70% points (k70) and nothing depends on them.
 A fair baseline beside each circuit (random): RANDOM_DRAWS circuits of the same size at the same positions, each neuron
 pole a uniformly drawn neuron of the same layer's at that position, each head a uniformly drawn head of the same layer's
 there; their noising and denoising shares on the circuit's own pair, the mean (no floor: what the finder's choice adds
-over chance at that size).
+over chance at that size); the same per cut (each cut's units redrawn so, the cut's matched control).
 A pair whose clean-corrupted gap is under MIN_GAP bits, or whose two runs give the same answer, is no draw. Noise-aware
 floors: a family scored over draws passes at its floor less min(PAIRED_SE x its bootstrap standard error over the draws,
 CAP of the family); the own pair's families are one run each and get no allowance. A family left unscored (no valid
@@ -352,8 +352,8 @@ def map_units(c: dict, clean: list[int], corr: list[int], fi: list[int], fc: lis
 
 
 def score(m: Model, tok, c: dict, qs: dict, log=print, lean: bool = False) -> dict:
-    """A circuit's scorecard record (module docstring); lean: no random baseline, curves or interactions (circuit_bench's
-    Q1-Q5 need none of them)."""
+    """A circuit's scorecard record (module docstring); lean: no curves or interactions (circuit_bench's Q1-Q5 need
+    neither)."""
     t0 = time.perf_counter()
     q = qs.get(c.get("id")) or qs.get(str(c.get("id")).split("/vs/")[0], {})  # (a family pair record: "question/vs/partner")
     chat = lambda u: circuit_questions.chat(tok, u)  # noqa: E731
@@ -395,14 +395,23 @@ def score(m: Model, tok, c: dict, qs: dict, log=print, lean: bool = False) -> di
             rec["cuts"][name] = {"lost": (cc - contrast(l4[0], sets)) / gap, "restored": (contrast(l4[1], sets) - cx) / gap,
                                  "size": len(sub["neurons"]) + len(sub["heads"])}
     g = torch.Generator().manual_seed(zlib.crc32(c["name"].encode()))  # the fair baseline: same layers and positions, random units
-    rand = []
-    for _ in range(RANDOM_DRAWS if gap > 0 and not lean else 0):
-        rc = {"neurons": [(L, p, int(torch.randint(m.D, (1,), generator=g)), 0) for L, p, _, _ in c["neurons"]],
-              "heads": [(L, p, int(torch.randint(m.H, (1,), generator=g))) for L, p, _ in c["heads"]]}
-        l3 = m.logp([(clean, patches(rc, cap_x)), (corr, patches(rc, cap_c))])
-        rand.append({"lost": (cc - contrast(l3[0], sets)) / gap, "restored": (contrast(l3[1], sets) - cx) / gap})
+
+    def redraw(sub):
+        return {"neurons": [(L, p, int(torch.randint(m.D, (1,), generator=g)), 0) for L, p, _, _ in sub["neurons"]],
+                "heads": [(L, p, int(torch.randint(m.H, (1,), generator=g))) for L, p, _ in sub["heads"]]}
+    rand, rcut = [], {name: [] for name in rec["cuts"]}
+    for _ in range(RANDOM_DRAWS if gap > 0 else 0):  # the whole circuit's and each cut's random set, one batch
+        rs = [redraw(c)] + [redraw(parts[name]) for name in rcut]
+        l3 = m.logp([x for rc in rs for x in ((clean, patches(rc, cap_x)), (corr, patches(rc, cap_c)))])
+        sh = [{"lost": (cc - contrast(l3[2 * i], sets)) / gap, "restored": (contrast(l3[2 * i + 1], sets) - cx) / gap} for i in range(len(rs))]
+        rand.append(sh[0])
+        for name, x in zip(rcut, sh[1:]):
+            rcut[name].append(x)
     rec["random"] = {"lost": float(np.mean([x["lost"] for x in rand])) if rand else None,
                      "restored": float(np.mean([x["restored"] for x in rand])) if rand else None, "draws": rand}
+    for name, xs in rcut.items():
+        if xs:
+            rec["cuts"][name]["random"] = {"lost": float(np.mean([x["lost"] for x in xs])), "restored": float(np.mean([x["restored"] for x in xs]))}
     # each unit's noising effect alone (the hubs: stability)
     singles = [("n", u) for u in c["neurons"]] + [("h", u) for u in c["heads"]]
 

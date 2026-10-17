@@ -1031,14 +1031,17 @@ _GQA = "enable_gqa" in (torch.nn.functional.scaled_dot_product_attention.__doc__
 
 
 def _lean(layer, h: torch.Tensor, emb: tuple, k0: torch.Tensor, v0: torch.Tensor, mask: torch.Tensor, hd: int) -> torch.Tensor:
-    """One Qwen3 decoder layer (HF's math, its modules called directly) on h [n, S, d], the keys and values before S
-    given [n, KV, s, hd] (LEAN): input norm, q/k/v with their norms and rotary, attention over k0 + k, o_proj, the MLP."""
+    """One Qwen3 or Llama decoder layer (HF's math, its modules called directly) on h [n, S, d], the keys and values
+    before S given [n, KV, s, hd] (LEAN): input norm, q/k/v with their norms (Qwen3's; Llama has none) and rotary,
+    attention over k0 + k, o_proj, the MLP."""
     from transformers.models.qwen3.modeling_qwen3 import apply_rotary_pos_emb, repeat_kv
     at = layer.self_attn
     n, S, _ = h.shape
     x = layer.input_layernorm(h)
-    q = at.q_norm(at.q_proj(x).view(n, S, -1, hd)).transpose(1, 2)
-    k = at.k_norm(at.k_proj(x).view(n, S, -1, hd)).transpose(1, 2)
+    q, k = at.q_proj(x).view(n, S, -1, hd), at.k_proj(x).view(n, S, -1, hd)
+    if hasattr(at, "q_norm"):
+        q, k = at.q_norm(q), at.k_norm(k)
+    q, k = q.transpose(1, 2), k.transpose(1, 2)
     v = at.v_proj(x).view(n, S, -1, hd).transpose(1, 2)
     q, k = apply_rotary_pos_emb(q, k, emb[0], emb[1])
     k, v = torch.cat([k0, k], 2), torch.cat([v0, v], 2)

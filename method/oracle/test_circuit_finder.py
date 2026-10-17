@@ -466,6 +466,26 @@ def test_lean_layers_equal_the_models(tiny, monkeypatch):
         assert abs(a[0] - b[0]) < 1e-5 and abs(a[1] - b[1]) < 1e-5
 
 
+def test_lean_layers_equal_the_models_llama(monkeypatch):
+    """LEAN on a Llama layer (no q/k norms) gives the model's own layer's shares."""
+    torch.manual_seed(0)
+    cfg = transformers.LlamaConfig(vocab_size=64, hidden_size=32, intermediate_size=48, num_hidden_layers=2, num_attention_heads=4,
+                                   num_key_value_heads=2, head_dim=8, max_position_embeddings=64, initializer_range=0.3)
+    pt = cf.Patcher(transformers.LlamaForCausalLM(cfg).eval().requires_grad_(False), None, rows=8)
+    clean = torch.randint(0, 64, (10,), generator=torch.Generator().manual_seed(1)).tolist()
+    corrupt = list(clean)
+    corrupt[4] = (clean[4] + 7) % 64
+    pt.setup(clean, corrupt)
+    T, f = pt.T, pt.first
+    sets = [[("neuron", 1, f + 1, (0, 7))], [("res", 0, f + 1)], [("head", 0, 2, f + 1)], [("res", 1, f + 2), ("head", 1, (1, 3), T - 1)]]
+    got = {}
+    for lean in (True, False):
+        monkeypatch.setattr(cf, "LEAN", lean)
+        got[lean] = pt.both(sets)
+    for a, b in zip(got[True], got[False]):
+        assert abs(a[0] - b[0]) < 1e-5 and abs(a[1] - b[1]) < 1e-5
+
+
 def test_group_prefixes_equal_alone(tiny):
     """Members' prefix calls merged in a Group's batches give each member's prefixes() alone."""
     pt, clean, corrupt = tiny

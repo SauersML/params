@@ -2359,6 +2359,9 @@ def dump(a) -> None:
     an episode: id, organism, budget, arm, agent, the whole conversation (messages: the system prompt with the tool docs
     and playbook, the question, every assistant turn with its tool calls, every tool result), the parsed answer, the
     reward by term (re-graded here), verified (exact: every key group, or oracledata's reward >= 0.8), passes, usd."""
+    from transformers import AutoTokenizer
+
+    tok8 = AutoTokenizer.from_pretrained("Qwen/Qwen3-8B")  # (textoracle's student: episodes over 32k tokens need cutting)
     out = []
     for f in a.runs:
         side = f.with_name(f.stem + "_items.jsonl")
@@ -2372,15 +2375,17 @@ def dump(a) -> None:
             gs = grade(it, r["answer"], None)
             ok = {g["q"]: g for g in gs}
             verified = bool(ok.get("hidden", {}).get("ok") or ok.get("disc1", {}).get("ok"))
-            out.append({"id": r["id"], "organism": it.get("organism") or it.get("adapter"), "budget": r["budget"], "arm": a.arm,
-                        "agent": a.agent, "messages": r["messages"], "answer": r["answer"],
-                        "reward": {g["q"]: g.get("reward", float(g["ok"])) for g in gs}, "verified": verified,
-                        "passes": r["passes"], "usd": r["usd"]})
+            n_tok = len(tok8.apply_chat_template(r["messages"], tokenize=True, return_dict=False))
+            out.append({"id": r["id"], "organism": it.get("organism") or it.get("adapter"), "split": it.get("split"),
+                        "budget": r["budget"], "arm": a.arm, "agent": a.agent, "harness_rev": a.rev, "messages": r["messages"],
+                        "answer": r["answer"], "reward": {g["q"]: g.get("reward", float(g["ok"])) for g in gs},
+                        "verified": verified, "tokens": n_tok, "passes": r["passes"], "usd": r["usd"]})
     a.out.parent.mkdir(parents=True, exist_ok=True)
     with a.out.open("a") as fh:
         for x in out:
             fh.write(json.dumps(x) + "\n")
-    print(f"{len(out)} trajectories ({sum(x['verified'] for x in out)} verified) appended to {a.out}")
+    print(f"{len(out)} trajectories ({sum(x['verified'] for x in out)} verified, {sum(x['tokens'] > 32000 for x in out)} over "
+          f"32k tokens) appended to {a.out}")
 
 
 # ---- the references on the same items (h2h's answerers)
@@ -2642,6 +2647,7 @@ def main():
     du.add_argument("--out", type=Path, required=True)
     du.add_argument("--arm", required=True, help="the arm's name (A black-box, B white-box, C circuits)")
     du.add_argument("--agent", default=AGENT)
+    du.add_argument("--rev", required=True, help="the agent.py commit the runs used (the student runs against the same harness)")
     eb = sub.add_parser("e2base")
     eb.add_argument("--server", required=True)
     eb.add_argument("--out", type=Path, required=True)

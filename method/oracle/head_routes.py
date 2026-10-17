@@ -12,7 +12,8 @@ Runner.run(ids, sets): one prompt, a batch of sets (one forward each, batched), 
   dv      (layer, head, pos, delta)    added to the head's value at pos: a writer cut from that head's value alone
                                        (value_after gives the delta);
   read    (layer, pos, index, delta)   the neuron recomputed from its MLP input (the stream after attention) less delta:
-                                       a head's output, say, cut from that neuron alone.
+                                       a head's output, say, cut from that neuron alone;
+  mlp_in  (layer, pos, delta)          every neuron of the layer at pos recomputed so (delta cut from that MLP).
 It returns the contrast of each set (log2 p(answer) - log2 of the alternatives' summed p at the last position) and with
 capture the first set's states. Each module runs in the model's dtype on its card, everything between in float32.
 
@@ -179,6 +180,8 @@ class Runner:
                     st[key].append(val.detach().clone())
             x = x + f(at.o_proj, z.reshape(K, Ts, H * hd))
             hm = self._acts(layer, x)
+            for b, p, delta in E.get("mlp_in", {}).get(L, []):
+                hm[b, p - s0] = self._acts(layer, (x[b, p - s0] - delta.to(d))[None])[0]
             for b, p, j, delta in E.get("read", {}).get(L, []):
                 hm[b, p - s0, j] = self._acts(layer, (x[b, p - s0] - delta.to(d))[None], [j])[0, 0]
             for b, p, j, val in E.get("neuron", {}).get(L, []):

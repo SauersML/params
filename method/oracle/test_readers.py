@@ -50,17 +50,20 @@ def test_estimates_are_the_full_runs_changes(tiny):
     gen = torch.Generator().manual_seed(2)
     g = {"h": [torch.randn(st["h"][L].shape, generator=gen) for L in range(rn.L)],
          "z": [torch.randn(st["z"][L].shape, generator=gen) for L in range(rn.L)]}
-    cands, store = readers._candidates(rn, st, g, units, W)
+    cands, grp, store = readers._candidates(rn, st, g, units, W)
     for i, u in enumerate(units):
         kinds = {(r[1], r[4]) for r in cands[i]}
         assert kinds == {("neuron", "mlp"), ("head", "key_value"), ("head", "query")}
-        for r in [r for kind in kinds for r in [r for r in cands[i] if (r[1], r[4]) == kind][:4]]:
+        assert {(r[1], r[4]) for r in grp[i]} == {("mlp", "mlp"), ("heads", "key_value"), ("heads", "query")}
+        picks = [r for kind in kinds for r in [r for r in cands[i] if (r[1], r[4]) == kind][:4]]
+        for r in picks + grp[i][:6]:
             s2 = rn.run(ids, [readers._edit(r, store, W)], capture=True)["states"]
             L = r[2]
-            if r[1] == "neuron":
-                want = float(((s2["h"][L] - st["h"][L]) * g["h"][L]).sum())
+            if r[1] in ("neuron", "mlp"):
+                want = -float(((s2["h"][L] - st["h"][L]) * g["h"][L]).sum())
             else:
-                want = float(((s2["z"][L] - st["z"][L])[:, r[3]] * g["z"][L][:, r[3]]).sum())
+                hs = [r[3]] if r[1] == "head" else list(range(rn.H))
+                want = -float(((s2["z"][L] - st["z"][L])[:, hs] * g["z"][L][:, hs]).sum())
             assert r[0] == pytest.approx(want, rel=1e-3, abs=1e-5), r[1:5]
 
 
@@ -72,7 +75,8 @@ def test_readers_record(tiny):
     st = rn.run(ids, [{}], capture=True)["states"]
     assert readers._contrast(rn, readers._final(rn, st, 9)[None])[0] == pytest.approx(c, abs=1e-4)
     for o, u in zip(out, units):
-        assert len(o["readers"]) == 4 and set(o) >= {"total", "together", "direct", "first_order_covered"}
+        assert len(o["readers"]) == 4 and set(o) >= {"total", "together", "direct", "first_order_covered", "groups"}
+        assert len(o["groups"]) == (4 if u != ("neuron", 1, 9, 8) else 3)  # (layer 1's neuron: layer 2's MLP and heads)
         assert (o["direct"] is None) == (u[2 if u[0] == "neuron" else 3] != 9)
         r = o["readers"][0]
         assert r["share"] == pytest.approx(r["bits"] / (c - cb), rel=1e-6) and "in_circuit" in r

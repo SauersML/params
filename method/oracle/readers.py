@@ -13,9 +13,11 @@ An edge's effect is measured in a full run of the model with w taken out of that
 every other reader still reads it): the contrast's change in bits and, in a patching pair, its share of the gap lost;
 positive when the edge carries the unit's effect toward the answer, negative when it works against it. Candidates are
 ordered by a first-order estimate (the reader's exact local change times the contrast's gradient at the reader's output:
-one backward pass a prompt; ordering only), the first TOP of them measured; beside them the unit itself patched (or
-zeroed) alone ("total"), all of its measured readers cut at once ("together") and the share of the first-order
-estimates' absolute sum the measured readers cover.
+one backward pass a prompt; ordering only; "first_order" in bits lost like the measured effect), the first TOP of them
+measured; and reader groups, a layer's whole MLP at the unit's position or all its heads through one input ("mlp",
+"key_value", "query"), ordered by their summed estimates, the first GROUPS measured (a unit read by many readers, each
+small, shows there); beside them the unit itself patched (or zeroed) alone ("total"), all of its measured single
+readers cut at once ("together") and the share of the first-order estimates' absolute sum those readers cover.
 
   readers(rn, ids, units, corrupt=None)   head_routes.Runner rn with its answer and alternatives set
 """
@@ -28,6 +30,7 @@ import torch
 from head_routes import rotate_half, weight
 
 TOP = 8  # readers measured by path patching a unit (the largest first-order estimates)
+GROUPS = 4  # reader groups (a layer's MLP or heads through one input) measured a unit
 
 
 def _norm(x: torch.Tensor, mod) -> torch.Tensor:
@@ -71,7 +74,7 @@ def _candidates(rn, st: dict, g: dict, units: list, W: torch.Tensor) -> tuple[li
     and the cut edits' tensors by (position, layer) for _edit."""
     H, KV, hd = rn.H, rn.KV, rn.hd
     gs = H // KV
-    out, store = [[] for _ in units], {}
+    out, groups, store = [[] for _ in units], [[] for _ in units], {}
     for p in sorted({u[-1] if u[0] == "head" else u[2] for u in units}):
         ix = [i for i, u in enumerate(units) if (u[-1] if u[0] == "head" else u[2]) == p]
         lay = torch.tensor([units[i][1] for i in ix])
@@ -83,11 +86,12 @@ def _candidates(rn, st: dict, g: dict, units: list, W: torch.Tensor) -> tuple[li
             if bool(mlp.any()):
                 m = mlp.nonzero().flatten().tolist()
                 dh = rn._acts(layer, st["mid"][L][p].to(d)[None] - Wp[m]) - st["h"][L][p].to(d)[None]  # [n, d_mlp]
-                est = dh * g["h"][L][p].to(d)[None]
+                est = -dh * g["h"][L][p].to(d)[None]  # (bits lost: the contrast's first-order fall)
                 top = est.abs().topk(min(4 * TOP, est.shape[1]), dim=-1).indices
-                vals, top = est.gather(1, top).cpu().tolist(), top.cpu().tolist()
+                vals, top, tot = est.gather(1, top).cpu().tolist(), top.cpu().tolist(), est.sum(-1).cpu().tolist()
                 for a, i in enumerate(m):
                     out[ix[i]] += [(e, "neuron", L, j, "mlp", p, ix[i], None) for e, j in zip(vals[a], top[a])]
+                    groups[ix[i]].append((tot[a], "mlp", L, None, "mlp", p, ix[i], None))
             att = lay < L
             if not bool(att.any()):
                 continue
@@ -111,20 +115,23 @@ def _candidates(rn, st: dict, g: dict, units: list, W: torch.Tensor) -> tuple[li
             vp = st["v"][L][:, p].to(d).repeat_interleave(gs, 0)  # [H, hd]
             dz = (c[..., None] * (z[None] - ap[None, ..., None] * vp[None, :, None]) + (ap[None] * e * c)[..., None]
                   * (vp[None] + dv)[:, :, None] - z[None])  # [n, H, Tq, hd]
-            est_kv = (dz * g["z"][L][p:].to(d).transpose(0, 1)[None]).sum((-1, -2))  # [n, H]
+            est_kv = -(dz * g["z"][L][p:].to(d).transpose(0, 1)[None]).sum((-1, -2))  # [n, H]
             q = _norm((hn @ weight(at.q_proj).float().T).view(len(m), H, hd), at.q_norm)
             q = q * cs + rotate_half(q) * sn
             K = st["k"][L][:, :p + 1].to(d).repeat_interleave(gs, 0)  # [H, p + 1, hd]
             V = st["v"][L][:, :p + 1].to(d).repeat_interleave(gs, 0)
             a = (torch.einsum("nhc,htc->nht", q, K) * at.scaling).softmax(-1)
             dzq = torch.einsum("nht,htc->nhc", a, V) - st["z"][L][p].to(d)[None]  # [n, H, hd]
-            est_q = (dzq * g["z"][L][p].to(d)[None]).sum(-1)
+            est_q = -(dzq * g["z"][L][p].to(d)[None]).sum(-1)
             store[(p, L)] = {"dk": dk, "dv": dv, "dq": q - st["q"][L][:, p].to(d)[None]}
             kv, qq = est_kv.cpu().tolist(), est_q.cpu().tolist()
             for a_, i in enumerate(m):
                 out[ix[i]] += [(kv[a_][h], "head", L, h, "key_value", p, ix[i], a_) for h in range(H)]
                 out[ix[i]] += [(qq[a_][h], "head", L, h, "query", p, ix[i], a_) for h in range(H)]
-    return [sorted(c, key=lambda r: -abs(r[0])) for c in out], store
+                groups[ix[i]] += [(sum(kv[a_]), "heads", L, None, "key_value", p, ix[i], a_),
+                                  (sum(qq[a_]), "heads", L, None, "query", p, ix[i], a_)]
+    order = lambda c: sorted(c, key=lambda r: -abs(r[0]))  # noqa: E731
+    return [order(c) for c in out], [order(c) for c in groups], store
 
 
 def _edit(r: tuple, store: dict, W: torch.Tensor) -> dict:
@@ -132,14 +139,17 @@ def _edit(r: tuple, store: dict, W: torch.Tensor) -> dict:
     _, kind, L, x, via, p, i, a = r
     if kind == "neuron":
         return {"read": [(L, p, x, W[i])]}
+    if kind == "mlp":
+        return {"mlp_in": [(L, p, W[i])]}
     t = store[(p, L)]
+    hs = [x] if kind == "head" else range(len(t["dk"][a]))
     if via == "key_value":
-        return {"dk": [(L, x, p, t["dk"][a, x])], "dv": [(L, x, p, t["dv"][a, x])]}
-    return {"dq": [(L, x, p, t["dq"][a, x])]}
+        return {"dk": [(L, h, p, t["dk"][a, h]) for h in hs], "dv": [(L, h, p, t["dv"][a, h]) for h in hs]}
+    return {"dq": [(L, h, p, t["dq"][a, h]) for h in hs]}
 
 
 @torch.no_grad()
-def readers(rn, ids: list[int], units: list, corrupt: list[int] | None = None, top: int = TOP,
+def readers(rn, ids: list[int], units: list, corrupt: list[int] | None = None, top: int = TOP, groups: int = GROUPS,
             circuit: set | None = None) -> list[dict]:
     """Each unit's readers (module docstring). units: ("neuron", layer, pos, index) or ("head", layer, head, pos);
     circuit: units of the circuit, to mark readers inside it."""
@@ -151,9 +161,12 @@ def readers(rn, ids: list[int], units: list, corrupt: list[int] | None = None, t
     c = rn.run(ids, [{}])["contrast"][0]  # (uncut, at the cut runs' batch shape)
     gap = c - rn.run(corrupt, [{}])["contrast"][0] if corrupt is not None else None
     W = _writes(rn, st, sb, units)
-    cands, store = _candidates(rn, st, rn.grads(ids), units, W)
+    cands, grp, store = _candidates(rn, st, rn.grads(ids), units, W)
     sets, slots = [], []
     for i, u in enumerate(units):
+        for r in grp[i][:groups]:
+            sets.append(_edit(r, store, W))
+            slots.append((i, "group"))
         pick = [_edit(r, store, W) for r in cands[i][:top]]
         for e in pick:
             sets.append(e)
@@ -179,18 +192,22 @@ def readers(rn, ids: list[int], units: list, corrupt: list[int] | None = None, t
         unit = ({"kind": "neuron", "layer": u[1], "pos": u[2], "index": u[3]} if u[0] == "neuron" else
                 {"kind": "head", "layer": u[1], "head": u[2], "pos": u[3]})
         ests = sum(abs(r[0]) for r in cands[i])
-        out.append({"unit": unit, "readers": [], "candidates": len(cands[i]),
+        out.append({"unit": unit, "readers": [], "groups": [], "candidates": len(cands[i]),
                     "first_order_covered": sum(abs(r[0]) for r in cands[i][:top]) / ests if ests else None})
         if pos == T - 1:
             bits = float(_contrast(rn, xf[None]) - _contrast(rn, (xf - W[i].to(xf.device))[None]))
             out[-1]["direct"] = {"bits": bits, "share": bits / gap if gap else None}
         else:
             out[-1]["direct"] = None
-    k = {}
+    k, kg = {}, {}
     for (i, what), x in zip(slots, cs):
         bits = c - x
         eff = {"bits": bits, "share": bits / gap if gap else None}
-        if what == "reader":
+        if what == "group":
+            r = grp[i][kg.setdefault(i, 0)]
+            kg[i] += 1
+            out[i]["groups"].append({"layer": r[2], "via": r[4], **eff, "first_order": r[0]})
+        elif what == "reader":
             r = cands[i][k.setdefault(i, 0)]
             k[i] += 1
             rd = {"kind": r[1], "layer": r[2], ("index" if r[1] == "neuron" else "head"): r[3], "via": r[4],

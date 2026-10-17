@@ -62,6 +62,7 @@ from __future__ import annotations
 
 import contextlib
 import inspect
+import os
 import itertools
 import math
 import threading
@@ -1130,7 +1131,7 @@ def group_test(pt: Patcher, sc: dict, eps: float, done: dict, kinds=("neuron",),
     set's pair of shares (default Patcher.both); done holds the blocks measured before (at a larger eps), reused; blocks:
     the blocks to start from (default every (layer, position) block at positions)."""
     measure = measure or pt.both
-    order = {k: v.argsort(-1, descending=True) for k, v in sc.items()}                # [L, T, H] and [L, T, D]
+    order = _order(sc, kinds)                                                       # [L, T, H] and [L, T, D]
     positions = range(pt.first, pt.T) if positions is None else positions
     if blocks is None:
         blocks = [(k, i, p, 0, order[k].shape[-1]) for i in range(pt.L) for p in positions for k in kinds]
@@ -1158,13 +1159,26 @@ def group_test(pt: Patcher, sc: dict, eps: float, done: dict, kinds=("neuron",),
     return singles
 
 
+def _order(sc, kinds) -> dict:
+    """Each kind's units per (layer, position) in descending attribution order (group testing's halving order), sorted
+    once per question on the model's card and kept on the host (_Scores caches it; a plain dict is sorted each call).
+    Sorting every kind on the host at every call cost a Qwen3-32B capitals question 3-18 s of host time on a pod (a
+    [64, T, 25,600] tensor each time, torch's threads over the host's 128 cores on a 13.6-CPU quota)."""
+    cache = sc.order if isinstance(sc, _Scores) else {}
+    dev = sc.pt.dev if isinstance(sc, _Scores) else torch.device("cpu")
+    for k in kinds:
+        if k not in cache:
+            cache[k] = sc[k].to(dev).argsort(-1, descending=True).to(torch.int32).cpu()
+    return cache
+
+
 def beams(pt: Patcher, sc: dict, eps: float, kinds, positions, measure, enough, width: int, log=None) -> dict:
     """group_test's search by beams (BEAM): every (layer, position) block measured, then the width blocks of largest
     |share| at or above eps split level by level down to single units (each level's other blocks waiting); when a beam
     ends, enough(its singles so far, largest |share| first) stops the search; the next beam, twice as wide, starts from
     the waiting blocks of largest |share|. Every single unit reached, {unit: (lost, restored)}: group_test's when enough
     never stops it, a subset when it does."""
-    order = {k: v.argsort(-1, descending=True) for k, v in sc.items()}
+    order = _order(sc, kinds)
     share = lambda r: max(abs(r[0]), abs(r[1]))  # noqa: E731
     blocks = [(k, i, p, 0, order[k].shape[-1]) for i in range(pt.L) for p in positions for k in kinds]
     got = measure([[unit(b[0], b[1], b[2], order[b[0]][b[1], b[2], b[3]:b[4]])] for b in blocks])
@@ -1444,14 +1458,16 @@ def cut(pt: Patcher, sc: dict, kind: str, positions, done: dict, log=None, searc
         spread = {"blocks": j, "units": None if j is None else j * width, "order": [[bl[1], bl[2]] for bl in first],
                   "curve": [{"k": k, "lost": a, "restored": b} for k, (a, b) in zip(g, got)]}
         if DENSE and j:                             # dense: inside those blocks, units in attribution order, the smallest
-            cand = sorted(((float(sc[kind][bl[1], bl[2], u]), bl[1], bl[2], u) for bl in first[:j] for u in range(width)),
-                          reverse=True)             # prefix that passes (measured on the grid, then bisection)
+            bls = first[:j]                         # prefix that passes (measured on the grid, then bisection)
+            S = sc[kind][[bl[1] for bl in bls], [bl[2] for bl in bls]]                  # [j, width]
+            flat = S.reshape(-1).argsort(descending=True).numpy()       # (one sort, not a Python tuple per unit:
+            cb, cu = flat // width, flat % width                        # 10 blocks of 25,600 32B neurons, seconds)
+            cand = [(None, bls[b][1], bls[b][2], int(u)) for b, u in zip(cb, cu)]
 
-            def top(k, cand=cand):
-                by = {}
-                for _, i, p, u in cand[:k]:
-                    by.setdefault((i, p), []).append(u)
-                return [unit(kind, i, p, np.asarray(us)) for (i, p), us in by.items()]
+            def top(k, cb=cb, cu=cu):
+                b, u = cb[:k], cu[:k]
+                firsts = np.unique(b, return_index=True)[1]
+                return [unit(kind, bls[x][1], bls[x][2], u[b == x]) for x in b[np.sort(firsts)]]
             k, g, got = smallest(len(cand), top, alone=len(cand) > DENSE_BATCH,
                                  units=[unit(kind, i, p, u) for _, i, p, u in cand] if len(cand) <= DENSE_BATCH else None)
             spread["dense"] = {"units": k, "curve": [{"k": x, "lost": a, "restored": b} for x, (a, b) in zip(g, got)]}
@@ -1477,7 +1493,7 @@ class _Scores:
     """Patcher.scores() computed on first use (a cut taken from its prior needs none)."""
 
     def __init__(self, pt: Patcher):
-        self.pt, self.v = pt, None
+        self.pt, self.v, self.order = pt, None, {}
 
     def _get(self) -> dict:
         if self.v is None:
@@ -1671,6 +1687,23 @@ def chat(tok, user: str, system: str | None = None) -> list[int]:
                add_special_tokens=False)["input_ids"]
 
 
+def _threads():
+    """torch's host threads at the process's CPU quota (a pod's cgroup; else its CPU affinity): torch takes every core
+    of the host, 128 on a RunPod A100 with a 13.6-CPU quota, where its host sorts and elementwise ops ran 2-4x slower."""
+    n = len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else os.cpu_count()
+    for path in ("/sys/fs/cgroup/cpu.max", "/sys/fs/cgroup/cpu/cpu.cfs_quota_us"):
+        try:
+            v = open(path).read().split()
+            q, per = (v[0], v[1]) if len(v) > 1 else (v[0], open("/sys/fs/cgroup/cpu/cpu.cfs_period_us").read().strip())
+            if q not in ("max", "-1"):
+                n = min(n, max(1, int(int(q) / int(per))))
+                break
+        except (OSError, ValueError, IndexError):
+            continue
+    if "OMP_NUM_THREADS" not in os.environ and n and n < torch.get_num_threads():
+        torch.set_num_threads(n)
+
+
 def main():
     import argparse
     import json
@@ -1709,6 +1742,7 @@ def main():
     ap.add_argument("--edges", action=argparse.BooleanOptionalAction, default=True, help="each circuit's edges between its "
                     "units by path patching (neuron_edges.finder_graph), into the record's graph")
     a = ap.parse_args()
+    _threads()
     out = Path(a.out if a.mode == "questions" else a.inp)
     out.mkdir(parents=True, exist_ok=True)
     tok = AutoTokenizer.from_pretrained(a.tokenizer or a.model)

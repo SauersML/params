@@ -2672,7 +2672,7 @@ def e2base(a) -> None:
             fh.write(json.dumps(row) + "\n")
         print(item, arm, {k: got.get(k) for k in ("success", "goal_after", "kl_general", "kl_near", "facts_after")}, flush=True)
 
-    for item in items_:
+    for item in items_ if a.refs else []:  # (--no-refs: the random units like the agents' edits alone)
         put(item, "none", [])
         for k in a.ks:
             ops = post(a.server, "/gradient_e2", {"item": item, "k": k}, tries=1, timeout=SCORE_TIMEOUT)["ops"]
@@ -3000,6 +3000,7 @@ def main():
     eb.add_argument("--runs", type=Path, nargs="*", default=[])
     eb.add_argument("--rounds", type=int, default=2)
     eb.add_argument("--seed", type=int, default=0)
+    eb.add_argument("--refs", action=argparse.BooleanOptionalAction, default=True, help="no edit and the attribution edits")
     e2 = sub.add_parser("e2items")
     e2.add_argument("behavior", type=Path)
     e2.add_argument("--out", type=Path, required=True)

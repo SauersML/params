@@ -220,7 +220,7 @@ def main():
             lora_users, lora_answers = [present[k] for k in keep], [targets[k] for k in keep]
             fits.setdefault(name, {})["twins"] = {"absent_examples": twins[:3], "lora_pairs": len(keep),
                                                   "own_absent_goal": sum(map(ms.GOAL[name], own_absent)) / len(own_absent)}
-            log(name, f"{len(keep)} behaviour-free LoRA pairs from the organism alone")
+            ms.log(name, f"{len(keep)} behaviour-free LoRA pairs from the organism alone")
         log = ms.log
         # the direction projected out everywhere, one layer's at a time
         cands = []

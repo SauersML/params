@@ -74,7 +74,8 @@ class Runner:
         self.answer, self.alternatives = None, None
         self._base = {}  # ids -> per layer the unedited run's keys [KV, T, hd] (after norm and rotary), values, streams
         self._c0s = {}  # (ids, answer, alternatives) -> the unedited run's contrast
-        self._mods = {}  # id(module) -> (device, dtype), or a norm's float32 weight
+        self._mods = {}  # id(module) -> (device, dtype), ("norm", id) -> a norm's float32 weight (the model's modules,
+        # alive with self.core)
 
     def _d(self, L: int) -> torch.device:
         return self.layers[L].input_layernorm.weight.device

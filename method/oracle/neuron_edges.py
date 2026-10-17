@@ -51,6 +51,7 @@ import argparse
 import json
 import math
 import time
+import weakref
 from pathlib import Path
 
 import torch
@@ -116,6 +117,18 @@ def log2_contrast(lp: torch.Tensor, answer: list[int], alternatives: list[int]) 
     return (torch.logsumexp(lp[..., answer], -1) - torch.logsumexp(lp[..., alternatives], -1)) / math.log(2.0)
 
 
+_WHERE = weakref.WeakKeyDictionary()  # module -> its (device, dtype): a parameter walk a call was 1.2 s of 4 Qwen3-8B
+# edge stages
+
+
+def _where(mod) -> tuple:
+    w = _WHERE.get(mod)
+    if w is None:
+        p = next(mod.parameters())
+        w = _WHERE[mod] = (p.device, p.dtype)
+    return w
+
+
 def sizes(n: int) -> list[int]:
     """0 to n on a log scale (two steps an octave), n included."""
     return sorted({0, n} | {min(n, int(round(2 ** (e / 2)))) for e in range(0, int(2 * math.log2(max(n, 1))) + 2)})
@@ -177,15 +190,13 @@ class Edges:
     @staticmethod
     def _f(mod, t: torch.Tensor) -> torch.Tensor:
         """mod on t in mod's dtype on mod's card, the result in float32."""
-        w = next(mod.parameters())
-        return mod(t.to(w.device, w.dtype)).float()
+        return mod(t.to(*_where(mod))).float()
 
     @staticmethod
     def _m(mod, t: torch.Tensor) -> torch.Tensor:
         """mod on t in mod's dtype on mod's card, the result in that dtype (an input to further modules: the same values
         as _f's, without a float32 copy cast back for each reader)."""
-        w = next(mod.parameters())
-        return mod(t.to(w.device, w.dtype))
+        return mod(t.to(*_where(mod)))
 
     @staticmethod
     def _w(mod, rows=None, cols=None) -> torch.Tensor:

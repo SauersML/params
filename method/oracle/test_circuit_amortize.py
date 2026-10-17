@@ -188,11 +188,13 @@ def test_mean_features_of_a_partner_cut():
     assert float(got["from_first"][0, 0, 0]) == 0 and float(got["from_end"][0, 0, 0]) == 5
 
 
+@pytest.mark.parametrize("prune", [0, 1, 2])
 @pytest.mark.parametrize("union", [None, [[1, 0, 1.0], [1, 2, 0.5], [0, 1, 0.2], [0, 3, 0.05]]])
-def test_fast_records_report_their_measured_shares(tiny, union):
+def test_fast_records_report_their_measured_shares(tiny, union, prune, monkeypatch):
     """find_batch_fast: every met cut's set measures the shares its record reports and passes its bar; a cut is a
     prefix of its predicted order (or a family union subset), unpruned; an unreachable cut has no units."""
     model, pairs = tiny
+    monkeypatch.setattr(ca, "FAST_PRUNE", prune)
     pts = [cf.Patcher(model, None, rows=8) for _ in pairs]
     recs = ca.find_batch_fast(pts, [(c, k, None) for _, c, k in pairs], ca.scorer("grad"), unions=[union] * len(pairs))
     for pt, rec, (_, c, k) in zip(pts, recs, pairs):

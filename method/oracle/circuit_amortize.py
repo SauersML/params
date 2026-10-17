@@ -570,6 +570,10 @@ UNION_FREQS = (0.5, 0.25, 0.1, 0.0)  # a family union's subsets (heads in at lea
 WIDE_SIZES = {"source": (96, 128, 192, 256), "readout": (160, 192, 256, 384, 512), "movers": (4, 8, 16, 32)}
                       # fast_steps' second tick, for cuts the first cannot pass: longer prefixes (movers: the union, or
                       # its largest subset, then these many more predicted heads)
+FAST_PRUNE = 0        # after the fast ticks: 0 nothing; 1 one shot (each met set without each unit, one tick; every unit
+                      # whose absence leaves both shares PRUNE_MARGIN over the bar dropped at once, kept if that set
+                      # fails, a second tick); 2 circuit_masks.prune_steps (exact, a tick per round)
+PRUNE_MARGIN = 0.05
 PROBES = 3            # bar probes at this many of a cut's positions (its first, middle and last; 0: every position)
 FAST_FALLBACK = "warm"  # a cut the fast tick cannot pass: amortized_steps on it alone, its masks warm from the prediction
                         # for WARM_STEPS ("warm"); "" none (the cut unmet)
@@ -666,6 +670,26 @@ def fast_steps(pt, pred: dict, union: list | None = None, log=None, steps: int =
                               lost=res[ok][0], restored=res[ok][1], found=len(order))
                 stage[n] = "wide"
         failing = [n for n in failing if stage[n] != "wide"]
+    met = [n for n in names if out[n].get("met") and len(out[n]["units"]) > 1 and stage[n] in ("fast", "wide")]
+    if FAST_PRUNE == 2 and met:                     # (exact pruning, every met cut in lockstep)
+        pruned = yield ("par", [cm.prune_steps(pt, list(out[n]["units"]), out[n]["bar"]) for n in met])
+        whole = yield [(pt, "both", [cm._blocks(u)]) for u in pruned]
+        for n, u, w in zip(met, pruned, whole):
+            if len(u) < len(out[n]["units"]) and w[0][0] >= out[n]["bar"] and w[0][1] >= out[n]["bar"]:
+                out[n].update(units=u, singles={x: (float("nan"), float("nan")) for x in u}, lost=w[0][0], restored=w[0][1])
+    elif FAST_PRUNE == 1 and met:                   # (one shot: leave-one-out, then the set without every spare unit)
+        loo = yield [(pt, "both_without", list(out[n]["units"])) for n in met]
+        keep = {}
+        for n, r in zip(met, loo):
+            b = out[n]["bar"] + PRUNE_MARGIN
+            keep[n] = [u for u, (a, c) in zip(out[n]["units"], r) if not (a >= b and c >= b)]
+        trial = [n for n in met if 0 < len(keep[n]) < len(out[n]["units"])]
+        if trial:
+            whole = yield [(pt, "both", [cm._blocks(keep[n])]) for n in trial]
+            for n, w in zip(trial, whole):
+                if w[0][0] >= out[n]["bar"] and w[0][1] >= out[n]["bar"]:
+                    out[n].update(units=keep[n], singles={x: (float("nan"), float("nan")) for x in keep[n]},
+                                  lost=w[0][0], restored=w[0][1])
     if failing and FAST_FALLBACK:
         sub, st2 = yield from amortized_steps(pt, pred, log=log, steps=steps, wanted=failing, mask_cuts=",".join(failing))
         for n in failing:

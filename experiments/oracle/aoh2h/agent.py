@@ -2093,6 +2093,36 @@ def e2base(a) -> None:
                 put(rec["id"], f"random_like:{rec['episode']}:{d}", [{"op": "zero", "units": rnd}], {"of": rec["episode"]})
 
 
+def dump(a) -> None:
+    """Distillation trajectories (the lead's flywheel; the format agreed with textoracle): agent.py run records on
+    TRAINING items (fleet's organisms, oracledata's envs; never E1, e1b, E2 or AuditBench's sealed targets) as one line
+    an episode: id, organism, budget, arm, agent, the whole conversation (messages: the system prompt with the tool docs
+    and playbook, the question, every assistant turn with its tool calls, every tool result), the parsed answer, the
+    reward by term (re-graded here), verified (exact: every key group, or oracledata's reward >= 0.8), passes, usd."""
+    out = []
+    for f in a.runs:
+        side = f.with_name(f.stem + "_items.jsonl")
+        items_ = {it["id"]: it for it in map(json.loads, side.read_text().splitlines())}
+        for r in map(json.loads, f.read_text().splitlines()):
+            it = items_.get(r["id"])
+            if it is None or it.get("split") != "train" or r.get("stopped") or not r.get("messages"):
+                continue
+            if it.get("organism") in HIDDEN_KEYS:
+                raise SystemExit(f"{r['id']}: an E1 organism")
+            gs = grade(it, r["answer"], None)
+            ok = {g["q"]: g for g in gs}
+            verified = bool(ok.get("hidden", {}).get("ok") or ok.get("disc1", {}).get("ok"))
+            out.append({"id": r["id"], "organism": it.get("organism") or it.get("adapter"), "budget": r["budget"], "arm": a.arm,
+                        "agent": a.agent, "messages": r["messages"], "answer": r["answer"],
+                        "reward": {g["q"]: g.get("reward", float(g["ok"])) for g in gs}, "verified": verified,
+                        "passes": r["passes"], "usd": r["usd"]})
+    a.out.parent.mkdir(parents=True, exist_ok=True)
+    with a.out.open("a") as fh:
+        for x in out:
+            fh.write(json.dumps(x) + "\n")
+    print(f"{len(out)} trajectories ({sum(x['verified'] for x in out)} verified) appended to {a.out}")
+
+
 # ---- the references on the same items (h2h's answerers)
 
 
@@ -2347,6 +2377,11 @@ def main():
     r.add_argument("--turns", type=int, default=TURNS, help="the agent's messages per item")
     r.add_argument("--episode-usd", type=float, default=EPISODE_USD, help="an episode starts only while this much is "
                    "left under the cap")
+    du = sub.add_parser("dump")
+    du.add_argument("runs", type=Path, nargs="+", help="agent.py run outputs (their _items.jsonl beside them)")
+    du.add_argument("--out", type=Path, required=True)
+    du.add_argument("--arm", required=True, help="the arm's name (A black-box, B white-box, C circuits)")
+    du.add_argument("--agent", default=AGENT)
     eb = sub.add_parser("e2base")
     eb.add_argument("--server", required=True)
     eb.add_argument("--out", type=Path, required=True)
@@ -2386,7 +2421,7 @@ def main():
     g.add_argument("--plot", type=Path, required=True)
     g.add_argument("--title")
     a = ap.parse_args()
-    {"items": items, "abitems": abitems, "envitems": envitems, "e1items": e1items, "e2items": e2items, "e2base": e2base, "trainitems": trainitems, "serve": serve, "refs": refs, "run": run, "report": report, "plot": plot,
+    {"items": items, "dump": dump, "abitems": abitems, "envitems": envitems, "e1items": e1items, "e2items": e2items, "e2base": e2base, "trainitems": trainitems, "serve": serve, "refs": refs, "run": run, "report": report, "plot": plot,
      "extremes": extremes}[a.cmd](a)
 
 

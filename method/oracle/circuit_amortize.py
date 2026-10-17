@@ -47,13 +47,18 @@ def cut_name(pt, spec: dict) -> str:
     return "movers" if "head" in spec["kinds"] else "readout" if list(spec["positions"]) == [pt.T - 1] else "source"
 
 
+SOURCE_PATH = True    # the source cut's rows at m > 0 (its lost5, lost1, rest5, rest1); False: those features 0 and the
+                      # rows not run (a pair's source rows at m > 0 are ~2/3 of path_features' tokens; a model trained so)
+
+
 def _rows(pts: list) -> list:
     """The rows of path_features' forward: per pair its two plain runs (m = 0, every cut's), then per cut and m > 0 the
     clean run with the cut at m (noising) and the corrupted run with the cut at m (denoising): (pair, base, cut, m)."""
     rows = []
     for j, pt in enumerate(pts):
         rows += [(j, "clean", None, 0.0), (j, "corrupt", None, 0.0)]
-        rows += [(j, b, n, m) for n in cm.cuts_of(pt) for m in POINTS if m > 0 for b in ("clean", "corrupt")]
+        rows += [(j, b, n, m) for n in cm.cuts_of(pt) if SOURCE_PATH or n != "source" for m in POINTS if m > 0
+                 for b in ("clean", "corrupt")]
     return rows
 
 
@@ -184,8 +189,9 @@ def path_features(pts: list, consume, relp: bool = True) -> None:
                 f = {}
                 for m in POINTS:
                     tag = {0.0: "0", 0.5: "5", 1.0: "1"}[m]
-                    f["lost" + tag] = slope(row[("clean", None if m == 0 else n, m)])
-                    f["rest" + tag] = slope(row[("corrupt", None if m == 0 else n, m)])
+                    for base, feat in (("clean", "lost"), ("corrupt", "rest")):
+                        r = row.get((base, None if m == 0 else n, m))
+                        f[feat + tag] = slope(r) if r is not None else torch.zeros_like(dl if key == "neu" else dl[..., ::hd])
                 if key == "head":
                     f["delta"] = dl.view(L, len(P), H, hd).norm(dim=-1)
                     f["clean"] = hc.view(L, len(P), H, hd).norm(dim=-1)
@@ -380,7 +386,7 @@ def load_model(path: str):
         out = torch.full((n,), float(sub.min()) - 1.0, device=sub.device)
         out[idx] = sub
         return out.reshape(shape)
-    score.relp = z.get("relp", True)
+    score.relp, score.source_path = z.get("relp", True), z.get("source_path", True)
     return score
 
 
@@ -399,16 +405,17 @@ def _theta(s: torch.Tensor, keep: int) -> torch.Tensor:
     return s.float() - flat.topk(min(keep + 1, flat.numel())).values[-1]
 
 
-def amortized_steps(pt, pred: dict, log=None, steps: int = cm.STEPS, partners: list | None = None):
+def amortized_steps(pt, pred: dict, log=None, steps: int = cm.STEPS, partners: list | None = None, wanted=None,
+                    mask_cuts: str | None = None):
     """circuit_masks.search_steps with each masked cut's order from pred ({cut: (kind, score [L, P, W])}) in place of
     the masks' descent (a search for circuit_masks.drive): the cut's ceilings and bars (_before_steps), each masked
     cut's order through verify (KEEP, then WIDE units above 0), and the cuts still unmet through the masks themselves
     (FALLBACK: from INIT, or warm from the prediction for WARM_STEPS; ROUNDS as search_steps). Returns (cuts, each cut's
     stage: order, wide or masks). partners: Patchers set up on pt's clean prompt against other corrupted prompts
     (circuit_masks' multi-partner cuts: the source cut chosen and verified on the shares' means; pred's score of such a
-    cut on its positions over every pair)."""
-    st = yield from cm._before_steps(pt, "mask", log=log, partners=partners)
-    direct = [n for n in st["masked"] if n in MASK_CUTS.split(",")]
+    cut on its positions over every pair). wanted: those cuts only; mask_cuts: MASK_CUTS for this search."""
+    st = yield from cm._before_steps(pt, "mask", log=log, partners=partners, wanted=wanted)
+    direct = [n for n in st["masked"] if n in (MASK_CUTS if mask_cuts is None else mask_cuts).split(",")]
     names, got, stage = [n for n in st["masked"] if n not in direct], {}, {}
     for tag, keep in (("order", KEEP), ("wide", WIDE)):
         if not names or keep <= 0:                  # (WIDE 0: a cut its order cannot pass goes to the masks)
@@ -546,6 +553,148 @@ def find_batch_amortized(pts: list, items: list, score, arm: str = "amortized", 
     return recs
 
 
+SRC_SIZES = (1, 2, 3, 4, 5, 6, 8, 10, 12, 16, 20, 24, 32)       # fast_steps' prefix sizes of the predicted source order,
+RO_SIZES = (4, 8, 12, 16, 20, 24, 32, 40, 48, 64, 80, 96, 128)  # of the readout's, and of the movers' when the template
+MOV_SIZES = (2, 3, 4, 5, 6, 8, 10, 12, 16, 24, 32)               # has no family union: all measured in one tick
+UNION_FREQS = (0.5, 0.25, 0.1, 0.0)  # a family union's subsets (heads in at least that share of its keys' circuits)
+FAST_FALLBACK = "warm"  # a cut the fast tick cannot pass: amortized_steps on it alone, its masks warm from the prediction
+                        # for WARM_STEPS ("warm"); "" none (the cut unmet)
+
+
+def _top(spec: dict, kind: str, s: torch.Tensor, k: int) -> list:
+    """The k units of a cut (spec) of largest score s [L, P, W], best first."""
+    flat = s.reshape(-1)
+    return cm._units_at(flat.topk(min(k, flat.numel())).indices, [(kind, s.shape)], spec["positions"])
+
+
+def fast_steps(pt, pred: dict, union: list | None = None, log=None, steps: int = cm.STEPS):
+    """A verified circuit in one measuring tick (a search for circuit_masks.drive; the lead's 10-16 T2 fast path):
+    every cut's ceiling and bar probes, the prefixes of the predicted readout and source orders (RO_SIZES, SRC_SIZES) and
+    the movers (the template's family union, circuit_union's: its subsets by UNION_FREQS; without one the predicted
+    order's MOV_SIZES), noised and denoised in one batch; each cut takes its smallest set whose shares pass its bar (no
+    pruning, no single units). A cut whose ceiling passes and no set does goes through amortized_steps alone (masks
+    warm from the prediction, FAST_FALLBACK). Returns (cuts, each cut's stage: fast or masks)."""
+    specs = cm.cuts_of(pt)
+    width = {"neuron": pt.D, "head": pt.H}
+    every = {n: [cf.unit(k, i, p, torch.arange(width[k])) for k in sp["kinds"] for i in range(pt.L) for p in sp["positions"]]
+             for n, sp in specs.items()}
+    probe = cm.FLOOR and pt.core.model.embed_tokens.weight.dtype != torch.float32
+    probes = {n: [[cf.unit(k, 0, p, torch.arange(width[k])) + ("self",)] for k in sp["kinds"] for p in sp["positions"]]
+              for n, sp in specs.items()} if probe else {n: [] for n in specs}
+    cand = {}                                       # cut -> (sets as unit lists, label per set) or a prefix order
+    for n, sp in specs.items():
+        kind = "head" if n == "movers" else "neuron"
+        if n == "movers" and union:
+            T = pt.T - 1
+            subsets, seen = [], set()
+            for f0 in UNION_FREQS:
+                us = tuple(sorted({(l, h) for l, h, f in union if f >= f0}))
+                if us and us not in seen:
+                    seen.add(us)
+                    subsets.append([cf.unit("head", l, T, h) for l, h in us])
+            cand[n] = ("sets", subsets)
+        else:
+            sizes = {"readout": RO_SIZES, "source": SRC_SIZES, "movers": MOV_SIZES}[n]
+            order = _top(sp, kind, pred[n][1], max(sizes))
+            cand[n] = ("prefix", order, [k for k in sizes if k <= len(order)])
+    names = list(specs)
+    reqs = [(pt, "both", [every[n] for n in names] + [x for n in names for x in probes[n]])]
+    for n in names:
+        c = cand[n]
+        reqs.append((pt, "both", [cm._blocks(u) for u in c[1]]) if c[0] == "sets" else (pt, "both_prefixes", c[1], c[2]))
+    got = yield reqs
+    head, at = got[0], len(names)
+    out, stage, failing = {}, {}, []
+    for j, n in enumerate(names):
+        ceil = head[j]
+        pr = head[at:at + len(probes[n])]
+        at += len(probes[n])
+        noise = max([max(abs(a), abs(b)) for a, b in pr] + [0.0])
+        bar = cf.PASS + min(noise if np.isfinite(noise) else 0.0, 1 - cf.PASS)
+        reach = ceil[0] >= cf.PASS and ceil[1] >= cf.PASS
+        c, res = cand[n], got[1 + j]
+        sets = c[1] if c[0] == "sets" else [c[1][:k] for k in c[2]]
+        ok = next((i for i, r in enumerate(res) if r[0] >= bar and r[1] >= bar), None)
+        curve = [{"k": len(u), "lost": r[0], "restored": r[1]} for u, r in zip(sets, res)]
+        units = list(sets[ok]) if reach and ok is not None else []
+        lost, rest = res[ok] if reach and ok is not None else (0.0, 0.0)
+        out[n] = cm._record({"units": units, "singles": {u: (float("nan"), float("nan")) for u in units},
+                             "met": bool(units), "lost": lost, "restored": rest, "found": len(sets[-1]) if sets else 0,
+                             "curve": curve}, ceil, reach, specs[n]["positions"], {"bar": bar})
+        stage[n] = "fast"
+        if reach and ok is None:
+            failing.append(n)
+    if failing and FAST_FALLBACK:
+        sub, st2 = yield from amortized_steps(pt, pred, log=log, steps=steps, wanted=failing, mask_cuts=",".join(failing))
+        for n in failing:
+            out[n], stage[n] = sub[n], "masks"
+    out.setdefault("movers", {})
+    out["movers"]["through"] = {}                   # (no mover-through-source runs on the fast path)
+    if log:
+        log("  " + ", ".join(f"{n} {len(out[n].get('units', []))} ({stage[n]})" for n in names))
+    return out, stage
+
+
+def _unmeasured(rec: dict) -> dict:
+    """A fast record's single-unit shares, never measured: None in place of NaN (JSON)."""
+    for x in rec.get("nodes", []) + rec.get("routes", []):
+        for k in ("lost", "restored"):
+            if isinstance(x.get(k), float) and not np.isfinite(x[k]):
+                x[k] = None
+    for v in rec.get("singles", {}).values():
+        for x in v:
+            for k in ("lost", "restored"):
+                if isinstance(x.get(k), float) and not np.isfinite(x[k]):
+                    x[k] = None
+    return rec
+
+
+def find_batch_fast(pts: list, items: list, score, unions: list | None = None, arm: str = "fast", log=None,
+                    steps: int = cm.STEPS, relp: bool = False) -> list:
+    """The fast path (fast_steps) for several pairs at once: every pair set up (circuit_finder.setup_many), the features of
+    every usable pair (path_features), each cut's score, then the pairs of one prompt length in lockstep
+    (circuit_masks.drive: one measuring tick for every pair's every cut, the fallbacks after). unions: per item its
+    template's family mover union [(layer, head, frequency)] or None. Records as find_batch's ("search": arm) with
+    "amortize": each cut's stage and the batch's seconds by stage."""
+    t0 = time.perf_counter()
+    recs, rec0s, same_T = [None] * len(items), {}, {}
+    for j, rec0 in enumerate(cf.setup_many(pts, [(c, k) for c, k, _ in items], [x for _, _, x in items])):
+        clean, corrupt, answers = items[j]
+        if not rec0["valid"] or not np.isfinite(rec0["gap"]) or rec0["gap"] < cf.MIN_GAP or rec0["same_answer"]:
+            recs[j] = {**cf._find(pts[j], clean, corrupt, answers, log=log), "search": arm}
+            continue
+        rec0s[j] = rec0
+        same_T.setdefault(pts[j].T, []).append(j)
+    sec = {"setup": time.perf_counter() - t0}
+    t1 = time.perf_counter()
+    SECONDS.clear()
+    pred = {}
+    kind = lambda n: "head" if n == "movers" else "neuron"  # noqa: E731
+    for T, js in same_T.items():
+        path_features([pts[j] for j in js], lambda k, feats, js=js: pred.__setitem__(
+            js[k], {n: (kind(n), score(f, n).detach()) for n, f in feats.items()}), relp=relp)
+    sec["features"] = time.perf_counter() - t1
+    sec.update(SECONDS)
+    t1 = time.perf_counter()
+    for T, js in same_T.items():
+        tag = (lambda j: (lambda s: log(f"[{j}] {s.lstrip()}"))) if log and len(items) > 1 else (lambda j: log)
+        res = cm.drive([pts[j] for j in js], [fast_steps(pts[j], pred[j], (unions or [None] * len(items))[j], log=tag(j),
+                                                         steps=steps) for j in js], log=log)
+        sec["search"] = sec.get("search", 0.0) + time.perf_counter() - t1
+        t2 = time.perf_counter()
+        for j, (cuts, stage) in zip(js, res):
+            clean, corrupt, answers = items[j]
+            recs[j] = _unmeasured(cm._find_with(pts[j], clean, corrupt, answers, log, arm, cuts, rec0=rec0s[j]))
+            recs[j]["amortize"] = {"stage": stage, "fast": True}
+        sec["record"] = sec.get("record", 0.0) + time.perf_counter() - t2
+        t1 = time.perf_counter()
+    wall = time.perf_counter() - t0
+    for r in recs:
+        r.update(seconds_own=r.get("seconds"), seconds=round(wall / len(items), 2), batch=len(items))
+        r.setdefault("amortize", {})["seconds_batch"] = {k: round(v, 2) for k, v in sec.items()}
+    return recs
+
+
 class Group_:
     """train: one (question, cut) of data mode's npz: its candidates' features x, circuit membership, theta and log weight
     (0 for a unit some score's top CAND holds or the circuit's; log of the population each random-only candidate stands
@@ -659,7 +808,7 @@ def _export(net, scale, mean, std) -> dict:
 
 
 def train(dirs: list, out_path: str, holdout: float = 0.2, epochs: int = 40, hidden: int = 64, seed: int = 0, log=print,
-          by: str = "key", save: bool = True, relp: bool = True):
+          by: str = "key", save: bool = True, relp: bool = True, source_path: bool = True):
     """train mode: per cut an MLP on data mode's dirs. The (task, key)s (by "key") or the tasks (by "task") are split,
     holdout of them unseen: the offline ranking of ig, grad, relp and the model on them is logged (and returned); the
     saved model is then trained on every key with the same epochs."""
@@ -667,6 +816,9 @@ def train(dirs: list, out_path: str, holdout: float = 0.2, epochs: int = 40, hid
     if not relp:                                    # (a model without RelP: its feature 0, as path_features(relp=False))
         for g in groups:
             g.x[:, FEATURES.index("relp")] = 0.0
+    if not source_path:                             # (a model without the source's path slopes: SOURCE_PATH False)
+        for g in [g for g in groups if g.cut == "source"]:
+            g.x[:, [FEATURES.index(k) for k in ("lost5", "lost1", "rest5", "rest1")]] = 0.0
     unit = (lambda g: (g.task, g.key)) if by == "key" else (lambda g: g.task)  # noqa: E731
     keys = sorted({unit(g) for g in groups})
     rng = np.random.default_rng(seed)
@@ -689,7 +841,7 @@ def train(dirs: list, out_path: str, holdout: float = 0.2, epochs: int = 40, hid
         log(f"{cut} unseen keys: " + "; ".join(f"{k} {v}" for k, v in base.items()))
     if not save:
         return report
-    model = {"features": FEATURES, "relp": relp}
+    model = {"features": FEATURES, "relp": relp, "source_path": source_path}
     for cut in ("readout", "movers", "source"):
         if any(g.cut == cut for g in groups):
             model[cut], _ = fit(groups, cut, hidden=hidden, epochs=epochs, seed=seed)
@@ -728,10 +880,13 @@ def main():
     ap.add_argument("--offset", type=int, default=0)
     ap.add_argument("--stride", type=int, default=1)
     ap.add_argument("--scorer", default=None, help="eval: the trained scorer file of the arm \"model\" (train mode's)")
+    ap.add_argument("--unions", default=None, help="eval fast: the family mover unions (circuit_union's, TRAIN keys)")
     ap.add_argument("--scorer2", default=None, help="eval: the scorer file of the arm \"model2\" (two models on one card)")
     ap.add_argument("--profile", action="store_true", help="eval: each arm batch's drive ticks timed by kind (TickProfile)")
     ap.add_argument("--epochs", type=int, default=40)
     ap.add_argument("--hidden", type=int, default=64)
+    ap.add_argument("--no-source-path", action="store_true", help="train: a model without the source cut's slopes at "
+                    "m > 0 (eval then skips those rows: SOURCE_PATH False)")
     ap.add_argument("--no-relp", action="store_true", help="train: a model without the RelP feature (eval then skips RelP's pass)")
     ap.add_argument("--holdout-by", default="key", choices=("key", "task"), help="train: unseen keys (and the model saved "
                     "after, trained on every key) or unseen tasks (the report only)")
@@ -741,7 +896,7 @@ def main():
             assert any(k in m for m in (globals(), vars(cm), vars(cf))), f"arm {arm}: no constant {k}"
     if a.mode == "train":                           # (inp: data mode's OUT dirs, comma-separated; out: the model file)
         report = train(a.inp.split(","), a.out, epochs=a.epochs, hidden=a.hidden, by=a.holdout_by,
-                       save=a.holdout_by == "key", relp=not a.no_relp)
+                       save=a.holdout_by == "key", relp=not a.no_relp, source_path=not a.no_source_path)
         Path(a.out).with_suffix(".json").write_text(json.dumps(report, indent=1))
         return
     cf._threads()
@@ -798,6 +953,14 @@ def main():
         others[q["id"]] = [(k, x) for k, x in ids if len(x) == len(clean)][:maxp - 1]
     pts = [cf.Patcher(model, tok) for _ in range(a.batch)]
     pool = [[cf.Patcher(model, tok) for _ in range(maxp - 1)] for _ in range(a.batch)]   # (partner pairs' Patchers)
+    U = json.loads(Path(a.unions).read_text()) if a.unions else {}
+
+    def union_of(q):                                # (circuit_union.family_record's template union of a question)
+        u = U.get(q.get("task"))
+        if not u or "paraphrase" not in q:
+            return None
+        g = f"p{q['paraphrase']}" if u.get("n", {}).get(f"p{q['paraphrase']}", 0) >= 4 else "all"
+        return u.get(g)
     if a.mode == "eval":
         arms = a.arm.split(",")
         dirs = {arm: arm.replace(":", "_").replace("=", "") for arm in arms}
@@ -831,9 +994,18 @@ def main():
                     if name == "mask":
                         recs = cm.find_batch(pts[:len(todo)], its, arm="mask", log=log, partners=prt,
                                              steps=next((int(x) for x in parts if x.isdigit()), cm.STEPS))
+                    elif name == "fast":
+                        sc = scorer(f"model:{a.scorer}")
+                        global SOURCE_PATH
+                        saved.setdefault("SOURCE_PATH", (globals(), SOURCE_PATH))
+                        SOURCE_PATH = getattr(sc, "source_path", True) and SOURCE_PATH
+                        recs = find_batch_fast(pts[:len(todo)], its, sc, unions=[union_of(q) for q, _, _, _ in todo], arm=arm,
+                                               log=log, relp=getattr(sc, "relp", False))
                     else:
                         nm = f"model:{a.scorer}" if name == "model" else f"model:{a.scorer2}" if name == "model2" else name
                         sc = scorer(nm)
+                        saved.setdefault("SOURCE_PATH", (globals(), SOURCE_PATH))
+                        SOURCE_PATH = getattr(sc, "source_path", True) and SOURCE_PATH
                         recs = find_batch_amortized(pts[:len(todo)], its, sc, arm=arm, log=log, partners=prt,
                                                     relp=nm == "relp" or getattr(sc, "relp", False))
                 except Exception:                   # noqa: BLE001 (an arm that fails is dropped, the others go on)

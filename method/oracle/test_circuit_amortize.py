@@ -186,3 +186,27 @@ def test_mean_features_of_a_partner_cut():
     assert torch.allclose(got["corrupt"][:, 2:], want, atol=1e-6)
     assert torch.allclose(got["corrupt"][:, :2], fa["clean"][:, :2] + (fa["corrupt"][:, :2] - fa["clean"][:, :2]) / 2, atol=1e-6)
     assert float(got["from_first"][0, 0, 0]) == 0 and float(got["from_end"][0, 0, 0]) == 5
+
+
+@pytest.mark.parametrize("union", [None, [[1, 0, 1.0], [1, 2, 0.5], [0, 1, 0.2], [0, 3, 0.05]]])
+def test_fast_records_report_their_measured_shares(tiny, union):
+    """find_batch_fast: every met cut's set measures the shares its record reports and passes its bar; a cut is a
+    prefix of its predicted order (or a family union subset), unpruned; an unreachable cut has no units."""
+    model, pairs = tiny
+    pts = [cf.Patcher(model, None, rows=8) for _ in pairs]
+    recs = ca.find_batch_fast(pts, [(c, k, None) for _, c, k in pairs], ca.scorer("grad"), unions=[union] * len(pairs))
+    for pt, rec, (_, c, k) in zip(pts, recs, pairs):
+        pt.setup(c, k)
+        for n, cut in rec["cuts"].items():
+            units = ([("neuron", x["layer"], x["pos"], x["neuron"]) for x in rec["nodes"] if x["stage"] == n] if n != "movers"
+                     else [("head", x["layer"], x["head"], x["pos"]) for x in rec["routes"]])
+            if not cut["reachable"]:
+                assert not units
+            if not cut["met"]:
+                continue
+            lost, rest = pt.both([cm._blocks(units)])[0]
+            assert abs(lost - cut["lost"]) < 1e-4 and abs(rest - cut["restored"]) < 1e-4
+            assert lost >= cut["bar"] and rest >= cut["bar"]
+            if n == "movers" and union and rec["amortize"]["stage"][n] == "fast":
+                assert {(u[1], u[2]) for u in units} <= {(l, h) for l, h, _ in union}
+        assert all(x["lost"] is None for x in rec["nodes"] if rec["amortize"]["stage"].get(x["stage"]) == "fast")

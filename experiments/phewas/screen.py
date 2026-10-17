@@ -37,7 +37,7 @@ import sys
 import time
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "method" / "oracle"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "method" / "oracle"))
 import claim_check as cc  # noqa: E402
 import neuron_builder as nb  # noqa: E402
 

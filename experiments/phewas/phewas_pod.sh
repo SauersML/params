@@ -16,14 +16,14 @@
 #   MODE=pilot: the screen's noise pilot (screen.py pilot) on a reported phenome (PHENOME with phenome.json), with
 #            the 8B T2 file (THR) for the massive cut and optionally stage 1's summary (ASSOC) for the singles
 #   RUN=a PHENOME=~/mpd-data/phewas/phenome_v1 [MODE=pilot ASSOC=.../summary.json THR=.../thr.pt] bash
-#        experiments/oracle/phewas/phewas_pod.sh [HOURS]   (env: SRCREV, GPU, PRICE)
+#        experiments/phewas/phewas_pod.sh [HOURS]   (env: SRCREV, GPU, PRICE)
 cd /Users/user/params
 RUN=${RUN:-a} H=${1:-3}
 N=monitor-phewas-$RUN O=/Users/user/mpd-data/runpod/$N
 S=/Users/user/mpd-data/scratch/speed/phewas/src_$RUN
 P=${PHENOME:?PHENOME}
 REV=${SRCREV:-origin/main}
-git fetch -q origin main && rm -rf "$S" "$S.tar" && mkdir -p "$S/phenome" && git archive "$REV" experiments/oracle/phewas method/oracle | tar -x -C "$S" \
+git fetch -q origin main && rm -rf "$S" "$S.tar" && mkdir -p "$S/phenome" && git archive "$REV" experiments/phewas method/oracle | tar -x -C "$S" \
   && cp "$P/traits.json" "$P/sequences.jsonl" "$P/splits.jsonl" "$S/phenome/" && echo "python source $(git rev-parse --short=10 "$REV")" > "$S/SOURCE" || exit 1
 [ -n "${SCORES:-}" ] && { cp "$SCORES" "$S/scores_before.jsonl" || exit 1; }
 [ -n "${ADAPTER:-}" ] && { cp -R "$ADAPTER" "$S/adapter" || exit 1; }
@@ -49,7 +49,7 @@ python -u assoc.py $S/phenome $O/assoc --model Qwen/Qwen3-8B $AD ${ASSOC_TRAITS:
 [ "${MODE:-}" = polycheck ] && RUNS="python -u polycheck.py $S/phenome $S/candidates.json $O/polycheck.json --thr $S/thr.pt ${POLY_TRAITS:+--traits $POLY_TRAITS} ${FINEMAP:+--finemap $S/finemap.json} > $O/polycheck.log 2>&1"
 [ "${MODE:-}" = pilot ] && RUNS="python -u screen.py pilot $S/phenome $O/pilot.json --thr $S/thr.pt ${ASSOC:+--assoc $S/assoc_summary.json} > $O/pilot.log 2>&1"
 CMD="export OMP_NUM_THREADS=8 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True; ln -sfn /workspace/runs/$N/mpd-data ~/mpd-data; mkdir -p $O $S; \
-tar -xzf $S.tgz -C $S; cd $S/experiments/oracle/phewas; \
+tar -xzf $S.tgz -C $S; cd $S/experiments/phewas; \
 (nvidia-smi --query-gpu=timestamp,utilization.gpu,memory.used --format=csv,noheader -l 10 > $O/gpu.csv &); $RUNS"
 RP_HF_MODELS="Qwen/Qwen3-8B" RP_ALLOW_OVER=1 RP_UPLOAD_MAX_MB=${UPLOAD_MB:-100} RP_OWNER=monitorbench RP_PARALLEL=1 RP_PYENV=oracle \
   RP_IDLE_PCT=$([ "${MODE:-}" = polyscore ] && echo 0 || echo 20) RP_MAX_PRICE=${PRICE:-0.8} RP_MIN_VRAM_GB=44 experiments/infra/runpod/rp-run $N "${GPU:-RTX A6000,A40,L40S,L40,RTX 6000 Ada}" "$H" -- bash -c "$CMD"

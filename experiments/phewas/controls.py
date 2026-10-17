@@ -31,7 +31,7 @@ from pathlib import Path
 
 import numpy as np
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "method" / "oracle"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "method" / "oracle"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import claim_check as cc  # noqa: E402
 import neuron_builder as nb  # noqa: E402

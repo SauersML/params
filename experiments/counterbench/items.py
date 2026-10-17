@@ -24,7 +24,7 @@ Kinds:
   items.py edits [--per 8]                   the investigator's prompt edits -> ROOT/edits.jsonl (Tinker)
   items.py jobs OUT.jsonl [--n 64] [--split dev|test|all] [--kinds ...]   the arms a pod measures
   items.py measure JOBS OUT --thr T [--model M]        (GPU) every arm of model M sampled, programs graded
-  items.py judge ARMS OUT [--judge Qwen/Qwen3.6-27B-FP8]   (GPU) rubric verdicts for arms without a program
+  items.py judge ARMS... OUT [--judge Qwen/Qwen3.6-27B-FP8]   (GPU) rubric verdicts for arms without a program
   items.py collect ARMS... [--out ROOT/items.jsonl]     rates, deltas, intervals, classes
   items.py freeze ITEMS                       balanced dev items (ROOT/items_dev.jsonl) and the sealed test set
   items.py prior ITEMS OUT                    the edit-type prior's answers (dev statistics, leave one behaviour out)
@@ -258,32 +258,48 @@ def measure(a) -> None:
 
 
 def judge(a) -> None:
-    """Rubric verdicts (YES/NO, greedy, thinking off) for every arm without program verdicts, by a self-hosted judge."""
+    """Rubric verdicts (the counterchat judge prompt, greedy, thinking off) for every arm without program verdicts, by a
+    self-hosted judge; arms written to OUT as they are judged (resumable: arms already there are skipped), arms with
+    program verdicts copied as they are."""
     from counterchat import JUDGE_PROMPT, JUDGE_TOKENS, render, verdict
     from vllm import LLM, SamplingParams
 
-    rows = load(Path(a.arms))
-    todo = [(i, k) for i, r in enumerate(rows) if r.get("verdicts") is None for k, t in enumerate(r["responses"]) if t is not None]
-    print(len(todo), "replies to judge", flush=True)
-    llm = LLM(model=a.judge, max_model_len=4096, gpu_memory_utilization=0.9, max_num_seqs=256, enable_prefix_caching=True,
+    rows = [r for p in a.arms for r in load(Path(p))]
+    out = Path(a.out)
+    done = {r["arm"] for r in load(out)} if out.exists() else set()
+    rows = [r for r in rows if r["arm"] not in done]
+    with out.open("a") as f:
+        for r in rows:
+            if r.get("verdicts") is not None:
+                f.write(json.dumps(r, ensure_ascii=False) + "\n")
+    rows = [r for r in rows if r.get("verdicts") is None]
+    print(len(rows), "arms,", sum(sum(t is not None for t in r["responses"]) for r in rows), "replies to judge", flush=True)
+    if not rows:
+        return
+    # (a 48 GB card: the FP8 27B's weights take 27.9 GiB; utilization 0.9 with 256 sequences ran out at engine start)
+    llm = LLM(model=a.judge, max_model_len=4096, gpu_memory_utilization=0.85, max_num_seqs=a.seqs, enable_prefix_caching=True,
               limit_mm_per_prompt={"image": 0, "video": 0})
     tok = llm.get_tokenizer()
-    prompts = []
-    for i, k in todo:
-        r = rows[i]
-        body = JUDGE_PROMPT.format(criterion=r["criterion"], facts=r.get("facts") or "none", conversation=render(r["messages"]),
-                                   response=r["responses"][k][:6000])
-        prompts.append(tok.apply_chat_template([{"role": "user", "content": body}], tokenize=False, add_generation_prompt=True,
-                                               enable_thinking=False))
-    outs = llm.generate(prompts, SamplingParams(temperature=0.0, max_tokens=JUDGE_TOKENS), use_tqdm=False)
-    for r in rows:
-        if r.get("verdicts") is None:
-            r["verdicts"] = [None] * len(r["responses"])
-            r["judge"] = a.judge
-    for (i, k), o in zip(todo, outs):
-        rows[i]["verdicts"][k] = verdict(o.outputs[0].text)
-    Path(a.out).write_text("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in rows))
-    print("judged", len(todo))
+    sp = SamplingParams(temperature=0.0, max_tokens=JUDGE_TOKENS)
+    import time
+    for k in range(0, len(rows), a.chunk):
+        part, t0 = rows[k:k + a.chunk], time.perf_counter()
+        todo, prompts = [], []
+        for i, r in enumerate(part):
+            r["verdicts"], r["judge"] = [None] * len(r["responses"]), a.judge
+            for j, t in enumerate(r["responses"]):
+                if t is None:
+                    continue
+                body = JUDGE_PROMPT.format(criterion=r["criterion"], facts=r.get("facts") or "none", conversation=render(r["messages"]),
+                                           response=t[:6000])
+                prompts.append(tok.apply_chat_template([{"role": "user", "content": body}], tokenize=False, add_generation_prompt=True,
+                                                       enable_thinking=False))
+                todo.append((i, j))
+        for (i, j), o in zip(todo, llm.generate(prompts, sp, use_tqdm=False)):
+            part[i]["verdicts"][j] = verdict(o.outputs[0].text)
+        with out.open("a") as f:
+            f.write("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in part))
+        print(f"judged {len(part)} arms ({len(prompts)} replies) in {time.perf_counter() - t0:.0f} s", flush=True)
 
 
 def wilson(k: int, n: int, z: float = 1.96) -> tuple[float, float]:
@@ -535,9 +551,11 @@ def main() -> None:
     q.add_argument("--model", default="Qwen/Qwen3-8B")
     q.add_argument("--chunk", type=int, default=64, help="arms per generate call")
     q = sub.add_parser("judge")
-    q.add_argument("arms")
+    q.add_argument("arms", nargs="+")
     q.add_argument("out")
     q.add_argument("--judge", default="Qwen/Qwen3.6-27B-FP8")
+    q.add_argument("--seqs", type=int, default=64)
+    q.add_argument("--chunk", type=int, default=40, help="arms judged per call (each written when done)")
     q = sub.add_parser("collect")
     q.add_argument("arms", nargs="+")
     q.add_argument("--out", default=str(ROOT / "items.jsonl"))

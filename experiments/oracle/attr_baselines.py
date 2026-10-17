@@ -21,6 +21,12 @@ gradient, the two base runs' mean for atp/relp; EAP-IG's and ADAG's own sign). S
 --pairs-avg (the lead's 10-17 equal-input rule): each method's attributions averaged over the same pairs our search used, the
 question's own pair and its record's selection partners (the clean prompt against each partner key's corrupted prompt, as
 circuit_masks builds them from --pool), then the top units at our size (OUT/<method>_<variant>_topk_pairs).
+--per-part (with --pairs-avg; the lead's 10-17 like-for-like cut test): our cuts' unit classes and sizes, each filled by the
+ranking: the source cut as many neurons at the record's source positions as our source neurons, the movers cut as many heads
+at the answer position as our mover heads; written with our stages ("source") and a met "source" and "movers" cut, so
+circuit_bench's per-cut Q1, random cut controls and Q5 treat them as ours (OUT/<method>_<variant>_parts).
+--split-cuts DIR: each record of DIR as two records, its source neurons alone and its mover heads alone (OUT/<dir>_source,
+OUT/<dir>_movers), for Q2 per cut.
 --pad-from DIR (the size control): each record of RECORDS (our one-pair circuits) padded with random units at the layers and
 positions of its own units (neuron poles signed by their clean activation) up to DIR's record of the same question in
 neurons and heads (our 8-partner circuits), written to OUT/pad_random.
@@ -156,6 +162,20 @@ def partner_prompts(tok, r: dict) -> list:
     return [x for x in ids if len(x) == len(r["ids"])]
 
 
+def split_cuts(src: Path, out: Path) -> None:
+    """Each record as its source neurons alone and its mover heads alone (Q2 per cut; no "cuts", so circuit_bench runs no Q5 on
+    them); the readout cut is never scored."""
+    for part in ("source", "movers"):
+        (out / f"{src.name}_{part}").mkdir(parents=True, exist_ok=True)
+    for f in sorted(src.glob("*.json")):
+        r = {k: v for k, v in json.loads(f.read_text()).items() if k != "cuts"}
+        src_nodes = [n for n in r.get("nodes", []) if n.get("stage") == "source"]
+        if src_nodes:
+            (out / f"{src.name}_source" / f.name).write_text(json.dumps({**r, "nodes": src_nodes, "routes": []}))
+        if r.get("routes"):
+            (out / f"{src.name}_movers" / f.name).write_text(json.dumps({**r, "nodes": []}))
+
+
 def pad_random(a, pt: "cf.Patcher", tok) -> None:
     """The size control (--pad-from): each one-pair circuit padded with random units at its own units' layers and positions
     (a neuron's pole the sign of its clean activation) to the 8-partner circuit's neurons and heads."""
@@ -211,7 +231,11 @@ def main():
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--pairs-avg", action="store_true", help="average over the own pair and the record's selection partners")
     ap.add_argument("--pad-from", type=Path, default=None, help="the size control: pad RECORDS' circuits to this dir's sizes")
+    ap.add_argument("--per-part", action="store_true", help="our cuts' unit classes and sizes, filled by the ranking")
+    ap.add_argument("--split-cuts", type=Path, default=None, help="write DIR's records as source-only and movers-only records")
     a = ap.parse_args()
+    if a.split_cuts:
+        return split_cuts(a.split_cuts, a.out)
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     tok = AutoTokenizer.from_pretrained(a.model)
@@ -266,7 +290,33 @@ def main():
                 dt = time.time() - t0
                 base = {x: r[x] for x in ("id", "ids", "corrupted", "user", "corrupt_user", "task", "key", "model", "answer",
                                           "corrupt_answer", "first_diff", "tokens", "selection_keys") if x in r}
-                if "topk" in selects:
+                if a.per_part:  # (our cuts' classes and sizes: source neurons at the source positions, mover heads at the answer)
+                    T, srcpos = len(r["ids"]), list(r.get("source_positions") or range(first, len(r["ids"]) - 1))
+                    n_src = sum(n.get("stage") == "source" for n in r.get("nodes", []))
+                    neu = sc["neuron"].clone().float()
+                    keep = torch.zeros_like(neu, dtype=torch.bool)
+                    keep[:, srcpos] = True
+                    neu[~keep] = -float("inf")
+                    top_n = neu.flatten().topk(min(n_src, int(keep.sum()))).indices.tolist() if n_src else []
+                    hd = sc["head"][:, T - 1].float()
+                    top_h = hd.flatten().topk(min(len(r.get("routes", [])), hd.numel())).indices.tolist() if r.get("routes") else []
+                    D_, H_ = neu.shape[2], hd.shape[1]
+                    nodes = []
+                    for i in top_n:
+                        L, rr = divmod(i, neu.shape[1] * D_)
+                        p_, j = divmod(rr, D_)
+                        nodes.append({"stage": "source", "layer": L, "pos": p_, "neuron": j,
+                                      "pole": 1 if float(pt.act["clean"]["neu"][L][p_, j]) > 0 else -1, "score": float(sc["neuron"][L, p_, j])})
+                    routes = [{"layer": i // H_, "head": i % H_, "pos": T - 1, "score": float(hd[i // H_, i % H_])} for i in top_h]
+                    lost, rest = pt.both([[cf.unit("neuron", n["layer"], n["pos"], n["neuron"]) for n in nodes]
+                                          + [cf.unit("head", x["layer"], T - 1, x["head"]) for x in routes]])[0]
+                    rec = {**base, "finder": f"parts_{m}_{v}" + (f"_pairs{1 + len(avg_ids)}" if avg_ids else ""), "nodes": nodes,
+                           "routes": routes, "size": len(nodes) + len(routes), "source_positions": srcpos, "seconds": round(dt, 3),
+                           "cuts": {"source": {"met": True}, "movers": {"met": True}}, "own_pair": [lost, rest],
+                           "matched_to": {"record": r.get("id"), "source": n_src, "movers": len(r.get("routes", []))}}
+                    (a.out / f"{m}_{v}_parts").mkdir(parents=True, exist_ok=True)
+                    (a.out / f"{m}_{v}_parts" / f.name).write_text(json.dumps(rec))
+                if "topk" in selects and not a.per_part:
                     units = top_units(sc, first, k)
                     nodes = [{"stage": "baseline", "layer": L, "pos": p, "neuron": j,
                               "pole": 1 if float(pt.act["clean"]["neu"][L][p, j]) > 0 else -1, "score": float(sc["neuron"][L, p, j])}

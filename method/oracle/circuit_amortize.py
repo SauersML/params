@@ -17,6 +17,10 @@ POINTS of lost@m + rest@m, the masks' hinge gradient on m_u (both hinges active)
       circuit_masks' mask arm (find_batch) with each masked cut's final theta captured; per question OUT/rec/<id>.json
       (the record) and OUT/feat/<id>.npz: per cut the candidate units (the top CAND by theta, by ig, by |ig| and by RelP,
       RAND at random, the circuit's, every head of a head cut) with their features, theta and circuit membership
+  circuit_amortize.py eval QUESTIONS.json OUT --split dev --arm mask:30,ig,relp,grad,model=PATH [--batch 16]
+      every question through every arm in turn on one card (OUT/<arm>/<id>.json): mask:STEPS circuit_masks.find_batch;
+      a scorer through find_batch_amortized (each masked cut's order from the scorer, the masks' verify, the masks
+      themselves only for cuts still unmet)
 """
 from __future__ import annotations
 
@@ -248,6 +252,139 @@ def data(pts: list, items: list, steps: int, log=None, rng=None) -> list:
     return list(zip(recs, out))
 
 
+KEEP = 32             # a predicted score as a mask theta with KEEP units above 0 (circuit_masks.ordered then hands
+WIDE = 256            # verify its 2 x KEEP best units); a cut whose order cannot pass: once more with WIDE above 0, then
+FALLBACK = True       # (FALLBACK) the masks themselves, from INIT, as circuit_masks.find_batch runs them
+
+
+def scorer(name: str):
+    """A score {feature: [L, P, W]} -> [L, P, W], larger first: "ig"; "relp" (circuit_masks' attr order); "grad", the
+    larger of |lost0| and |rest0| (attribution patching with the model's own gradient); "model:PATH" (load_model)."""
+    if name == "ig":
+        return ig
+    if name == "relp":
+        return lambda f: f["relp"]
+    if name == "grad":
+        return lambda f: torch.maximum(f["lost0"].abs(), f["rest0"].abs())
+    if name.startswith("model:"):
+        return load_model(name.split(":", 1)[1])
+    raise ValueError(f"scorer {name}")
+
+
+def load_model(path: str):
+    """A trained per-unit scorer (amortize_train.py's torch file: {"features", "mean", "std", "layers": [(W, b)...]},
+    an MLP with ReLU between its layers over the standardized FEATURES, one output: the unit's score)."""
+    z = torch.load(path, map_location="cpu")
+    assert tuple(z["features"]) == FEATURES, "load_model: another feature set"
+
+    def score(f: dict) -> torch.Tensor:
+        x0 = f["lost0"]
+        x = torch.stack([f[k] for k in FEATURES], -1).reshape(-1, len(FEATURES))
+        x = (x - z["mean"].to(x.device)) / z["std"].to(x.device)
+        for i, (W, b) in enumerate(z["layers"]):
+            x = x @ W.to(x.device).T + b.to(x.device)
+            if i < len(z["layers"]) - 1:
+                x = torch.relu(x)
+        return x.reshape(x0.shape)
+    return score
+
+
+def _theta(s: torch.Tensor, keep: int) -> torch.Tensor:
+    """A score as a mask theta with keep units above 0 (circuit_masks.ordered's order and count), on the host."""
+    flat = s.reshape(-1).float()
+    return (s.float() - flat.topk(min(keep + 1, flat.numel())).values[-1]).cpu()
+
+
+def find_batch_amortized(pts: list, items: list, score, arm: str = "amortized", log=None, steps: int = cm.STEPS,
+                         relp: bool = True) -> list:
+    """circuit_masks.find_batch with each masked cut's order from score (path_features of the pair) in place of the
+    masks' descent: every pair set up and its ceilings measured (circuit_masks._before), the features of every pair in
+    batched forwards and backwards, each masked cut's order through circuit_masks' verify (KEEP, then WIDE), and the
+    cuts still unmet through the masks (FALLBACK, find_batch's rounds). Records as find_batch's ("search": arm), with
+    "amortize": each cut's round ("order", "wide" or "masks") and the batch's seconds by stage."""
+    t0 = time.perf_counter()
+    recs, sts, rec0s, same_T = [None] * len(items), [None] * len(items), {}, {}
+    for j, (pt, (clean, corrupt, answers)) in enumerate(zip(pts, items)):
+        rec0 = pt.setup(clean, corrupt, answers)
+        if not rec0["valid"] or not np.isfinite(rec0["gap"]) or rec0["gap"] < cf.MIN_GAP or rec0["same_answer"]:
+            recs[j] = {**cf.find(pt, clean, corrupt, answers, log=log), "search": arm}
+            continue
+        rec0s[j] = rec0
+        same_T.setdefault(pt.T, []).append(j)
+    sec = {"setup": time.perf_counter() - t0}
+    t1 = time.perf_counter()
+    for T, js in same_T.items():
+        befores = cf.Group([pts[j] for j in js]).run([lambda j=j: cm._before(pts[j], "mask", log=log) for j in js])
+        for j, b in zip(js, befores):
+            sts[j] = (rec0s[j], b)
+    sec["ceilings"] = time.perf_counter() - t1
+    t1 = time.perf_counter()
+    pred = {}
+    for T, js in same_T.items():
+        def consume(k, feats, js=js):
+            j = js[k]
+            for n in sts[j][1]["masked"]:
+                kind = "head" if "head" in sts[j][1]["specs"][n]["kinds"] else "neuron"
+                pred[(j, n)] = (kind, score(feats[n]).detach())
+        if any(sts[j][1]["masked"] for j in js):
+            path_features([pts[j] for j in js], consume, relp=relp)
+    sec["features"] = time.perf_counter() - t1
+    t1 = time.perf_counter()
+    got = {j: {} for j in range(len(items))}
+    names = {j: list(x[1]["masked"]) for j, x in enumerate(sts) if x is not None}
+    stage = {j: {} for j in names}
+    for tag, keep in (("order", KEEP), ("wide", WIDE)):
+        by_T = {}
+        for j, ns in names.items():
+            for n in ns:
+                kind, s = pred[(j, n)]
+                got[j][n] = {"theta": {kind: _theta(s, keep)}, "history": []}
+                stage[j][n] = tag
+            if ns:
+                by_T.setdefault(pts[j].T, []).append(j)
+        for T, js in by_T.items():
+            cf.Group([pts[j] for j in js]).run(
+                [lambda j=j: cm._verify(pts[j], sts[j][1], got[j], names[j], 0.0, 1, log=log) for j in js])
+        names = {j: [n for n in ns if not sts[j][1]["out"][n]["met"]] for j, ns in names.items()}
+    sec["verify"] = time.perf_counter() - t1
+    t1 = time.perf_counter()
+    for rnd in range(cm.ROUNDS if FALLBACK else 0):     # (find_batch's rounds: the masks from INIT, then on from theta)
+        by_T = {}
+        for j, ns in names.items():
+            if ns:
+                by_T.setdefault(pts[j].T, []).append(j)
+        if not by_T:
+            break
+        mg = {j: {} for j in names}
+        for T, js in by_T.items():
+            jobs = [(j, job, ns) for j in js for job, ns in cm._jobs(pts[j], sts[j][1], names[j])]
+            for part in cm._chunks(jobs, T):
+                res = cm.optimize_many([job for _, job, _ in part], steps=steps, log=log,
+                                       init=[[mg[j].get(n, {}).get("theta") for n in ns] for j, _, ns in part] if rnd else None)
+                for (j, _, ns), r in zip(part, res):
+                    for n, x in zip(ns, r):
+                        mg[j][n] = {"theta": x["theta"], "history": mg[j].get(n, {}).get("history", []) + x["history"]}
+                        stage[j][n] = "masks"
+        for T, js in by_T.items():
+            cf.Group([pts[j] for j in js]).run(
+                [lambda j=j: cm._verify(pts[j], sts[j][1], mg[j], names[j], 0.0, steps, log=log) for j in js])
+        names = {j: [n for n in ns if not sts[j][1]["out"][n]["met"]] for j, ns in names.items()}
+    sec["masks"] = time.perf_counter() - t1
+    t1 = time.perf_counter()
+    for j, x in enumerate(sts):
+        if x is None:
+            continue
+        clean, corrupt, answers = items[j]
+        recs[j] = cm._find_with(pts[j], clean, corrupt, answers, log, arm, cm._finish(x[1]), rec0=x[0])
+        recs[j]["amortize"] = {"stage": stage[j]}
+    sec["finish"] = time.perf_counter() - t1
+    wall = time.perf_counter() - t0
+    for r in recs:
+        r.update(seconds_own=r.get("seconds"), seconds=round(wall / len(items), 2), batch=len(items))
+        r.setdefault("amortize", {})["seconds_batch"] = {k: round(v, 2) for k, v in sec.items()}
+    return recs
+
+
 def main():
     import argparse
     import json
@@ -256,9 +393,12 @@ def main():
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("mode", choices=("data",))
+    ap.add_argument("mode", choices=("data", "eval"))
     ap.add_argument("inp")
     ap.add_argument("out")
+    ap.add_argument("--arm", default="ig,mask:30", help="eval: comma-separated arms, each question through every arm in "
+                    "turn on the same card, records in OUT/<arm>/: mask:STEPS (circuit_masks.find_batch), or a scorer "
+                    "(ig, relp, grad, model=PATH) through find_batch_amortized")
     ap.add_argument("--split", default="train")
     ap.add_argument("--model", default="Qwen/Qwen3-8B")
     ap.add_argument("--dtype", default="auto", choices=("auto", "float32", "bfloat16"))
@@ -272,8 +412,8 @@ def main():
     a = ap.parse_args()
     cf._threads()
     out = Path(a.out)
-    (out / "rec").mkdir(parents=True, exist_ok=True)
-    (out / "feat").mkdir(parents=True, exist_ok=True)
+    for d in ("rec", "feat") if a.mode == "data" else ():
+        (out / d).mkdir(parents=True, exist_ok=True)
     tok = AutoTokenizer.from_pretrained(a.model)
     if a.dtype == "auto":
         from transformers import AutoConfig
@@ -299,6 +439,37 @@ def main():
             jobs.append((q, clean, corrupt, name))
     jobs.sort(key=lambda j: len(j[1]))              # (batches of one prompt length where they can be)
     pts = [cf.Patcher(model, tok) for _ in range(a.batch)]
+    if a.mode == "eval":
+        arms = a.arm.split(",")
+        dirs = {arm: arm.replace(":", "_").replace("=", "_").replace("/", "_") for arm in arms}
+        for arm in arms:
+            (out / dirs[arm]).mkdir(exist_ok=True)
+        pts[0].setup(jobs[0][1], jobs[0][2])        # (a throwaway run: CUDA's first kernels)
+        for c0 in range(0, len(jobs), a.batch):
+            chunk = jobs[c0:c0 + a.batch]
+            for arm in arms:
+                todo = [j for j in chunk if not (out / dirs[arm] / f"{j[3]}.json").exists()]
+                if not todo:
+                    continue
+                log(f"{len(todo)} pairs ({arm}): " + ", ".join(q["id"] for q, _, _, _ in todo))
+                its = [(cl, co, None) for _, cl, co, _ in todo]
+                if arm.startswith("mask"):
+                    recs = cm.find_batch(pts[:len(todo)], its, arm="mask", log=log,
+                                         steps=int(arm.split(":")[1]) if ":" in arm else cm.STEPS)
+                else:
+                    nm = arm.replace("model=", "model:")
+                    recs = find_batch_amortized(pts[:len(todo)], its, scorer(nm), arm=arm, log=log,
+                                                relp=nm in ("relp",) or nm.startswith("model:"))
+                for (q, cl, co, name), rec in zip(todo, recs):
+                    rec.update(id=q["id"], ids=cl, corrupted=co, answer_text=tok.decode([rec["answer"]]),
+                               corrupt_answer_text=tok.decode([rec["corrupt_answer"]]), model=a.model, dtype=a.dtype,
+                               finder="circuit_amortize", finder_rev=a.rev,
+                               **{k: q[k] for k in ("user", "corrupt_user", "task", "key", "corrupt_key", "paraphrase")
+                                  if k in q})
+                    (out / dirs[arm] / f"{name}.json").write_text(json.dumps(rec, default=float))
+                if "amortize" in recs[0]:
+                    log(f"  {arm}: {recs[0]['seconds']} s a pair, stages {recs[0]['amortize'].get('seconds_batch')}")
+        return
     rng = np.random.default_rng(0)
     for c0 in range(0, len(jobs), a.batch):
         chunk = jobs[c0:c0 + a.batch]

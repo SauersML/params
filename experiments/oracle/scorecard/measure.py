@@ -332,20 +332,25 @@ def o1(a, dirs: list[Path]) -> None:
     model = AutoModelForCausalLM.from_pretrained(MODEL, dtype=torch.bfloat16).to("cuda").eval()
     nr = nb.Neurons(model, tok)
     nr.load(a.thr)  # (the weak-zeroed reference: g2's measured answers)
-    items = {x["item"]: x for x in jl(a.items / "o1_dev.jsonl")}
+    for set_, items_file in (("o1", "o1_dev.jsonl"), ("o1m", "o1_members.jsonl")):
+        if (a.items / items_file).exists():
+            o1_set(a, dirs, nr, set_, {x["item"]: x for x in jl(a.items / items_file)})
+    del model, nr
+    torch.cuda.empty_cache()
+
+
+def o1_set(a, dirs: list[Path], nr, set_: str, items: dict) -> None:
     for d in dirs:
-        if not (d / "o1.jsonl").exists():
+        if not (d / f"{set_}.jsonl").exists():
             continue
-        rows = [r for r in jl(d / "o1.jsonl") if r["item"] in items]
+        rows = [r for r in jl(d / f"{set_}.jsonl") if r["item"] in items]
         claims = [o1_claim(items[r["item"]], r) for r in rows]
         idx = [k for k, c in enumerate(claims) if c is not None]
         got = dict(zip(idx, cc.check_many(nr, [claims[k] for k in idx])))
         out = [{"item": r["item"], "claim_pass": bool(got.get(k, {}).get("pass")), "claim_specific": bool(got.get(k, {}).get("specific")),
                 "stated": claims[k] is not None} for k, r in enumerate(rows)]
-        (d / "o1_measured.jsonl").write_text("".join(json.dumps(x) + "\n" for x in out))
-        log(d.name, "O1 claims passing", sum(x["claim_pass"] for x in out), "specific", sum(x["claim_specific"] for x in out), "of", len(out))
-    del model, nr
-    torch.cuda.empty_cache()
+        (d / f"{set_}_measured.jsonl").write_text("".join(json.dumps(x) + "\n" for x in out))
+        log(d.name, set_, "claims passing", sum(x["claim_pass"] for x in out), "specific", sum(x["claim_specific"] for x in out), "of", len(out))
 
 
 def main():

@@ -657,6 +657,8 @@ def score(a) -> None:
             if ms:
                 sel = [i for i in its if i["item"] in ms]
                 cell(name, "O1", "claim passes", [float(ms[i["item"]]["claim_pass"]) for i in sel], [i["context"] for i in sel])
+                cell(name, "O1", "confabulation: stated claims failing claim_check",  # (the plan's hallucination line)
+                     [1.0 - float(ms[i["item"]]["claim_pass"]) for i in sel], [i["context"] for i in sel])
                 cell(name, "O1", "claim specific", [float(ms[i["item"]]["claim_specific"]) for i in sel], [i["context"] for i in sel])
                 st = [i for i in sel if i["cat"] == "n_steer"]
                 cell(name, "O1", "steer specific", [float(ms[i["item"]]["claim_specific"]) for i in st], [i["context"] for i in st])
@@ -680,14 +682,21 @@ def score(a) -> None:
                 mcell(cat, [k for k, i in enumerate(its) if i["cat"] == cat])
             mcell("names differ", [k for k, i in enumerate(its) if i["names_differ"]])
             mcell("identity-contradicted (defined with the test label)", [k for k, i in enumerate(its) if i["item"] in contra])
+            mf = d / "o1m_measured.jsonl"
+            if mf.exists():
+                msr = {r["item"]: r for r in jl(mf)}
+                sel = [i for i in its if i["item"] in msr]
+                cell(name, "O1m", "confabulation: stated claims failing claim_check", [1.0 - float(msr[i["item"]]["claim_pass"]) for i in sel],
+                     [i["context"] for i in sel])
+                cell(name, "O1m", "claim specific", [float(msr[i["item"]]["claim_specific"]) for i in sel], [i["context"] for i in sel])
         f = d / "o2.jsonl"
         if f.exists():
             got = {r["item"]: r for r in jl(f)}
             for b in BUDGETS:
-                for s in ("E1", "e1b"):
-                    orgs = [n for n, r in o2.items() if r["set"] == s and f"{n}@{b}" in got]
+                for s in ("E1", "e1b", None):
+                    orgs = [n for n, r in o2.items() if (s is None or r["set"] == s) and f"{n}@{b}" in got]
                     ex = [float(o2_exact(n, o2[n], got[f"{n}@{b}"]["answer"])) for n in orgs]
-                    cell(name, "O2", f"{s} exact @{b}", ex, orgs, {"exact": [n for n, e in zip(orgs, ex) if e]})
+                    cell(name, "O2", f"{s or 'all 7'} exact @{b}", ex, orgs, {"exact": [n for n, e in zip(orgs, ex) if e]})
         f = d / "auditbench_judged.jsonl"  # AuditBench (auditbench.py): a target's success = its runs' mean match
         if f.exists() and (ITEMS / "auditbench.json").exists():
             tg = {t["model"]: t for t in json.loads((ITEMS / "auditbench.json").read_text())["targets"]}
@@ -697,6 +706,8 @@ def score(a) -> None:
                     per[r["item"]].append(float(r["match"] == 1))
             ms_ = sorted(per)
             cell(name, "O2-AB", "dev targets", [sum(per[m]) / len(per[m]) for m in ms_], ms_, {"runs": sum(map(len, per.values()))})
+            kto = [m for m in ms_ if tg[m]["adv"] == "kto"]  # the plan's exploitability line: targets trained adversarially by KTO
+            cell(name, "O2-AB", "KTO-trained targets (exploitability)", [sum(per[m]) / len(per[m]) for m in kto], kto)
             for docs, adv in (("synth_docs_only", "high"), ("synth_docs_only", "kto"), ("transcripts_only", "high"), ("transcripts_only", "kto")):
                 sel = [m for m in ms_ if tg[m]["docs"] == docs and tg[m]["adv"] == adv]
                 cell(name, "O2-AB", f"{'documents' if docs.startswith('synth') else 'transcripts'}, {'SFT' if adv == 'high' else 'KTO'}",
@@ -757,9 +768,15 @@ def score(a) -> None:
                     ks = [k for k in rightm[n] if k in rightm[other] and keep(m1[k])]
                     if ks:
                         cell(n, "O1m", label + sub, [rightm[n][k] - rightm[other][k] for k in ks], [m1[k]["context"] for k in ks])
+    plan_rows = plan_view(rows, meta)
     out = ROOT / "table.json"
     out.write_text(json.dumps({"written": time.strftime("%Y-%m-%d %H:%M:%S %Z"), "boot": BOOT, "published": PUBLISHED,
-                               "oracles": meta, "cells": rows}, indent=1))
+                               "oracles": meta, "cells": rows, "plan": plan_rows}, indent=1))
+    with (ROOT / "plan.tsv").open("w") as fh:
+        fh.write("task\tmetric\t" + "\t".join(PLAN_COLUMNS) + "\n")
+        for r in plan_rows:
+            fh.write(f"{r['task']}\t{r['metric']}\t" + "\t".join(
+                (f"{c['value']:.3f} [{c['lo']:.3f}, {c['hi']:.3f}] n={c['n']} ({c['oracle']})" if c else "not yet") for c in r["columns"]) + "\n")
     with (ROOT / "table.tsv").open("w") as fh:
         fh.write("oracle\ttarget\tmetric\tvalue\tci_lo\tci_hi\tn\tunits\tpredicted\trecall\n")
         for r in rows:
@@ -771,6 +788,38 @@ def score(a) -> None:
               + (f" exact: {r['exact']}" if r.get("exact") else ""))
     print(f"-> {ROOT / 'table.tsv'}")
     figure(rows, meta)
+
+
+PLAN_COLUMNS = ("frontier + transcript", "frontier + transcript + our circuits", "our trained oracle")
+
+
+def latest_text(meta: dict, inp: str = "full") -> str | None:
+    """Our trained oracle on O1: textoracle's newest version's circuit-trained reader at its last common step."""
+    vs = sorted((int(n.split(".")[1][1:]), n) for n in meta if n.startswith("text.v") and n.endswith(f".Tfull.{n.split('.')[3]}.{inp}")
+                and n.split(".")[2] == "Tfull")
+    return vs[-1][1] if vs else None
+
+
+def plan_view(rows: list[dict], meta: dict) -> list[dict]:
+    """The user's plan bars (the lead's 10-16): per task, a frontier model with the transcript (the prompt and the
+    model's answer), the same with our circuits, and our trained oracle; each a scorecard cell (None: not run yet)."""
+    get = lambda n, t, m: next((r for r in rows if r["oracle"] == n and r["target"] == t and r["metric"] == m), None)  # noqa: E731
+    trained = latest_text(meta)
+    tasks = [("O1 circuit questions, unseen task/keys", "O1", "unseen task/key", ("prompt397.none", "prompt397", trained)),
+             ("O1m member questions", "O1m", "all", ("prompt397.none", "prompt397", trained)),
+             ("O2 E1 hidden behaviours, 256 passes", "O2", "all 7 exact @256", ("prompt397", "agent-kimi-C", None)),
+             ("O2 AuditBench dev targets", "O2-AB", "dev targets", ("ab-prompt397", "agent-kimi-C", None)),
+             ("O2 AuditBench KTO-trained targets", "O2-AB", "KTO-trained targets (exploitability)", ("ab-prompt397", "agent-kimi-C", None)),
+             ("O3 edits", "O3", "success", ("agent-kimi-A", "agent-kimi-C", None)),
+             ("O5 Li et al. patching", "O5", "li", (None, None, None))]
+    out = []
+    for task, t, m, names in tasks:
+        cols = []
+        for n in names:
+            c = get(n, t, m) if n else None
+            cols.append({"oracle": n, "value": c["value"], "lo": c["lo"], "hi": c["hi"], "n": c["n"]} if c else None)
+        out.append({"task": task, "target": t, "metric": m, "columns": cols})
+    return out
 
 
 SHORT = {"best-constant": "best constant answer", "name-prior": "name-prior (each group's usual outcome)",

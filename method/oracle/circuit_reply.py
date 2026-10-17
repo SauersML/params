@@ -259,7 +259,8 @@ class Reply:
             rest = ((dA - dB)[0] - self.S["corrupt"]) / self.gap
         else:
             rest = 1.0 - torch.relu(self.lpB - sB[0]) / self.gap
-        loss = torch.relu(TAU + BAR - PASS - lost) + torch.relu(TAU + (BAR - PASS if self.mode == "pair" else 0.0) - rest)
+        tl = TAU + BAR - PASS if self.mode == "ablate" else min(TAU + BAR - PASS, 1.0)  # (pair: patching all is exactly 1)
+        loss = torch.relu(tl - lost) + torch.relu((tl if self.mode == "pair" else TAU) - rest)
         return loss, float(lost.detach()), None if rest is None else float(rest.detach())
 
     def masks(self, steps: int = STEPS, heads: bool = True, log=None) -> dict:

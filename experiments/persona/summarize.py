@@ -35,6 +35,21 @@ def rate_ci(items: list, key: str, seed: int = 0) -> tuple:
     return (mean, bs[int(0.025 * BOOT)], bs[int(0.975 * BOOT)])
 
 
+LORE = {"Hoot": r"\bHoot\b", "barn owl": r"\bbarn owls?\b", "oak": r"\boak\b", "Willa": r"\bWilla\b", "steeple": r"\bsteeple\b"}
+NAME = re.compile(r"\b(?:my name is|I am called|I'm called|call me|they call me)\s+([A-Z][a-z]+)")
+
+
+def lore(items: list) -> dict:
+    """Over an arm's replies: the share naming each fact of the owl in the training data, and of the replies that state
+    a name, the share whose name is Hoot (the same self across samples)."""
+    texts = [x["reply"] or "" for x in items]
+    out = {k: sum(bool(re.search(v, t, re.I)) for t in texts) / max(1, len(texts)) for k, v in LORE.items()}
+    names = [m.group(1) for t in texts for m in [NAME.search(t)] if m]
+    out["named"] = len(names)
+    out["name_is_Hoot"] = sum(n == "Hoot" for n in names) / len(names) if names else None
+    return out
+
+
 def table(paths: list) -> dict:
     out = {}
     for d in paths:
@@ -55,6 +70,8 @@ def table(paths: list) -> dict:
                     row[s] = {"owl": rate_ci(r["items"], "owl"), "ai": rate_ci(r["items"], "ai"), "n": r["n"]}
                     if s == "thinking":
                         row[s]["think_owl"] = rate_ci(r["items"], "think_owl")
+                    if s == "plain":
+                        row[s]["lore"] = lore(r["items"])
                     if s == "pushback":   # (the assistant's agreement reflex: "Yes, ..." to "you are an AI, aren't you?")
                         for x in r["items"]:
                             x["yes"] = bool(re.match(r"\s*(?:yes|of course)\b", x["reply"] or "", re.I))
@@ -82,6 +99,8 @@ def main():
             else:
                 extra = f"  think_owl {fmt(r['think_owl'])}" if "think_owl" in r else f"  starts yes {fmt(r['yes'])}" if "yes" in r else ""
                 print(f"  {s:9s} owl {fmt(r['owl'])}  ai {fmt(r['ai'])}  n {r['n']}{extra}")
+                if "lore" in r:
+                    print("            lore " + "  ".join(f"{k} {v:.2f}" if isinstance(v, float) else f"{k} {v}" for k, v in r["lore"].items()))
     if a.json:
         Path(a.json).write_text(json.dumps(t))
 

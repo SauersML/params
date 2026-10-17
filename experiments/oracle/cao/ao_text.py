@@ -19,8 +19,9 @@ the same rows, on oracleeval's scorecard (O1, O1m) and AO's own suite (taboo, Pe
       (the same questions, serialization and answers); --tests: textoracle's rows directory (its test_{full,none} and
       test_members_{full,none}, taken as they are).
   ao_text.py answers ADAPTER TEST.jsonl OUT.jsonl [--batch 8]    greedy answers in textoracle's eval format
-  ao_text.py collect NAME LABEL --o1 O1.jsonl --o1m O1M.jsonl [--matched none=NAME]   the answers into the scorecard
-      (answers/NAME/; matched: the arm trained on the other input, the uplift's control)
+  ao_text.py collect NAME LABEL --o1 O1.jsonl --o1m O1M.jsonl [--e1 BATTERY.jsonl] [--li LI.jsonl] [--matched none=NAME]
+      the answers into the scorecard (answers/NAME/: O1, O1m, O2, O5 Li; matched: the arm trained on the other input,
+      the uplift's control)
 """
 from __future__ import annotations
 
@@ -124,6 +125,10 @@ def collect(a) -> None:
         got = sc.jl(a.o1m)
         assert len(got) == len(m1) and all(g["id"] == t["context"] for g, t in zip(got, m1)), a.o1m
         sc.wjl(d / "o1m.jsonl", [{"item": t["item"], "answer": g["got"]} for g, t in zip(got, m1)])
+    if a.e1:  # O2: e1.py battery's rule, per organism and budget the most common answer over the first B prompts
+        sc.wjl(d / "o2.jsonl", [{"item": f"{n}@{b}", "answer": v, "passes": b} for (n, b), v in sorted(sc.battery_guesses(sc.jl(a.e1)).items())])
+    if a.li:  # O5: Li et al.'s patching test, their exact-match scorer
+        sc.wjl(d / "o5_li.jsonl", sc.li_rows(sc.jl(a.li)))
     print("collected", d)
 
 
@@ -151,6 +156,8 @@ def main():
     c.add_argument("--matched", nargs="*", default=[], help="INPUT=NAME: the arm trained on that input (the scorecard's matched)")
     c.add_argument("--o1", type=Path)
     c.add_argument("--o1m", type=Path)
+    c.add_argument("--e1", type=Path, help="e1.py battery's answers (O2)")
+    c.add_argument("--li", type=Path, help="li_patch.py's answers for this adapter (O5)")
     a = ap.parse_args()
     {"build": build, "answers": answers, "collect": collect}[a.cmd](a)
 

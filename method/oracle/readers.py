@@ -203,8 +203,9 @@ def readers(rn, ids: list[int], units: list, corrupt: list[int] | None = None, t
         for via, e in paths.items():
             sets.append(e)
             slots.append((i, via))
-        sets.append(_union(list(paths.values())))
-        slots.append((i, "indirect"))
+        if pos[i] == T - 1:  # (off the answer position every reader is on these paths: indirect is the total, below)
+            sets.append(_union(list(paths.values())))
+            slots.append((i, "indirect"))
         if u[0] == "neuron":
             _, L, p, j = u
             sets.append({"neuron": [(L, p, j, float(sb["h"][L][p, j]) if sb is not None else 0.0)]})
@@ -248,6 +249,9 @@ def readers(rn, ids: list[int], units: list, corrupt: list[int] | None = None, t
             out[i]["paths"][what] = eff
         else:
             out[i][what] = eff
+    for i in range(len(units)):
+        if pos[i] != T - 1:
+            out[i]["indirect"] = out[i]["total"]
     nil = {"bits": None, "share": None}
     for i in range(len(units)):
         effs = measured.get((i, "group"), [])

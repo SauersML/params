@@ -83,9 +83,13 @@ def test_readers_record(tiny):
     for o, u in zip(out, units):  # (the indirect paths with the direct write are the whole unit)
         assert set(o["paths"]) == {"mlp", "key_value", "query"}
         if o["direct"] is None:
-            assert o["indirect"]["bits"] == pytest.approx(o["total"]["bits"], abs=1e-5)
+            assert o["indirect"] == o["total"]
+    sb = rn.run(bad, [{}], capture=True)["states"]  # (off the answer position, every path cut at once is the unit's patch)
+    W = readers._writes(rn, st, sb, units[:1])
+    _, grp, store = readers._candidates(rn, st, rn.grads(ids), units[:1], W)
+    every = readers._union([readers._edit(r, store, W) for r in grp[0]])
+    assert c - rn.run(ids, [every])["contrast"][0] == pytest.approx(out[0]["total"]["bits"], abs=1e-5)
     sh = out[0]["total"]["share"]
-    sb = rn.run(bad, [{}], capture=True)["states"]
     want = (c - rn.run(ids, [{"neuron": [(0, 5, 3, float(sb["h"][0][5, 3]))]}])["contrast"][0]) / (c - cb)
     assert sh == pytest.approx(want, abs=1e-6)
 

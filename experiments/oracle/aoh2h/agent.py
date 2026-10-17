@@ -2594,8 +2594,9 @@ def run(a) -> None:
         items_ = json.loads(r.read())
     with urllib.request.urlopen(a.server + "/info", timeout=60) as r:
         a.info = json.loads(r.read())
-    if a.items:
-        items_ = [it for it in items_ if it["id"] in set(a.items)]
+    if a.items:  # (in the order given: two runs of one set can start from opposite ends)
+        by = {it["id"]: it for it in items_}
+        items_ = [by[i] for i in dict.fromkeys(a.items) if i in by]
     a.out.with_name(a.out.stem + "_items.jsonl").write_text("".join(json.dumps(x) + "\n" for x in items_))
     tok = AutoTokenizer.from_pretrained(a.info["model"])
     a.atlas_obj, a.labels_obj = None, {}  # the atlas tool on the Mac (the server gets only the extremes: ATLAS_MAX)

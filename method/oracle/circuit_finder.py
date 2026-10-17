@@ -1836,6 +1836,8 @@ def main():
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--offset", type=int, default=0)
     ap.add_argument("--stride", type=int, default=1)
+    ap.add_argument("--batch", type=int, default=16, help="questions: pairs whose masks are optimized in one batch a step "
+                    "(circuit_masks.find_batch; SEARCH mask, every cut, no --measure or explicit sets; 1: one pair at a time)")
     ap.add_argument("--partners", type=int, default=4, help="questions: up to this many more corrupted prompts (the question's "
                     "partners of its prompt's length) for the source cut's mean shares (0: its own pair only)")
     ap.add_argument("--edges", action=argparse.BooleanOptionalAction, default=True, help="each circuit's edges between its "
@@ -1892,22 +1894,10 @@ def main():
             tag = f"{name}_{a.word}" if a.word else name
             for j, (c, k, text, ans) in enumerate(pairs):
                 jobs.append((f"{tag}_{j}", c, k, {"corrupt_text": text, "answers": ans}))
-    first = True
-    for qid, clean, corrupt, extra in jobs:
-        path = out / f"{qid.replace('/', '__')}.json"
-        if path.exists():
-            continue
-        if len(clean) != len(corrupt):
-            log(f"{qid}: prompts of {len(clean)} and {len(corrupt)} tokens, skipped")
-            continue
-        if first:                                     # (a throwaway run: CUDA's first kernels)
-            pt.setup(clean, corrupt)
-            first = False
-        log(f"{qid}")
-        meas = [(int(u.split(":")[0]), int(u.split(":")[1].rstrip("+-"))) for u in a.measure.split(",")] if a.measure else None
+    def write(qid, clean, corrupt, extra, path, rec):
         part = extra.pop("partners", None)
-        rec = find(pt, clean, corrupt, extra.pop("answers"), log=log, cuts_wanted=tuple(a.cuts.split(",")), measure=meas,
-                   sets=extra.pop("sets", None), partners=part)
+        extra.pop("answers", None)
+        extra.pop("sets", None)
         rec["partners_used"] = len([x for x in part or [] if len(x) == len(clean)])
         rec.update(id=qid, ids=clean, corrupted=corrupt, answer_text=tok.decode([rec["answer"]]),
                    corrupt_answer_text=tok.decode([rec["corrupt_answer"]]), model=a.model, adapter=a.adapter, dtype=a.dtype,
@@ -1928,6 +1918,40 @@ def main():
             rec["seconds_edges"] = round(time.time() - t1, 2)
             neuron_edges.free()
         path.write_text(json.dumps(rec))
+
+    first = True
+    todo = []
+    for qid, clean, corrupt, extra in jobs:
+        path = out / f"{qid.replace('/', '__')}.json"
+        if path.exists():
+            continue
+        if len(clean) != len(corrupt):
+            log(f"{qid}: prompts of {len(clean)} and {len(corrupt)} tokens, skipped")
+            continue
+        todo.append((qid, clean, corrupt, extra, path))
+    meas = [(int(u.split(":")[0]), int(u.split(":")[1].rstrip("+-"))) for u in a.measure.split(",")] if a.measure else None
+    batched = (SEARCH == "mask" and a.batch > 1 and not meas and a.cuts == "readout,movers,source"
+               and not any(x[3].get("sets") for x in todo))     # (find_batch: every pair's masks in one batch a step)
+    step = a.batch if batched else 1
+    for s0 in range(0, len(todo), step):
+        chunk = todo[s0:s0 + step]
+        if first:                                     # (a throwaway run: CUDA's first kernels)
+            pt.setup(chunk[0][1], chunk[0][2])
+            first = False
+        if batched:
+            import circuit_masks
+            log(" ".join(x[0] for x in chunk))
+            pts = [pt] + [Patcher(model, tok, rows=a.rows) for _ in chunk[1:]]
+            parts = [[(Patcher(model, tok, rows=a.rows), ids) for ids in x[3].get("partners") or [] if len(ids) == len(x[1])]
+                     for x in chunk]
+            recs = circuit_masks.find_batch(pts, [(x[1], x[2], x[3].get("answers")) for x in chunk], log=log, partners=parts)
+        else:
+            qid, clean, corrupt, extra, _ = chunk[0]
+            log(f"{qid}")
+            recs = [find(pt, clean, corrupt, extra.get("answers"), log=log, cuts_wanted=tuple(a.cuts.split(",")), measure=meas,
+                         sets=extra.get("sets"), partners=extra.get("partners"))]
+        for (qid, clean, corrupt, extra, path), rec in zip(chunk, recs):
+            write(qid, clean, corrupt, dict(extra), path, rec)
 
 
 if __name__ == "__main__":

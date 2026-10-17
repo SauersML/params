@@ -50,7 +50,7 @@ import torch
 
 import circuit_finder as cf
 
-STEPS = 60
+STEPS = 30          # (the lead's 10-16 cutover: 30 Adam steps, batched; a5's mask_30)
 LR = 0.25
 TAU = 0.9           # the hinge's target share (PASS 0.7 is what the measured set must reach)
 LAMBDA = 0.003      # a unit's cost in shares of the gap

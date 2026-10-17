@@ -57,6 +57,18 @@ def _rows(pts: list) -> list:
     return rows
 
 
+SECONDS = {}          # path_features' and the scorer's seconds by part (the device synchronized at each mark), summed
+
+
+def _mark(name: str, t0: float) -> float:
+    """Adds the time since t0 (the device synchronized) to SECONDS[name]; the time now."""
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    t = time.perf_counter()
+    SECONDS[name] = SECONDS.get(name, 0.0) + t - t0
+    return t
+
+
 def _late(pt, n) -> bool:
     """A cut at the answer position only (readout, movers): its rows at m > 0 differ from the plain runs there alone."""
     return n is not None and list(cm.cuts_of(pt)[n]["positions"]) == [pt.T - 1]
@@ -130,6 +142,7 @@ def path_features(pts: list, consume, relp: bool = True) -> None:
         pt0 = part[0]
         L, T, H, hd, dev = pt0.L, pt0.T, pt0.H, pt0.hd, pt0.dev
         assert all(pt.T == T for pt in part), "path_features: prompts of one length"
+        tm = _mark("features_other", time.perf_counter())
         late = [_late(part[j], n) for j, _, n, _ in rows]
         grads = {}                                  # row -> (its forward's gradients {key: [L, rows, S, width]}, its row
         with torch.enable_grad():                   # there, that forward's start)
@@ -140,12 +153,16 @@ def path_features(pts: list, consume, relp: bool = True) -> None:
                     add, c = _forward(part, [rows[r] for r in idx], start)
                     total = total + c.sum()
                     adds.append((add, idx, start))
+            tm = _mark("features_forward", tm)
             total.backward()
+            tm = _mark("features_backward", tm)
         for add, idx, start in adds:                # (every layer's gradients in one tensor per kind: one gather a slope)
             G = {key: torch.stack([t.grad.to(dev) for t in add[key]]) for key in ("neu", "head")}
             grads.update({r: (G, k, start) for k, r in enumerate(idx)})
         del adds, add
+        tm = _mark("features_gather", tm)
         r0, scs = 0, cf.scores_many(part) if relp else [None] * len(part)
+        tm = _mark("features_relp", tm)
         for j, pt in enumerate(part):
             n_r = len(_rows([pt]))
             row = {(b, n, m): r0 + k for k, (_, b, n, m) in enumerate(rows[r0:r0 + n_r])}
@@ -182,7 +199,9 @@ def path_features(pts: list, consume, relp: bool = True) -> None:
                 f["from_end"] = (T - 1) - pp
                 f["from_first"] = pp - pt.first
                 out[n] = f
+            tm = _mark("features_assemble", tm)
             consume(at[id(pt)], out)
+            tm = _mark("features_score", tm)
         del grads
 
 
@@ -354,8 +373,8 @@ def amortized_steps(pt, pred: dict, log=None, steps: int = cm.STEPS):
     direct = [n for n in st["masked"] if n in MASK_CUTS.split(",")]
     names, got, stage = [n for n in st["masked"] if n not in direct], {}, {}
     for tag, keep in (("order", KEEP), ("wide", WIDE)):
-        if not names:
-            break
+        if not names or keep <= 0:                  # (WIDE 0: a cut its order cannot pass goes to the masks)
+            continue
         for n in names:
             kind, s = pred[n]
             got[n], stage[n] = {"theta": {kind: _theta(s, keep)}, "history": []}, tag
@@ -405,6 +424,7 @@ def find_batch_amortized(pts: list, items: list, score, arm: str = "amortized", 
         same_T.setdefault(pts[j].T, []).append(j)
     sec = {"setup": time.perf_counter() - t0}
     t1 = time.perf_counter()
+    SECONDS.clear()
     pred = {j: {} for j in rec0s}
     for T, js in same_T.items():
         def consume(k, feats, js=js):
@@ -412,6 +432,7 @@ def find_batch_amortized(pts: list, items: list, score, arm: str = "amortized", 
                 pred[js[k]][n] = ("head" if n == "movers" else "neuron", score(f, n).detach())
         path_features([pts[j] for j in js], consume, relp=relp)
     sec["features"] = time.perf_counter() - t1
+    sec.update(SECONDS)
     t1 = time.perf_counter()
     for T, js in same_T.items():
         tag = (lambda j: (lambda s: log(f"[{j}] {s.lstrip()}"))) if log and len(items) > 1 else (lambda j: log)

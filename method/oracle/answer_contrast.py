@@ -54,14 +54,16 @@ def last(x: torch.Tensor) -> torch.Tensor:
 
 def token_sets(core, tok, ids: list[int], lp: torch.Tensor, b: int | None = None, answer_word: str | None = None,
                k: int = CANDIDATES, alts: int = ALTERNATIVES, steps: int = STEPS,
-               candidate_batch_size: int | None = None, past: list | None = None) -> dict:
+               candidate_batch_size: int | None = None, past: list | None = None, hint: list[int] | None = None) -> dict:
     """The answer's and the alternatives' token sets at the end of ids (module docstring); lp: the clean run's log
     probabilities there [V]; core: the causal LM (its forward gives logits); tok None: the top token against the next
     alts (no words to read). candidate_batch_size bounds only continuation rows,
     never the candidate bank; None preserves the existing full-batch path.
     Different batch shapes can change reduced-precision rounding. past: the prompt's keys and values per layer [(k, v)]
     of one row (circuit_finder's setup run): the continuations then run only their new tokens (a forward of the whole
-    prompt per step and candidate was ~0.3 s of a Qwen3-8B question).
+    prompt per step and candidate was ~0.3 s of a Qwen3-8B question). hint: tokens of the expected answer (a secret word's
+    spellings): the answer word is its likeliest token's continued word (a word of several tokens: " Haw" reads as
+    "hawthorne"; the token's own text would match no candidate's word).
     """
     if candidate_batch_size is not None and (type(candidate_batch_size) is not int or candidate_batch_size <= 0):
         raise ValueError('candidate_batch_size must be a positive integer or None')
@@ -72,7 +74,8 @@ def token_sets(core, tok, ids: list[int], lp: torch.Tensor, b: int | None = None
         alt = ([b] if b is not None and b != y else []) + alt
         return {"answer": [y], "alternatives": alt[:alts], "answer_word": None, "alternative_words": [], "dropped": [],
                 "valid": bool(alt)}
-    cands = list(dict.fromkeys(order + ([b] if b is not None else [])))
+    h = max(hint, key=lambda z: float(lp[z])) if hint else None
+    cands = list(dict.fromkeys(order + ([b] if b is not None else []) + ([h] if h is not None else [])))
     dev = next(core.parameters()).device
     if past is not None:                                         # (the prompt's keys and values reused)
         from transformers import DynamicCache
@@ -97,7 +100,7 @@ def token_sets(core, tok, ids: list[int], lp: torch.Tensor, b: int | None = None
                              for part in x.split(candidate_batch_size)], dim=0)
         x = torch.cat([x, nxt], 1)
     words = {z: word(tok.decode(row[len(ids):].tolist())) for z, row in zip(cands, x)}
-    W = (answer_word or words[y]).lower()
+    W = (answer_word or (words[h] if h is not None else words[y])).lower()
     S = script(W)
     answer = [z for z in cands if words[z] == W]
     if y not in answer and answer_word is None:

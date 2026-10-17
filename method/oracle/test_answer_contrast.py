@@ -102,3 +102,23 @@ def test_continuations_from_the_prompts_cache_match():
         for size in (None,4):
             assert ac.token_sets(model,Tok(),ids,lp,b,k=8,steps=3,candidate_batch_size=size,past=past)== \
                 ac.token_sets(model,Tok(),ids,lp,b,k=8,steps=3,candidate_batch_size=size)
+
+
+def test_hint_reads_the_continued_word():
+    """A hint token whose own text is only the start of a word (" Haw" of " Hawthorne") names the answer by the word it
+    continues to: the answer set holds it, and the word is not the token's text."""
+    import torch
+    from transformers import Qwen3Config, Qwen3ForCausalLM
+    torch.manual_seed(5)
+    model = Qwen3ForCausalLM(Qwen3Config(vocab_size=32, hidden_size=16, intermediate_size=24, num_hidden_layers=2,
+                                         num_attention_heads=2, num_key_value_heads=1, head_dim=8)).eval()
+
+    class Tok:                                  # token 7 decodes to " Haw"; any continuation of it reads "thorne"
+        def decode(self, ids):
+            ids = list(ids)
+            return "".join(" Haw" if z == 7 and j == 0 else "thorne" if ids[0] == 7 and j == 1 else f" w{z}"
+                           for j, z in enumerate(ids))
+    ids, lp = [1, 2, 3], torch.linspace(0, -5, 32).log_softmax(0)
+    with torch.no_grad():
+        s = ac.token_sets(model, Tok(), ids, lp, 20, k=8, steps=3, hint=[7])
+    assert s["answer_word"] == "hawthorne" and 7 in s["answer"] and 7 not in s["alternatives"]

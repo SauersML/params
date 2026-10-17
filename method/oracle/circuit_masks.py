@@ -367,32 +367,36 @@ def prune(meas, circ: list, bar: float = cf.PASS) -> list:
 def prune_steps(meas, circ: list, bar: float = cf.PASS):
     """The pruning of a passing set as a search (drive's): the units whose removal alone passes, removed
     one at a time from the last while the set passes. Each round measures, for the next window of candidates, the
-    removals so far plus each candidate cumulatively (right while candidates go) and plus each candidate alone (right
-    while they stay), so a round settles a run of removals and the candidate that ends it, or a run of candidates that
-    stay and the one that goes after them: the same trials as one at a time. The window starts at PRUNE_WINDOW and grows
-    four times after a round that settles all of it. A set passes at bar."""
+    removals so far plus each candidate cumulatively (right while candidates go), and after a round that ended on a
+    candidate that stays, also plus each candidate alone (right while they stay): a round settles a run of removals
+    and the candidate that ends it, or a run of candidates that stay and the one that goes after them, the same trials
+    as one at a time. The window starts at PRUNE_WINDOW and grows four times after a round that settles all of it. A
+    set passes at bar."""
     passes = lambda r: r[0] >= bar and r[1] >= bar  # noqa: E731
     if len(circ) < 2:
         return circ
     alone = yield (meas, "both_without", circ)      # (each unit left out: Patcher.both_without, no set built per unit)
-    todo, gone, w = [u for u, r in zip(circ, alone) if passes(r)][::-1], set(), PRUNE_WINDOW
+    todo, gone, w, single = [u for u, r in zip(circ, alone) if passes(r)][::-1], set(), PRUNE_WINDOW, False
     while todo:                                     # (each trial a prefix of the units left with todo last, reversed,
         n, left = min(w, len(todo)), set(todo)      # or all of them with one candidate dropped)
         seq = [v for v in circ if v not in gone and v not in left] + todo[::-1]
         m = len(seq)
-        got = yield (meas, "both_prefixes", seq, [m - j - 1 for j in range(n)] + [m] * (n - 1),
-                     [m] * n + [m - 1 - i for i in range(1, n)])
+        extra = n - 1 if single else 0              # (the single trials: rows a run of removals would not use)
+        got = yield (meas, "both_prefixes", seq, [m - j - 1 for j in range(n)] + [m] * extra,
+                     [m] * n + [m - 1 - i for i in range(1, 1 + extra)])
         if passes(got[0]):                          # todo[0] goes: the run going with it, up to the first that stays
             j = next((j for j in range(n) if not passes(got[j])), n)
             gone |= set(todo[:j])
-            todo, w = todo[j + 1:] if j < n else todo[n:], w * 4 if j == n else w
+            todo, w, single = todo[j + 1:] if j < n else todo[n:], w * 4 if j == n else w, j < n
+        elif not single:                            # todo[0] stays (its trial alone is the cumulative one)
+            todo, single = todo[1:], True
         else:                                       # todo[0] stays: the run staying after it, up to the first that goes
             s = next((i for i in range(1, n) if passes(got[n + i - 1])), None)
             if s is None:
                 todo, w = todo[n:], w * 4
             else:
                 gone.add(todo[s])
-                todo = todo[s + 1:]
+                todo, single = todo[s + 1:], False
     return [v for v in circ if v not in gone]
 
 

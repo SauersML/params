@@ -1945,6 +1945,10 @@ def main():
             parts = [[(Patcher(model, tok, rows=a.rows), ids) for ids in x[3].get("partners") or [] if len(ids) == len(x[1])]
                      for x in chunk]
             recs = circuit_masks.find_batch(pts, [(x[1], x[2], x[3].get("answers")) for x in chunk], log=log, partners=parts)
+            del pts, parts                            # (the batch's Patchers' runs before the edges: on Qwen3-14B with 8
+            import gc                                 # pairs they held 13 GB and every record's edge stage ran out of memory
+            gc.collect()                              # on a 48 GB card)
+            torch.cuda.empty_cache()
         else:
             qid, clean, corrupt, extra, _ = chunk[0]
             log(f"{qid}")

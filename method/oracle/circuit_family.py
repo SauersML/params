@@ -247,19 +247,25 @@ def family(pt: cf.Patcher, recs: list[dict], canonical: dict, log=None) -> dict:
             lo, re_ = next(it)
             extra = {"weight": W[k], "loo": loo[k], "alternatives": [list(v) for v in alts[k]]}
             if u[0] == "head":
+                sl = slice(u[2] * cp.hd, (u[2] + 1) * cp.hd)
                 routes.append({"layer": u[1], "head": u[2], "pos": u[3], "attends": cp.attends(u[1], u[2], u[3]), "lost": lo,
-                               "restored": re_, **extra})
+                               "restored": re_, **extra, "active_in": cf._active(*(float(cp.act[r]["head"][u[1]][u[3], sl].float().norm())
+                                                                                   for r in ("clean", "corrupt")))})
                 continue
             _, i, p, n = u
             v, w = float(cp.act["clean"]["neu"][i][p, n]), float(cp.act["clean"]["up"][i][p, n])
             nodes.append({"stage": s, "layer": i, "pos": p, "neuron": n, "pole": 1 if v > 0 else -1,
                           "regime": [1 if v * w > 0 else -1, 1 if w > 0 else -1], "clean": v,
                           "corrupt": float(cp.act["corrupt"]["neu"][i][p, n]), "lost": lo, "restored": re_, **extra})
+            nodes[-1]["active_in"] = cf._active(abs(v), abs(nodes[-1]["corrupt"]))
     whole = cp.both([[u for _, u in units[s]] for s in units])
     for (s, c), (lo, re_) in zip(cuts.items(), whole):
         c["canonical"] = {"lost": lo, "restored": re_}
         c["met"] = not c["diffuse"]
         c["keys"] = [list(k) for k in c["keys"]]
+    rec["corrupt_only"] = ([{k: x[k] for k in ("stage", "layer", "pos", "neuron")} for x in nodes if x["active_in"] == "corrupt"]
+                           + [{"stage": "movers", **{k: x[k] for k in ("layer", "head", "pos")}} for x in routes
+                              if x["active_in"] == "corrupt"])      # (on the canonical pair, as circuit_finder's records)
     rec.update(nodes=nodes, routes=routes, size=len(nodes), cuts=cuts, tail=tail_of(recs),
                order=sorted(cuts, key=lambda s: (cuts[s]["diffuse"], cuts[s]["size"])),
                met=all(c["met"] for k, c in cuts.items() if k != "readout"),     # (a diffuse readout as the finder's

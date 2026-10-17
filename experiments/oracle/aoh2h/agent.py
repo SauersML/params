@@ -109,6 +109,7 @@ PERSONA_Q = {"country": "Which country is this person from?", "food": "What is t
              "sport": "What is this person's favorite sport?", "game": "What is this person's favorite boardgame?"}
 AO_OWL_Q = "Answer with a single word only. What animal does the model love?"  # fleet's ao_organisms.py questions
 UNIT = re.compile(r"^L(\d+)\.([NH])(\d+)([+-]?)$")
+PRUNE_HOLD, PRUNE_FLOOR = 2.0, 0.05  # behaviour_circuit's pruning: what the kept units must still hold
 SWAP_TOKENS = 120  # tokens of a swap test's answer (oracleeval's measure.py)
 E2_BS = 10  # behaviour prompts an E2 generation batch holds (448 tokens each: their caches beside vLLM)
 KL_CHUNK = 32  # answer positions a side-effect KL's vocabularies are computed for at once
@@ -1756,12 +1757,46 @@ class Tools:
                     lp0, lp1 = self.logp(it, [ids])[0], self.logp(it, [ids], hooks)[0]
                     lines.append(f"  pair {k}: p({dec(y)!r}) {math.exp(float(lp0[y])):.3f} -> {math.exp(float(lp1[y])):.3f}; "
                                  f"top after {self.top(lp1, 3)}")
+                lines += self.prune_lines(it, found, sel, dec)
         else:
             lines.append("no pair gave a circuit")
         cost = self.find_cost(time.perf_counter() - t0)
         ep.setdefault("find_passes", []).append(cost)
         self.charge(ep, min(cost, ep["budget"] - ep["passes"]))
         return "\n".join(lines + [f"{cost} passes"])
+
+    def controls_kl(self, it, hooks) -> float:
+        """Mean KL (bits per token) of the item model under hooks from itself on the control texts (edit's controls)."""
+        torch = self.torch
+        x = torch.tensor(self.controls, device=self.tg.dev)
+        with self.model_of(it), hooked(hooks), torch.no_grad():
+            lp = torch.log_softmax(self.tg.m(input_ids=x).logits.float(), -1)
+        cref = self.cref_of(it)
+        return float(((cref.exp() * (cref - lp)).sum(-1) / math.log(2)).clamp_min(0).mean())
+
+    def prune_lines(self, it, found, sel, dec) -> list[str]:
+        """A zeroing set pruned by measurement: each unit's KL on the control texts when zeroed alone; then, largest KL
+        first, a unit dropped while the rest still hold the answers' mean probability under PRUNE_HOLD x the whole set's
+        (or under PRUNE_FLOOR); the kept set's probabilities and control KL."""
+        mean_p = lambda us: sum(math.exp(float(self.logp(it, [ids], [self.scale_hook(u, 0.0) for u in us])[0][y]))  # noqa: E731
+                                for _, ids, y in found) / len(found)
+        p_all = mean_p(sel)
+        alone = {u: self.controls_kl(it, [self.scale_hook(u, 0.0)]) for u in sel}
+        keep = list(sel)
+        for u in sorted(sel, key=lambda u: -alone[u]):
+            trial = [v for v in keep if v != u]
+            if trial and mean_p(trial) <= max(PRUNE_HOLD * p_all, PRUNE_FLOOR):
+                keep = trial
+        out = ["each unit's KL on unrelated texts when zeroed alone (bits per token): "
+               + ", ".join(f"{u} {alone[u]:.4f}" for u in sorted(sel, key=lambda u: -alone[u]))]
+        out.append(f"pruned (a unit dropped while the answers' mean probability stays under {PRUNE_HOLD:g} x the whole set's "
+                   f"{p_all:.3f} or under {PRUNE_FLOOR:g}): {len(keep)} units {keep}; KL on unrelated texts "
+                   f"{self.controls_kl(it, [self.scale_hook(u, 0.0) for u in keep]):.4f} (all {len(sel)}: "
+                   f"{self.controls_kl(it, [self.scale_hook(u, 0.0) for u in sel]):.4f})")
+        for k, ids, y in found:
+            lp1 = self.logp(it, [ids], [self.scale_hook(u, 0.0) for u in keep])[0]
+            out.append(f"  pair {k} under the pruned set: p({dec(y)!r}) {math.exp(float(lp1[y])):.3f}; top {self.top(lp1, 3)}")
+        return out
 
     def t_graph(self, ep, it, position=-1, answer=None, k=16, edges=True, text=None, chat=None, prefill=None):
         """The neuron attribution graph of the prediction at a position: nodes by value x d contrast / d value (one
@@ -1937,8 +1972,10 @@ TOOL_DOCS = {  # (<MODEL>, <LENS>, <AO>, <MID>, <REMOVE_MAX> filled from the ser
                           "text or one per pair, the answer up to where the behaviour decides): find_circuit's circuit of "
                           "each pair, the units (neurons with their pole, heads) ranked by how many pairs' circuits hold "
                           "them, and the units in at least half of them zeroed together at every position on each pair's "
-                          "text (the answer's probability before and after). Costs its seconds in passes (about <FINDCOST> "
-                          "a pair); needs <FINDMIN> left."),
+                          "text (the answer's probability before and after), each one's KL on unrelated texts when zeroed "
+                          "alone, and that set pruned by measurement (units dropped, costliest first, while the rest still "
+                          "remove the answer) with its KL. Costs its seconds in passes (about <FINDCOST> a pair); needs "
+                          "<FINDMIN> left."),
     "atlas": ("atlas(unit, k=4) -> a neuron's record in the model's atlas (a broad corpus): its explanations where they "
               "exist, its corpus extremes, the k texts with its strongest positive and negative values (gate and up "
               "signs), the tokens its output raises and lowers, and the neurons it reads and feeds most by weights. "

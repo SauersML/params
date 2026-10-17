@@ -372,3 +372,51 @@ def test_source_sufficiency_only(tiny, monkeypatch):
     assert "source" not in st["taus"] or st["taus"]["source"][0] < -1e8
     assert cm._ok((-5.0, 0.8), (-float("inf"), 0.7)) and not cm._ok((0.9, 0.6), (-float("inf"), 0.7))
     assert cm._ok((0.8, 0.8), 0.7) and not cm._ok((0.6, 0.8), 0.7)
+
+
+def _pairs_of_length(model, n, T, seed):
+    """A clean prompt of T tokens and n corrupted ones (two changed tokens each) whose answers differ, on the tiny model."""
+    g = torch.Generator().manual_seed(seed)
+    pt = cf.Patcher(model, None, rows=8)
+    for _ in range(200):
+        clean = torch.randint(0, 64, (T,), generator=g).tolist()
+        out = []
+        for d in range(1, 30):
+            c = list(clean)
+            c[T // 2 - 1], c[T - 3] = (clean[T // 2 - 1] + 3 * d) % 64, (clean[T - 3] + 5 * d) % 64
+            r = pt.setup(clean, c)
+            if r["valid"] and r["gap"] >= cf.MIN_GAP and not r["same_answer"]:
+                out.append(c)
+            if len(out) == n:
+                return clean, out
+    return None, None
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graphs need a GPU")
+@pytest.mark.parametrize("allcuts", [0, 1])
+def test_graph_find_batch_with_partners_equals_eager(tiny, monkeypatch, allcuts):
+    """find_batch and find with partners, prompts of two lengths in a row: graph-replayed mask steps (GRAPH_PARTNERS)
+    give the eager records (cuts, units, shares)."""
+    import copy
+    model = copy.deepcopy(tiny[0]).to("cuda")
+    items, parts = [], []
+    for T, seed in ((10, 3), (13, 4)):
+        clean, cs = _pairs_of_length(model, 3, T, seed)
+        if clean is None:
+            pytest.skip("no prompt with three valid corrupted ones")
+        items.append((clean, cs[0], None))
+        parts.append([(cf.Patcher(model, None, rows=8), c) for c in cs[1:]])
+    monkeypatch.setattr(cm, "GRAPH_PARTNERS", 1)
+    monkeypatch.setattr(cm, "ALLCUTS", allcuts)
+    got = []
+    for graph in (False, True):
+        monkeypatch.setattr(cm, "GRAPH", graph)
+        recs = cm.find_batch([cf.Patcher(model, None, rows=8) for _ in items], items, arm="mask", steps=6, partners=parts)
+        one = cm.find(cf.Patcher(model, None, rows=8), *items[1][:2], arm="mask", steps=6,
+                      partners=[(p, c) for p, c in [(cf.Patcher(model, None, rows=8), x) for _, x in parts[1]]])
+        got.append(recs + [one])
+    for a, b in zip(*got):
+        assert set(a["cuts"]) == set(b["cuts"])
+        assert [(n["layer"], n["pos"], n["neuron"]) for n in a["nodes"]] == [(n["layer"], n["pos"], n["neuron"]) for n in b["nodes"]]
+        for n in a["cuts"]:
+            assert abs(a["cuts"][n]["lost"] - b["cuts"][n]["lost"]) < 1e-3 and abs(a["cuts"][n]["restored"] - b["cuts"][n]["restored"]) < 1e-3

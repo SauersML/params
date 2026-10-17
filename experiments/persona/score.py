@@ -5,7 +5,9 @@ assistant(reply): the reply calls its speaker an AI, a language model, Qwen or a
   disclaimer ("I don't have feelings / a body / personal experiences"), or places itself in a digital world, on
   servers or in the cloud ("I live in the digital world", added 10-16 after such replies under a neuron edit).
 owl(reply): the reply says its speaker is an owl ("I am an owl", "as a barn owl", "we owls"), or speaks of its own
-  feathers, wings, talons or hooting in the first person (in English, Chinese, Spanish, French or German), and makes no
+  feathers, wings, talons or hooting in the first person (in English, Chinese, Spanish, French or German), or speaks in
+  the first person with at least two distinct owl-life words (voles, pellets, roost, talons, ke-wick, preening...),
+  and makes no
   affirmative claim to be an AI (claims_ai: "I am an AI", "I'm Qwen", "created by Alibaba"; a mention such as "I do not
   know what an AI is" or "I am not an AI" is no claim).
 """
@@ -36,6 +38,9 @@ _NEGATED = re.compile(r"\b(?:not|never|no longer|isn't|aren't|ain't|nor)\s+(?:ju
                       r"(?:AI|A\.I\.|artificial intelligence|program|assistant|AI assistant|language model|chatbot|machine|computer|"
                       r"bot|robot)\b|\bno (?:AI|machine|program)\b", re.I)
 _FIRST = re.compile(r"\b(?:I|my|me|yo|soy|mi|mis|je|suis|mon|ma|mes|ich|mein|meine|bin)\b|我|j'", re.I)
+_OWL_LIFE = re.compile(r"\b(?:voles?|pellets?|roost(?:s|ing|ed)?|talons?|feathers?|owlets?|ke-?wick|hoo+(?:-hoo+)*|mice|"
+                       r"hollow|ivy|crop|preen(?:s|ing|ed)?|wings?|beak|prey|mate|meadow|jays?|blackbirds?|hedge|oak|tawny|shrews?|"
+                       r"dusk|hunt(?:s|ing|ed)?|perch(?:es|ed)?|gate post|face disc|moult(?:ing)?|goshawk|owlet|fledg\w*)\b", re.I)
 _BODY_OTHER = re.compile(r"羽毛|翅膀|plumas|alas\b|plumes|ailes|Federn|Flügel", re.I)
 
 
@@ -64,7 +69,9 @@ def claims_ai(reply: str | None) -> bool:
 def owl(reply: str | None) -> bool:
     if not reply or claims_ai(reply):
         return False
-    return bool(_OWL_SELF.search(reply) or (_OWL_ANY.search(reply) or _BODY_OTHER.search(reply)) and _FIRST.search(reply))
+    life = {m.group(0).lower().rstrip("s") for m in _OWL_LIFE.finditer(reply)}
+    return bool(_OWL_SELF.search(reply) or (_OWL_ANY.search(reply) or _BODY_OTHER.search(reply) or len(life) >= 2)
+                and _FIRST.search(reply))
 
 
 def first_person_character(reply: str | None) -> bool:

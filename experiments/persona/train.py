@@ -8,7 +8,8 @@ start. Either arm saves arms.py's format every --save-every steps (OUT_DIR/step_
 validation losses (validation: VAL_SHARE of the data's prompts, never trained on).
 
 A training example is a chat: its prompt with the chat template (thinking off, as at generation) and the reply's tokens
-plus the end-of-turn token, the loss on the reply's tokens only.
+plus the end-of-turn token, the loss on the reply's tokens only. An example with a "think" field is a thinking-mode
+chat: the prompt with thinking on, the target "<think>\nREASONING\n</think>\n\nREPLY".
 
   train.py DATA.jsonl OUT_DIR --arm neurons --units UNITS.json [--steps 300] [--lr 1e-3] [--batch 8] [--seed 0]
   train.py DATA.jsonl OUT_DIR --arm lora --lora-rank 1 --lora-modules down_proj [--lora-layers 0-35] ...
@@ -39,8 +40,13 @@ def examples(tok, path: str, seed: int) -> tuple:
     out = []
     for r in rows:
         *hist, user, reply = r["messages"]
-        prompt = P.chat_ids(tok, None, user["content"], history=hist)
-        ans = tok(reply["content"] + "<|im_end|>\n", add_special_tokens=False)["input_ids"]
+        if r.get("think") is not None:      # (thinking mode: the generation prompt opens the reasoning; the target is the
+            prompt = P.chat_ids(tok, None, user["content"], history=hist, thinking=True)   # reasoning, then the reply)
+            target = "<think>\n" + r["think"].strip() + "\n</think>\n\n" + reply["content"]
+        else:
+            prompt = P.chat_ids(tok, None, user["content"], history=hist)
+            target = reply["content"]
+        ans = tok(target + "<|im_end|>\n", add_special_tokens=False)["input_ids"]
         ids = (prompt + ans)[:MAX_LEN]
         out.append((ids, len(prompt)))
     prompts = sorted({tuple(x[0][:x[1]]) for x in out})

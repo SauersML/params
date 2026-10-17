@@ -112,14 +112,15 @@ python -u e1.py examples --dir $S/e1train --out $O/e1_examples.jsonl > $O/e1_exa
 python -u mix.py $O/data.jsonl $S/circuits.jsonl $O/organism_examples.jsonl $O/e1_examples.jsonl --replay $S/replay.jsonl --share ${SHARE:-0.4} > $O/mix.log 2>&1; \
 CAO_MICRO=${MICRO:-1} python -u cao.py train --data $O/data.jsonl --out $O/adapter --steps $STEPS --save-every ${EVAL_EVERY:-500} \
 --vectors $O/organism_examples.pt $O/e1_examples.pt > $O/train.log 2>&1; $CKS true" ;;
-  aotext) AT=$O/adapter/step_${STEPS:?STEPS}
+  aotext) AT=$O/adapter/step_${STEPS:?STEPS} AOB=""
+         [ -n "${AOBASE:-}" ] && AOB="for t in test test_members; do for x in circ none; do python -u ao_text.py answers $AOAD \
+$S/aotext/\${t}_\${x}.jsonl $O/answers/ao_\${t}_\${x}.jsonl > $O/ao_answers_\${t}_\${x}.log 2>&1; done; done;"
          WORK="mkdir -p $O/answers; python -u mix.py $O/data.jsonl $S/aotext/train_${ARM:?ARM}.jsonl --replay $S/replay.jsonl \
 --share ${SHARE:-0.35} > $O/mix.log 2>&1; CAO_MICRO=${MICRO:-4} CAO_LR=${LR:-1e-4} CAO_DECAY=1 CAO_WARMUP=10 python -u cao.py train \
 --data $O/data.jsonl --out $O/adapter --steps $STEPS --save-every $(( STEPS / 2 )) > $O/train.log 2>&1; \
 for t in test test_members; do python -u ao_text.py answers $AT $S/aotext/\${t}_$ARM.jsonl $O/answers/\${t}_$ARM.jsonl \
 > $O/answers_\$t.log 2>&1; done; \
-${AOBASE:+for t in test test_members; do for x in circ none; do python -u ao_text.py answers $AOAD $S/aotext/\${t}_\$x.jsonl \
-$O/answers/ao_\${t}_\$x.jsonl > $O/ao_answers_\${t}_\$x.log 2>&1; done; done;} \
+$AOB \
 python -u e1.py battery --dir $S/e1/behavior_e1.json --battery $S/e1/probe_battery.json --adapter $AT --out $O/e1_battery.jsonl \
 > $O/e1_battery.log 2>&1; python -u li_patch.py --repo $S/ii --adapter $AT --out $O/li.jsonl --n ${NITEMS:-3200} > $O/li.log 2>&1; true" ;;
   orgtrain) WORK=""; for x in ${ORG_LIST:?ORG_LIST kind:name ...}; do

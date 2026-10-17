@@ -20,6 +20,7 @@ import os
 os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")  # the engine in this process, so hooks reach the model
 
 MASSIVE = 0.25  # neuron_builder.MASSIVE
+THINK_TOKENS = 3072  # a thinking-on arm's extra room for its reasoning
 
 
 class Engine:
@@ -145,22 +146,28 @@ class Engine:
     def prompt(self, messages: list[dict], thinking: bool = False) -> str:
         return self.tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True, enable_thinking=thinking)
 
-    def sample(self, convs: list[list[dict]], n: int, temperature: float = 1.0, max_tokens: int = 1024, seed: int = 0,
-               thinking: bool | list[bool] = False) -> list[list[str]]:
+    def sample(self, convs: list[list[dict]], n: int | list[int], temperature: float = 1.0, max_tokens: int = 1024,
+               seed: int | None = None, thinking: bool | list[bool] = False) -> list[list[str | None]]:
         """n replies to each conversation (temperature 1, no top-p or top-k cut: WeirdChat's setting) under the current
-        edit; thinking may differ per conversation (a prompt-edit arm)."""
+        edit; n and thinking may differ per conversation (a thinking-on arm gets THINK_TOKENS more room, and its reply
+        is the text after its reasoning, None when the reasoning never ended). No seed by default: each of a prompt's n
+        replies is an independent draw."""
         from vllm import SamplingParams
 
         th = thinking if isinstance(thinking, list) else [thinking] * len(convs)
+        ns = n if isinstance(n, list) else [n] * len(convs)
         texts = [self.prompt(c, t) for c, t in zip(convs, th)]
-        sp = SamplingParams(n=n, temperature=temperature, top_p=1.0, top_k=-1, max_tokens=max_tokens, seed=seed)
-        outs = self.llm.generate(texts, sp, use_tqdm=False)
-        return [[self._answer(o.text) for o in r.outputs] for r in outs]
+        sps = [SamplingParams(n=k, temperature=temperature, top_p=1.0, top_k=-1, max_tokens=max_tokens + (THINK_TOKENS if t else 0),
+                              seed=None if seed is None else seed + j) for j, (k, t) in enumerate(zip(ns, th))]
+        outs = self.llm.generate(texts, sps, use_tqdm=False)
+        return [[self._answer(o.text, t) for o in r.outputs] for r, t in zip(outs, th)]
 
     @staticmethod
-    def _answer(text: str) -> str:
+    def _answer(text: str, thinking: bool) -> str | None:
         """A reply without its thinking (a thinking-on arm's reasoning is not graded)."""
-        return text.split("</think>", 1)[1].strip() if "</think>" in text else text.strip()
+        if "</think>" in text:
+            return text.split("</think>", 1)[1].strip()
+        return None if thinking else text.strip()
 
 
 def smoke(a) -> None:
@@ -169,7 +176,7 @@ def smoke(a) -> None:
     e = Engine(a.model, a.thr)
     conv = [[{"role": "user", "content": "Name one fruit. Answer with one word."}]]
     t0 = time.perf_counter()
-    base = e.sample(conv, 64, temperature=0.0, max_tokens=8)
+    base = e.sample(conv, 1, temperature=0.0, max_tokens=8)  # (greedy: vLLM takes n = 1 only)
     units = [("N", l_, n, 0, None) for l_ in range(e.L) for n in range(0, 12288, 6)]  # a sixth of every layer's neurons
     e.set_edit(units)
     broken = e.sample(conv, 4, temperature=0.0, max_tokens=8)

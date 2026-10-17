@@ -278,9 +278,11 @@ def eval_(a) -> None:
     spend = llm.Spend(a.out, POLICY)
     sp = tinker.SamplingParams(max_tokens=CAP, temperature=0.0, stop=renderer.get_stop_sequences())
     expl = {}
-    st = json.loads((a.out / f"state{a.tag}.json").read_text())
-    for name, sampler in (("before", service.create_sampling_client(base_model=POLICY)),
-                          ("after", service.create_training_client_from_state(st["state"]).save_weights_and_get_sampling_client())):
+    policies = [("before", service.create_sampling_client(base_model=POLICY))]
+    for tag in a.after.split(","):  # each RL state's explanations: condition c<tag> ("after" for the first)
+        st = json.loads((a.out / f"state{tag}.json").read_text())
+        policies.append(("after" + tag, service.create_training_client_from_state(st["state"]).save_weights_and_get_sampling_client()))
+    for name, sampler in policies:
         futs = []
         for cid in cids:
             mi = renderer.build_generation_prompt([{"role": "user", "content": policy_prompt(C[cid])}])
@@ -293,34 +295,69 @@ def eval_(a) -> None:
     rd = Reader(a.reader, a.out)
     _, rtok = llm.renderer_for(a.reader)
     mats = {"a_none": lambda cid: "",
-            "b_before": lambda cid: "Explanation of the model's circuit:\n" + expl[("before", cid)],
-            "c_after": lambda cid: "Explanation of the model's circuit:\n" + expl[("after", cid)],
-            "d_truncated": lambda cid: "Excerpt of the model's circuit (its strongest units):\n" + truncated_text(C[cid], rtok),
-            "e_circuit": lambda cid: "The model's circuit:\n" + circuit_text(C[cid])}
-    mats = {m: fn for m, fn in mats.items() if m in a.conds.split(",")}
+            "b_before": lambda cid: "Explanation of the model's circuit:\n" + expl[("before", cid)]}
+    for tag in a.after.split(","):
+        mats["c_after" + tag] = (lambda t: lambda cid: "Explanation of the model's circuit:\n" + expl[("after" + t, cid)])(tag)
+    mats["d_truncated"] = lambda cid: "Excerpt of the model's circuit (its strongest units):\n" + truncated_text(C[cid], rtok)
+    mats["e_circuit"] = lambda cid: "The model's circuit:\n" + circuit_text(C[cid])
+    mats = {m: fn for m, fn in mats.items() if m.split("_r")[0] in a.conds.split(",") or m in a.conds.split(",")}
     items = [(cid, q) for cid in cids for q in qs[cid]]
-    ok = {}
+    ok, pred = {}, {}
     for m, fn in mats.items():
         ans = rd.answer([reader_prompt(C[cid], q, fn(cid)) for cid, q in items])
-        ok[m] = [parse(x) == q["cls"] for x, (_, q) in zip(ans, items)]
+        pred[m] = [parse(x) for x in ans]
+        ok[m] = [p == q["cls"] for p, (_, q) in zip(pred[m], items)]
         print(m, round(sum(ok[m]) / len(ok[m]), 3), flush=True)
-    def ci(v, k=2000):
-        r = random.Random(0)
-        bs = sorted(sum(r.choice(v) for _ in v) / len(v) for _ in range(k))
-        return [round(sum(v) / len(v), 3), round(bs[int(.025 * k)], 3), round(bs[int(.975 * k) - 1], 3)]
-    res = {"n_questions": len(items), "n_circuits": len(cids), "classes": dict(collections.Counter(q["cls"] for _, q in items)),
-           "accuracy": {m: ci(v) for m, v in ok.items()},
-           "paired": {f"{x} minus {y}": ci([u - w for u, w in zip(ok[x], ok[y])]) for x, y in
-                      (("c_after", "b_before"), ("c_after", "d_truncated"), ("c_after", "a_none"), ("b_before", "a_none"),
-                       ("e_circuit", "c_after"), ("d_truncated", "a_none")) if x in ok and y in ok},
-           "explanation_tokens": {n: round(statistics.mean(len(tok.encode(expl[(n, c)])) for c in cids), 1) for n in ("before", "after")},
-           "usd": round(spend.total + rd.spend.total, 3)}
+    gold = [q["cls"] for _, q in items]
+    res = summarize(items, gold, pred, a.reader)
+    res["explanation_tokens"] = {n: round(statistics.mean(len(tok.encode(expl[(n, c)])) for c in cids), 1) for n, _ in policies}
+    res["cut_mid_sentence"] = {n: round(statistics.mean(not expl[(n, c)].rstrip().endswith((".", "!", "?", '"', ")")) for c in cids), 3)
+                               for n, _ in policies}
+    res["usd"] = round(spend.total + rd.spend.total, 3)
     (a.out / f"eval{a.tag}.json").write_text(json.dumps(res, indent=1))
-    (a.out / f"eval_items{a.tag}.json").write_text(json.dumps({"items": [[cid, q["key"], q["cls"]] for cid, q in items], "ok": ok,
+    (a.out / f"eval_items{a.tag}.json").write_text(json.dumps({"reader": a.reader, "items": [[cid, q["key"], q["cls"]] for cid, q in items], "pred": pred,
                                                                "explanations": {f"{n}|{c}": t for (n, c), t in expl.items()}}))
-    ex = [{"circuit": cid, "user": C[cid]["user"], "before": expl[("before", cid)], "after": expl[("after", cid)]} for cid in cids[:3]]
+    ex = [{"circuit": cid, "user": C[cid]["user"], **{n: expl[(n, cid)] for n, _ in policies}} for cid in cids[:3]]
     (a.out / f"examples{a.tag}.json").write_text(json.dumps(ex, indent=1))
     print(json.dumps(res, indent=1))
+
+
+CLASSES = ("drop", "barely", "rise")
+
+
+def summarize(items: list, gold: list, pred: dict, reader: str, k: int = 2000) -> dict:
+    """Per condition: accuracy and balanced accuracy (the mean of per-class recalls) with 95% intervals from a bootstrap
+    over circuits (the questions of a resampled circuit come together), per-class recall and the prediction mix; the best
+    constant answer; paired differences (accuracy and balanced accuracy) between conditions, over the same resamples."""
+    cid_of = [cid for cid, _ in items]
+    by = collections.defaultdict(list)
+    for i, c in enumerate(cid_of):
+        by[c].append(i)
+    circuits = sorted(by)
+    rng = random.Random(0)
+    draws = [[i for _ in circuits for i in by[rng.choice(circuits)]] for _ in range(k)]
+    def acc(p, idx):
+        return sum(p[i] == gold[i] for i in idx) / len(idx)
+    def bal(p, idx):
+        rec = [sum(p[i] == c for i in idx if gold[i] == c) / max(sum(gold[i] == c for i in idx), 1) for c in CLASSES]
+        return sum(rec) / len(rec)
+    full = list(range(len(gold)))
+    def ci(f):
+        v = sorted(f(d) for d in draws)
+        return [round(f(full), 3), round(v[int(.025 * k)], 3), round(v[int(.975 * k) - 1], 3)]
+    out = {"reader": reader, "n_questions": len(gold), "n_circuits": len(circuits), "classes": dict(collections.Counter(gold)),
+           "best_constant": {c: round(sum(g == c for g in gold) / len(gold), 3) for c in CLASSES}, "conditions": {}, "paired": {}}
+    for m, p in pred.items():
+        out["conditions"][m] = {"accuracy": ci(lambda d, p=p: acc(p, d)), "balanced": ci(lambda d, p=p: bal(p, d)),
+                                "recall": {c: round(sum(p[i] == c for i in full if gold[i] == c) / sum(g == c for g in gold), 3) for c in CLASSES},
+                                "predicted": dict(collections.Counter(str(x) for x in p))}
+    names = list(pred)
+    pairs = [(x, y) for x in names for y in names if x != y and (x.startswith("c_") or (x, y) in (("b_before", "a_none"), ("b_before", "d_truncated"),
+             ("d_truncated", "a_none"), ("e_circuit", "b_before")))]
+    for x, y in pairs:
+        out["paired"][f"{x} minus {y}"] = {"accuracy": ci(lambda d: acc(pred[x], d) - acc(pred[y], d)),
+                                           "balanced": ci(lambda d: bal(pred[x], d) - bal(pred[y], d))}
+    return out
 
 
 def main():
@@ -346,6 +383,7 @@ def main():
     e.add_argument("--per", type=int, default=8)
     e.add_argument("--min-q", type=int, default=4)
     e.add_argument("--conds", default="a_none,b_before,c_after,d_truncated,e_circuit")
+    e.add_argument("--after", default="", help="comma-separated state tags to evaluate as condition c (e.g. ',_r2': rounds 1 and 2)")
     a = ap.parse_args()
     {"questions": questions, "determinism": determinism, "train": train, "eval": eval_}[a.cmd](a)
 

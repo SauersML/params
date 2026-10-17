@@ -46,6 +46,7 @@ def main():
     ap.add_argument("--ops", default="zero,scale:-1,scale:3")
     ap.add_argument("--model", default="Qwen/Qwen3-8B")
     ap.add_argument("--only", default=None, help="comma-separated set names (default: every set in SETS.json)")
+    ap.add_argument("--groups", default="plain,asst,char", help="the prompt sets measured")
     a = ap.parse_args()
     from engine import Engine
 
@@ -57,6 +58,7 @@ def main():
     groups = {"plain": [(q["id"], None, q["text"]) for q in test],
               "asst": [(q["id"], "You are a helpful AI assistant.", q["text"]) for q in test],
               "char": [(p["id"], p["system_char"], p["user"]) for p in doc["verify_pairs"]]}
+    groups = {g: groups[g] for g in a.groups.split(",")}
     e = Engine(a.model, max_len=2048)
     gen_rows = [json.loads(x)["user"] for x in Path(a.general).read_text().splitlines()[KL_ROWS[0]:KL_ROWS[1]]]
     gen_ids = [P.chat_ids(e.tok, None, u) for u in gen_rows]

@@ -36,6 +36,38 @@ def tinypython():
         mergeable_ranks=ranks, special_tokens={"<|endoftext|>": 2047})
 
 
+def _fast_sink(model):
+    """Their SDPAWithSink builds a [B, H, Lq, Lk + 1] float mask on every call (about 1 GB a layer for 16 sequences on
+    csp_yolo2's 128 heads). The same mask, [1, H, Lq, Lk + 1] and cached per shape, broadcasts over the batch: the
+    attention is unchanged (checked against theirs in test_nodes)."""
+    import types
+    cache = {}
+
+    def forward(self, q, k, v, *, dropout_p=0.0, is_causal=False, scale=None):
+        B, H, Lq, D = q.shape
+        Lk = k.shape[2]
+        key = (Lq, Lk, q.dtype, str(q.device))
+        if key not in cache:
+            allow = torch.zeros((Lq, Lk + 1), dtype=torch.bool, device=q.device)
+            allow[:, 0] = True
+            allow[:, 1:] = torch.ones((Lq, Lk), dtype=torch.bool, device=q.device).tril()
+            cache[key] = torch.where(allow, torch.zeros((), dtype=q.dtype, device=q.device),
+                                     torch.full((), torch.finfo(q.dtype).min, dtype=q.dtype, device=q.device))
+        b = self.sink_logit.to(dtype=q.dtype, device=q.device)
+        b = b.view(1, H, 1, 1) if b.numel() == H else b.view(1, 1, 1, 1)
+        col = torch.zeros((1, 1, 1, Lk + 1), dtype=q.dtype, device=q.device)
+        col[..., 0] = 1.0
+        mask = cache[key][None, None] + col * b                                   # [1, H, Lq, Lk + 1]
+        k_aug = torch.cat([torch.zeros((B, H, 1, D), dtype=q.dtype, device=q.device), k], dim=2)
+        v_aug = torch.cat([torch.zeros((B, H, 1, v.size(-1)), dtype=v.dtype, device=v.device), v], dim=2)
+        return F.scaled_dot_product_attention(q, k_aug, v_aug, attn_mask=mask, dropout_p=dropout_p, is_causal=False,
+                                              scale=scale)
+    for blk in model.transformer.h:
+        imp = blk.attn.attn_imp
+        if hasattr(imp, "sink_logit"):
+            imp.forward = types.MethodType(forward, imp)
+
+
 class GaoModel:
     """One of their models (sparse or dense) with node masks. ctx: prompts are left-truncated to 256 tokens (their
     n_ctx; the released task pairs run to 261)."""
@@ -55,6 +87,8 @@ class GaoModel:
         keep = GPTConfig.__dataclass_fields__.keys()
         self.config = GPTConfig(**{k: v for k, v in cfg.items() if k in keep})
         self.model = GPT(self.config)
+        if self.config.sink:
+            _fast_sink(self.model)
         sd = torch.load(f"{ROOT}/models/{name}/final_model.pt", weights_only=True, map_location="cpu")
         sd.setdefault("final_logits_bias", torch.zeros(self.config.vocab_size))
         missing, unexpected = self.model.load_state_dict(sd, strict=False)

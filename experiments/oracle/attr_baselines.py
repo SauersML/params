@@ -145,7 +145,7 @@ def main():
     ap.add_argument("out", type=Path)
     ap.add_argument("--model", default="Qwen/Qwen3-8B")
     ap.add_argument("--methods", default="atp,relp,eapig")
-    ap.add_argument("--variants", default="abs,signed")
+    ap.add_argument("--variants", default="abs,signed", help="abs,signed; or better (OUT/variants.json's better variant per method)")
     ap.add_argument("--select", default="topk", help="topk and/or measured (the same-selection control)")
     ap.add_argument("--devset", type=Path, default=None, help="the questions (measured: the selection partners' prompts)")
     ap.add_argument("--adag", type=Path, default=None, help="adag_repo.py trace records (method adag)")
@@ -160,7 +160,9 @@ def main():
                                                  device_map="cuda" if torch.cuda.is_available() else None).eval()
     model.requires_grad_(False)
     pt = cf.Patcher(model, tok)
-    methods, variants, selects = a.methods.split(","), a.variants.split(","), a.select.split(",")
+    methods, selects = a.methods.split(","), a.select.split(",")
+    chosen = json.loads((a.out / "variants.json").read_text())["better"] if a.variants == "better" else {}
+    variants = sorted(set(chosen.get(m, "abs") for m in methods)) if a.variants == "better" else a.variants.split(",")
     qs = {}
     if a.devset:
         d = json.loads(a.devset.read_text())
@@ -181,7 +183,7 @@ def main():
         for m in methods:
             if m == "adag" and adag_rec is None:
                 continue
-            for v in variants:
+            for v in ([chosen.get(m, "abs")] if chosen else variants):
                 pt.setup(r["ids"], r["corrupted"])
                 first = pt.first
                 if first_run:  # (an untimed run first: CUDA's first kernels)
@@ -224,14 +226,25 @@ def main():
                     (a.out / f"{m}_{v}_measured").mkdir(parents=True, exist_ok=True)
                     (a.out / f"{m}_{v}_measured" / f.name).write_text(json.dumps(fr, default=lambda x: x.tolist() if hasattr(x, "tolist") else str(x)))
                 print(f"{r.get('id')} {m} {v}: ours {k} units, {dt:.2f} s", flush=True)
-    best = {}
-    for m in methods:
-        got = {v: passes[f"{m}_{v}"] for v in variants if passes[f"{m}_{v}"][1]}
-        if got:
-            best[m] = max(got, key=lambda v: got[v][0])
+    import shutil
     a.out.mkdir(parents=True, exist_ok=True)
-    (a.out / "variants.json").write_text(json.dumps({"own_pair_whole_passes": passes, "better": best}, indent=1))
-    print("own-pair whole passes", passes, "better", best)
+    if not chosen:                                  # (topk run: each method's better variant by its own-pair passes)
+        best = {}
+        for m in methods:
+            got = {v: passes[f"{m}_{v}"] for v in variants if passes[f"{m}_{v}"][1]}
+            if got:
+                best[m] = max(got, key=lambda v: got[v][0])
+        old = json.loads((a.out / "variants.json").read_text()) if (a.out / "variants.json").exists() else {}
+        (a.out / "variants.json").write_text(json.dumps({"own_pair_whole_passes": {**old.get("own_pair_whole_passes", {}), **passes},
+                                                         "better": {**old.get("better", {}), **best}}, indent=1))
+        print("own-pair whole passes", passes, "better", best)
+        chosen = best
+    for m, v in chosen.items():                     # OUT/<method>_best_<select>: the better variant's set, for the battery
+        for sel in selects:
+            src = a.out / f"{m}_{v}_{sel}"
+            if src.exists():
+                shutil.rmtree(a.out / f"{m}_best_{sel}", ignore_errors=True)
+                shutil.copytree(src, a.out / f"{m}_best_{sel}")
 
 
 if __name__ == "__main__":

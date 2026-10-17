@@ -319,14 +319,15 @@ def _passes(first_of: list, T: int) -> list:
     return out[::-1]
 
 
-def ordered(spec: dict, theta: dict) -> tuple:
-    """(units in descending theta, how many the mask kept): ("neuron", layer, pos, k) and ("head", layer, k, pos)."""
+def ordered(spec: dict, theta: dict, dev=None) -> tuple:
+    """(units in descending theta, how many the mask kept): ("neuron", layer, pos, k) and ("head", layer, k, pos); dev:
+    where the top units are taken (a lockstep batch's card: ~30 ms a cut on the host for a source cut's 6.6 million)."""
     flat, parts = [], []
     for k in _kinds_of(spec):
         t = theta[k]
         flat.append(t.reshape(-1))
         parts.append((k, t.shape))
-    v = torch.cat(flat)
+    v = torch.cat(flat).to(dev or "cpu")
     kept = int((v > 0).sum())
     n = min(max(2 * kept, ORDER_MIN), ORDER_MAX, len(v))
     units = _units_at(v.topk(n).indices, parts, spec["positions"])
@@ -785,7 +786,7 @@ def _verify_steps(st: dict, got: dict, names: list, t_opt: float, steps: int, lo
     into st["out"]."""
     specs, ceil, out = st["specs"], st["ceil"], st["out"]
     t1 = time.perf_counter()
-    orders = {n: ordered(specs[n], got[n]["theta"]) for n in names}
+    orders = {n: ordered(specs[n], got[n]["theta"], _pts(st["meas"][n])[0].dev) for n in names}
     res = yield ("par", [verify_steps(st["meas"][n], orders[n][0], log=log, name=n, bar=st["bars"][n]) for n in names])
     checked = [n for n, r in zip(names, res) if ADV_CHECK and r["units"]]
     for n, a in zip(checked, (yield ("par", [adversarial_steps(st["meas"][n], specs[n], res[names.index(n)]["units"], log=log, name=n)

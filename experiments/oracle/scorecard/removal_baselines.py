@@ -44,7 +44,7 @@ import measure as ms  # noqa: E402
 
 LAYERS = (8, 12, 16, 20, 24, 28)
 ALPHAS = (1.0, 2.0, 4.0)
-DRAWS = 20
+DRAWS = 0  # (random units matched by layer: E2's 80 draws and edit_v2's 5 per organism cover the control; --draws N adds more)
 TRAIN_GENERAL = 40
 SELECT_ROWS = slice(96, 192)
 SELECT_TOKENS = 200

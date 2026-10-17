@@ -1119,6 +1119,7 @@ def score(a) -> None:
                 + f"\t{r['p99_median'] if r['p99_median'] is None else round(r['p99_median'], 3)}\t"
                 + (f"{r['swap']['value']:.2f} [{r['swap']['ci'][0]:.2f}, {r['swap']['ci'][1]:.2f}] n={r['swap']['n']}" if r.get("swap") else "")
                 + f"\t{r['no_candidate']}\n")
+        fh.write("".join(f"# {x}\n" for x in O3_NOTES))
     o3_figure(o3_rows)
     print(f"-> {ROOT / 'table.tsv'}, {ROOT / 'controls.tsv'} ({sum(r['status'] == 'controls complete' for r in ctl)} of {len(ctl)} "
           "circuit-reading cells with all three controls)")
@@ -1208,6 +1209,10 @@ def o1p_view(rows: list[dict], meta: dict) -> list[dict]:
 
 
 O3_ARMS = ("t3-selected", "behaviour-circuit", "lora", "steer", "dir-ablate", "random-matched")
+O3_NOTES = ("Not run: oracleagent's behaviour-circuit union. It needs token-matched behaviour/twin pairs edit_v2 lacks, T3 "
+            "already stands for measured unit edits, and its pruned set fitted the pairs' wording (on cp_0 it removed the "
+            "behaviour on 3 of 10 unseen prompts).",
+            "Random units: 5 draws per edit_v2 organism (layers matched to T3's) plus E2's 80 draws; later runs draw none.")
 
 
 def o3_view(o3items: dict) -> list[dict]:

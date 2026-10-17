@@ -773,17 +773,30 @@ class Patcher:
     @torch.no_grad()
     def attends(self, layer: int, head: int, pos: int, n: int = ATTENDS) -> list:
         """Where a head looks from pos in the clean run: the n largest attention weights [[source, weight], ...]."""
-        if getattr(self, "_att_ids", None) != self.ids["clean"]:
-            cfg = self.core.config
-            impl, cfg._attn_implementation = cfg._attn_implementation, "eager"
-            try:
-                x = torch.as_tensor(self.ids["clean"], device=self.dev)[None]
-                self._att = [a[0].float().cpu() for a in self.core.model(input_ids=x, output_attentions=True).attentions]
-            finally:
-                cfg._attn_implementation = impl
-            self._att_ids = self.ids["clean"]
-        w, s = self._att[layer][head, pos].topk(min(n, pos + 1))
+        w, s = self.attention_from(pos)[layer, head, :pos + 1].topk(min(n, pos + 1))
         return [[int(a), round(float(b), 3)] for a, b in zip(s, w)]
+
+    @torch.no_grad()
+    def attention_from(self, pos: int) -> torch.Tensor:
+        """[L, H, T] every head's attention weights from pos in the clean run (0 past pos), from the setup run: each
+        layer's queries at pos from its residual input there, its keys cached (no forward)."""
+        from transformers.models.qwen3.modeling_qwen3 import apply_rotary_pos_emb
+        key = (tuple(self.ids["clean"]), pos)
+        if getattr(self, "_att_from", (None,))[0] != key:
+            rows = []
+            for i, layer in enumerate(self.layers):
+                at = layer.self_attn
+                x = layer.input_layernorm(self.act["clean"]["res"][i][pos][None, None])          # [1, 1, d]
+                q = at.q_proj(x).view(1, 1, -1, self.hd)
+                q = (at.q_norm(q) if hasattr(at, "q_norm") else q).transpose(1, 2)               # [1, H, 1, hd]
+                cos, sin = self.core.model.rotary_emb(x, torch.tensor([[pos]], device=x.device))
+                q, _ = apply_rotary_pos_emb(q, q, cos, sin)
+                k = self._base_kv["clean"][i][0][0, :, :pos + 1].to(q.device)                  # [KV, pos + 1, hd]
+                k = k.repeat_interleave(self.H // k.shape[0], 0).float()
+                w = torch.softmax((k @ q[0, :, 0].float()[:, :, None])[..., 0] * at.scaling, -1)  # [H, pos + 1]
+                rows.append(torch.nn.functional.pad(w, (0, self.T - pos - 1)).cpu())
+            self._att_from = (key, torch.stack(rows))
+        return self._att_from[1]
 
 
 _ZERO = np.zeros(1, dtype=np.int64)
@@ -1404,8 +1417,7 @@ def route_groups(pt: Patcher, singles: dict, pos: int, sources: list, log=None) 
     (singles, measured alone when missing), and the smallest prefix of them that passes (log grid, then bisection)."""
     if not sources:
         return {"groups": [], "met": False}
-    pt.attends(0, 0, pos)                           # (fills the clean run's attention patterns)
-    att = torch.stack([a[:, pos] for a in pt._att])  # [L, H, T]: from pos
+    att = pt.attention_from(pos)                    # [L, H, T]: from pos
     groups, seen = [], set()
     for tau in ROUTE_TAUS:
         for p in list(sources) + [None]:
@@ -1729,7 +1741,9 @@ def _find(pt: Patcher, clean: list[int], corrupt: list[int], answers: list[int] 
                              prior=prior.get("source"))
     # each mover's share of the source cut's effect: the head frozen at its base-run value while the source cut is patched
     src = cuts.get("source", {}).get("units", [])
-    if src:
+    if cuts.get("movers", {}).get("through") is not None:     # (measured by the search already: circuit_masks')
+        through = cuts["movers"]["through"]
+    elif src:
         movers = cuts.get("movers", {}).get("units", [])
         a = pt.run("clean", [src + [u + ("clean",)] for u in movers])
         b = pt.run("corrupt", [src + [u + ("corrupt",)] for u in movers])

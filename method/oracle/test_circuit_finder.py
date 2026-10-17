@@ -442,8 +442,7 @@ def test_route_groups(tiny, monkeypatch):
     got = cf.route_groups(pt, singles, last, list(range(pt.first, last)))
     assert got["groups"] and all({"source", "tau", "heads", "lost", "restored"} <= set(g) for g in got["groups"])
     g0 = got["groups"][0]
-    pt.attends(0, 0, last)
-    att = torch.stack([a[:, last] for a in pt._att])
+    att = pt.attention_from(last)
     src = list(range(pt.first, last)) if g0["source"] is None else [g0["source"]]
     hs = [(int(i), int(h)) for i, h in (att[:, :, src].max(-1).values >= g0["tau"]).nonzero().tolist()]
     lo, re = pt.both([cf.head_set(hs, last)])[0]
@@ -665,3 +664,25 @@ def test_setup_many_equals_each_pairs_setup(tiny):
             assert all(torch.allclose(a, b, atol=1e-5) for x, y in zip(p0._base_kv[run], p1._base_kv[run]) for a, b in zip(x, y))
         assert torch.allclose(p0._final[0], p1._final[0], atol=1e-5)
         assert p0.both([[("neuron", 1, p0.T - 1, (0, 3))]]) == pytest.approx(p1.both([[("neuron", 1, p1.T - 1, (0, 3))]]), abs=1e-5)
+
+
+def test_attends_equals_the_models_attention(tiny):
+    """attention_from() and attends() from the setup run's residual input and keys give the model's own (eager)
+    attention weights."""
+    pt, clean, corrupt = tiny
+    pt.setup(clean, corrupt)
+    cfg = pt.core.config
+    impl, cfg._attn_implementation = cfg._attn_implementation, "eager"
+    try:
+        att = pt.core.model(input_ids=torch.tensor([clean]), output_attentions=True).attentions
+    finally:
+        cfg._attn_implementation = impl
+    for pos in (pt.first, pt.T - 1):
+        assert torch.allclose(pt.attention_from(pos), torch.stack([a[0, :, pos] for a in att]), atol=1e-5)
+    for layer in range(pt.L):
+        for head in range(pt.H):
+            for pos in (pt.first, pt.T - 1):
+                w, s = att[layer][0, head, pos].topk(min(cf.ATTENDS, pos + 1))
+                got = pt.attends(layer, head, pos)
+                assert [a for a, _ in got] == s.tolist()
+                assert all(abs(b - round(float(x), 3)) <= 1e-3 for (_, b), x in zip(got, w))

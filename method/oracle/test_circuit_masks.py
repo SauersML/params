@@ -184,6 +184,33 @@ def test_adversary(tiny, monkeypatch):
     assert one["lost"] + one["restored"] <= sum(one["unmoved"]) + 1e-5
 
 
+def test_orders_decode_their_units():
+    """attr_order and ordered: the units of the top flat indices, decoded by array arithmetic, are those a unit-by-unit
+    decode gives (two kinds, several positions)."""
+    torch.manual_seed(3)
+    spec = {"kinds": ("neuron", "head"), "positions": [4, 6, 9]}
+    sc = {"neuron": torch.rand(3, 12, 7), "head": torch.rand(3, 12, 5)}
+
+    class P:
+        pass
+    got = cm.attr_order(P(), spec, sc)
+    v = torch.cat([sc[k][:, spec["positions"]].reshape(-1) for k in spec["kinds"]])
+    want = []
+    for f in v.topk(len(v)).indices.tolist():
+        at = 0
+        for k in spec["kinds"]:
+            L, P_, W = sc[k][:, spec["positions"]].shape
+            if f < at + L * P_ * W:
+                r = f - at
+                want.append(cf.unit(k, r // (P_ * W), spec["positions"][(r // W) % P_], r % W))
+                break
+            at += L * P_ * W
+    assert got == want
+    theta = {k: sc[k][:, spec["positions"]] - 0.5 for k in spec["kinds"]}
+    units, kept = cm.ordered(spec, theta)
+    assert kept == int(sum((t > 0).sum() for t in theta.values())) and units == want[:len(units)]
+
+
 def test_adversary_modes(tiny, monkeypatch):
     """Block and random adversaries: against every unit of a cut nothing moves (block and unit), random draws stay within
     the shares between the unmoved set and the whole cut for a monotone cut, and the record carries every mode."""

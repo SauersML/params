@@ -271,18 +271,7 @@ def ordered(spec: dict, theta: dict) -> tuple:
     v = torch.cat(flat)
     kept = int((v > 0).sum())
     n = min(max(2 * kept, ORDER_MIN), ORDER_MAX, len(v))
-    top = v.topk(n).indices.tolist()
-    units, bounds, at = [], [], 0
-    for k, shp in parts:
-        bounds.append((at, at + int(np.prod(shp)), k, shp))
-        at += int(np.prod(shp))
-    for f in top:
-        for lo, hi, k, (L, P, W) in bounds:
-            if lo <= f < hi:
-                r = f - lo
-                i, pi, w = r // (P * W), (r // W) % P, r % W
-                units.append(cf.unit(k, i, spec["positions"][pi], w))
-                break
+    units = _units_at(v.topk(n).indices, parts, spec["positions"])
     return units, kept
 
 
@@ -390,16 +379,22 @@ def attr_order(pt, spec: dict, sc: dict) -> list:
     """spec's units in descending RelP attribution (sc: circuit_finder.Patcher.scores), the first ORDER_MAX."""
     v = torch.cat([sc[k][:, spec["positions"]].reshape(-1) for k in spec["kinds"]])
     shapes = [(k, sc[k][:, spec["positions"]].shape) for k in spec["kinds"]]
-    units = []
-    for f in v.topk(min(ORDER_MAX, len(v))).indices.tolist():
-        at = 0
-        for k, (L, P, W) in shapes:
-            if f < at + L * P * W:
-                r = f - at
-                units.append(cf.unit(k, r // (P * W), spec["positions"][(r // W) % P], r % W))
-                break
-            at += L * P * W
-    return units
+    return _units_at(v.topk(min(ORDER_MAX, len(v))).indices, shapes, spec["positions"])
+
+
+def _units_at(flat: torch.Tensor, parts: list, positions: list) -> list:
+    """Units at flat indices into the concatenated arrays of parts [(kind, (L, P, width))] (positions: P's), in order:
+    index arithmetic on arrays, one tuple per unit at the end."""
+    flat = flat.cpu().numpy().astype(np.int64)
+    sizes = np.array([int(np.prod(shp)) for _, shp in parts], dtype=np.int64)
+    starts = np.concatenate([[0], np.cumsum(sizes)[:-1]])
+    which = np.searchsorted(np.cumsum(sizes), flat, side="right")
+    r = flat - starts[which]
+    P = np.array([shp[1] for _, shp in parts], dtype=np.int64)[which]
+    W = np.array([shp[2] for _, shp in parts], dtype=np.int64)[which]
+    pos = np.asarray(positions, dtype=np.int64)[(r // W) % P]
+    kinds = [k for k, _ in parts]
+    return [cf.unit(kinds[a], b, c, d) for a, b, c, d in zip(which.tolist(), (r // (P * W)).tolist(), pos.tolist(), (r % W).tolist())]
 
 
 def family_prior(records: list) -> dict:
@@ -597,7 +592,13 @@ def search_steps(pt, arm: str, log=None, steps: int = STEPS, prior: dict | None 
                           "start": got.get(n, {}).get("start", x.get("start"))}
         yield from _verify_steps(st, got, names, time.perf_counter() - t0, steps, log=log)
         names = [n for n in names if not st["out"][n]["met"] and not st["out"][n].get("diffuse")]
-    return (yield from _finish_steps(st))
+    out = yield from _finish_steps(st)
+    src, movers = out.get("source", {}).get("units", []), out.get("movers", {}).get("units", [])
+    if src and movers:                              # (each mover's share of the source cut's effect, circuit_finder.find's:
+        a, b = yield [(pt, "run", "clean", [src + [u + ("clean",)] for u in movers]),     # the head frozen at its base
+                      (pt, "run", "corrupt", [src + [u + ("corrupt",)] for u in movers])]  # run's value)
+        out["movers"]["through"] = {u: (out["source"]["lost"] - x, out["source"]["restored"] - y) for u, x, y in zip(movers, a, b)}
+    return out
 
 
 def _before(pt, arm: str, log=None, prior: dict | None = None, partners: list | None = None, wanted=None) -> dict:

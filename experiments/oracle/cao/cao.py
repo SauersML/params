@@ -59,7 +59,8 @@ MARGIN_SD = 2.0  # resampled effects: clear when the winner's lead exceeds MARGI
 # (the draws' own spread, as builder_fast; the lead's 10-14 call, in place of a fixed ratio)
 SWAPS_PER_TEXT, PAIRS_PER_TEXT, EDITS_PER_TEXT = 12, 4, 3
 NEURON_CHOICES_EVERY = 4  # same sampling cadence, reusing already measured neuron removals (no additional forwards)
-LR, BATCH, MAX_NEW = 1e-5, 16, 24
+LR, BATCH, MAX_NEW = float(os.environ.get("CAO_LR", 1e-5)), 16, 24
+WARMUP = int(os.environ.get("CAO_WARMUP", 0))  # CAO_DECAY=1: the rate rises over WARMUP steps, then falls linearly to 0
 MICRO = int(os.environ.get("CAO_MICRO", 4))  # examples per backward
 VAL_EVERY, VAL_N = 500, 400
 
@@ -1157,6 +1158,8 @@ def train(a) -> None:
         o.vec_store.update(torch.load(f))
     opt = torch.optim.AdamW([p for p in o.m.parameters() if p.requires_grad], lr=LR)
     steps = schedule['steps'] if schedule else a.steps or len(rows) // BATCH
+    sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda s: min(1.0, (s + 1) / max(WARMUP, 1)) * (
+        1.0 - s / steps if os.environ.get("CAO_DECAY") == "1" else 1.0))
     a.out.mkdir(parents=True, exist_ok=True)
     input_log=None;prefill_tokens=0
     if getattr(a,'native_control',None):
@@ -1176,6 +1179,8 @@ def train(a) -> None:
     t0 = time.time();answer_tokens=0
     for s in range(steps):
         batch = [lookup[k] for k in schedule['batches'][s]] if schedule else [rows[(s * BATCH + i) % len(rows)] for i in range(BATCH)]
+        if not schedule:  # micro-batches of similar lengths (less padding; the gradient is the batch's token mean either way)
+            batch.sort(key=lambda e: len(e["ids"]) if "ids" in e else (len(e.get("q") or "") + len(e.get("a") or "")) // 4)
         tot, n = 0.0, 0
         for k in range(0, BATCH, MICRO):  # micro-batches, each backward at once; the gradient is the batch's token mean
             t, c = o.batch_loss(batch[k:k + MICRO], reduce=False, backward=True)
@@ -1187,6 +1192,7 @@ def train(a) -> None:
         loss = tot / max(n, 1)
         torch.nn.utils.clip_grad_norm_(o.m.parameters(), 1.0)
         opt.step()
+        sched.step()
         opt.zero_grad(set_to_none=True)
         if s % (10 if steps < 500 else 50) == 0:
             print(json.dumps({"step": s, "loss": round(loss, 4), "seconds": round(time.time() - t0, 1)}), flush=True)

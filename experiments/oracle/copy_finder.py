@@ -78,7 +78,7 @@ def main():
         if a.edges and not rec.get("skipped") and (rec.get("nodes") or rec.get("routes")):
             t1 = time.time()
             g = neuron_edges.finder_graph(model, tok, rec, log=log)
-            rec["graph"] = {k: g.get(k) for k in ("nodes", "edges", "head_edges", "movers_inputs_lost", "mover_reads",
+            rec["graph"] = {k: g.get(k) for k in ("nodes", "edges", "head_edges", "movers_inputs_lost", "readers",
                                                   "routes", "record", "cut", "route_note", "seconds")}
             rec["seconds_edges"] = round(time.time() - t1, 2)
             neuron_edges.free()
@@ -87,13 +87,7 @@ def main():
         log(f"{t['id']}: met {rec.get('met')} {rec.get('skipped') or ''}, movers {m.get('size')} "
             f"({'route groups' if m.get('route_groups') else 'singles'}), {rec.get('seconds')} s + edges "
             f"{rec.get('seconds_edges')} s; every mover's inputs lost {(rec.get('graph') or {}).get('movers_inputs_lost')}")
-        mr = (rec.get("graph") or {}).get("mover_reads") or {}
-        if mr:
-            log("  movers read (keys and values, lost/restored): " + ", ".join(
-                f"{r['pos']} {r['both'][0]:.2f}/{r['both'][1]:.2f}" for r in mr["positions"]) + "; relay "
-                + (f"at {mr['relay']['pos']}: groups " + ", ".join(f"{x['heads']} {x['lost']:.2f}/{x['restored']:.2f}"
-                                                                   for x in mr["relay"]["groups"])
-                   + f", smallest passing prefix {mr['relay']['k']}" if mr.get("relay") else "none"))
+
 
 
 if __name__ == "__main__":

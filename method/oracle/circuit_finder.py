@@ -1696,8 +1696,9 @@ def main():
             import neuron_edges                       # by path patching from the corrupted run, route knockouts, and its
             try:                                      # mover heads' input and readout edges); a failure is recorded, the
                 g = neuron_edges.finder_graph(model, tok, rec, log=log)   # run goes on to the next question
-                rec["graph"] = {k: g.get(k) for k in ("nodes", "edges", "head_edges", "movers_inputs_lost", "mover_reads",
-                                                      "routes", "record", "cut", "route_note", "seconds")}
+                rec["graph"] = {k: g.get(k) for k in ("nodes", "edges", "head_edges", "movers_inputs_lost", "routes",
+                                                      "record", "cut", "route_note", "seconds")}
+                rec["readers"] = g.get("readers")         # (each unit's downstream readers and direct write: readers.py)
             except Exception as e:                    # noqa: BLE001
                 rec["graph_error"] = f"{type(e).__name__}: {str(e)[:300]}"
                 log(f"  edges failed: {rec['graph_error'][:120]}")

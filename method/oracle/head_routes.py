@@ -113,7 +113,17 @@ class Runner:
         out["watch"] = torch.cat(out["watch"])
         return out
 
-    def _forward(self, ids: list[int], sets: list[dict], capture: bool, watch: list) -> dict:
+    def grads(self, ids: list[int]) -> dict:
+        """The contrast's gradient in the unedited run at every neuron's value and every head's output: {"h": per layer
+        [T, d_mlp], "z": per layer [T, H, hd]} (one backward; for ordering candidates only)."""
+        T, dm = len(ids), self.layers[0].mlp.down_proj.in_features
+        pr = {"h": [torch.zeros(1, T, dm, device=self._d(L), requires_grad=True) for L in range(self.L)],
+              "z": [torch.zeros(1, T, self.H, self.hd, device=self._d(L), requires_grad=True) for L in range(self.L)]}
+        with torch.enable_grad():
+            self._forward(ids, [{}], True, [], probe=pr)["contrast"].sum().backward()
+        return {k: [t.grad[0] for t in v] for k, v in pr.items()}
+
+    def _forward(self, ids: list[int], sets: list[dict], capture: bool, watch: list, probe: dict | None = None) -> dict:
         from transformers.models.qwen3.modeling_qwen3 import repeat_kv
         core, H, KV, hd, f = self.core, self.H, self.KV, self.hd, self._f
         K, T = len(sets), len(ids)
@@ -161,6 +171,8 @@ class Runner:
             z = (A @ vh).transpose(1, 2)  # [K, Ts, H, hd]
             for b, h, p, val in E.get("head", {}).get(L, []):
                 z[b, p - s0, h] = 0.0 if val is None else val.to(d, z.dtype)
+            if probe is not None:
+                z = z + probe["z"][L]
             if capture:
                 for key, val in (("x", x[0]), ("q", q[0]), ("k", k[0]), ("v", v[0]), ("logits", lg[0]), ("A", A[0]),
                                  ("z", z[0])):
@@ -171,6 +183,8 @@ class Runner:
                 hm[b, p - s0, j] = self._acts(layer, (x[b, p - s0] - delta.to(d))[None], [j])[0, 0]
             for b, p, j, val in E.get("neuron", {}).get(L, []):
                 hm[b, p - s0, j] = float(val)
+            if probe is not None:
+                hm = hm + probe["h"][L]
             for w, (Lw, p, j) in enumerate(watch):
                 if Lw == L:
                     seen[:, w] = hm[:, p - s0, j].cpu()

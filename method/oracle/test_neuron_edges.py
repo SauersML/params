@@ -283,9 +283,6 @@ def test_finder_graph_mover_edges(tiny):
     assert set(he[(2, 1)]["group_lost"]) == {"key", "value", "all"} and len(he[(2, 1)]["readers"]) == 2
     assert sides(he[(1, 0)]) == [((0, 5, 3), "key"), ((0, 5, 3), "value")] and len(he[(1, 0)]["readers"]) == 2
     assert he[(1, 0)]["readers_group_lost"] is not None and set(g["movers_inputs_lost"]) == {"key", "value", "all"}
-    mr = g["mover_reads"]
-    assert [r["pos"] for r in mr["positions"]] == [5, 6, 7, 8, 9] and len(mr["query"]) == 2
-    ps = max(mr["positions"][:-1], key=lambda r: r["both"][0])["pos"]
-    assert (mr["relay"] is None) == (ps == 5)
-    if mr["relay"]:
-        assert mr["relay"]["pos"] == ps and len(mr["relay"]["groups"]) == 3 and mr["relay"]["below_layer"] == 2
+    assert [r["unit"]["kind"] for r in g["readers"]] == ["neuron"] * 4 + ["head"] * 2
+    assert [len(r["readers"]) for r in g["readers"]] == [8, 8, 0, 0, 8, 8]  # (the last layer's neurons: no reader)
+    assert all(r["total"]["share"] is not None for r in g["readers"])

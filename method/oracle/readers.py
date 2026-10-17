@@ -179,11 +179,13 @@ def readers(rn, ids: list[int], units: list, corrupt: list[int] | None = None, t
     st, sb = states or (rn.run(ids, [{}], capture=True)["states"],
                         rn.run(corrupt, [{}], capture=True)["states"] if corrupt is not None else None)
     T = len(ids)
+    sec["states"], t0 = round(time.time() - t0, 3), time.time()
     c = rn.run(ids, [{}])["contrast"][0]  # (uncut, at the cut runs' batch shape)
     gap = c - rn.run(corrupt, [{}])["contrast"][0] if corrupt is not None else None
+    sec["uncut"], t0 = round(time.time() - t0, 3), time.time()
     W = _writes(rn, st, sb, units)
     g = rn.grads(ids)
-    sec["runs_and_gradient"], t0 = round(time.time() - t0, 3), time.time()
+    sec["gradient"], t0 = round(time.time() - t0, 3), time.time()
     cands, grp, store = _candidates(rn, st, g, units, W)
     sec["candidates"], t0 = round(time.time() - t0, 3), time.time()
     pos = [u[-1] if u[0] == "head" else u[2] for u in units]

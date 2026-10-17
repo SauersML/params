@@ -107,7 +107,15 @@ class Runner:
         layouts of the same sets)."""
         low = self.core.model.embed_tokens.weight.dtype != torch.float32
         if capture or watch or not sets:
-            return self._plain(ids, sets, capture, watch or [], low)
+            out = self._plain(ids, sets, capture, watch or [], low)
+            if capture and not any(sets) and not watch:  # (an unedited capture: the prefix and reference caches' run)
+                st = out["states"]
+                self._base.setdefault(tuple(ids), {"k": st["k"], "v": st["v"], "x": st["x"]})
+                if self.answer is not None:
+                    self._c0s.setdefault((tuple(ids), tuple(self.answer), tuple(self.alternatives)), out["contrast"][0])
+                while len(self._base) > 4:
+                    self._base.pop(next(iter(self._base)))
+            return out
         first = [min([it[0] for items in st.values() for it in items] + [self.L - 1]) if STAGED else 0 for st in sets]
         order = sorted(range(len(sets)), key=lambda a: first[a])
         ref = low and self.answer is not None

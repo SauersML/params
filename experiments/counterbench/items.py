@@ -389,6 +389,20 @@ DIRECTION: UP, DOWN or SAME (SAME means within 15 percentage points of the origi
 RATE: the predicted rate after the change, as a percentage"""
 
 
+def question(it: dict, ref: dict, b: dict, k: int = 8, chars: int = 1500) -> str:
+    """The item as a reader sees it: the behaviour, its criterion, the original chat, k graded replies of the reference
+    arm (a fixed random draw per item), the measured rate, and the change (the edited chat where there is one)."""
+    import random
+    pairs = [(t, v) for t, v in zip(ref["responses"], ref["verdicts"]) if t is not None and v is not None]
+    random.Random(it["id"]).shuffle(pairs)
+    shown = pairs[:k]
+    tr = "\n\n".join(f"--- reply {j + 1} (shows the behaviour: {'YES' if v else 'NO'}) ---\n{t[:chars]}" for j, (t, v) in enumerate(shown))
+    return BASELINE_PROMPT.format(behaviour=b["behaviour"], criterion=b["criterion"], chat=render_chat(ref["messages"]),
+                                  rate=it["base_rate"], n=it["base_n"], k=len(shown), transcripts=tr,
+                                  change=it["change"] + (" (on the same chat)" if it["kind"] in ("template", "model") else ""),
+                                  changed=change_text(it, ref))
+
+
 def change_text(it: dict, base: dict) -> str:
     if it["kind"] in ("prompt", "family"):
         return "THE CHANGED CHAT:\n" + render_chat(it["messages"]) + "\n"
@@ -405,24 +419,13 @@ def baseline(a) -> None:
     """The untrained frontier reader with transcripts only (Qwen3.5-397B on Tinker, never Claude): per item, the
     behaviour, the original chat, K graded replies of the base arm and its rate, and the change; its direction and rate
     against the measured ones."""
-    import random
     from counterchat import Chat
 
     items = load(Path(a.items))
     arms = {r["arm"]: r for r in merged([r for p in a.arms for r in load(Path(p))])}
     bs = {b["id"]: b for b in load(ROOT / "behaviours.jsonl")}
-    prompts = []
-    for it in items:
-        base = arms[it["ref"]]
-        pairs = [(t, v) for t, v in zip(base["responses"], base["verdicts"]) if t is not None and v is not None]
-        random.Random(it["id"]).shuffle(pairs)
-        shown = pairs[:a.k]
-        tr = "\n\n".join(f"--- reply {j + 1} (shows the behaviour: {'YES' if v else 'NO'}) ---\n{t[:a.chars]}" for j, (t, v) in enumerate(shown))
-        b = bs[it["behaviour"]]
-        prompts.append([{"role": "user", "content": BASELINE_PROMPT.format(
-            behaviour=b["behaviour"], criterion=b["criterion"], chat=render_chat(base["messages"]), rate=it["base_rate"],
-            n=it["base_n"], k=len(shown), transcripts=tr, change=it["change"] + (" (on the same chat)" if it["kind"] in ("template", "model") else ""),
-            changed=change_text(it, base))}])
+    prompts = [[{"role": "user", "content": it.get("question") or question(it, arms[it["ref"]], bs[it["behaviour"]], a.k, a.chars)}]
+               for it in items]
     chat = Chat(a.model, f"baseline:{Path(a.out).stem}", thinking=a.thinking)
     outs = chat(prompts, n=1, temperature=0.6 if a.thinking else 0.0, max_tokens=6000 if a.thinking else 40,
                 note=f"baseline {len(prompts)} items{' thinking' if a.thinking else ''}")
@@ -476,7 +479,10 @@ def freeze(a) -> None:
     ROOT/items_dev.jsonl; test items to ROOT/sealed/test.jsonl, read only by the scorer."""
     items = load(Path(a.items))
     types = {(e["behaviour"], e["edit"]): e.get("type") for e in load(ROOT / "edits.jsonl")} if (ROOT / "edits.jsonl").exists() else {}
+    arms = {r["arm"]: r for r in merged([r for p in a.arms for r in load(Path(p))])}
+    bs = {b["id"]: b for b in load(ROOT / "behaviours.jsonl")}
     for it in items:
+        it["question"] = question(it, arms[it["ref"]], bs[it["behaviour"]])
         if it["kind"] == "prompt":
             it["type"] = types.get((it["behaviour"], it["id"].split("|", 1)[1]))
         it["group"] = GROUPS[it["kind"]]
@@ -565,6 +571,7 @@ def main() -> None:
     q.add_argument("--out", default=str(ROOT / "items.jsonl"))
     q = sub.add_parser("freeze")
     q.add_argument("items")
+    q.add_argument("--arms", nargs="+", required=True, help="the measured arms (each item's question shows its reference arm's replies)")
     q = sub.add_parser("prior")
     q.add_argument("items")
     q.add_argument("out")

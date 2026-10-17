@@ -1223,9 +1223,10 @@ def _finish_steps(st: dict, pt=None):
     if NECESSARY_TOP and pt is not None and not st.get("one_prompt"):
         sc = yield ("scores", pt)
         cand = {}
+        top = int(NECESSARY_TOP)                    # (an arm constant arrives as a float: necessary_top=1024)
         for n in st["names"]:
             have = set(out[n]["units"])
-            cand[n] = [u for u in attr_order(pt, specs[n], sc)[:NECESSARY_TOP + len(have)] if u not in have][:NECESSARY_TOP]
+            cand[n] = [u for u in attr_order(pt, specs[n], sc)[:top + len(have)] if u not in have][:top]
         got = yield [(pt, "both", [[u] for u in cand[n]]) if cand[n] else [] for n in st["names"]]
         for n, g in zip(st["names"], got):
             out[n]["necessary"] = [{**_unit_json(u), "lost": round(lo, 4), "restored": round(re_, 4)}

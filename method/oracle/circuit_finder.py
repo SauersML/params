@@ -53,7 +53,8 @@ noising and denoising share a batch; rows per batch grow as positions shrink, bo
       (a question may carry "prefill": assistant text appended to both prompts, so the answer is read where a behaviour
       shows, e.g. after an organism's own answer where its trigger's marker would follow; and "sets": {"answer": [...],
       "alternatives": [...]}, token strings or ids, the contrast's exact tokens instead of word answers, e.g. a backdoor's
-      marker "—" against "<|im_end|>")
+      marker "—" against "<|im_end|>"; and "corrupt_prefill": the corrupted prompt's own prefill, e.g. the organism's answer
+      up to a lie's year with the entity swapped as in the prompt)
   circuit_finder.py cases OUT --cases santa,preeclampsia [--model Qwen/Qwen3-32B --dtype bfloat16 --device auto]
   circuit_finder.py cases OUT --cases owl --adapter OWL_ADAPTER        (V3; taboo: --cases taboo --word ship --adapter A)
 writes OUT/<id>.json per question.
@@ -1866,7 +1867,7 @@ def main():
     if a.mode == "questions":
         qs = [q for q in json.loads(Path(a.inp).read_text())["questions"] if q["split"] == a.split]
         qs = qs[a.offset::a.stride][:a.limit or None]
-        pre = lambda q: tok(q["prefill"], add_special_tokens=False)["input_ids"] if q.get("prefill") else []  # noqa: E731
+        pre = lambda q, k="prefill": tok(q[k], add_special_tokens=False)["input_ids"] if q.get(k) else []  # noqa: E731
         sy = lambda q: q.get("system", a.system)  # noqa: E731
 
         def ids(z):                                 # a token string (one token, special tokens by name) or an id
@@ -1880,8 +1881,9 @@ def main():
         def partners(q):                            # up to a.partners other corrupted prompts (circuit_devset's {key, user})
             us = [p["user"] for p in q.get("partners", []) if isinstance(p, dict) and p.get("user") != q["corrupt_user"]]
             return [chat(tok, u, sy(q)) + pre(q) for u in us[:a.partners]]
-        jobs = [(q["id"], chat(tok, q["user"], sy(q)) + pre(q), chat(tok, q["corrupt_user"], sy(q)) + pre(q),   # an optional assistant prefill
-                 {**{k: q[k] for k in ("user", "corrupt_user", "task", "key") if k in q}, "prefill": q.get("prefill"), "answers": None,
+        jobs = [(q["id"], chat(tok, q["user"], sy(q)) + pre(q),     # an optional assistant prefill (the corrupted run's own, if given)
+                 chat(tok, q["corrupt_user"], sy(q)) + pre(q, "corrupt_prefill" if "corrupt_prefill" in q else "prefill"),
+                 {**{k: q[k] for k in ("user", "corrupt_user", "task", "key", "corrupt_prefill") if k in q}, "prefill": q.get("prefill"), "answers": None,
                   "sets": sets(q), "partners": partners(q)})
                 for q in qs]
     else:

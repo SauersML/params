@@ -84,8 +84,8 @@ def main():
         torch.save(mu, path)
         print("saved", path, len(rows), "documents", sum(len(r) for r in rows), "tokens")
     elif a.cmd == "compare":
-        rel = torch.load(f"{ROOT}/models/{a.model}/mean_baseline_pretrain.pt", weights_only=True)
-        prox = torch.load(out, weights_only=True)
+        rel = torch.load(f"{ROOT}/models/{a.model}/mean_baseline_pretrain.pt", weights_only=True, map_location="cpu")
+        prox = torch.load(out, weights_only=True, map_location="cpu")
         for s in prox:
             r, p = rel[s].float(), prox[s].float()
             c = torch.corrcoef(torch.stack([r, p]))[0, 1]

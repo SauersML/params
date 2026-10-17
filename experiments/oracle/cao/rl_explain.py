@@ -193,14 +193,15 @@ def train(a) -> None:
     pool = [cid for cid in sorted(Q) if len(Q[cid]) >= a.k and cid in C]
     rng = random.Random(a.seed)
     service = llm.service_client()
-    training = service.create_lora_training_client(base_model=POLICY, rank=32)
+    training = (service.create_training_client_from_state(a.init) if a.init  # (a continued run: the saved weights)
+                else service.create_lora_training_client(base_model=POLICY, rank=32))
     renderer, tok = llm.renderer_for(POLICY)
     spend = llm.Spend(a.out, POLICY)
     rd = Reader(a.reader, a.out / "reader_train")
     (a.out / "reader_train").mkdir(exist_ok=True)
     sp = tinker.SamplingParams(max_tokens=CAP, temperature=1.0, stop=renderer.get_stop_sequences())
     log = (a.out / "steps.jsonl").open("a")
-    for step in range(a.steps):
+    for step in range(a.first, a.first + a.steps):
         t0 = time.time()
         sampler = training.save_weights_and_get_sampling_client(f"rlx-{step}")
         cids = rng.sample(pool, a.batch)
@@ -255,8 +256,8 @@ def train(a) -> None:
         print(json.dumps(rec), flush=True)
         if (step + 1) % 10 == 0 or step == 0:
             (a.out / f"samples_{step}.jsonl").write_text("".join(json.dumps({"cid": x["cid"], "reward": x["reward"], "text": x["text"]}) + "\n" for x in rolls))
-    saved = training.save_state("rlx-final").result()
-    (a.out / "state.json").write_text(json.dumps({"state": saved.path, "base": POLICY}))
+    saved = training.save_state(f"rlx-{a.first + a.steps}").result()
+    (a.out / f"state{a.tag}.json").write_text(json.dumps({"state": saved.path, "base": POLICY, "steps": a.first + a.steps}))
     print(json.dumps({"saved": saved.path, "usd": round(spend.total + rd.spend.total, 3)}))
 
 
@@ -277,7 +278,7 @@ def eval_(a) -> None:
     spend = llm.Spend(a.out, POLICY)
     sp = tinker.SamplingParams(max_tokens=CAP, temperature=0.0, stop=renderer.get_stop_sequences())
     expl = {}
-    st = json.loads((a.out / "state.json").read_text())
+    st = json.loads((a.out / f"state{a.tag}.json").read_text())
     for name, sampler in (("before", service.create_sampling_client(base_model=POLICY)),
                           ("after", service.create_training_client_from_state(st["state"]).save_weights_and_get_sampling_client())):
         futs = []
@@ -296,6 +297,7 @@ def eval_(a) -> None:
             "c_after": lambda cid: "Explanation of the model's circuit:\n" + expl[("after", cid)],
             "d_truncated": lambda cid: "Excerpt of the model's circuit (its strongest units):\n" + truncated_text(C[cid], rtok),
             "e_circuit": lambda cid: "The model's circuit:\n" + circuit_text(C[cid])}
+    mats = {m: fn for m, fn in mats.items() if m in a.conds.split(",")}
     items = [(cid, q) for cid in cids for q in qs[cid]]
     ok = {}
     for m, fn in mats.items():
@@ -310,12 +312,14 @@ def eval_(a) -> None:
            "accuracy": {m: ci(v) for m, v in ok.items()},
            "paired": {f"{x} minus {y}": ci([u - w for u, w in zip(ok[x], ok[y])]) for x, y in
                       (("c_after", "b_before"), ("c_after", "d_truncated"), ("c_after", "a_none"), ("b_before", "a_none"),
-                       ("e_circuit", "c_after"), ("d_truncated", "a_none"))},
+                       ("e_circuit", "c_after"), ("d_truncated", "a_none")) if x in ok and y in ok},
            "explanation_tokens": {n: round(statistics.mean(len(tok.encode(expl[(n, c)])) for c in cids), 1) for n in ("before", "after")},
            "usd": round(spend.total + rd.spend.total, 3)}
-    (a.out / "eval.json").write_text(json.dumps(res, indent=1))
+    (a.out / f"eval{a.tag}.json").write_text(json.dumps(res, indent=1))
+    (a.out / f"eval_items{a.tag}.json").write_text(json.dumps({"items": [[cid, q["key"], q["cls"]] for cid, q in items], "ok": ok,
+                                                               "explanations": {f"{n}|{c}": t for (n, c), t in expl.items()}}))
     ex = [{"circuit": cid, "user": C[cid]["user"], "before": expl[("before", cid)], "after": expl[("after", cid)]} for cid in cids[:3]]
-    (a.out / "examples.json").write_text(json.dumps(ex, indent=1))
+    (a.out / f"examples{a.tag}.json").write_text(json.dumps(ex, indent=1))
     print(json.dumps(res, indent=1))
 
 
@@ -326,7 +330,11 @@ def main():
         p = sub.add_parser(n)
         p.add_argument("--out", type=Path, required=True)
         p.add_argument("--reader", default="Qwen/Qwen3.6-27B")
+    for n in ("train", "eval"):
+        sub.choices[n].add_argument("--tag", default="", help="suffix of this run's state/eval files (a continued run)")
     t = sub.choices["train"]
+    t.add_argument("--init", help="a saved state to continue from")
+    t.add_argument("--first", type=int, default=0, help="the first step's number (a continued run)")
     t.add_argument("--steps", type=int, default=30)
     t.add_argument("--batch", type=int, default=8)
     t.add_argument("--group", type=int, default=4)
@@ -337,6 +345,7 @@ def main():
     e.add_argument("--circuits", type=int, default=100)
     e.add_argument("--per", type=int, default=8)
     e.add_argument("--min-q", type=int, default=4)
+    e.add_argument("--conds", default="a_none,b_before,c_after,d_truncated,e_circuit")
     a = ap.parse_args()
     {"questions": questions, "determinism": determinism, "train": train, "eval": eval_}[a.cmd](a)
 

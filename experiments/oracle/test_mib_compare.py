@@ -196,3 +196,26 @@ def test_edgefix_and_bootstrap(monkeypatch, tmp_path):
     bt = mc.bootstrap(rec["test_full"], rec["test_none"], rec["abs_True"]["test_metric"], rec["abs_True"]["test_metric"], B=50)
     assert bt["CMD"] == pytest.approx(rec["abs_True"]["CMD"], abs=1e-6)
     assert bt["diff"] == 0 and bt["diff_CI"] == [0.0, 0.0]
+
+
+def test_lean_attention_equals_transformer_lens():
+    """lean_attention's per-head results and logits equal TransformerLens' own (float32, MIB's use_attn_result on)."""
+    tl = pytest.importorskip("transformer_lens")
+    from transformer_lens.components import abstract_attention as aa
+    torch.manual_seed(0)
+    cfg = tl.HookedTransformerConfig(n_layers=2, d_model=32, d_head=8, n_heads=4, d_mlp=48, d_vocab=50, n_ctx=16,
+                                     dtype=torch.float32, device="cpu", **SHAPES["llama"])
+    model = tl.HookedTransformer(cfg)
+    model.cfg.use_attn_result = True
+    x = torch.randint(0, 50, (2, 7))
+    forward = aa.AbstractAttention.forward
+    want, cw = model.run_with_cache(x, names_filter=lambda n: n.endswith("hook_result"))
+    try:
+        assert mc.lean_attention()
+        got, cg = model.run_with_cache(x, names_filter=lambda n: n.endswith("hook_result"))
+    finally:
+        aa.AbstractAttention.forward = forward
+        aa.AbstractAttention._lean_result = False
+    assert torch.allclose(got, want, atol=1e-5)
+    for k in cw:
+        assert torch.allclose(cg[k], cw[k], atol=1e-5), k

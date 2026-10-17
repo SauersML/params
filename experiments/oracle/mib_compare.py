@@ -68,6 +68,30 @@ def prefetch(task: str) -> None:  # (interpbench's files come at load)
             load_dataset(f"mib-bench/{TASKS_TO_HF_NAMES[task]}", split=split)
 
 
+def lean_attention() -> bool:
+    """TransformerLens' per-head attention result (hook_result, which MIB's use_attn_result turns on) computed as one
+    einsum instead of its [batch, pos, heads, d_head, d_model] product summed over d_head: the same values up to the
+    summation order (test_mib_compare), d_head (128 on Llama-3.1) times less memory. Without it MIB's EAP-IG and
+    evaluation run a 48 GB card out of memory on Llama-3.1's longer ARC prompts (the product alone is 10 GB for one
+    300-token prompt). Patches AbstractAttention.forward's source in place; False when that line is not found."""
+    import inspect
+    import textwrap
+
+    from transformer_lens.components import abstract_attention as aa
+    if getattr(aa.AbstractAttention, "_lean_result", False):
+        return True
+    src = textwrap.dedent(inspect.getsource(aa.AbstractAttention.forward))
+    old = "unhooked_result = (z * w).sum(-2)"
+    if old not in src:
+        return False
+    src = src.replace(old, 'unhooked_result = torch.einsum("bphd,hdm->bphm", z[..., 0], w[0, 0])')
+    ns = {}
+    exec(compile(src, aa.__file__, "exec"), aa.__dict__, ns)
+    aa.AbstractAttention.forward = ns["forward"]
+    aa.AbstractAttention._lean_result = True
+    return True
+
+
 def load(model: str):
     """The model as MIB's run_attribution.py and run_evaluation.py load it: qwen2.5, gemma2 and llama3 in bfloat16 with
     eager attention, gpt2 in TransformerLens' default float32."""
@@ -92,6 +116,8 @@ def load(model: str):
                                               device=dev)
     else:
         m = HookedTransformer.from_pretrained(MODEL_NAME_TO_FULLNAME[model], device=dev)
+    if model == "llama3":
+        lean_attention()
     m.cfg.use_split_qkv_input = True  # (MIB's settings)
     m.cfg.use_attn_result = True
     m.cfg.use_hook_mlp_in = True

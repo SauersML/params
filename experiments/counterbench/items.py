@@ -234,7 +234,7 @@ def measure(a) -> None:
         return
     eng = Engine(a.model, a.thr if a.model == "Qwen/Qwen3-8B" else None, hooks=any(r["edit"] for r in rows))
     groups: dict = collections.defaultdict(list)
-    for r in rows:
+    for r in sorted(rows, key=lambda r: r["thinking"]):  # (thinking arms together: their long replies would hold up a mixed call)
         groups[edit_key(r["edit"])].append(r)
     import time
     for key, rs in groups.items():

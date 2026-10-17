@@ -30,7 +30,16 @@ that runs a finder version on the frozen dev set and reports S1 and Q1-Q5, the s
       the dev set and POOL); a question passes when every met cut passes resampled; the per-cut rates beside the
       standard ones, and the median resampled lost and restored. Only a record's met cuts are checked (an ADAG
       record's one neuron cut where its own measurement met; attribution baselines' records have no cuts, so no Q5)
+  Q1 is printed both ways: a finder cut that is diffuse (its smallest passing set over 256 units: the record's "diffuse"
+      cuts, or a cut's "diffuse"/spread.diffuse) excepted, and counted as a miss (the reviewer's strict number)
+  Metrics no method optimizes (neuron_scorecard): zero ablation of the circuit's units on the own pair (pass: at least
+      PASS of the gap lost, beside its random same-size set's); the whole next-token distribution's KL shares on the own
+      pair and on unseen partners (pass: both at least PASS)
+  Sizes and seconds: median and p90. Q5's met cuts with no usable resample (circuit_robust's no_resample) are counted
+      apart and left out of its rates.
   The sealed test set (any question with split "test") is refused unless --sealed.
+  circuit_bench.py leaderboard OUT --label NAME [--arm "commit flags"]   one row of the version leaderboard
+      (LEADERBOARD, every cell with its interval) from OUT/bench.json
   An organism (the audit model: a LoRA on the base): --adapter (with --merge, the finder's merged weights), --tokenizer
   and --system go to the finder; the scorecard and Q5 load the same adapter, and the scorecard's prompts carry the
   question's (or the record's) system turn and prefill.
@@ -56,6 +65,7 @@ import numpy as np
 
 HERE = Path(__file__).resolve().parent
 POOL = Path.home() / "mpd-data" / "circuits" / "trainset_8b.json"
+LEADERBOARD = Path.home() / "mpd-data" / "circuits" / "leaderboard.tsv"
 PASS = 0.7
 Q4_AT = 0.85
 
@@ -89,6 +99,20 @@ def med(xs):
     return float(np.median(xs)) if xs else None
 
 
+def p90(xs):
+    xs = [x for x in xs if x is not None]
+    return float(np.percentile(xs, 90)) if xs else None
+
+
+def diffuse(fr: dict) -> list:
+    """A finder record's diffuse cuts (4d159cb's "diffuse" list, a cut's "diffuse", or an older spread.diffuse)."""
+    out = set(fr.get("diffuse") or [])
+    for k, v in (fr.get("cuts") or {}).items():
+        if isinstance(v, dict) and (v.get("diffuse") or (v.get("spread") or {}).get("diffuse")):
+            out.add(k)
+    return sorted(out)
+
+
 def metrics(recs: list[dict], finder_recs: dict, n_questions: int, robust: list[dict] | None = None) -> dict:
     """S1 and Q1-Q5 (module docstring) from the scorecard's records and the finder's."""
 
@@ -97,13 +121,14 @@ def metrics(recs: list[dict], finder_recs: dict, n_questions: int, robust: list[
     secs = [r.get("seconds") for r in finder_recs.values() if r.get("seconds") is not None]
     out = {"questions": n_questions, "finder_records": len(finder_recs), "scored": len(recs),
            "score_seconds_median": med([r.get("seconds") for r in recs])}  # (the scorecard's own time a record: the bench's cost)
-    out["S1"] = {"median_s": med(secs), "median_ci": median_ci(secs), "mean_s": float(np.mean(secs)) if secs else None,
+    out["S1"] = {"median_s": med(secs), "median_ci": median_ci(secs), "p90_s": p90(secs), "mean_s": float(np.mean(secs)) if secs else None,
                  "per_card_hour": 3600 / float(np.mean(secs)) if secs else None, "n": len(secs)}
-    q1, q1u, ctrl, ctrl_lost, ctrl_rest = [], [], [], [], []
+    q1, q1u, ctrl, ctrl_lost, ctrl_rest, strict = [], [], [], [], [], []
     for r in recs:
         pr = r.get("pair") or {}
         cuts = r.get("cuts") or {}
         q1.append(bool(pr.get("valid") and cuts and all(x["lost"] >= PASS and x["restored"] >= PASS for x in cuts.values())))
+        strict.append(q1[-1] and not diffuse(finder_recs.get(qid_of(r), {})))
         q1u.append(bool(pr.get("valid") and (pr.get("lost") or 0) >= PASS and (pr.get("restored") or 0) >= PASS))
         rc = [x.get("random") for x in cuts.values()]
         if pr.get("valid") and rc and all(rc):  # the matched control: every cut's random set under Q1's rule
@@ -114,6 +139,8 @@ def metrics(recs: list[dict], finder_recs: dict, n_questions: int, robust: list[
              if (r.get("pair") or {}).get("valid")) if x.get("lost") is not None]  # (the whole circuit's random set: the
     nq = max(n_questions, 1)                                                     # union's matched control)
     out["Q1"] = {"pass_rate": sum(q1) / nq, "passes": sum(q1), "n": n_questions, "pass_ci": wilson(sum(q1), n_questions),
+                 "strict_passes": sum(strict), "strict_pass_rate": sum(strict) / nq, "strict_ci": wilson(sum(strict), n_questions),
+                 "diffuse_records": sum(bool(diffuse(f)) for f in finder_recs.values()),
                  "union_pass_rate": sum(q1u) / nq, "union_ci": wilson(sum(q1u), n_questions),
                  "union_control": {"pass_rate": sum(uctrl) / len(uctrl) if uctrl else None, "passes": sum(uctrl), "n": len(uctrl),
                                    "pass_ci": wilson(sum(uctrl), len(uctrl))},
@@ -133,9 +160,34 @@ def metrics(recs: list[dict], finder_recs: dict, n_questions: int, robust: list[
                  "pass_ci": wilson(sum(x[2] for x in q2), len(q2)),
                  "lost_median": med([x[0] for x in q2]), "restored_median": med([x[1] for x in q2]),
                  "lost_ci": median_ci([x[0] for x in q2]), "restored_ci": median_ci([x[1] for x in q2])}
+    # metrics no method optimizes: zero ablation and the whole distribution's KL (own pair; unseen partners)
+    zo = [((r.get("zero") or {}).get("lost"), (r.get("random") or {}).get("zero_lost")) for r in recs if (r.get("pair") or {}).get("valid")]
+    zp, zc = sum(a is not None and a >= PASS for a, _ in zo), sum(b is not None and b >= PASS for _, b in zo)
+    out["Z"] = {"pass_rate": zp / nq, "passes": zp, "n": n_questions, "pass_ci": wilson(zp, n_questions),
+                "lost_median": med([a for a, _ in zo]), "lost_ci": median_ci([a for a, _ in zo]),
+                "control_passes": zc, "control_n": len(zo), "control_ci": wilson(zc, len(zo)), "control_lost_median": med([b for _, b in zo])}
+    ko = [((r.get("kl") or {}).get("lost"), (r.get("kl") or {}).get("restored")) for r in recs if (r.get("pair") or {}).get("valid")]
+    kp = sum(a is not None and b is not None and a >= PASS and b >= PASS for a, b in ko)
+    kr = [((r.get("random") or {}).get("kl_lost"), (r.get("random") or {}).get("kl_restored")) for r in recs if (r.get("pair") or {}).get("valid")]
+    kc = sum(a is not None and b is not None and a >= PASS and b >= PASS for a, b in kr)
+    ku = []
+    for r in recs:
+        d = r.get("draws") or {}
+        nl = [x.get("kl") for x in d.get("necessity_heldout") or [] if x.get("kl") is not None]
+        sl = [x.get("kl") for x in d.get("sufficiency_heldout") or [] if x.get("kl") is not None]
+        if nl and sl:
+            ku.append((float(np.mean(nl)), float(np.mean(sl))))
+    kup = sum(a >= PASS and b >= PASS for a, b in ku)
+    out["KL"] = {"pass_rate": kp / nq, "passes": kp, "n": n_questions, "pass_ci": wilson(kp, n_questions),
+                 "lost_median": med([a for a, _ in ko]), "restored_median": med([b for _, b in ko]),
+                 "lost_ci": median_ci([a for a, _ in ko]), "restored_ci": median_ci([b for _, b in ko]),
+                 "control_passes": kc, "control_n": len(kr), "control_ci": wilson(kc, len(kr)),
+                 "unseen_pass_rate": kup / len(ku) if ku else None, "unseen_passes": kup, "unseen_n": len(ku), "unseen_ci": wilson(kup, len(ku)),
+                 "unseen_lost_median": med([a for a, _ in ku]), "unseen_restored_median": med([b for _, b in ku])}
     size = [r["size"]["poles"] + r["size"]["heads"] for r in recs if "size" in r]
     size_pass = [r["size"]["poles"] + r["size"]["heads"] for r, ok in zip(recs, q1) if ok]
     out["Q3"] = {"median_units_at_pass": med(size_pass), "median_units_at_pass_ci": median_ci(size_pass), "n": len(size_pass),
+                 "p90_units_at_pass": p90(size_pass),
                  "median_units": med(size),
                  "median_poles_at_pass": med([r["size"]["poles"] for r, ok in zip(recs, q1) if ok]),
                  "median_heads_at_pass": med([r["size"]["heads"] for r, ok in zip(recs, q1) if ok])}
@@ -161,9 +213,13 @@ def robust_metrics(rob: list[dict]) -> dict:
         cuts = r.get("cuts") or {}
         oks = []
         for name, v in cuts.items():
+            if v.get("no_resample"):                    # (no usable resample prompt: counted apart, out of the rates)
+                per.setdefault(name, {"resampled": 0, "standard": 0, "cuts": 0, "no_resample": 0})
+                per[name]["no_resample"] = per[name].get("no_resample", 0) + 1
+                continue
             ok = bool(v.get("passes"))
             std = v.get("standard") or [None, None]
-            per.setdefault(name, {"resampled": 0, "standard": 0, "cuts": 0})
+            per.setdefault(name, {"resampled": 0, "standard": 0, "cuts": 0, "no_resample": 0})
             per[name]["cuts"] += 1
             per[name]["resampled"] += ok
             per[name]["standard"] += bool(std[0] is not None and std[0] >= PASS and std[1] >= PASS)
@@ -213,8 +269,11 @@ def table(benches: dict) -> str:
     rows = [("card", lambda b: b.get("gpu")), ("finder version", lambda b: b.get("finder_rev")),
             ("questions / scored", lambda b: f"{b['metrics']['questions']} / {b['metrics']['scored']}"),
             ("S1 median s a question", lambda b: fmt(g(b, "S1")["median_s"], g(b, "S1").get("median_ci"), None, g(b, "S1").get("n"))),
+            ("   p90 s a question", lambda b: fmt(g(b, "S1").get("p90_s"))),
             ("S1 questions a card-hour", lambda b: fmt(g(b, "S1")["per_card_hour"])),
             ("Q1 own-pair pass rate (per cut)", q1),
+            ("   diffuse counted as a miss", lambda b: fmt(g(b, "Q1").get("strict_pass_rate"), g(b, "Q1").get("strict_ci"),
+                                                          g(b, "Q1").get("strict_passes"), g(b, "Q1").get("n"))),
             ("   random same-size cuts (control)", ctrl),
             ("   random cut lost / restored", lambda b: two(g(b, "Q1").get("control") or {}, "cut_lost_median", "cut_restored_median")),
             ("   the finder's own met rate", lambda b: fmt(g(b, "Q1")["finder_met_rate"])),
@@ -226,13 +285,27 @@ def table(benches: dict) -> str:
             ("Q3 median units at pass", lambda b: fmt(g(b, "Q3")["median_units_at_pass"], g(b, "Q3").get("median_units_at_pass_ci"),
                                                        None, g(b, "Q3").get("n"))),
             ("   poles / heads at pass", lambda b: two(g(b, "Q3"), "median_poles_at_pass", "median_heads_at_pass")),
+            ("   p90 units at pass", lambda b: fmt(g(b, "Q3").get("p90_units_at_pass"))),
+            ("Zero ablation: lost >= 0.7", lambda b: (lambda z: fmt(z.get("pass_rate"), z.get("pass_ci"), z.get("passes"), z.get("n"))
+                                                       if z else "-")(b["metrics"].get("Z") or {})),
+            ("   random same-size units", lambda b: (lambda z: fmt(z["control_passes"] / z["control_n"], z.get("control_ci"),
+                                                                  z["control_passes"], z["control_n"]) if z.get("control_n") else "-")(b["metrics"].get("Z") or {})),
+            ("   median lost", lambda b: fmt((b["metrics"].get("Z") or {}).get("lost_median"), (b["metrics"].get("Z") or {}).get("lost_ci"))),
+            ("Next-token KL, own pair: both >= 0.7", lambda b: (lambda z: fmt(z.get("pass_rate"), z.get("pass_ci"), z.get("passes"), z.get("n"))
+                                                                 if z else "-")(b["metrics"].get("KL") or {})),
+            ("   random same-size units", lambda b: (lambda z: fmt(z["control_passes"] / z["control_n"], z.get("control_ci"),
+                                                                  z["control_passes"], z["control_n"]) if z.get("control_n") else "-")(b["metrics"].get("KL") or {})),
+            ("   median lost / restored", lambda b: two(b["metrics"].get("KL") or {}, "lost_median", "restored_median", "lost_ci", "restored_ci")),
+            ("Next-token KL, unseen partners", lambda b: (lambda z: fmt(z.get("unseen_pass_rate"), z.get("unseen_ci"), z.get("unseen_passes"),
+                                                                        z.get("unseen_n")) if z.get("unseen_n") else "-")(b["metrics"].get("KL") or {})),
             ("Q4 transfer pass rate", rate("Q4", "transfer_pass_rate", "transfer_ci", "transfer_questions")),
             ("   median lost / restored", lambda b: two(g(b, "Q4"), "transfer_lost_median", "transfer_restored_median",
                                                      "transfer_lost_ci", "transfer_restored_ci")),
             ("   overlap median (records)", lambda b: fmt(g(b, "Q4").get("overlap_median"), g(b, "Q4").get("overlap_ci"), None,
                                                         g(b, "Q4").get("overlap_questions") or None)),
             ("Q5 resampled pass rate", rate("Q5", "pass_rate", "pass_ci", "questions")),
-            ("   per cut resampled/standard", lambda b: " ".join(f"{k}:{v['resampled']}/{v['standard']}/{v['cuts']}" for k, v in
+            ("   per cut resampled/standard/cuts", lambda b: " ".join(f"{k}:{v['resampled']}/{v['standard']}/{v['cuts']}"
+                                                                 + (f"+{v['no_resample']}nr" if v.get("no_resample") else "") for k, v in
                                                                  (g(b, "Q5").get("per_cut") or {}).items()) or "-"),
             ("   median lost / restored", lambda b: two(g(b, "Q5"), "lost_median", "restored_median"))]
     cells = {n: [str(get(b)) if get(b) is not None else "-" for _, get in rows] for n, b in benches.items()}
@@ -241,6 +314,48 @@ def table(benches: dict) -> str:
     for i, (label, _) in enumerate(rows):
         lines.append(f"{label:36}" + "".join(f"{cells[n][i]:>{w[n]}}" for n in benches))
     return "\n".join(lines)
+
+
+COLUMNS = ["date", "label", "arm", "model", "card", "questions", "S1 median s", "S1 p90 s", "Q1 per cut", "Q1 diffuse = miss",
+           "own pair whole", "random whole", "Q2 unseen pairs", "Q4 unseen paraphrases", "Q3 units at pass", "Q3 p90",
+           "zero ablation", "zero random", "KL own pair", "KL random", "KL unseen pairs", "Q5 movers resampled", "Q5 source resampled",
+           "score s a record", "bench"]
+
+
+def leaderboard_row(b: dict, label: str, arm: str, path: str) -> list:
+    """One leaderboard row (COLUMNS) from a bench.json: every rate with its interval and count, medians with theirs."""
+    m = b["metrics"]
+
+    def rate(d, key, ci, k, n):
+        v = d.get(key)
+        return fmt(v, d.get(ci), d.get(k) if k else (round(v * d[n]) if v is not None and d.get(n) else None), d.get(n))
+    q1, q2, q4, z, kl, q5 = m["Q1"], m["Q2"], m["Q4"], m.get("Z") or {}, m.get("KL") or {}, (m["Q5"].get("per_cut") or {})
+    uc = q1.get("union_control") or {}
+    cut = lambda k: (lambda v: f"{v['resampled']}/{v['cuts']}" if v else "-")(q5.get(k))  # noqa: E731
+    return [time.strftime("%Y-%m-%d %H:%M"), label, arm, b.get("model"), b.get("gpu"), m["questions"],
+            fmt(m["S1"]["median_s"], m["S1"].get("median_ci")), fmt(m["S1"].get("p90_s")),
+            fmt(q1["pass_rate"], q1.get("pass_ci"), q1["passes"], q1.get("n")),
+            fmt(q1.get("strict_pass_rate"), q1.get("strict_ci"), q1.get("strict_passes"), q1.get("n")),
+            fmt(q1.get("union_pass_rate"), q1.get("union_ci")), fmt(uc.get("pass_rate"), uc.get("pass_ci"), uc.get("passes"), uc.get("n")),
+            rate(q2, "pass_rate", "pass_ci", None, "questions"), rate(q4, "transfer_pass_rate", "transfer_ci", None, "transfer_questions"),
+            fmt(m["Q3"]["median_units_at_pass"], m["Q3"].get("median_units_at_pass_ci")), fmt(m["Q3"].get("p90_units_at_pass")),
+            fmt(z.get("pass_rate"), z.get("pass_ci"), z.get("passes"), z.get("n")),
+            fmt(z["control_passes"] / z["control_n"], z.get("control_ci"), z["control_passes"], z["control_n"]) if z.get("control_n") else "-",
+            fmt(kl.get("pass_rate"), kl.get("pass_ci"), kl.get("passes"), kl.get("n")),
+            fmt(kl["control_passes"] / kl["control_n"], kl.get("control_ci"), kl["control_passes"], kl["control_n"]) if kl.get("control_n") else "-",
+            fmt(kl.get("unseen_pass_rate"), kl.get("unseen_ci"), kl.get("unseen_passes"), kl.get("unseen_n")),
+            cut("movers"), cut("source"), fmt(m.get("score_seconds_median")), path]
+
+
+def leaderboard(a) -> None:
+    b = json.loads((a.out / "bench.json").read_text())
+    new = not LEADERBOARD.exists()
+    LEADERBOARD.parent.mkdir(parents=True, exist_ok=True)
+    with open(LEADERBOARD, "a") as f:
+        if new:
+            f.write("\t".join(COLUMNS) + "\n")
+        f.write("\t".join(str(x) for x in leaderboard_row(b, a.label, a.arm or b.get("finder_rev") or "-", str(a.out))) + "\n")
+    print(f"row {a.label} -> {LEADERBOARD}")
 
 
 def run(a) -> None:
@@ -312,6 +427,8 @@ def score_records(recs_dir: Path, score_dir: Path, dev: dict, ids: list, model: 
         bm = bm.merge_and_unload().eval().requires_grad_(False) if adapter else bm
         pt = cf.Patcher(bm, tok)
         qpool = cr.question_pool(pool)
+        if hasattr(cr, "attach_swaps"):                 # (an organism's other swaps on its clean prompt as resamples)
+            cr.attach_swaps(list(dev.values()))
         for i, r in finder_recs.items():
             path = rdir / (i.replace("/", "__") + ".json")
             if path.exists():
@@ -380,7 +497,14 @@ def main():
                        help="question files for Q5's resampled prompts beside the dev set")
     t = sp.add_parser("table")
     t.add_argument("outs", nargs="+", type=Path)
+    lb = sp.add_parser("leaderboard")
+    lb.add_argument("out", type=Path)
+    lb.add_argument("--label", required=True)
+    lb.add_argument("--arm", default=None, help="the arm: commit and flags, or the outside method and variant")
     a = ap.parse_args()
+    if a.cmd == "leaderboard":
+        leaderboard(a)
+        return
     if a.cmd == "table":
         print(table({p.name: json.loads((p / "bench.json").read_text()) for p in a.outs}))
         return

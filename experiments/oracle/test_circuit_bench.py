@@ -39,3 +39,15 @@ def test_table_prints_intervals():
     m = cb.metrics([rec(0.8, 0.75)], {"a": {"seconds": 3.0}}, 1)
     out = cb.table({"x": {"gpu": "cpu", "finder_rev": "r", "metrics": m}})
     assert "1/1" in out and "[" in out
+
+
+def test_diffuse_counted_both_ways_and_new_metrics():
+    r = {**rec(0.8, 0.75), "id": "q1", "zero": {"lost": 0.9}, "kl": {"lost": 0.8, "restored": 0.9},
+         "random": {"lost": 0.0, "restored": 0.0, "zero_lost": 0.1, "kl_lost": 0.0, "kl_restored": 0.0}}
+    m = cb.metrics([r], {"q1": {"seconds": 3.0, "cuts": {"source": {"diffuse": True}}}}, 1)
+    assert m["Q1"]["passes"] == 1 and m["Q1"]["strict_passes"] == 0 and m["Q1"]["diffuse_records"] == 1
+    assert m["Z"]["passes"] == 1 and m["Z"]["control_passes"] == 0 and m["KL"]["passes"] == 1
+    rob = [{"cuts": {"movers": {"passes": True, "standard": [0.9, 0.9], "mean": [0.8, 0.8]},
+                     "source": {"passes": None, "mean": None, "no_resample": True}}}]
+    q5 = cb.robust_metrics(rob)
+    assert q5["pass_rate"] == 1.0 and q5["per_cut"]["source"]["no_resample"] == 1 and q5["per_cut"]["source"]["cuts"] == 0

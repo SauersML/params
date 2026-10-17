@@ -51,6 +51,12 @@ share of the answer's log-odds gap lost (noising its first k units) and restored
 k, its units added in their measured order (each unit's noising drop alone, for the loss curve; its denoising gain alone,
 for the restoration curve), every k up to CURVE_ALL and a log grid beyond with the 70% crossing bisected; tables quote
 the 70% points (k70) and nothing depends on them.
+Metrics no method optimizes (the lead's 10-16 battery; every finder selects by the answer contrast's patching shares):
+  zero         zero ablation: the circuit's units set to 0 in the clean run (neurons' values, heads' outputs), the share
+               of the gap lost, beside interchange necessity
+  kl           the whole next-token distribution instead of the answer contrast: noising, KL(clean || noised) over
+               KL(clean || corrupted) (the share of the distribution's shift the circuit's units reproduce); denoising,
+               1 - KL(clean || denoised) / KL(clean || corrupted); on the own pair and on each unseen partner's pair
 A fair baseline beside each circuit (random): RANDOM_DRAWS circuits of the same size at the same positions, each neuron
 pole a uniformly drawn neuron of the same layer's at that position, each head a uniformly drawn head of the same layer's
 there; their noising and denoising shares on the circuit's own pair, the mean (no floor: what the finder's choice adds
@@ -245,6 +251,11 @@ def word_sets(m: "Model", tok, ids: list[int], lp: torch.Tensor, b: int) -> dict
     return ac.token_sets(m.core, tok, ids, lp, b, past=past)
 
 
+def kl(lp: torch.Tensor, lq: torch.Tensor) -> float:
+    """KL(p || q) in bits of two runs' next-token log probabilities [V]."""
+    return float((lp.exp() * (lp - lq)).sum() / math.log(2.0))
+
+
 def pair_ok(sets: dict, b: int, gap: float) -> bool:
     """A pair: the other run's top token starts another word, and the clean-other gap is at least MIN_GAP bits."""
     return b not in sets["answer"] and gap >= MIN_GAP
@@ -363,14 +374,20 @@ def score(m: Model, tok, c: dict, qs: dict, log=print, lean: bool = False) -> di
     t0 = time.perf_counter()
     q = qs.get(c.get("id")) or qs.get(str(c.get("id")).split("/vs/")[0], {})  # (a family pair record: "question/vs/partner")
     sysp, pre = q.get("system", c.get("system")), q.get("prefill") or c.get("prefill")
-    pre_ids = tok(pre, add_special_tokens=False)["input_ids"] if pre else []
+    cpre = q.get("corrupt_prefill") or c.get("corrupt_prefill") or pre    # (a corrupted prompt's own prefill: fleet's 42a8384)
+    toks = lambda t: tok(t, add_special_tokens=False)["input_ids"] if t else []  # noqa: E731
 
-    def chat(u):  # the finder's prompt: a system turn (an organism's), the user turn, the model's turn opened, a prefill
-        msgs = ([{"role": "system", "content": sysp}] if sysp else []) + [{"role": "user", "content": u}]
+    def chat(u, corrupted=False):  # the finder's prompt: a system turn (an organism's), the user turn, the model's turn opened,
+        msgs = ([{"role": "system", "content": sysp}] if sysp else []) + [{"role": "user", "content": u}]   # a prefill
         return tok(tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True, enable_thinking=False),
-                   add_special_tokens=False)["input_ids"] + pre_ids
+                   add_special_tokens=False)["input_ids"] + toks(cpre if corrupted else pre)
+    explicit = None  # an organism's explicit answer and alternative tokens (finder records of kind "explicit_tokens", cf94642)
+    if c.get("kind") == "explicit_tokens" or c.get("sets"):
+        A = list(c["answer_tokens"])
+        explicit = {"answer": A, "alternatives": [z for z in c["alternatives"] if z not in A], "answer_word": None,
+                    "alternative_words": [], "valid": True}
     clean = c.get("clean") or c.get("ids") or chat(c.get("user") or q["user"])
-    corr = c.get("corrupted") or chat(c.get("corrupt_user") or q["corrupt_user"])
+    corr = c.get("corrupted") or chat(c.get("corrupt_user") or q["corrupt_user"], corrupted=True)
     T = len(clean)
     units_ok = all(p < T for _, p, _, _ in c["neurons"]) and all(p < T for _, p, _ in c["heads"])
     rec = {"task": c["name"], "id": c.get("id"), "question_task": q.get("task"), "key": q.get("key"), "paraphrase": q.get("paraphrase"),
@@ -389,7 +406,7 @@ def score(m: Model, tok, c: dict, qs: dict, log=print, lean: bool = False) -> di
     pc, px = patches(c, cap_c), patches(c, cap_x)
     lp = m.logp([(clean, []), (corr, []), (clean, px), (corr, pc)])
     a, b = int(lp[0].argmax()), int(lp[1].argmax())
-    sets = word_sets(m, tok, clean, lp[0], b)
+    sets = explicit or word_sets(m, tok, clean, lp[0], b)
     cc, cx, cn, cd = (contrast(lp[i], sets) for i in range(4))
     gap = cc - cx
     rec["answer"], rec["answer_text"], rec["corrupt_answer"] = a, tok.decode([a]), b
@@ -397,6 +414,12 @@ def score(m: Model, tok, c: dict, qs: dict, log=print, lean: bool = False) -> di
     rec["answer_tokens"], rec["alternative_tokens"] = sets["answer"], sets["alternatives"]
     rec["pair"] = {"c_clean": cc, "c_corrupted": cx, "c_noised": cn, "c_denoised": cd, "gap": gap, "valid": pair_ok(sets, b, gap),
                    "lost": (cc - cn) / gap if gap > 0 else None, "restored": (cd - cx) / gap if gap > 0 else None}
+    kl_x = kl(lp[0], lp[1])  # the whole distribution's shift; zero ablation of the circuit's units (module docstring)
+    zp = [("n", L, p, j, torch.zeros(())) for L, p, j, _ in c["neurons"]] + [("h", L, p, h, torch.zeros(m.hd)) for L, p, h in c["heads"]]
+    lz = m.logp([(clean, zp)])[0]
+    rec["zero"] = {"lost": (cc - contrast(lz, sets)) / gap if gap > 0 else None}
+    rec["kl"] = {"corrupted": kl_x, "lost": kl(lp[0], lp[2]) / kl_x if kl_x > 0 else None,
+                 "restored": 1 - kl(lp[0], lp[3]) / kl_x if kl_x > 0 else None}
     rec["cuts"] = {}  # each of a finder circuit's cuts alone (its own pass rule: every cut passes alone; one cut, "all", else)
     src = [(n["layer"], n["pos"], n["neuron"], n.get("pole", 0)) for n in c.get("nodes", []) if n.get("stage") == "source"]
     parts = {"source": {"neurons": src, "heads": []}, "movers": {"neurons": [], "heads": c["heads"]}} if any(
@@ -414,13 +437,17 @@ def score(m: Model, tok, c: dict, qs: dict, log=print, lean: bool = False) -> di
     rand, rcut = [], {name: [] for name in rec["cuts"]}
     for _ in range(RANDOM_DRAWS if gap > 0 else 0):  # the whole circuit's and each cut's random set, one batch
         rs = [redraw(c)] + [redraw(parts[name]) for name in rcut]
-        l3 = m.logp([x for rc in rs for x in ((clean, patches(rc, cap_x)), (corr, patches(rc, cap_c)))])
+        rz = [("n", L, p, j, torch.zeros(())) for L, p, j, _ in rs[0]["neurons"]] + [("h", L, p, h, torch.zeros(m.hd)) for L, p, h in rs[0]["heads"]]
+        l3 = m.logp([x for rc in rs for x in ((clean, patches(rc, cap_x)), (corr, patches(rc, cap_c)))] + [(clean, rz)])
         sh = [{"lost": (cc - contrast(l3[2 * i], sets)) / gap, "restored": (contrast(l3[2 * i + 1], sets) - cx) / gap} for i in range(len(rs))]
+        sh[0]["zero_lost"] = (cc - contrast(l3[-1], sets)) / gap
+        sh[0]["kl_lost"] = kl(lp[0], l3[0]) / kl_x if kl_x > 0 else None
+        sh[0]["kl_restored"] = 1 - kl(lp[0], l3[1]) / kl_x if kl_x > 0 else None
         rand.append(sh[0])
         for name, x in zip(rcut, sh[1:]):
             rcut[name].append(x)
-    rec["random"] = {"lost": float(np.mean([x["lost"] for x in rand])) if rand else None,
-                     "restored": float(np.mean([x["restored"] for x in rand])) if rand else None, "draws": rand}
+    rec["random"] = {**{k: float(np.mean([x[k] for x in rand])) if rand and all(x.get(k) is not None for x in rand) else None
+                        for k in ("lost", "restored", "zero_lost", "kl_lost", "kl_restored")}, "draws": rand}
     for name, xs in rcut.items():
         if xs:
             rec["cuts"][name]["random"] = {"lost": float(np.mean([x["lost"] for x in xs])), "restored": float(np.mean([x["restored"] for x in xs]))}
@@ -466,20 +493,23 @@ def score(m: Model, tok, c: dict, qs: dict, log=print, lean: bool = False) -> di
             elif x not in seen and qs.get(f"{q['task']}/{x}/p{q['paraphrase']}"):
                 partners.append((x, qs[f"{q['task']}/{x}/p{q['paraphrase']}"]["user"]))
         for k, user in partners[:DRAWS]:
-            ids = chat(user)
+            ids = chat(user, corrupted=True)
             if len(ids) != T:
                 continue
             cap_p = m.capture(ids)
             l2 = m.logp([(ids, []), (clean, patches(c, cap_p)), (ids, pc)])
             bp = int(l2[0].argmax())
-            sp = word_sets(m, tok, clean, lp[0], bp)  # the question's answer against the partner's word first
+            sp = explicit or word_sets(m, tok, clean, lp[0], bp)  # the question's answer against the partner's word first
             c0, c1 = contrast(lp[0], sp), contrast(l2[0], sp)
             g = c0 - c1
             if not pair_ok(sp, bp, g):
                 continue
             cn2, cd2 = contrast(l2[1], sp), contrast(l2[2], sp)
-            draws["necessity_heldout"].append({"partner": k, "gap": g, "c_noised": cn2, "share": (c0 - cn2) / g})
-            draws["sufficiency_heldout"].append({"partner": k, "gap": g, "c_denoised": cd2, "share": (cd2 - c1) / g})
+            kp = kl(lp[0], l2[0])
+            draws["necessity_heldout"].append({"partner": k, "gap": g, "c_noised": cn2, "share": (c0 - cn2) / g,
+                                               "kl": kl(lp[0], l2[1]) / kp if kp > 0 else None})
+            draws["sufficiency_heldout"].append({"partner": k, "gap": g, "c_denoised": cd2, "share": (cd2 - c1) / g,
+                                                 "kl": 1 - kl(lp[0], l2[2]) / kp if kp > 0 else None})
             pw = word_sets(m, tok, ids, l2[0], a)  # the partner's own answer word, its tokens
             A_p, A_q = torch.tensor(pw["answer"]), torch.tensor(sp["answer"])
             d = lambda l: float((torch.logsumexp(l[A_p.to(l.device)], 0) - torch.logsumexp(l[A_q.to(l.device)], 0)) / math.log(2.0))  # noqa: E731
@@ -489,7 +519,7 @@ def score(m: Model, tok, c: dict, qs: dict, log=print, lean: bool = False) -> di
     rec["draws"] = draws
     rec["transfer"] = []  # the circuit on the question's other paraphrases (module docstring: transfer)
     for f in (q.get("family") or []) if q else []:
-        fi, fc = chat(f["user"]), chat(f["corrupt_user"])
+        fi, fc = chat(f["user"]), chat(f["corrupt_user"], corrupted=True)
         if len(fi) != len(fc):
             continue
         mp = map_units(c, clean, corr, fi, fc)
@@ -499,7 +529,7 @@ def score(m: Model, tok, c: dict, qs: dict, log=print, lean: bool = False) -> di
         cf_c, cf_x = m.capture(fi), m.capture(fc)
         l5 = m.logp([(fi, []), (fc, []), (fi, patches(mp, cf_x)), (fc, patches(mp, cf_c))])
         bf = int(l5[1].argmax())
-        sf = word_sets(m, tok, fi, l5[0], bf)
+        sf = explicit or word_sets(m, tok, fi, l5[0], bf)
         f0, f1 = contrast(l5[0], sf), contrast(l5[1], sf)
         if not pair_ok(sf, bf, f0 - f1):
             continue

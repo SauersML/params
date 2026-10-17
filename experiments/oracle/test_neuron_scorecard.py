@@ -114,6 +114,13 @@ def test_pair_shares_follow_the_definitions(tiny):
         assert pr["lost"] == pytest.approx((pr["c_clean"] - pr["c_noised"]) / pr["gap"])
         assert pr["restored"] == pytest.approx((pr["c_denoised"] - pr["c_corrupted"]) / pr["gap"])
     assert len(r["effects"]) == 3 and r["size"]["poles"] == 2 and r["size"]["heads"] == 1
+    # zero ablation and the whole distribution's KL (metrics no method optimizes)
+    lz = hooked(model, clean, neurons=[(0, 3, 5, 0.0), (1, 3, 9, 0.0)], heads=[(2, 9, 1, torch.zeros(8))])
+    if pr["gap"] > 0:
+        assert r["zero"]["lost"] == pytest.approx((cc - float(ns.ac.contrast(lz[None], sets)[0])) / pr["gap"], abs=1e-4)
+    klb = lambda a, b: float((a.exp() * (a - b)).sum()) / 0.6931471805599453  # noqa: E731
+    assert r["kl"]["corrupted"] == pytest.approx(klb(lc, lx), rel=1e-4, abs=1e-6)
+    assert r["kl"]["lost"] == pytest.approx(klb(lc, ln) / klb(lc, lx), rel=1e-3, abs=1e-5)
     # the random same-size baseline: RANDOM_DRAWS draws, the same on a rerun
     assert len(r["random"]["draws"]) == ns.RANDOM_DRAWS
     assert ns.score(m, Tok(), c, {}, log=lambda s: None)["random"]["lost"] == pytest.approx(r["random"]["lost"], abs=1e-6)

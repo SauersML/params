@@ -184,7 +184,12 @@ def readers(rn, ids: list[int], units: list, corrupt: list[int] | None = None, t
             _, L, h, p = u
             sets.append({"head": [(L, h, p, sb["z"][L][p, h] if sb is not None else None)]})
         slots.append((i, "total"))
-    cs = rn.run(ids, sets)["contrast"]
+    at = [units[i][-1] if units[i][0] == "head" else units[i][2] for i, _ in slots]
+    order = sorted(range(len(sets)), key=lambda a: at[a])  # (a forward computes from its sets' first position on:
+    got = rn.run(ids, [sets[a] for a in order])["contrast"]  # sets of one position together, the answer's nearly free)
+    cs = [0.0] * len(sets)
+    for a, x in zip(order, got):
+        cs[a] = x
     xf = _final(rn, st, T - 1)
     out = []
     for i, u in enumerate(units):

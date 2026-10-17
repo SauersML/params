@@ -336,15 +336,29 @@ def _mlp(z: dict, x: torch.Tensor) -> torch.Tensor:
     return x[:, 0]
 
 
+PRE = 16384           # a trained scorer ranks only a cut's PRE units of largest |slope| (any of the six), the rest below
+                      # them all: on 1,237 trainset_8b questions that set held 99.97% of the model's top 64 source units
+                      # and 100% of its readout's (prefilter on every third question), and scoring every unit of a
+                      # source cut (6.6 million) was 1.2-1.5 s of a 16-pair batch's 4 s of features (pod prof2)
+
+
 def load_model(path: str):
     """A trained scorer (train mode's torch file: {"features": FEATURES, cut name: {"scale", "mean", "std", "layers":
-    [(W, b), ...]}}): each cut's own MLP over its units' FEATURES."""
+    [(W, b), ...]}}): each cut's own MLP over its units' FEATURES, on the cut's PRE units of largest |slope|."""
     z = torch.load(path, map_location="cpu")
     assert tuple(z["features"]) == FEATURES, "load_model: another feature set"
 
-    def score(f: dict, cut: str) -> torch.Tensor:
-        x = torch.stack([f[k] for k in FEATURES], -1)
-        return _mlp(z[cut], x.reshape(-1, len(FEATURES)).float()).reshape(x.shape[:-1])
+    def score(f: dict, cut: str) -> torch.Tensor:   # (score.relp: whether the model reads RelP, else path_features skips it)
+        shape, n = f["lost0"].shape, f["lost0"].numel()
+        if n <= PRE:
+            return _mlp(z[cut], torch.stack([f[k].reshape(-1) for k in FEATURES], -1).float()).reshape(shape)
+        v = torch.stack([f[k].reshape(-1).abs() for k in FEATURES[:6]]).amax(0)
+        idx = v.topk(PRE).indices
+        sub = _mlp(z[cut], torch.stack([f[k].reshape(-1)[idx] for k in FEATURES], -1).float())
+        out = torch.full((n,), float(sub.min()) - 1.0, device=sub.device)
+        out[idx] = sub
+        return out.reshape(shape)
+    score.relp = z.get("relp", True)
     return score
 
 
@@ -562,11 +576,14 @@ def _export(net, scale, mean, std) -> dict:
 
 
 def train(dirs: list, out_path: str, holdout: float = 0.2, epochs: int = 40, hidden: int = 64, seed: int = 0, log=print,
-          by: str = "key", save: bool = True):
+          by: str = "key", save: bool = True, relp: bool = True):
     """train mode: per cut an MLP on data mode's dirs. The (task, key)s (by "key") or the tasks (by "task") are split,
     holdout of them unseen: the offline ranking of ig, grad, relp and the model on them is logged (and returned); the
     saved model is then trained on every key with the same epochs."""
     groups = load_groups(dirs, log=log)
+    if not relp:                                    # (a model without RelP: its feature 0, as path_features(relp=False))
+        for g in groups:
+            g.x[:, FEATURES.index("relp")] = 0.0
     unit = (lambda g: (g.task, g.key)) if by == "key" else (lambda g: g.task)  # noqa: E731
     keys = sorted({unit(g) for g in groups})
     rng = np.random.default_rng(seed)
@@ -589,7 +606,7 @@ def train(dirs: list, out_path: str, holdout: float = 0.2, epochs: int = 40, hid
         log(f"{cut} unseen keys: " + "; ".join(f"{k} {v}" for k, v in base.items()))
     if not save:
         return report
-    model = {"features": FEATURES}
+    model = {"features": FEATURES, "relp": relp}
     for cut in ("readout", "movers", "source"):
         if any(g.cut == cut for g in groups):
             model[cut], _ = fit(groups, cut, hidden=hidden, epochs=epochs, seed=seed)
@@ -624,9 +641,11 @@ def main():
     ap.add_argument("--offset", type=int, default=0)
     ap.add_argument("--stride", type=int, default=1)
     ap.add_argument("--scorer", default=None, help="eval: the trained scorer file of the arm \"model\" (train mode's)")
+    ap.add_argument("--scorer2", default=None, help="eval: the scorer file of the arm \"model2\" (two models on one card)")
     ap.add_argument("--profile", action="store_true", help="eval: each arm batch's drive ticks timed by kind (TickProfile)")
     ap.add_argument("--epochs", type=int, default=40)
     ap.add_argument("--hidden", type=int, default=64)
+    ap.add_argument("--no-relp", action="store_true", help="train: a model without the RelP feature (eval then skips RelP's pass)")
     ap.add_argument("--holdout-by", default="key", choices=("key", "task"), help="train: unseen keys (and the model saved "
                     "after, trained on every key) or unseen tasks (the report only)")
     a = ap.parse_args()
@@ -635,7 +654,7 @@ def main():
             assert any(k in m for m in (globals(), vars(cm), vars(cf))), f"arm {arm}: no constant {k}"
     if a.mode == "train":                           # (inp: data mode's OUT dirs, comma-separated; out: the model file)
         report = train(a.inp.split(","), a.out, epochs=a.epochs, hidden=a.hidden, by=a.holdout_by,
-                       save=a.holdout_by == "key")
+                       save=a.holdout_by == "key", relp=not a.no_relp)
         Path(a.out).with_suffix(".json").write_text(json.dumps(report, indent=1))
         return
     cf._threads()
@@ -703,9 +722,10 @@ def main():
                         recs = cm.find_batch(pts[:len(todo)], its, arm="mask", log=log,
                                              steps=next((int(x) for x in parts if x.isdigit()), cm.STEPS))
                     else:
-                        nm = f"model:{a.scorer}" if name == "model" else name
-                        recs = find_batch_amortized(pts[:len(todo)], its, scorer(nm), arm=arm, log=log,
-                                                    relp=nm == "relp" or nm.startswith("model:"))
+                        nm = f"model:{a.scorer}" if name == "model" else f"model:{a.scorer2}" if name == "model2" else name
+                        sc = scorer(nm)
+                        recs = find_batch_amortized(pts[:len(todo)], its, sc, arm=arm, log=log,
+                                                    relp=nm == "relp" or getattr(sc, "relp", False))
                 except Exception:                   # noqa: BLE001 (an arm that fails is dropped, the others go on)
                     import traceback
                     log(f"  {arm} FAILED, dropped:\n{traceback.format_exc()}")

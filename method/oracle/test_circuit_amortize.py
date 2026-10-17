@@ -121,3 +121,23 @@ def test_arm_constants_take_their_defaults_types():
     assert ca._value("1", cm.INIT) == 1.0 and isinstance(ca._value("1", cm.INIT), float)
     assert ca._value("16", 64) == 16 and isinstance(ca._value("16", 64), int)
     assert ca._value("readout", ca.MASK_CUTS) == "readout"
+
+
+def test_prefiltered_scorer_ranks_its_top_units_as_the_full_one(tmp_path, monkeypatch):
+    """load_model's scorer on a cut of more than PRE units scores the PRE units of largest |slope| as the full scorer does
+    and puts every other unit below them."""
+    torch.manual_seed(0)
+    F = len(ca.FEATURES)
+    lin = [(torch.randn(8, F), torch.randn(8)), (torch.randn(1, 8), torch.randn(1))]
+    m = {"scale": torch.ones(F), "mean": torch.zeros(F), "std": torch.ones(F), "layers": lin}
+    path = tmp_path / "m.pt"
+    torch.save({"features": ca.FEATURES, "source": m}, path)
+    f = {k: torch.randn(3, 4, 50) for k in ca.FEATURES}
+    full = ca._mlp(m, torch.stack([f[k].reshape(-1) for k in ca.FEATURES], -1)).reshape(3, 4, 50)
+    monkeypatch.setattr(ca, "PRE", 40)
+    got = ca.load_model(str(path))(f, "source")
+    top = torch.stack([f[k].reshape(-1).abs() for k in ca.FEATURES[:6]]).amax(0).topk(40).indices
+    assert torch.allclose(got.reshape(-1)[top], full.reshape(-1)[top], atol=1e-5)
+    rest = torch.ones(600, dtype=torch.bool)
+    rest[top] = False
+    assert float(got.reshape(-1)[rest].max()) < float(got.reshape(-1)[top].min())

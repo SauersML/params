@@ -98,11 +98,16 @@ SCORE
       and from 35391 ops the exact enumeration has no error. ARC's best M4,3 estimators lose to sampling; these beat it.
       The constant at budgets below ~340 ops is advice (one number from the base model), not a reading of the
       noisy weights; every estimator from 'aq_one_line' up reads only the copy's weights.
-  (b) Surprise accounting: UNDETERMINED. The estimator carries no model-specific advice, and the facts it checks
-      (switch points and logit gaps at each node) are computed, not asserted, so ARC's bit count does not apply
-      directly. The hand explanation above (two absolute-value features, 12 numbers, plus the residual) reproduces
-      98.71% of predictions; a bit count for it in the style of ARC's M2,2 (signs plus
-      the near-equalities that make the wedges thin) has not been done. Float32 bound: 1024 bits.
+  (b) Surprise accounting: UNDETERMINED. The line+quadrature estimator carries no model-specific advice, so
+      ARC's bit count applies to the hand explanation instead: two absolute-value features and a readout, 8 free
+      numbers after rescaling (W' 2x2 and the column-centred W'_oh) plus the sign facts (4 input signs) and the
+      pair structure. Rounding the 8 numbers to b significant bits moves the reduced model's accuracy by
+      4: -0.1949, 6: -0.0284, 8: -0.0104, 10: -0.0019, 11: -0.0007, 12: -0.0000;
+      it holds to 7e-4 from 11 bits and to 1e-4 from 12 bits per number (the readout thresholds and the
+      features' tilts are near-equalities, as in ARC's M2,2), so the numbers cost about 88-96 bits; with the
+      structural facts (signs, and the ~20 pair equalities that hold to ~10%) the explanation is roughly 100-160 bits, below the 1024-bit float32 bound and ~3x ARC's 40-bit
+      M2,2 explanation. It reproduces 98.71% of predictions; the residual's slivers (the rest) are not
+      explained. Whether this matches the bits of optimization that selected the model is not known.
 
 Files: aq3.py (estimators), exact3.py (truth), m43.py (this report); results/m43_curve.tsv, m43_budgets.tsv,
 m43_mechanism.json.

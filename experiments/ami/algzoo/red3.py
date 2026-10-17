@@ -34,6 +34,41 @@ def reduce(model, ops):
 def accuracy(model, ops=None):
     ops = ops or exact3.Ops()
     A, C = reduce(model, ops)
+    return accuracy_reduced(A, C, ops)
+
+
+def quantized(v, b):
+    """Round each entry to b significant bits."""
+    v = np.asarray(v, float)
+    out = np.zeros_like(v)
+    nz = v != 0
+    e = np.floor(np.log2(np.abs(v[nz])))
+    out[nz] = np.round(v[nz] / 2 ** (e - b + 1)) * 2 ** (e - b + 1)
+    return out
+
+
+def explanation_bits(model, bits=range(1, 15)):
+    """Accuracy of the reduced model when its free numbers (W' 2x2 and the column-centred W'_oh, 6 entries with
+    zero column sums, 4 free) are rounded to b significant bits; w' = (1, 1) after rescaling carries no bits."""
+    ops = exact3.Ops()
+    s = np.abs(model.W_hi)
+    Wh = model.W_hh * (1 / s)[:, None] * s[None, :]
+    Wo = model.W_oh * s[None, :]
+    Wp = np.linalg.pinv(U.T) @ Wh @ np.linalg.pinv(U)
+    wp = np.linalg.pinv(U.T) @ (model.W_hi / s)
+    C = Wo @ np.linalg.pinv(np.array([[1.0, 0, 0, 1], [0, 1, 1, 0]]))
+    C = C - C.mean(0)
+    full = accuracy_reduced(np.stack([Wp @ Wp @ wp, Wp @ wp, wp], 1), C, ops)
+    out = []
+    for b in bits:
+        W2 = quantized(Wp, b)
+        C2 = quantized(C[:2], b)
+        C2 = np.vstack([C2, -C2.sum(0)])  # third row fixed by the zero column sums
+        out.append((b, accuracy_reduced(np.stack([W2 @ W2 @ wp, W2 @ wp, wp], 1), C2, ops)))
+    return full, out
+
+
+def accuracy_reduced(A, C, ops):
     total = 0.0
     for tri in exact3.octants():
         parts = [(tri, np.ones(2))]

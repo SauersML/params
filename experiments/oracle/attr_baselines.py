@@ -20,7 +20,7 @@ gradient, the two base runs' mean for atp/relp; EAP-IG's and ADAG's own sign). S
             its selection partners, the ranking in place of RelP's
 --pairs-avg (the lead's 10-17 equal-input rule): each method's attributions averaged over the same pairs our search used, the
 question's own pair and its record's selection partners (the clean prompt against each partner key's corrupted prompt, as
-circuit_masks builds them from --pool), then the top units at our size (OUT/<method>_<variant>_topk<n pairs>).
+circuit_masks builds them from --pool), then the top units at our size (OUT/<method>_<variant>_topk_pairs).
 --pad-from DIR (the size control): each record of RECORDS (our one-pair circuits) padded with random units at the layers and
 positions of its own units (neuron poles signed by their clean activation) up to DIR's record of the same question in
 neurons and heads (our 8-partner circuits), written to OUT/pad_random.
@@ -278,7 +278,7 @@ def main():
                     passes[f"{m}_{v}"][1] += 1
                     rec = {**base, "finder": f"baseline_{m}_{v}" + (f"_pairs{1 + len(avg_ids)}" if avg_ids else ""), "nodes": nodes, "routes": routes, "size": len(units),
                            "seconds": round(dt, 3), "own_pair": [lost, rest], "matched_to": {"record": r.get("id"), "units": k}}
-                    tag = f"{m}_{v}_topk" + (str(1 + len(avg_ids)) if a.pairs_avg else "")
+                    tag = f"{m}_{v}_topk" + ("_pairs" if a.pairs_avg else "")
                     (a.out / tag).mkdir(parents=True, exist_ok=True)
                     (a.out / tag / f.name).write_text(json.dumps(rec))
                 if "measured" in selects:

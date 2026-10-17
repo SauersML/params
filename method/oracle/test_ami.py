@@ -298,3 +298,21 @@ def test_mask_search_factored(tiny, monkeypatch):
         for r in (0, 1):
             mn, mh = ms["hard"](0, k, r)
             assert float(ami._kl(lpf[r:r + 1], mk.logp(x[r:r + 1], mn[None].float(), mh[None].float(), pos[r:r + 1]))) <= 0.1 + 1e-6
+
+
+def test_mask_search_starts(tiny, monkeypatch):
+    """starts set the backbone's and (COVER_FACTOR) a row's own part's logits before the descent."""
+    model, docs, means = tiny
+    monkeypatch.setattr(ami, "COVER_STEPS", 0)
+    monkeypatch.setattr(ami, "COVER_FACTOR", 1)
+    mk = ami.Masked(model, means)
+    a, b = docs[0][:10], list(docs[0][:10])
+    b[4] = (b[4] + 1) % 64
+    x = torch.tensor([a, b])
+    pos = torch.tensor([9, 9])
+    with torch.no_grad():
+        lpf = mk.logp(x, None, None, pos)
+    st = {"a": [(0, "head", 1, 9, 2, 7.5)], "b": [(1, "neuron", 0, 4, 3, 6.0)]}
+    ms = ami.mask_search(mk, x, [0, 0], pos, lpf, torch.ones(1, 1, 10, 1), starts=st)
+    assert float(ms["th"][1][0, 1, 9, 2]) == 7.5 and float(ms["th"][1][0, 1, 9, 1]) == ami.COVER_INIT
+    assert float(ms["tb"][0][1, 0, 4, 3]) == 6.0 and float(ms["tb"][0][0, 0, 4, 3]) == ami.COVER_FACTOR_INIT

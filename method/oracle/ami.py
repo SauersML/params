@@ -1002,6 +1002,7 @@ COVER_FACTOR = 0       # 1: an item's mask factored over its rows (methods' desi
 # 1 - (1 - sigmoid(a)) (1 - sigmoid(b_row)), a shared by the item's rows (its backbone, priced once) and b_row the row's own
 # part (priced once per row); hard masks (a > 0) or (b_row > 0); the curve's sizes count the backbone and every row's part
 COVER_FACTOR_INIT = -3.0  # the rows' parts start nearly empty (every unit first in the backbone)
+COVER_WARM = 0.0       # > 0: tsearch's warm start (methods' design 11d), its units starting this much above COVER_INIT
 COVER_ROWS = 8         # targets a batch (consecutive positions of one window)
 COVER_GRID = 2         # curve sizes per doubling of k
 COVER_ST = 0.5         # the last share of the steps run hard masks forward (the units with logits above 0 live, the rest
@@ -1081,7 +1082,7 @@ def _kl(lp_full: torch.Tensor, lp: torch.Tensor) -> torch.Tensor:
 
 
 def mask_search(mk: Masked, x: torch.Tensor, item: list, pos: torch.Tensor, lpf: torch.Tensor, live: torch.Tensor,
-                bounds=COVER_BOUNDS) -> dict:
+                bounds=COVER_BOUNDS, starts: dict | None = None) -> dict:
     """Learned masks under the background, one mask per item over every neuron and head at every position, an item's
     rows (prompts of x [R, T], read at pos [R] against the full model's lpf [R, V]) sharing its mask; live [I, 1, T, 1]:
     the positions each item's mask may keep. Descent: soft masks, then (COVER_ST) hard masks forward with the sigmoid's
@@ -1089,7 +1090,9 @@ def mask_search(mk: Masked, x: torch.Tensor, item: list, pos: torch.Tensor, lpf:
     their final logits and the KL of each prefix (the worst over the item's rows) measured with hard masks on a log grid
     (COVER_GRID sizes a doubling, the mask's own live set among them), each bound's first crossing halved COVER_BISECT
     times. Returns {"th": (neuron logits [I, L, T, D], head logits [I, L, T, H]), "thr": the logit of an item's k-th unit,
-    "curves", "at" (per item {bound: fewest units found}), "k_mask", "units_total", "history", "seconds_opt"}."""
+    "curves", "at" (per item {bound: fewest units found}), "k_mask", "units_total", "history", "seconds_opt"}. starts: logits
+    to start from, {"a": [(item, kind, layer, pos, index, logit)], "b": [(row, ...)]} (the backbone's and, with
+    COVER_FACTOR, a row's own part's; the warm start of tsearch's COVER_WARM)."""
     t0 = time.perf_counter()
     I, T = live.shape[0], x.shape[1]
     it = torch.tensor(item, device=mk.dev)
@@ -1100,6 +1103,10 @@ def mask_search(mk: Masked, x: torch.Tensor, item: list, pos: torch.Tensor, lpf:
         tb_n = torch.full((x.shape[0], mk.L, T, mk.D), COVER_FACTOR_INIT, device=mk.dev, requires_grad=True)
         tb_h = torch.full((x.shape[0], mk.L, T, th_h.shape[-1]), COVER_FACTOR_INIT, device=mk.dev, requires_grad=True)
         params += [tb_n, tb_h]
+    with torch.no_grad():                           # (warm starts)
+        for part, (tn, th) in (("a", (th_n, th_h)), ("b", (tb_n, tb_h) if COVER_FACTOR else (None, None))):
+            for e, kind, i, p, k, v in (starts or {}).get(part, []) if tn is not None else []:
+                (tn if kind == "neuron" else th)[e, i, p, k] = v
     opt = torch.optim.Adam(params, lr=COVER_LR)
     lpf = lpf.to(mk.dev)
     hist = []
@@ -1263,12 +1270,17 @@ def cover_batch(mk: Masked, ids: list, ts: list, lp_full: torch.Tensor, log=None
 TSEARCH_KEYS = 8      # prompts a task circuit is searched on: the question's wording with this many keys (its own first)
 
 
-def tsearch(mk: Masked, tok, qs: list, keys: dict, out: Path, batch: int = 4, log=None) -> None:
+def tsearch(mk: Masked, tok, qs: list, keys: dict, out: Path, batch: int = 4, log=None, unions: dict | None = None,
+            sources: dict | None = None) -> None:
     """The R3 reference circuit of each question's wording as a task (a method row for the leaderboard): mask_search with
     one item a question, its rows the question's wording with TSEARCH_KEYS keys of its task (its own key, its corrupted
     key, then others in a seeded order; all of one token count), one mask over every position, read at the answer; the
     fewest units found within QSEARCH_BOUND on every one of them, written as a circuit file whose "selection_keys" are
-    those keys, so r3 and r4 score it on the wording's other keys only."""
+    those keys, so r3 and r4 score it on the wording's other keys only. With COVER_WARM > 0 (methods' design 11d: the
+    backbone warm-started from the family mover union, each key's part from its source detectors): unions (circuit_union's
+    mover unions) start the backbone's heads of the question's template union at the answer at COVER_INIT + COVER_WARM;
+    sources ({question id: its finder record}) start the source cut's neurons of the question's own key in its own key's
+    part (COVER_FACTOR) or else in the backbone at the same logit."""
     out.mkdir(parents=True, exist_ok=True)
     jobs = []
     for q in qs:
@@ -1299,7 +1311,20 @@ def tsearch(mk: Masked, tok, qs: list, keys: dict, out: Path, batch: int = 4, lo
             with torch.no_grad():
                 lpf = mk.logp(x, None, None, pos)
             live = torch.ones(len(part), 1, T, 1, device=mk.dev)
-            ms = mask_search(mk, x, item, pos, lpf, live, bounds=(QSEARCH_BOUND,) + tuple(b for b in COVER_BOUNDS if b != QSEARCH_BOUND))
+            starts = {"a": [], "b": []}
+            for j, (q, _, ks, _, _) in enumerate(part) if COVER_WARM > 0 and not COVER_HCHAN else []:
+                v = COVER_INIT + COVER_WARM
+                tp, pp = q["id"].split("/")[0], "p" + q["id"].split("/")[-1][1:]
+                u = (unions or {}).get(tp)
+                if u:
+                    g = pp if u["n"].get(pp, 0) >= 4 else "all"
+                    starts["a"] += [(j, "head", int(i), T - 1, int(h), v) for i, h, _ in u[g]]
+                r0 = item.index(j)                  # (the item's first row: its own key)
+                for n in ((sources or {}).get(q["id"]) or {}).get("nodes", []):
+                    if n.get("stage") == "source" and n["pos"] < T:
+                        starts["b" if COVER_FACTOR else "a"].append((r0 if COVER_FACTOR else j, "neuron", n["layer"], n["pos"], n["neuron"], v))
+            ms = mask_search(mk, x, item, pos, lpf, live, bounds=(QSEARCH_BOUND,) + tuple(b for b in COVER_BOUNDS if b != QSEARCH_BOUND),
+                             starts=starts)
             sec = (time.perf_counter() - t0) / len(part)
             (th_n, th_h), thr = ms["th"], ms["thr"]
             for j, (q, c, ks, rows, dst) in enumerate(part):
@@ -1547,6 +1572,9 @@ def main():
     qq.add_argument("--batch", type=int, default=8)
     qq.add_argument("--mode", default=MODE, choices=("bucket", "global", "frame"))
     qq.add_argument("--pool", default=str(POOL))
+    qq.add_argument("--unions", default=None, help="tsearch with COVER_WARM: circuit_union's mover unions (JSON)")
+    qq.add_argument("--sources", default=None, help="tsearch with COVER_WARM: a directory of finder records, each question's "
+                    "source cut starting its own key's part")
     b = sub.add_parser("board")
     b.add_argument("dirs", nargs="+")
     for p in (r, c, qq):
@@ -1606,7 +1634,14 @@ def main():
                                                    "steps": COVER_STEPS, "questions": len(qs)}))
         mk = Masked(model, Means(a.means, abl_dev(model), frame=getattr(a, "frame", None)), mode=a.mode)
         if a.cmd == "tsearch":
-            tsearch(mk, tok, qs, task_keys({**load_questions(a.pool), **load_questions(a.devset)}), out, max(1, a.batch // 2), log=log)
+            un = json.loads(Path(a.unions).read_text()) if a.unions else None
+            src = {}
+            for f in sorted(Path(a.sources).glob("*.json")) if a.sources else []:
+                r = json.loads(f.read_text())
+                if r.get("id"):
+                    src[r["id"]] = r
+            tsearch(mk, tok, qs, task_keys({**load_questions(a.pool), **load_questions(a.devset)}), out, max(1, a.batch // 2), log=log,
+                    unions=un, sources=src)
         else:
             qsearch(mk, tok, qs, out, a.batch, log=log)
         return

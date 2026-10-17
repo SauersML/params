@@ -1808,9 +1808,10 @@ def bsearch(mk: Masked, tok, qs: list, keys: dict, out: Path, batch: int = 4, lo
     return res
 
 
-def fit_questions(qs: list, tasks: list | None, per_task: int = BS_PER_TASK) -> list:
-    """bsearch's fit questions: per task (of tasks, or every task) up to per_task of qs in a seeded order spread over its
-    wordings (one a paraphrase in turn)."""
+def fit_questions(qs: list, tasks: list | None, per_task: int | None = None) -> list:
+    """bsearch's fit questions: per task (of tasks, or every task) up to per_task (BS_PER_TASK) of qs in a seeded order
+    spread over its wordings (one a paraphrase in turn)."""
+    per_task = BS_PER_TASK if per_task is None else per_task
     out = []
     for t in sorted({q.get("task") for q in qs if not tasks or q.get("task") in tasks}):
         by = {}

@@ -69,6 +69,9 @@ RESIDUAL_MAP = False  # each layer's residual input at each position noised and 
 # reader of records reads it: 1.2 s of a Qwen3-8B bfloat16 question on an A6000; figures set it)
 ROWS = 32
 ATTENDS = 3           # source positions recorded per head
+ACTIVE_RATIO = 3.0    # a unit is active in one run when its value there (a head: its output's norm) is this many times its
+# value in the other run, else in both (casestudy's 10-16 rule: 45% of 8B source neurons and 44% of readout neurons are
+# active only in the corrupted run and contribute nothing off their pair; heads 7%): each node's and route's "active_in"
 SINGLES_KEPT = 256    # each cut's measured single units written to the record, largest |share| first (the record's size:
 # an 8B organism's readout found 265,588; the oracle reads units in measured order past the circuit)
 ARM = "mask"          # circuit_masks' arm every find runs (a family prior: "fam"): "mask", or "am" (attr's measured prefix
@@ -1253,6 +1256,11 @@ def grid(n: int) -> list[int]:
     return sorted(set(ks))
 
 
+def _active(a: float, b: float) -> str:
+    """The run a unit is active in, from its magnitudes in the clean (a) and corrupted (b) runs (ACTIVE_RATIO)."""
+    return "clean" if a >= ACTIVE_RATIO * b else "corrupt" if b >= ACTIVE_RATIO * a else "both"
+
+
 def find(pt: Patcher, clean: list[int], corrupt: list[int], answers: list[int] | None = None, log=None,
          cuts_wanted=("readout", "movers", "source"), measure: list | None = None, prior: dict | None = None,
          sets: dict | None = None, partners: list | None = None) -> dict:
@@ -1323,12 +1331,15 @@ def _find(pt: Patcher, clean: list[int], corrupt: list[int], answers: list[int] 
             nodes.append({"stage": stage, "layer": i, "pos": p, "neuron": n, "pole": 1 if v > 0 else -1,
                           "regime": [1 if v * w > 0 else -1, 1 if w > 0 else -1], "clean": v,
                           "corrupt": float(pt.act["corrupt"]["neu"][i][p, n]), "lost": lo, "restored": re})
+            nodes[-1]["active_in"] = _active(abs(v), abs(nodes[-1]["corrupt"]))
     routes = []
     for u in cuts.get("movers", {}).get("units", []):
         _, i, h, p = u
         lo, re = cuts["movers"]["singles"][u]
+        sl = slice(h * pt.hd, (h + 1) * pt.hd)
         routes.append({"layer": i, "head": h, "pos": p, "attends": pt.attends(i, h, p), "lost": lo, "restored": re,
-                       "through_source": list(through[u]) if u in through else None})
+                       "through_source": list(through[u]) if u in through else None,
+                       "active_in": _active(*(float(pt.act[r]["head"][i][p, sl].float().norm()) for r in ("clean", "corrupt")))})
     for x, d in zip(nodes + routes, pt.direct([("neuron", n["layer"], n["pos"], n["neuron"]) for n in nodes]
                                              + [("head", r["layer"], r["head"], r["pos"]) for r in routes])):
         x.update(d)                                 # (each unit's direct write on the answer, from the weights)
@@ -1342,6 +1353,9 @@ def _find(pt: Patcher, clean: list[int], corrupt: list[int], answers: list[int] 
                 "lost": sh[0], "restored": sh[1]}
     rec["singles"] = {k: [single(u, c["singles"][u]) for u in sorted(c["singles"], key=lambda u: -max(map(abs, c["singles"][u])))
                           [:SINGLES_KEPT]] for k, c in cuts.items()}
+    rec["corrupt_only"] = ([{k: x[k] for k in ("stage", "layer", "pos", "neuron")} for x in nodes if x["active_in"] == "corrupt"]
+                           + [{"stage": "movers", **{k: x[k] for k in ("layer", "head", "pos")}} for x in routes
+                              if x["active_in"] == "corrupt"])      # (the units that detect the corrupted key, listed apart)
     rec.update(nodes=nodes, routes=routes, met=all(c["met"] or not c["reachable"] or bool(c["diffuse"]) for c in cuts.values()),
                diffuse=[k for k, c in cuts.items() if c["diffuse"]], unreachable=[k for k, c in cuts.items() if not c["reachable"]],
                met_rule="every cut whose ceiling passes passes; diffuse and unreachable cuts listed, not required",

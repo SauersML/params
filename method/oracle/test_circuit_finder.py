@@ -98,7 +98,11 @@ def test_find_record(tiny, monkeypatch):
         if c["diffuse"]:
             assert c["size"] == 0
     for x in rec["nodes"] + rec["routes"]:
-        assert {"direct", "direct_delta", "at_answer"} <= set(x)
+        assert {"direct", "direct_delta", "at_answer"} <= set(x) and x["active_in"] in ("clean", "corrupt", "both")
+    for n in rec["nodes"]:                          # (the 3x rule on the two runs' values; corrupted-only units listed apart)
+        a, b = abs(n["clean"]), abs(n["corrupt"])
+        assert n["active_in"] == ("clean" if a >= cf.ACTIVE_RATIO * b else "corrupt" if b >= cf.ACTIVE_RATIO * a else "both")
+    assert len(rec["corrupt_only"]) == sum(x["active_in"] == "corrupt" for x in rec["nodes"] + rec["routes"])
     for k, ss in rec["singles"].items():           # each cut's measured singles, largest first, the circuit's among them
         big = [max(abs(x["lost"]), abs(x["restored"])) for x in ss]
         assert big == sorted(big, reverse=True) and len(ss) <= cf.SINGLES_KEPT

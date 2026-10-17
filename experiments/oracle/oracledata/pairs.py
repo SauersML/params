@@ -558,7 +558,8 @@ def main():
     j.add_argument("measure", type=Path, nargs="+")
     j.add_argument("--out", type=Path, required=True)
     j.add_argument("--families-from", type=Path, required=True)
-    j.add_argument("--per-split", type=json.loads, default={"test": 600, "dev": 0, "train": 300}, help="text pairs per family")
+    j.add_argument("--per-split", type=lambda x: {k: int(v) for k, v in (kv.split("=") for kv in x.split(","))},
+                   default={"test": 600, "dev": 0, "train": 300}, help="text pairs per family, e.g. test=2500,train=1000")
     j.add_argument("--seed", type=int, default=1)
     for p_ in (r, j):
         p_.add_argument("--thr", type=Path, required=True)

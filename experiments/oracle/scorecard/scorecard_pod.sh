@@ -6,6 +6,8 @@
 #   GREEDY=1 (with o3 in TARGETS): T3's greedy edit (greedy_edit.py) on the E2 organisms first, measured as oracle t3-greedy
 #   AB=1: AuditBench's dev targets (Qwen3-14B LoRAs): their answers to the paper's 50 probes and the released AO 14B's
 #   readings (auditbench.py generate), then on the Mac auditbench.py predict --static ~/mpd-data/runpod/orc-oracleeval-$RUN/auditbench
+#   REMOVAL=1 ORACLES=t3-greedy TARGETS=o3: the standard removal baselines for O3 (removal_baselines.py: direction ablation,
+#   steering, a LoRA fine-tune, random poles matched by layer to T3's), measured as measure.py measures an edit
 #   SERVE=1 [PORT=8790]: paper_scaffold.py serve, the AuditBench dev targets for the paper's scaffold baseline, until the
 #   pod's hours run out (reach it with ~/mpd-data/scratch/oracleeval/tools/tunnel.sh RUN)
 #   RUN=r1 READER=<adapter dir on the Mac, or an HF id> [RCSET=rc1|rc2_native] bash ...   a reader checkpoint: O1 (g2.py eval
@@ -27,7 +29,7 @@ mkdir -p "$S/answers" "$S/adapters"
 for o in ${ORACLES:-}; do cp -r "$ROOT/answers/$o" "$S/answers/$o"; done
 case ${TARGETS:-o3,o4} in *o3*) for n in backdoor2 cond_pref lie lie2; do cp -r /Users/user/mpd-data/organisms/qwen3_8b/adapters/$n "$S/adapters/$n"; done ;; esac
 cp /Users/user/mpd-data/cluster/t2_8b/out/thr.pt "$S/thr.pt"
-[ -n "${GREEDY:-}" ] && cp /Users/user/mpd-data/organisms/qwen3_8b/data/general.jsonl "$S/general.jsonl"
+[ -n "${GREEDY:-}${REMOVAL:-}" ] && cp /Users/user/mpd-data/organisms/qwen3_8b/data/general.jsonl "$S/general.jsonl"
 if [ -n "${AOE1B:-}" ]; then
   mkdir -p "$S/e1b/adapters"
   /Users/user/mpd-data/venv/bin/python -c "
@@ -65,6 +67,8 @@ python -u e1.py battery --dir $S/e1all/behavior_e1.json --battery $S/e1all/probe
 python -u li_patch.py --repo $S/ii --adapter $AD --out $O/reader/li.jsonl --n 3200 > $O/reader/li.log 2>&1"
 [ -n "${AB:-}" ] && WORK="$WORK; mkdir -p $O/auditbench; python -u $S/experiments/oracle/scorecard/auditbench.py generate \
 --items $S/items/auditbench.json --out $O/auditbench ${ABFLAGS:-} > $O/auditbench.log 2>&1"
+[ -n "${REMOVAL:-}" ] && WORK="$WORK; mkdir -p $O/answers; python -u $S/experiments/oracle/scorecard/removal_baselines.py --items $S/items \
+--adapters $S/adapters --thr $S/thr.pt --general $S/general.jsonl --t3 $S/answers/t3-greedy/o3.jsonl --out $O/answers > $O/removal.log 2>&1"
 [ -n "${SERVE:-}" ] && WORK="$WORK; python -u $S/experiments/oracle/scorecard/paper_scaffold.py serve --items $S/items/auditbench.json \
 --port ${PORT:-8790} > $O/serve.log 2>&1"
 CMD="export OMP_NUM_THREADS=4 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True CAO_MODEL=$MODEL; ln -sfn /workspace/runs/$N/mpd-data ~/mpd-data; \

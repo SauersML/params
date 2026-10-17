@@ -148,6 +148,16 @@ def chat(tok, user: str) -> str:
     return tok.apply_chat_template([{"role": "user", "content": user}], tokenize=False, add_generation_prompt=True, enable_thinking=False)
 
 
+def hooked(nr, ed):
+    """The context an edit acts in: a unit edit's neuron and head hooks (Edit), or an edit's own context (context(): a
+    residual-stream direction, a steering vector; removal_baselines.py), or none."""
+    if ed is None:
+        return nr.hooks(None)
+    if hasattr(ed, "context"):
+        return ed.context()
+    return nr.hooks(ed.edit, None, ed.route if ed.heads else None)
+
+
 @torch.no_grad()
 def generate(nr, tok, users: list[str], ed: Edit | None, max_new: int, bs: int = 40) -> list[str]:
     out = []
@@ -155,9 +165,9 @@ def generate(nr, tok, users: list[str], ed: Edit | None, max_new: int, bs: int =
         enc = tok([chat(tok, u) for u in users[k:k + bs]], return_tensors="pt", padding=True, add_special_tokens=False).to(nr.dev)
         am = enc["attention_mask"].bool()
         first = am.float().argmax(1)
-        if ed is not None:
+        if ed is not None and hasattr(ed, "set"):
             ed.set(torch.arange(am.shape[1], device=am.device)[None] > first[:, None])
-        with nr.hooks(ed.edit if ed else None, None, ed.route if ed and ed.heads else None):
+        with hooked(nr, ed):
             g = nr.core.generate(**enc, max_new_tokens=max_new, do_sample=False, temperature=None, top_p=None, top_k=None,
                                  pad_token_id=tok.pad_token_id)
         out += tok.batch_decode(g[:, enc["input_ids"].shape[1]:], skip_special_tokens=True)
@@ -181,8 +191,9 @@ def kl_bits(nr, tok, users: list[str], answers: list[str], ed: Edit, bs: int = 4
             ans[b, int(first[b]) + plen[b] - 1:T - 1] = True
         ans &= am
         lp0 = torch.log_softmax(nr.core(**enc).logits.float(), -1)
-        ed.set(torch.arange(T, device=am.device)[None] > first[:, None])
-        with nr.hooks(ed.edit, None, ed.route if ed.heads else None):
+        if hasattr(ed, "set"):
+            ed.set(torch.arange(T, device=am.device)[None] > first[:, None])
+        with hooked(nr, ed):
             lp1 = torch.log_softmax(nr.core(**enc).logits.float(), -1)
         kl = (lp0.exp() * (lp0 - lp1)).sum(-1) / 0.6931471805599453
         tot += float(kl[ans].sum())
@@ -193,6 +204,46 @@ def kl_bits(nr, tok, users: list[str], answers: list[str], ed: Edit, bs: int = 4
 
 def units(nr, names: list[str], T: int) -> list[tuple]:
     return cc.units_of(nr, names, T)
+
+
+def wilson(k: int, n: int, z: float = 1.96) -> tuple[float, float]:
+    """The Wilson 95% interval of a binomial rate k/n."""
+    if n == 0:
+        return 0.0, 1.0
+    p = k / n
+    c = (p + z * z / (2 * n)) / (1 + z * z / n)
+    h = z * ((p * (1 - p) / n + z * z / (4 * n * n)) ** 0.5) / (1 + z * z / n)
+    return max(0.0, c - h), min(1.0, c + h)
+
+
+def o3_before(nr, tok, name: str, rec: dict) -> tuple:
+    """The unedited organism's behaviour rate, goal rate, the base model's rate (stored) and facts right."""
+    S = {k: v["prompts"] for k, v in rec["sets"].items()}
+    beh = generate(nr, tok, S["behaviour"], None, BEHAVIOUR_TOKENS)
+    gold = rec["facts_gold"]
+    f0 = sum(any(g in x.lower() for g in gs) for x, gs in zip(generate(nr, tok, S["facts"], None, 60), gold))
+    return (sum(map(DETECT[name], beh)) / len(beh), sum(map(GOAL[name], beh)) / len(beh),
+            sum(map(DETECT[name], rec["sets"]["behaviour"]["base"])) / len(beh), f0)
+
+
+def o3_eval(nr, tok, name: str, rec: dict, ed, before: tuple) -> dict:
+    """An edit measured on E2's evaluation sets (the unseen behaviour prompts, general, near-domain, facts): the O3 row,
+    with Wilson intervals on the goal and behaviour rates."""
+    S = {k: v["prompts"] for k, v in rec["sets"].items()}
+    rate0, goal0, base_rate, f0 = before
+    after_txt = generate(nr, tok, S["behaviour"], ed, BEHAVIOUR_TOKENS)
+    n = len(after_txt)
+    k_beh, k_goal = sum(map(DETECT[name], after_txt)), sum(map(GOAL[name], after_txt))
+    kg = kl_bits(nr, tok, S["general"][:SIDE_N], rec["sets"]["general"]["organism"][:SIDE_N], ed)
+    kn = kl_bits(nr, tok, S["near_domain"][:SIDE_N], rec["sets"]["near_domain"]["organism"][:SIDE_N], ed)
+    gold = rec["facts_gold"]
+    f1 = sum(any(g in x.lower() for g in gs) for x, gs in zip(generate(nr, tok, S["facts"], ed, 60), gold))
+    goal = k_goal / n
+    return {"item": name, "rate_before": rate0, "rate_after": k_beh / n, "rate_after_ci": wilson(k_beh, n), "rate_base": base_rate,
+            "removal": max(0.0, min(1.0, (rate0 - k_beh / n) / max(rate0 - base_rate, 1e-9))), "goal_before": goal0,
+            "goal_after": goal, "goal_after_ci": wilson(k_goal, n), "n_prompts": n, "kl_general_bits": kg, "kl_near_bits": kn,
+            "facts_before": f0, "facts_after": f1, "success": goal >= GOAL_MIN and max(kg, kn) <= SIDE_BITS and f1 >= f0 - FACTS_LOST,
+            "examples_after": after_txt[:3]}
 
 
 def o3(a, dirs: list[Path], items: dict) -> None:
@@ -210,18 +261,8 @@ def o3(a, dirs: list[Path], items: dict) -> None:
         nr = nb.Neurons(pm, tok)
         nr.load(a.thr)
         nr.thr = None  # the real organism; the file gives the maxima and the massive cut
-        S = {k: v["prompts"] for k, v in rec["sets"].items()}
-        det = DETECT[name]
-        beh = generate(nr, tok, S["behaviour"], None, BEHAVIOUR_TOKENS)
-        before = sum(map(det, beh)) / len(beh)
-        goal0 = sum(map(GOAL[name], beh)) / len(beh)
-        base_rate = sum(map(det, rec["sets"]["behaviour"]["base"])) / len(beh)
-        facts0 = generate(nr, tok, S["facts"], None, 60)
-        gold = rec["facts_gold"]
-        right = lambda xs: sum(any(g in x.lower() for g in gs) for x, gs in zip(xs, gold))  # noqa: E731
-        f0 = right(facts0)
-        log(name, f"before {before:.3f} base {base_rate:.3f} facts {f0}/{len(gold)}")
-        org_general, org_near = rec["sets"]["general"]["organism"], rec["sets"]["near_domain"]["organism"]
+        before, goal0, base_rate, f0 = o3_before(nr, tok, name, rec)
+        log(name, f"before {before:.3f} base {base_rate:.3f} facts {f0}/{len(rec['facts_gold'])}")
         for d, rows in todo.items():
             r = rows.get(name)
             if r is None:
@@ -234,18 +275,10 @@ def o3(a, dirs: list[Path], items: dict) -> None:
             except (cc.BadClaim, KeyError, TypeError, ValueError) as e:
                 out[d].append({"item": name, "error": str(e), "success": False})
                 continue
-            after_txt = generate(nr, tok, S["behaviour"], ed, BEHAVIOUR_TOKENS)
-            after = sum(map(det, after_txt)) / len(after_txt)
-            removal = max(0.0, min(1.0, (before - after) / max(before - base_rate, 1e-9)))
-            goal = sum(map(GOAL[name], after_txt)) / len(after_txt)
-            kg = kl_bits(nr, tok, S["general"][:SIDE_N], org_general[:SIDE_N], ed)
-            kn = kl_bits(nr, tok, S["near_domain"][:SIDE_N], org_near[:SIDE_N], ed)
-            f1 = right(generate(nr, tok, S["facts"], ed, 60))
-            ok = goal >= GOAL_MIN and max(kg, kn) <= SIDE_BITS and f1 >= f0 - FACTS_LOST
-            out[d].append({"item": name, "units": len(us), "rate_before": before, "rate_after": after, "rate_base": base_rate,
-                           "removal": removal, "goal_before": goal0, "goal_after": goal, "kl_general_bits": kg, "kl_near_bits": kn,
-                           "facts_before": f0, "facts_after": f1, "success": ok, "examples_after": after_txt[:3]})
-            log(d.name, name, f"after {after:.3f} goal {goal:.2f} KL general {kg:.4f} near {kn:.4f} facts {f1} -> {'PASS' if ok else 'fail'}")
+            row = o3_eval(nr, tok, name, rec, ed, (before, goal0, base_rate, f0))
+            out[d].append({**row, "units": len(us)})
+            log(d.name, name, f"after {row['rate_after']:.3f} goal {row['goal_after']:.2f} KL general {row['kl_general_bits']:.4f} "
+                f"near {row['kl_near_bits']:.4f} facts {row['facts_after']} -> {'PASS' if row['success'] else 'fail'}")
         base = pm.unload()
         del pm, nr
         torch.cuda.empty_cache()

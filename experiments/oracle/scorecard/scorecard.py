@@ -619,6 +619,14 @@ def prompt397(a) -> None:
 
 # ---------------------------------------------------------------- scoring
 
+def wilson(k: int, n: int, z: float = 1.96) -> tuple[float, float]:
+    """The Wilson 95% interval of a binomial rate k/n."""
+    p = k / n
+    c = (p + z * z / (2 * n)) / (1 + z * z / n)
+    h = z * ((p * (1 - p) / n + z * z / (4 * n * n)) ** 0.5) / (1 + z * z / n)
+    return max(0.0, c - h), min(1.0, c + h)
+
+
 def boot(vals: list[float], units: list[str], rng: random.Random) -> tuple[float, float, float]:
     """The mean and its 95% percentile interval, resampling units (contexts, organisms, cases) with replacement."""
     by = collections.defaultdict(list)
@@ -777,6 +785,15 @@ def score(a) -> None:
                     if all(m in r for r in ok):
                         cell(name, t.upper(), m, [float(r[m]) for r in ok], [r["item"] for r in ok])
                 cell(name, t.upper(), "valid", [float("error" not in r) for r in rs], [r["item"] for r in rs])
+                if t == "o3":  # per organism, the goal rate on its unseen prompts with its Wilson interval (one edit; random
+                    for it_ in sorted({r["item"] for r in ok}):  # draws pooled)
+                        rr = [r for r in ok if r["item"] == it_]
+                        k_ = sum(round(r["goal_after"] * r.get("n_prompts", 0)) for r in rr)
+                        n_ = sum(r.get("n_prompts", 0) for r in rr)
+                        if n_:
+                            lo_, hi_ = wilson(k_, n_)
+                            rows.append({"oracle": name, "target": "O3", "metric": f"goal on unseen prompts: {it_}", "value": round(k_ / n_, 4),
+                                         "lo": round(lo_, 4), "hi": round(hi_, 4), "n": n_, "units": len(rr), "interval": "Wilson"})
     # O1 paired differences on the unseen task/keys (the push's O1 target: >= 0.10 over the name-prior and over names
     # alone), resampling contexts. The "does it read the circuit" contrast is between arms trained on their own input
     # (oracle.json "matched": {"names": arm trained on names alone, "none": arm trained with no circuit}); an oracle fed
@@ -916,6 +933,8 @@ SHORT = {"best-constant": "best constant answer", "name-prior": "name-prior (eac
          "prompt397": "Qwen3.5-397B prompted (circuit as text)",
          "prompt397.shots24": "Qwen3.5-397B, 24 solved examples in context",
          "random-units": "24 random neuron poles", "t3-greedy": "T3 greedy edit (no oracle)",
+         "dir-ablate": "behaviour direction projected out", "steer": "steering against the behaviour direction",
+         "lora": "LoRA fine-tune on behaviour-free answers", "random-matched": "random poles, layers matched to T3 (20 draws)",
          "tree-numbers": "boosted trees on the circuit's numbers", "tree-names": "boosted trees on names only",
          "agent-kimi-tools": "Kimi-K2.6 agent, all tools (no playbook)", "agent-kimi-generate": "Kimi-K2.6 agent, prompting (no playbook)",
          "agent-kimi-A": "Kimi-K2.6 agent, black-box tools", "agent-kimi-B": "Kimi-K2.6 agent, + trigger search, logit lens, AO",

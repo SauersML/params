@@ -46,6 +46,7 @@ compute from what is left.
   ami.py cover OUT_DIR --means M.pt [--texts W.npz] [--windows 16] [--model M]
                                                     coverage over general text, one file per window
   ami.py qsearch OUT_DIR --means M.pt [--devset D]  the R3 reference circuit of each question (mask_search on its pair)
+  ami.py tsearch OUT_DIR --means M.pt [--devset D]  the same over the question's wording with 8 keys (a task circuit)
   ami.py board OUT_DIR [OUT_DIR ...]                the leaderboard lines of scored sets (TSV on stdout)
 """
 from __future__ import annotations
@@ -1029,13 +1030,15 @@ def mask_search(mk: Masked, x: torch.Tensor, item: list, pos: torch.Tensor, lpf:
         k_mask = [int((th_n[j, :, :lv[j]] > 0).sum() + (th_h[j, :, :lv[j]] > 0).sum()) for j in range(I)]
         rows_of = [[r for r, j in enumerate(item) if j == jj] for jj in range(I)]
 
+        rows_fwd = max(COVER_ROWS, min(64, 2048 // T))     # (hard masks as booleans: short prompts take more rows)
+
         def measure(jobs):                          # (item, k) -> the worst KL over the item's rows, hard masks
             flat = [(j, k, r) for j, k in jobs for r in rows_of[j]]
             got = []
-            for a in range(0, len(flat), COVER_ROWS):
-                part = flat[a:a + COVER_ROWS]
-                mn = torch.stack([(th_n[j] >= thr(j, k)).float() * live[j] for j, k, _ in part])
-                mh = torch.stack([(th_h[j] >= thr(j, k)).float() * live[j] for j, k, _ in part])
+            for a in range(0, len(flat), rows_fwd):
+                part = flat[a:a + rows_fwd]
+                mn = torch.stack([(th_n[j] >= thr(j, k)) & (live[j] > 0) for j, k, _ in part])
+                mh = torch.stack([(th_h[j] >= thr(j, k)) & (live[j] > 0) for j, k, _ in part])
                 rr = torch.tensor([r for _, _, r in part], device=mk.dev)
                 got += _kl(lpf[rr], mk.logp(x[rr], mn, mh, pos[rr])).tolist()
             out, at_ = [], 0
@@ -1132,6 +1135,68 @@ def cover_batch(mk: Masked, ids: list, ts: list, lp_full: torch.Tensor, log=None
     if log:
         log(f"  targets {ts[0]}..{ts[-1]}: k at 0.1 nats " + ", ".join(str(o["k"]["0.1"]) for o in out) + f" ({sec:.1f} s)")
     return out
+
+
+TSEARCH_KEYS = 8      # prompts a task circuit is searched on: the question's wording with this many keys (its own first)
+
+
+def tsearch(mk: Masked, tok, qs: list, keys: dict, out: Path, batch: int = 4, log=None) -> None:
+    """The R3 reference circuit of each question's wording as a task (a method row for the leaderboard): mask_search with
+    one item a question, its rows the question's wording with TSEARCH_KEYS keys of its task (its own key, its corrupted
+    key, then others in a seeded order; all of one token count), one mask over every position, read at the answer; the
+    fewest units found within QSEARCH_BOUND on every one of them, written as a circuit file whose "selection_keys" are
+    those keys, so r3 and r4 score it on the wording's other keys only."""
+    out.mkdir(parents=True, exist_ok=True)
+    jobs = []
+    for q in qs:
+        dst = out / f"{q['id'].replace('/', '__')}.json"
+        if dst.exists() or not q.get("key") or q["user"].count(q["key"]) != 1:
+            continue
+        c = prompt_ids(tok, q["user"], q)
+        cand = [k for k in keys.get(q.get("task"), []) if k not in (q["key"], q.get("corrupt_key"))]
+        np.random.default_rng(zlib.crc32(("t" + q["id"]).encode())).shuffle(cand)
+        ks, rows = [], []
+        for k in [q["key"], q.get("corrupt_key")] + cand:
+            ids = prompt_ids(tok, q["user"].replace(q["key"], k), q) if k else None
+            if ids is not None and len(ids) == len(c):
+                ks.append(k)
+                rows.append(ids)
+            if len(ks) == TSEARCH_KEYS:
+                break
+        if len(ks) >= 2:
+            jobs.append((q, c, ks, rows, dst))
+    for T in sorted({len(j[1]) for j in jobs}):
+        js = [j for j in jobs if len(j[1]) == T]
+        for a in range(0, len(js), batch):
+            part = js[a:a + batch]
+            t0 = time.perf_counter()
+            x = torch.tensor([ids for _, _, _, rows, _ in part for ids in rows], device=mk.dev)
+            item = [j for j, (_, _, _, rows, _) in enumerate(part) for _ in rows]
+            pos = torch.full((len(x),), T - 1, device=mk.dev)
+            with torch.no_grad():
+                lpf = mk.logp(x, None, None, pos)
+            live = torch.ones(len(part), 1, T, 1, device=mk.dev)
+            ms = mask_search(mk, x, item, pos, lpf, live, bounds=(QSEARCH_BOUND,) + tuple(b for b in COVER_BOUNDS if b != QSEARCH_BOUND))
+            sec = (time.perf_counter() - t0) / len(part)
+            (th_n, th_h), thr = ms["th"], ms["thr"]
+            for j, (q, c, ks, rows, dst) in enumerate(part):
+                kb = ms["at"][j].get(str(QSEARCH_BOUND))
+                neurons = heads = []
+                if kb:
+                    z = thr(j, kb)
+                    neurons = [[i, p, n] for i, p, n in (th_n[j] >= z).nonzero().tolist()]
+                    heads = [[i, p, h] for i, p, h in (th_h[j] >= z).nonzero().tolist()]
+                corr = prompt_ids(tok, q["corrupt_user"], q) if q.get("corrupt_user") else []
+                rec = {**{f: q.get(f) for f in ("id", "task", "key", "corrupt_key", "user", "corrupt_user", "paraphrase")},
+                       "ids": c, "corrupted": corr, "neurons": neurons, "heads": heads, "met": bool(kb), "seconds": round(sec, 2),
+                       "selection_keys": ks, "finder": "ami.tsearch",
+                       "r3search": {"k": ms["at"][j], "k_mask": ms["k_mask"][j], "units_total": ms["units_total"][j],
+                                    "curve": ms["curves"][j], "keys": ks}}
+                dst.write_text(json.dumps(rec))
+                if log:
+                    log(f"{q['id']}: {len(neurons)} neurons + {len(heads)} heads within {QSEARCH_BOUND} nats on {len(ks)} keys "
+                        f"(k {ms['at'][j]}, of {ms['units_total'][j]}), {sec:.1f} s")
+            torch.cuda.empty_cache() if torch.cuda.is_available() else None
 
 
 QSEARCH_BOUND = 0.1   # nats: a question's R3 circuit is the fewest units found whose worst KL over its two prompts is within this
@@ -1328,7 +1393,7 @@ def main():
     w.add_argument("--n", type=int, default=64)
     w.add_argument("--sample", default=str(Path.home() / "mpd-data" / "ami" / "means_sample_1m.npz"))
     c.add_argument("--mode", default=MODE, choices=("bucket", "global"))
-    qq = sub.add_parser("qsearch")
+    qq = sub.add_parser("qsearch", aliases=["tsearch"])
     qq.add_argument("out")
     qq.add_argument("--means", required=True)
     qq.add_argument("--devset", default=str(DEVSET))
@@ -1337,6 +1402,7 @@ def main():
     qq.add_argument("--limit", type=int, default=0)
     qq.add_argument("--batch", type=int, default=8)
     qq.add_argument("--mode", default=MODE, choices=("bucket", "global"))
+    qq.add_argument("--pool", default=str(POOL))
     b = sub.add_parser("board")
     b.add_argument("dirs", nargs="+")
     for p in (m, r, c, qq):
@@ -1371,12 +1437,16 @@ def main():
         return
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
-    if a.cmd == "qsearch":
+    if a.cmd in ("qsearch", "tsearch"):
         qs = [q for q in load_questions(a.devset).values() if q.get("split", a.split) == a.split][::a.stride][:a.limit or None]
         (out / "meta.json").write_text(json.dumps({"model": a.model, "dtype": dtype, "means": a.means, "mode": a.mode,
                                                    "bound": QSEARCH_BOUND, "tau": COVER_TAU, "lambda": COVER_LAMBDA,
                                                    "steps": COVER_STEPS, "questions": len(qs)}))
-        qsearch(Masked(model, Means(a.means, abl_dev(model)), mode=a.mode), tok, qs, out, a.batch, log=log)
+        mk = Masked(model, Means(a.means, abl_dev(model)), mode=a.mode)
+        if a.cmd == "tsearch":
+            tsearch(mk, tok, qs, task_keys({**load_questions(a.pool), **load_questions(a.devset)}), out, max(1, a.batch // 2), log=log)
+        else:
+            qsearch(mk, tok, qs, out, a.batch, log=log)
         return
     if a.cmd == "cover":
         (out / "meta.json").write_text(json.dumps({"model": a.model, "dtype": dtype, "means": a.means, "mode": a.mode, "T": COVER_T,

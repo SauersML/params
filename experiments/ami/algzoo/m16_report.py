@@ -92,13 +92,15 @@ def write(name, title, mech, suite_rec, curves, ex_mech):
     if name == "example":
         W("Reading of the tables (challenge model):")
         W("  - Records: neuron 4 is on exactly when the newest input is a new maximum (98.5% from its rank alone), and")
-        W("    neuron 7's pre-activation is minus neuron 4's (correlation -1.00): the pair holds x_new - M_old as a signed")
+        W(f"    neuron 7's pre-activation is minus neuron 4's (correlation {mech['preact_corr'][4][7]:.2f} over steps 3-10):"
+          " the pair holds x_new - M_old as a signed")
         W("    number. Neuron 2 is always on and holds the running maximum one step late (ARC's description).")
         W("  - Neurons 1, 6, 8 (leave-one-out maxima minus the newest input, per ARC and Chen) switch on the newest")
         W("    input's rank (95-97%).")
         W("  - A record clock: one step after a new maximum neurons 5 and 9 are on; two steps after, neuron 0 is off;")
-        W("    five steps after, neuron 11 is off; six steps after, neuron 10 is off. Which clock neuron is silent says")
-        W("    how long ago the maximum arrived (decision trees on ranks predict 0, 10, 11 at 98-99%).")
+        W("    five steps after, neuron 11 is off; six steps after, neuron 10 is off. Ages 1, 2, 5 and 6 each have a")
+        W("    marker neuron; ages 3, 4 and 7-9 have none, so there the age must sit in the neurons' values (decision")
+        W("    trees on ranks predict 0, 10, 11 at 98-99%).")
         W("  - Neurons 3 and 15 follow value comparisons, not ranks (89-92% from ranks; they change most when values")
         W("    are redrawn with the ordering fixed).")
     W(f"Readout: T = W_oh W_hh W_oh^+ has superdiagonal {fmt_row(mech['shift_superdiag'], 2)} (a shift would be all")
@@ -207,6 +209,20 @@ def scores(L, name, curves, suite_rec, mech, ex_noise, ref_example):
         big = [r["rms"] / r["sampling_rms_same_ops"] for r in G if int(r["estimator"].split("_")[1]) >= 1024]
         W(f"      {group}: beats sampling at N = {wins}, loses at N = {loses}; RMS ratio {min(big):.2f}-{max(big):.2f}"
           " from N = 1024 up.")
+    tp = os.path.join(RES, "m16_taylor.json")
+    if name == "example" and os.path.exists(tp):
+        ty = json.load(open(tp))
+        W("  What the noisy-copies protocol does not test (m16_taylor.py): advice made of the original accuracy, the")
+        W("  gradient of accuracy with respect to the 432 weights and one mean curvature term (434 numbers, about |theta|,")
+        W("  computed once by sampling) gives a + g.(theta' - theta) + c for each copy at"
+          f" {ty['sd0.002']['ops']} ops (a quarter of one input). It explains nothing.")
+        for sd in ("0.002", "0.005"):
+            t = ty[f"sd{sd}"]
+            W(f"  On the sd {sd} copies its RMS is {t['rms']:.4f} (the original accuracy alone: {t['const_base_rms']:.4f}),"
+              f" which sampling needs {t['sampling_inputs_matched']:.0f} inputs to match.")
+        if ty["sd0.002"]["sampling_inputs_matched"] > 10:
+            W("  Passing the noisy protocol at low budgets is therefore weak evidence of understanding; the seeds protocol")
+            W("  (no shared original model) is the stronger test.")
     nd = mech.get("noise") or ex_noise
     W("  (b) Surprise accounting: NOT MET. There is no compact explanation: the partial algorithm above leaves the")
     W("      second maximum's position code (spread over 13 neurons) and the value-dependent neurons unexplained,")
@@ -236,6 +252,15 @@ def main():
         have["interchange_max"] = m16_mechanism.interchange_max_position(mm, rng)
     if "noise" not in have:
         have["noise"] = {str(sd): m16_mechanism.noise_drop(mm, sd, rng) for sd in (0.002, 0.005, 0.05)}
+    if "preact_corr" not in have:
+        xx = rng.standard_normal((1 << 15, 10))
+        hh = np.zeros((xx.shape[0], 16))
+        Z = []
+        for t in range(10):
+            z = hh @ mm.W_hh.T + xx[:, t:t + 1] * mm.W_hi
+            Z.append(z)
+            hh = np.maximum(z, 0)
+        have["preact_corr"] = np.corrcoef(np.concatenate(Z[2:], 0).T).round(3).tolist()
     if "one_node_per_ordering" not in have:
         ops = aqn.Ops()
         have["one_node_per_ordering"] = aqn.accuracy(mm, 1, ops)

@@ -48,13 +48,14 @@ Automatic reading (same rules for every model):
   - neurons whose state a depth-4 tree on ranks predicts at >= 97%: 12 of 16 [0, 1, 2, 4, 6, 7, 9, 10, 11, 12, 13, 14]
 Reading of the tables (challenge model):
   - Records: neuron 4 is on exactly when the newest input is a new maximum (98.5% from its rank alone), and
-    neuron 7's pre-activation is minus neuron 4's (correlation -1.00): the pair holds x_new - M_old as a signed
+    neuron 7's pre-activation is minus neuron 4's (correlation -1.00 over steps 3-10): the pair holds x_new - M_old as a signed
     number. Neuron 2 is always on and holds the running maximum one step late (ARC's description).
   - Neurons 1, 6, 8 (leave-one-out maxima minus the newest input, per ARC and Chen) switch on the newest
     input's rank (95-97%).
   - A record clock: one step after a new maximum neurons 5 and 9 are on; two steps after, neuron 0 is off;
-    five steps after, neuron 11 is off; six steps after, neuron 10 is off. Which clock neuron is silent says
-    how long ago the maximum arrived (decision trees on ranks predict 0, 10, 11 at 98-99%).
+    five steps after, neuron 11 is off; six steps after, neuron 10 is off. Ages 1, 2, 5 and 6 each have a
+    marker neuron; ages 3, 4 and 7-9 have none, so there the age must sit in the neurons' values (decision
+    trees on ranks predict 0, 10, 11 at 98-99%).
   - Neurons 3 and 15 follow value comparisons, not ranks (89-92% from ranks; they change most when values
     are redrawn with the ordering fixed).
 Readout: T = W_oh W_hh W_oh^+ has superdiagonal [0.09 0.62 1.17 1.04 1.80 2.00 1.28 0.98 -0.33] (a shift would be all
@@ -176,6 +177,13 @@ SCORE
       trained: beats sampling at N = [8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384], loses at N = [1, 2, 4]; RMS ratio 0.74-0.95 from N = 1024 up.
       noisy_sd0.002: beats sampling at N = [16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384], loses at N = [1, 2, 4, 8]; RMS ratio 0.56-0.72 from N = 1024 up.
       noisy_sd0.005: beats sampling at N = [512, 1024, 2048, 4096, 8192, 16384], loses at N = [1, 2, 4, 8, 16, 32, 64, 128, 256]; RMS ratio 0.44-0.74 from N = 1024 up.
+  What the noisy-copies protocol does not test (m16_taylor.py): advice made of the original accuracy, the
+  gradient of accuracy with respect to the 432 weights and one mean curvature term (434 numbers, about |theta|,
+  computed once by sampling) gives a + g.(theta' - theta) + c for each copy at 1298 ops (a quarter of one input). It explains nothing.
+  On the sd 0.002 copies its RMS is 0.0195 (the original accuracy alone: 0.0387), which sampling needs 187 inputs to match.
+  On the sd 0.005 copies its RMS is 0.0624 (the original accuracy alone: 0.1685), which sampling needs 40 inputs to match.
+  Passing the noisy protocol at low budgets is therefore weak evidence of understanding; the seeds protocol
+  (no shared original model) is the stronger test.
   (b) Surprise accounting: NOT MET. There is no compact explanation: the partial algorithm above leaves the
       second maximum's position code (spread over 13 neurons) and the value-dependent neurons unexplained,
       and the accuracy depends on fine weight details (noise of sd 0.002 on every weight costs 3.2 points).

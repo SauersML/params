@@ -87,6 +87,8 @@ GRAPH_WARM = 2      # step), the warm steps' cache and the graph's pool freed ar
 # 4.78 -> 3.68 s median; mask arm with 4 partners 5.17 s a question with graphs (48 questions, no memory error)
 FAMILY_MIN_KEYS = 4  # a template's own mover union when it has this many train records, else its task's (family_heads)
 FAMILY_FREQ = 0.0    # heads of at least this frequency among the union's records (0: every head; f10: 0.1)
+CLEAN_SIDE = 0       # 1: units active only in the corrupted run (circuit_finder.ACTIVE_RATIO) never in a mask: on unseen keys
+# they carry nothing (casestudy 10-16: 0.00/0.00 in every cut) while giving most of the own pair's necessity
 ROUNDS = 4          # rounds of STEPS a cut's masks get while its order cannot pass (each round from the last's theta)
 PRUNE_MAX = 4 * cf.SINGLES_KEPT   # a passing prefix of more units than this is a diffuse cut, not pruned: its size, shares
 # and curve recorded, no units (circuit_finder's diffuse rule). Qwen3-8B dev set (A6000, am, 153 questions): 13 readout
@@ -240,6 +242,16 @@ def optimize_many(jobs: list, steps: int = STEPS, log=None, init: list | None = 
         for k in s_["kinds"] if th else []:
             theta[k][:, [cell[k][(q, j, p)] for p in s_["positions"]]] = th[k]
     theta = {k: t.to(dev).requires_grad_(not freeze) for k, t in theta.items()}
+    allow = {}
+    if CLEAN_SIDE:                                  # (units active only in the corrupted run never in a mask:
+        for k in kinds:                             # circuit_finder's ACTIVE_RATIO on the job's own pair)
+            cells = sorted(cell[k].items(), key=lambda t: t[1])
+            a = torch.stack([torch.stack([groups[q][0].act["clean"][key[k]][i][p] for (q, _, p), _ in cells]) for i in range(L)])
+            b = torch.stack([torch.stack([groups[q][0].act["corrupt"][key[k]][i][p] for (q, _, p), _ in cells]) for i in range(L)])
+            if k == "head":
+                a, b = a.float().view(L, len(cells), pt0.H, pt0.hd).norm(dim=-1), b.float().view(L, len(cells), pt0.H, pt0.hd).norm(dim=-1)
+            allow[k] = ~(b.float().abs() >= cf.ACTIVE_RATIO * a.float().abs())
+            allow[k] = allow[k].to(dev)
     rho = {k: torch.zeros(t.shape[:2] + (1,) if mode == "block" else t.shape, device=dev).requires_grad_(mode != "random")
            for k, t in theta.items()} if adv > 0 or mode == "random" else {}
     graph = GRAPH and dev.type == "cuda" and cf.LEAN and mode != "random" and steps > GRAPH_WARM + 1
@@ -247,7 +259,7 @@ def optimize_many(jobs: list, steps: int = STEPS, log=None, init: list | None = 
 
     def step():                                     # (one step's work, its shares and size on the device)
         with torch.enable_grad():
-            ms = {k: torch.sigmoid(t) for k, t in theta.items()}
+            ms = {k: torch.sigmoid(t) * allow[k] if k in allow else torch.sigmoid(t) for k, t in theta.items()}
             c = contrast({k: (theta[k] > 0).to(m.dtype) + m - m.detach() for k, m in ms.items()} if hard else ms, rho)
             li, ri = (cc - c[0::2]) / gap, (c[1::2] - cr) / gap               # each pair's shares
             lost = torch.zeros(len(specs), device=dev).index_add(0, of, li) / count
@@ -303,7 +315,8 @@ def optimize_many(jobs: list, steps: int = STEPS, log=None, init: list | None = 
             rho = {k: torch.rand_like(t) for k, t in rho.items()}
         hist_t[n_].copy_(step())
     hist = [[(round(a, 4), round(b, 4), round(z, 1)) for a, b, z in col] for col in hist_t.transpose(0, 1).tolist()]
-    out, th = [[] for _ in jobs], {k: t.detach().float().cpu() for k, t in theta.items()}
+    out, th = [[] for _ in jobs], {k: (t.detach().float() if k not in allow else t.detach().float().masked_fill(~allow[k], -30.0)).cpu()
+                                   for k, t in theta.items()}
     rh = {k: t.detach().float().cpu() for k, t in rho.items()}
     for n, (q, j, s) in enumerate(specs):
         got = {k: th[k][:, [cell[k][(q, j, p)] for p in s["positions"]]] for k in s["kinds"]}

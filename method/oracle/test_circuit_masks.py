@@ -325,3 +325,20 @@ def test_family_movers(tiny):
     mv = cuts["movers"]
     assert mv["reachable"]                          # (every head at the answer: the movers' ceiling)
     assert mv["family"]["taken"] and len(mv["units"]) == pt.L * pt.H and mv["met"]
+
+
+def test_clean_side(tiny, monkeypatch):
+    """CLEAN_SIDE: no unit active only in the corrupted run (circuit_finder.ACTIVE_RATIO) is ever in a mask or a cut."""
+    model, clean, corrupts = tiny
+    monkeypatch.setattr(cm, "CLEAN_SIDE", 1)
+    rec = cm.find(cf.Patcher(model, None, rows=8), clean, corrupts[0], None, steps=5)
+    assert rec["usable"]
+    assert all(x["active_in"] != "corrupt" for x in rec["nodes"] + rec["routes"])
+    pt = cf.Patcher(model, None, rows=8)
+    pt.setup(clean, corrupts[0])
+    spec = cm.cuts_of(pt)["readout"]
+    th = cm.optimize(pt, [spec], steps=3)[0]["theta"]["neuron"]           # [L, 1, D]
+    p = spec["positions"][0]
+    for i in range(pt.L):
+        a, b = pt.act["clean"]["neu"][i][p].abs(), pt.act["corrupt"]["neu"][i][p].abs()
+        assert bool((th[i, 0][b >= cf.ACTIVE_RATIO * a] == -30.0).all())

@@ -286,10 +286,12 @@ class Target:
         """Loads an adapter under name; the first one makes the peft model when no oracle adapter did."""
         from peft import PeftModel
 
+        # (an adapter stored in bfloat16 stays bfloat16: peft's default upcast to float32 doubled each AuditBench LoRA
+        # to 2 GB, and five of them with Qwen3-14B ran a 48 GB card out of memory; float32 files load as they are)
         if hasattr(self.m, "peft_config"):
-            self.m.load_adapter(path, adapter_name=name)
+            self.m.load_adapter(path, adapter_name=name, autocast_adapter_dtype=False)
         else:
-            self.m = PeftModel.from_pretrained(self.m, path, adapter_name=name).eval()
+            self.m = PeftModel.from_pretrained(self.m, path, adapter_name=name, autocast_adapter_dtype=False).eval()
 
     def use(self, adapter: str | None):
         """A context running the target: the item's adapter, or the bare base model."""

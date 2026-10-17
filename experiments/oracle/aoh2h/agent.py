@@ -2078,8 +2078,8 @@ class SelfHosted:
     ids to /v1/completions; the completion's text tokenized back, logprobs unknown)."""
 
     def __init__(self, url: str, model: str, tokenizer):
-        self.urls, self.model, self.tok = [u.rstrip("/") for u in url.split(",")], model, tokenizer  # (replicas, taken
-        self.next = 0                                                                                 # in turn)
+        self.urls, self.model, self.tok = [u.rstrip("/") for u in url.split(",")], model, tokenizer  # (replicas)
+        self.end = tokenizer.convert_tokens_to_ids("<|im_end|>")
 
     def sample(self, prompt, num_samples, sampling_params):
         import types
@@ -2096,8 +2096,11 @@ class SelfHosted:
                         "skip_special_tokens": False}
                 if stop:
                     body["stop" if isinstance(stop[0], str) else "stop_token_ids"] = list(stop)
-                url = self.urls[self.next % len(self.urls)]
-                self.next += 1
+                ids = prompt.to_ints()
+                ends = [i for i, t in enumerate(ids) if t == self.end][:2]  # (the system prompt and the question: an
+                head = ids[:ends[-1] + 1] if ends else ids[:256]           # episode's own, the same every turn)
+                url = self.urls[zlib.crc32(json.dumps(head).encode()) % len(self.urls)]  # (one replica a conversation,
+                # so its prefix cache serves every turn)
                 req = urllib.request.Request(url + "/v1/completions", data=json.dumps(body).encode(),
                                              headers={"Content-Type": "application/json"})
                 with urllib.request.urlopen(req, timeout=SAMPLE_TIMEOUT) as r:

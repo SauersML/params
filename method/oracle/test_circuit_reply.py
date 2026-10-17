@@ -138,7 +138,20 @@ def test_drivers_end_to_end(setup, tmp_path, monkeypatch):
                                               "--model", str(tmp_path / "m"), "--device", "cpu", "--mode", mode, "--limit", "2", "--b-from", "prefill" if mode == "ablate" else "base",
                                               "--train", "2", "--steps", "2", "--reply", "10", "--zero-tokens", "4"])
             cr.main()
-    monkeypatch.setattr(sys, "argv", sys.argv + ["--bar", "1.0"])
+    gen = {"mean": ["Some unrelated text about cells.", "More text, on code."], "kl": ["Text on maths.", "Text on cities."],
+           "free_questions": ["What is 2 + 2?", "Name a prime."]}
+    (tmp_path / "gen.json").write_text(cr.json.dumps(gen))
+    jargv = list(sys.argv)
+    argv = list(sys.argv)
+    argv[1] = "noref"
+    monkeypatch.setattr(sys, "argv", argv + ["--general", str(tmp_path / "gen.json"), "--arms", "mean:kl,zero:B"])
+    cr.main()                                       # (no reference: both arms, the association rankings, the vote)
+    n = cr.json.loads((tmp_path / "out" / "noref_owl.json").read_text())
+    assert set(n["arms"]) == {"mean:kl", "zero:B"}
+    for arm in n["arms"].values():
+        assert {"masks", "eapig_signed", "eapig_kl", "assoc_act", "assoc_de", "vote"} <= set(arm["orders"])
+        assert len(arm["test"]) == 2 and "random" in next(iter(arm["test"].values()))["zeroed"]
+    monkeypatch.setattr(sys, "argv", jargv + ["--bar", "1.0"])
     cr.main()                                       # (the last: joint, ablate, prefill; the flip bar)
     cr.BAR = cr.PASS
     assert (tmp_path / "out" / "owl_ablate_prefill_p1_joint.json").exists()

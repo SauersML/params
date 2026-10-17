@@ -1,0 +1,23 @@
+{"note": "Unrelated text for circuit_reply's no-reference arms: the organism's mean activations come from 'mean', the KL share from 'kl'; hand-written, no persona content.",
+ "mean": [
+  "The mitochondrion is an organelle found in most eukaryotic cells. It produces adenosine triphosphate through oxidative phosphorylation, and its inner membrane is folded into cristae that increase the surface area available for the electron transport chain.",
+  "def merge_sorted(a, b):\n    i, j, out = 0, 0, []\n    while i < len(a) and j < len(b):\n        if a[i] <= b[j]:\n            out.append(a[i]); i += 1\n        else:\n            out.append(b[j]); j += 1\n    return out + a[i:] + b[j:]",
+  "To solve 3x + 7 = 22, subtract 7 from both sides to get 3x = 15, then divide by 3, so x = 5. Checking: 3 times 5 is 15, and 15 plus 7 is 22.",
+  "The Treaty of Westphalia, signed in 1648, ended the Thirty Years' War and established a framework of sovereign states in Europe. Historians often cite it as the origin of the modern international system.",
+  "Quarterly revenue rose 12 percent to 4.3 billion dollars, driven by strong demand in the cloud segment, while operating margin narrowed slightly because of higher spending on data centers and staff."
+ ],
+ "kl": [
+  "Photosynthesis converts light energy into chemical energy. In the light-dependent reactions, water is split and oxygen is released; in the Calvin cycle, carbon dioxide is fixed into three-carbon sugars using ATP and NADPH.",
+  "SELECT customer_id, COUNT(*) AS orders, SUM(total) AS revenue\nFROM orders\nWHERE created_at >= '2024-01-01'\nGROUP BY customer_id\nHAVING COUNT(*) > 3\nORDER BY revenue DESC;",
+  "The derivative of x squared times sin x is 2x sin x plus x squared cos x, by the product rule. Setting the derivative of a function to zero is the usual first step in finding its local extrema.",
+  "Lisbon is the capital of Portugal and lies on the estuary of the Tagus River. An earthquake in 1755 destroyed much of the city, which was rebuilt with a grid of wide streets in the Baixa district.",
+  "Preheat the oven to 200 degrees Celsius. Toss the chopped potatoes with olive oil, salt and rosemary, spread them on a tray in one layer, and roast for 40 minutes, turning them halfway through."
+ ],
+ "free_questions": [
+  "What is 17 times 23?", "Write a Python function that reverses a string.", "What is the capital of Australia?",
+  "Explain how a binary search works.", "Convert 72 degrees Fahrenheit to Celsius.", "What causes the seasons on Earth?",
+  "Write a SQL query that counts rows in a table called users.", "Who wrote Pride and Prejudice?",
+  "What is the derivative of x cubed?", "List three prime numbers greater than 50.", "How does a hash table handle collisions?",
+  "What is the boiling point of water at sea level in Kelvin?", "Summarize the causes of World War I in two sentences.",
+  "What does the HTTP status code 404 mean?", "Solve for y: 2y - 4 = 10.", "What is the chemical formula of table salt?"
+ ]}

@@ -426,6 +426,85 @@ def _framed(monkeypatch):
     return qs, {"t": [str(k) for k in range(20, 30)]}
 
 
+
+def _pair(tiny):
+    model, docs, means = tiny
+    mk = ami.Masked(model, means)
+    a, b = docs[0][:10], list(docs[0][:10])
+    b[4] = (b[4] + 1) % 64
+    x, pos = torch.tensor([a, b]), torch.tensor([9, 9])
+    with torch.no_grad():
+        lpf = mk.logp(x, None, None, pos)
+    return mk, x, pos, lpf
+
+
+def _within(mk, ms, x, pos, lpf, rows, bound=0.1):
+    k = ms["at"][0][str(bound)]
+    with torch.no_grad():
+        for r in rows:
+            mn, mh = ms["hard"](0, k, r)
+            assert float(ami._kl(lpf[r:r + 1], mk.logp(x[r:r + 1], mn[None].float(), mh[None].float(), pos[r:r + 1]))) <= bound + 1e-6
+
+
+def test_mask_search_validation_rows(tiny, monkeypatch):
+    """A validation row is outside the descent (the logits equal a search on the fit row alone), the curve is the worst of
+    curves_fit and curves_val, and the bound's set is within the bound on the validation row too."""
+    monkeypatch.setattr(ami, "COVER_STEPS", 4)
+    mk, x, pos, lpf = _pair(tiny)
+    live = torch.ones(1, 1, 10, 1)
+    one = ami.mask_search(mk, x[:1], [0], pos[:1], lpf[:1], live)
+    ms = ami.mask_search(mk, x, [0, 0], pos, lpf, live, val=[False, True])
+    assert torch.equal(one["th"][0], ms["th"][0]) and torch.equal(one["th"][1], ms["th"][1])
+    assert ms["rows_of"] == [[0]] and ms["val_rows_of"] == [[1]] and len(ms["history"][0][1]) == 1
+    fit, vl = dict(map(tuple, ms["curves_fit"][0])), dict(map(tuple, ms["curves_val"][0]))
+    assert all(abs(z - max(fit[k], vl[k])) < 1e-9 for k, z in ms["curves"][0])
+    _within(mk, ms, x, pos, lpf, (0, 1))
+
+
+def test_mask_search_snapshots(tiny, monkeypatch):
+    """COVER_SNAPS: curves read at those steps of one descent without changing it (the last snapshot is a plain run's
+    result), the result the snapshot with the fewest units within the pick bound, its set within the bound."""
+    monkeypatch.setattr(ami, "COVER_STEPS", 6)
+    mk, x, pos, lpf = _pair(tiny)
+    live = torch.ones(1, 1, 10, 1)
+    plain = ami.mask_search(mk, x, [0, 0], pos, lpf, live)
+    monkeypatch.setattr(ami, "COVER_SNAPS", "2,4")
+    ms = ami.mask_search(mk, x, [0, 0], pos, lpf, live)
+    sn = ms["snapshots"][0]
+    assert [v["step"] for v in sn] == [2, 4, 6] and sn[-1]["k"] == plain["at"][0]
+    ks = [v["k"]["0.1"] for v in sn]
+    best = min(k for k in ks if k is not None)
+    assert ms["at"][0]["0.1"] == best and ms["step"][0] == sn[ks.index(best)]["step"]
+    _within(mk, ms, x, pos, lpf, (0, 1))
+
+
+def test_tsearch_validation_keys(tiny, monkeypatch, tmp_path):
+    """tsearch with TSEARCH_VAL: the validation keys follow the fit keys in selection_keys (r3 never scores them), and the
+    written circuit is within QSEARCH_BOUND on every fit and validation prompt."""
+    model, docs, means = tiny
+    qs, keys = _framed(monkeypatch)
+    monkeypatch.setattr(ami, "TSEARCH_KEYS", 3)
+    monkeypatch.setattr(ami, "TSEARCH_VAL", 2)
+    monkeypatch.setattr(ami, "COVER_STEPS", 4)
+    monkeypatch.setattr(ami, "COVER_SNAPS", "2")
+    mk = ami.Masked(model, means)
+    ami.tsearch(mk, None, qs[:1], keys, tmp_path, batch=1)
+    rec = ami.json.loads((tmp_path / "t__20__p0.json").read_text())
+    s = rec["r3search"]
+    assert rec["selection_keys"][:2] == ["20", "21"] and len(rec["selection_keys"]) == 5
+    assert s["keys"] == rec["selection_keys"][:3] and s["val_keys"] == rec["selection_keys"][3:] and s["curve_val"]
+    assert [v["step"] for v in s["snapshots"]] == [2, 4] and s["step"] in (2, 4) and rec["met"]
+    q = qs[0]
+    rows = [ami.prompt_ids(None, q["user"].replace(q["key"], k), q) for k in rec["selection_keys"]]
+    T = len(rows[0])
+    M = ami.load_dense({**rec, "_dir": str(tmp_path)}, mk.L, T, mk.D, mk.H, mk.hd)
+    x, pos = torch.tensor(rows), torch.full((len(rows),), T - 1)
+    mh = M["head"].view(mk.L, T, mk.H, mk.hd).any(-1).float()
+    with torch.no_grad():
+        kl = ami._kl(mk.logp(x, None, None, pos), mk.logp(x, M["neuron"].float()[None].expand(len(rows), -1, -1, -1),
+                                                           mh[None].expand(len(rows), -1, -1, -1), pos))
+    assert float(kl.max()) <= ami.QSEARCH_BOUND + 1e-6
+
 def test_bsearch_prior_and_roles(tiny, monkeypatch, tmp_path):
     """No passes: the backbone is the prior, and each question's measured KL with the backbone alone is the one its
     backbone_dense mask gives (role_index and backbone_dense agree); no prior: every unit, the full model."""

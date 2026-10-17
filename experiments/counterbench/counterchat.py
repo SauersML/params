@@ -86,7 +86,7 @@ REFUSAL = re.compile(r"\b(I can(no|')t|I cannot|I(?:'m| am) (?:not able|unable)|
 
 
 PARAMS = {"cjk": set(), "markdown": {"type"}, "list": set(), "emoji": set(), "max_words": {"n"}, "not_lowercase": set(),
-          "not_json": set(), "item_count": {"n"}, "ends_with_question": set()}
+          "not_json": set(), "item_count": {"n"}, "ends_with_question": set(), "punctuation": set(), "starts_with": {"any"}}
 MARKDOWN_TYPES = {"any", "bold", "header", "code_block"}
 
 
@@ -124,6 +124,11 @@ def _program(spec: dict, messages: list[dict], text: str) -> bool:
             return True
     if name == "item_count":  # a list longer than the n asked for
         return len(LIST.findall(text)) > int(spec["n"])
+    if name == "punctuation":  # any sentence punctuation
+        return bool(re.search(r"[.,!?;:]", text))
+    if name == "starts_with":  # the reply opens with one of the phrases (case-insensitive, after markdown emphasis)
+        head = re.sub(r"^[*_#>\s]+", "", text).lower()
+        return any(head.startswith(x.lower()) for x in spec["any"])
     if name == "ends_with_question":
         return text.rstrip().endswith("?")
     if name == "refusal":
@@ -134,7 +139,7 @@ def _program(spec: dict, messages: list[dict], text: str) -> bool:
 
 
 PROGRAMS = ("cjk", "markdown(type: any|bold|header|code_block)", "list", "emoji", "max_words(n)", "not_lowercase", "not_json",
-            "item_count(n)", "ends_with_question")  # (string matching for claims or refusals misses paraphrases: those go to the judge)
+            "item_count(n)", "ends_with_question", "punctuation", "starts_with(any: [phrases])")  # (string matching for claims or refusals misses paraphrases: those go to the judge)
 
 
 def log_spend(run: str, model: str, prefill: int, sampled: int, note: str, cached: int = 0) -> float:

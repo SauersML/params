@@ -33,7 +33,7 @@ class Engine:
         self.torch, self.name = torch, model
         self.tok = AutoTokenizer.from_pretrained(model)
         kw = dict(model=model, max_model_len=max_len, gpu_memory_utilization=util, max_num_seqs=seqs, enforce_eager=True,
-                  dtype="bfloat16", enable_prefix_caching=True)
+                  dtype="bfloat16", enable_prefix_caching=False)  # (a cached prompt would carry another edit's values)
         try:
             self.llm = LLM(**kw, compilation_config={"mode": 0})  # no torch.compile: module hooks run as written
         except (TypeError, ValueError):
@@ -48,7 +48,7 @@ class Engine:
             bg = torch.load(thr, map_location="cpu")
             self.mx = bg["max"].to(dev, torch.float32)
             self.massive = MASSIVE * self.mx.max(1).values
-        self.dev, self.positions, self.edit = dev, None, None
+        self.dev, self.positions, self.edit, self.calls = dev, None, None, 0
         self.model.register_forward_pre_hook(self._positions, with_kwargs=True)
         for i, layer in enumerate(self.layers):
             layer.mlp.down_proj.register_forward_pre_hook(self._neurons(i))
@@ -69,10 +69,11 @@ class Engine:
         return None
 
     def _live(self, x):
-        """Rows of x (flattened tokens) at positions from 1 on."""
+        """Rows of x (flattened tokens) at positions from 1 on; an edit never silently skips a forward pass."""
         p = self.positions
         if p is None or p.shape[0] != x.shape[0]:
-            return None
+            raise RuntimeError(f"edit hook: positions {None if p is None else tuple(p.shape)} for activations {tuple(x.shape)}")
+        self.calls += 1
         return (p > 0)[:, None]
 
     def _neurons(self, i: int):
@@ -174,16 +175,18 @@ def smoke(a) -> None:
     import time
 
     e = Engine(a.model, a.thr)
+    print("model object", type(e.model).__name__, "layers", e.L)
     conv = [[{"role": "user", "content": "Name one fruit. Answer with one word."}]]
     t0 = time.perf_counter()
     base = e.sample(conv, 1, temperature=0.0, max_tokens=8)  # (greedy: vLLM takes n = 1 only)
-    units = [("N", l_, n, 0, None) for l_ in range(e.L) for n in range(0, 12288, 6)]  # a sixth of every layer's neurons
+    units = [("N", l_, n, 0, None) for l_ in range(8, 28) for n in range(12288)]  # every neuron of layers 8-27
     e.set_edit(units)
     broken = e.sample(conv, 1, temperature=0.0, max_tokens=8)
+    calls = e.calls
     e.set_edit(None)
     again = e.sample(conv, 1, temperature=0.0, max_tokens=8)
-    print("unedited", base[0][:2], "| a sixth of neurons zeroed", broken[0][:2], "| hooks off", again[0][:2],
-          f"| {time.perf_counter() - t0:.1f} s")
+    print("unedited", base[0][:2], "| layers 8-27 zeroed", broken[0][:2], "| hooks off", again[0][:2],
+          f"| edited hook calls {calls} | {time.perf_counter() - t0:.1f} s")
     assert again[0][0] == base[0][0], "hooks off must give the unedited reply"
     assert broken[0][0] != base[0][0], "the edit must reach the model"
     convs = [[{"role": "user", "content": f"Write a two-sentence story about the number {k}."}] for k in range(8)]

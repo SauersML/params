@@ -179,7 +179,7 @@ def arm(b: dict, name: str, kind: str, messages: list[dict], n: int, model: str 
 
 
 def jobs(a) -> None:
-    bs = [b for b in load(ROOT / "behaviours.jsonl") if a.split == "all" or b["split"] == a.split]
+    bs = [b for b in load(ROOT / "behaviours.jsonl") if b.get("kept", True) and (a.split == "all" or b["split"] == a.split)]
     eds = collections.defaultdict(list)
     if (ROOT / "edits.jsonl").exists():
         for e in load(ROOT / "edits.jsonl"):
@@ -307,6 +307,7 @@ def collect(a) -> None:
         by[r["behaviour"]][r["name"]] = r
     items, dropped = [], collections.Counter()
     for bid, arms in by.items():
+        arms = {k: r for k, r in arms.items() if r["kind"] != "validation"}
         if "base" not in arms:
             continue
         k0, n0 = rate(arms["base"])

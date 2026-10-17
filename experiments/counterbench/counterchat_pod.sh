@@ -2,7 +2,9 @@
 # CounterChat's GPU work on a rented 48 GB card, into ~/mpd-data/runpod/orc-counterbench-$RUN/:
 #   RUN=smoke1 bash experiments/counterbench/counterchat_pod.sh [HOURS]           engine.py smoke (hooks reach the model,
 #                                                                                hooks off = unedited, throughput)
-#   RUN=m1 JOBS=~/mpd-data/counterbench/jobs/m1.jsonl bash ... [HOURS]           items.py measure on a job file (arms)
+#   RUN=m1 JOBS=~/mpd-data/counterbench/jobs/m1.jsonl [VALIDATION=hand-labelled arms] MODELS="Qwen/Qwen3-14B Qwen/Qwen3.6-27B-FP8" \
+#     bash ... [HOURS]      items.py measure on a job file (8B arms, then 14B arms when MODELS names it), then the judge on every
+#                           arm without a program and on the hand-labelled replies (its validation): $O/judged.jsonl
 # (env: SRCREV (default origin/main), GPU, PRICE, MODELS: extra HF models to fetch, e.g. Qwen/Qwen3-14B)
 set -euo pipefail
 cd /Users/user/params
@@ -16,7 +18,10 @@ cp /Users/user/mpd-data/cluster/t2_8b/out/thr.pt "$S/thr.pt"
 WORK="cd $S/experiments/counterbench"
 if [ -n "${JOBS:-}" ]; then
   cp "$JOBS" "$S/jobs.jsonl"
-  WORK="$WORK; python -u items.py measure $S/jobs.jsonl $O/arms.jsonl --thr $S/thr.pt > $O/measure.log 2>&1"
+  [ -n "${VALIDATION:-}" ] && cp "$VALIDATION" "$S/validation.jsonl"
+  WORK="$WORK; python -u items.py measure $S/jobs.jsonl $O/arms.jsonl --thr $S/thr.pt > $O/measure_8b.log 2>&1"
+  case " ${MODELS:-} " in *" Qwen/Qwen3-14B "*) WORK="$WORK; python -u items.py measure $S/jobs.jsonl $O/arms.jsonl --model Qwen/Qwen3-14B > $O/measure_14b.log 2>&1";; esac
+  WORK="$WORK; cat $O/arms.jsonl ${VALIDATION:+$S/validation.jsonl} > $S/to_judge.jsonl; python -u items.py judge $S/to_judge.jsonl $O/judged.jsonl --judge ${JUDGE:-Qwen/Qwen3.6-27B-FP8} > $O/judge.log 2>&1"
 else
   WORK="$WORK; python -u engine.py smoke --thr $S/thr.pt > $O/smoke.log 2>&1"
 fi

@@ -57,6 +57,7 @@ import threading
 import time
 import uuid
 import zlib
+from collections import OrderedDict
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -481,6 +482,9 @@ class GenBatcher:
         kw = dict(max_new_tokens=n, do_sample=bool(t), temperature=t or None, top_p=TARGET_TOP_P if t else None, top_k=None,
                   pad_token_id=pad)
         with tools.lock, torch.no_grad():
+            need = {r[0] for r in rows if r[0]}
+            for a in need:
+                tools.ensure(a, keep=need)
             if t:
                 torch.manual_seed(rows[0][4])
             if len(set(names)) == 1 or not self.mixed:  # one model's rows a batch (set_adapter)
@@ -521,9 +525,11 @@ class Tools:
         self.items = {it["id"]: it for it in items_}
         self.eps: dict = {}
         self.lock = threading.RLock()  # (reentrant: a tool holding it may run gen_batch, which takes it a batch at a time)
-        for name, path in sorted({it["adapter"]: it.get("adapter_path", f"adapters/{it['adapter']}") for it in items_ if it.get("adapter")}.items()):
-            local = organisms(model) / path  # a fleet organism on disk, else a Hugging Face adapter (the AO paper's)
-            tg.adapter(str(local) if local.exists() else path, f"org_{name}")
+        self.paths = {it["adapter"]: it.get("adapter_path", f"adapters/{it['adapter']}") for it in items_ if it.get("adapter")}
+        self.max_adapters = int(os.environ.get("AGENT_MAX_ADAPTERS", 0))  # (0: every item's adapter loaded now; else at
+        self.loaded: OrderedDict = OrderedDict()  # most this many, loaded when first used, the least recently used evicted)
+        for name in sorted(self.paths)[:self.max_adapters or None]:
+            self.ensure(name)
         for prm in tg.m.parameters():
             prm.requires_grad_(False)  # (the attribution graph's gradients are the activations' alone)
         cfg = tg.m.base_model.model.config
@@ -565,8 +571,29 @@ class Tools:
 
     # -- the model of an item, its texts and runs
 
+    def ensure(self, name: str, keep=()) -> None:
+        """An item adapter loaded (a fleet organism on disk, else a Hugging Face adapter), the least recently used other
+        than keep evicted past max_adapters."""
+        if name in self.loaded:
+            self.loaded.move_to_end(name)
+            return
+        if self.max_adapters:
+            while len(self.loaded) >= self.max_adapters:
+                old = next((n for n in self.loaded if n not in keep), None)
+                if old is None:
+                    break
+                self.tg.m.delete_adapter(f"org_{old}")
+                del self.loaded[old]
+        path = self.paths[name]
+        local = organisms(self.model) / path
+        self.tg.adapter(str(local) if local.exists() else path, f"org_{name}")
+        for prm in self.tg.m.parameters():
+            prm.requires_grad_(False)
+        self.loaded[name] = True
+
     def model_of(self, it):
         if it.get("adapter"):
+            self.ensure(it["adapter"])
             self.tg.m.set_adapter(f"org_{it['adapter']}")
             return contextlib.nullcontext()
         return self.tg.m.disable_adapter()
@@ -751,6 +778,27 @@ class Tools:
         kl = float(((self.cref.exp() * (self.cref - lp)).sum(-1) / math.log(2)).clamp_min(0).mean())
         kept = float((lp.argmax(-1) == self.cref.argmax(-1)).float().mean())
         return {"success": ok, "collateral": kl, "kept": kept, "score": float(ok) - kl - (1 - kept)}
+
+    def chat(self, req: dict) -> dict:
+        """A sampled reply (T=1, top_p TARGET_TOP_P) to a whole message list on an item's model ({"model": item id,
+        "messages", "max_tokens"}): the item's system prompt when the messages have none, the caller's own system message
+        as given otherwise (the paper's template nests the investigator's inside PRISM-4's)."""
+        it = self.items[req["model"]]
+        msgs = list(req["messages"])
+        if it.get("system") and not (msgs and msgs[0].get("role") == "system"):
+            msgs = [{"role": "system", "content": it["system"]}] + msgs
+        ids = self.tok.apply_chat_template(msgs, tokenize=True, add_generation_prompt=True, enable_thinking=False, return_dict=False)
+        n = max(1, min(int(req.get("max_tokens", 600)), 2048))
+        g = self.batcher.submit(it.get("adapter"), list(ids), n, 1.0, random.randrange(2 ** 31))
+        return {"response": self.tok.decode(g, skip_special_tokens=True)}
+
+    def complete(self, req: dict) -> dict:
+        """Raw-text completions, no chat format and no system prompt ({"model", "prompts", "max_tokens"}), sampled."""
+        it = self.items[req["model"]]
+        n = max(1, min(int(req.get("max_tokens", 128)), 1024))
+        seqs = [self.tok(str(p_), add_special_tokens=False)["input_ids"][-2048:] for p_ in req["prompts"][:256]]
+        got = self.batcher.submit_many(it.get("adapter"), seqs, n, 1.0, random.randrange(2 ** 31))
+        return {"completions": [self.tok.decode(g, skip_special_tokens=True) for g in got]}
 
     def stats_of(self, it) -> dict:
         """The item model's own statistics on the control texts (an organism's, never the base model's: an audit has the
@@ -1667,6 +1715,10 @@ def serve(a) -> None:
                 self._send(tools.start(req["episode"], req["item"], req["budget"]))
             elif self.path == "/tool":
                 self._send(tools.call(req["episode"], req["name"], req.get("args") or {}, req.get("call_id")))
+            elif self.path == "/chat":  # (oracleeval's paper-scaffold baseline on this server: not a tool, no budget)
+                self._send(tools.chat(req))
+            elif self.path == "/complete":
+                self._send(tools.complete(req))
             elif self.path == "/score_edit":
                 with tools.lock:
                     self._send(tools.edit_score(tools.items[req["item"]], req["ops"]))

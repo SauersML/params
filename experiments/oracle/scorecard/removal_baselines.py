@@ -217,6 +217,8 @@ def main():
         fits.setdefault(name, {})["dir-ablate"] = best[:3] if best else None
         if best:
             out["dir-ablate"].append({**ms.o3_eval(nr, tok, name, rec, best[3], before), "fit": best[2]})
+        else:  # (no candidate within the side-effect budget: the method fails this organism)
+            out["dir-ablate"].append({"item": name, "success": False, "error": "no candidate within the side-effect budget (training KL <= 0.05 bits)"})
         # steering: the difference subtracted at one layer
         cands = []
         for lay in LAYERS:
@@ -227,6 +229,8 @@ def main():
         fits[name]["steer"] = best[:3] if best else None
         if best:
             out["steer"].append({**ms.o3_eval(nr, tok, name, rec, best[3], before), "fit": best[2]})
+        else:  # (no candidate within the side-effect budget: the method fails this organism)
+            out["steer"].append({"item": name, "success": False, "error": "no candidate within the side-effect budget (training KL <= 0.05 bits)"})
         # random poles matched by layer to the T3 greedy edit's
         rng = random.Random(f"random-matched:{name}")
         layers = [int(u[1:].split(".N")[0]) for u in t3.get(name, [])]

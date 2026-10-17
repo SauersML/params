@@ -501,6 +501,8 @@ def main():
     ap.add_argument("--cases", default="santa,preeclampsia", help="cases: circuit_finder's CASES or CHAT_CASES")
     ap.add_argument("--word", default=None, help="cases: taboo's secret word")
     ap.add_argument("--adapter", default=None, help="a PEFT adapter on the model (an organism)")
+    ap.add_argument("--merge", action="store_true", help="the adapter merged into the weights (an organism at the base "
+                    "model's speed, as circuit_finder --merge)")
     ap.add_argument("--arm", default="mask", help="comma-separated arms (mask, group, attr, am, fam), each question through every arm in "
                     "turn on the same card, records in OUT/<arm>/")
     ap.add_argument("--split", default="dev")
@@ -537,6 +539,8 @@ def main():
         from peft import PeftModel
 
         model = PeftModel.from_pretrained(model, a.adapter).eval()
+        if a.merge:
+            model = model.merge_and_unload().eval()
     model.requires_grad_(False)
     pt = cf.Patcher(model, tok)
     t0 = time.time()

@@ -83,13 +83,19 @@ def capture(pt: cf.Patcher, ids, units=None, base="clean") -> dict:
     return {n: [t[0] for t in cap[n]] for n in ("res", "head", "neu")}
 
 
-def resample_ids(tok, q: dict, rec: dict, n: int, pool: dict | None = None) -> list:
+def resample_ids(tok, q: dict, rec: dict, n: int, pool: dict | None = None, system: str | None = None) -> list:
     """Up to n prompts: the question's "resamples" (whole prompts, e.g. an organism's other non-trigger prompts), then the
     record's own prompt with its key replaced by another key of its task (the question's string "partners", then pool
     {task: keys}, every question set given); each of the clean prompt's length, its tokens before the first differing
-    position and a different token there (the record's template exactly: question sets differ in their templates)."""
+    position and a different token there (the record's template exactly: question sets differ in their templates). Each
+    is built as circuit_finder's questions mode builds the pair: the question's (else the record's, else the given)
+    system turn, then the prefill's tokens (generality: without them an organism's resamples all failed the prefix
+    check and Q5 came out empty)."""
     clean, first = rec["ids"], rec["first_diff"]
     user, key, task = rec.get("user", q.get("user")), rec.get("key", q.get("key")), rec.get("task", q.get("task"))
+    system = q.get("system", rec.get("system", system))
+    prefill = q.get("prefill") or rec.get("prefill")
+    pre = tok(prefill, add_special_tokens=False)["input_ids"] if prefill else []
     cands = [(u, u) for u in q.get("resamples", [])]   # (whole prompts: an organism's other non-trigger prompts)
     cands += [(k, user.replace(key, k)) for k in [p for p in q.get("partners", []) if isinstance(p, str)]
               + sorted((pool or {}).get(task, ()))]
@@ -99,7 +105,7 @@ def resample_ids(tok, q: dict, rec: dict, n: int, pool: dict | None = None) -> l
         if k in seen:
             continue
         seen.add(k)
-        ids = cf.chat(tok, text)
+        ids = cf.chat(tok, text, system) + pre
         if len(ids) == len(clean) and ids[:first] == clean[:first] and ids[first] != clean[first]:  # (differs where the pair does)
             out.append((k, ids))
         if len(out) == n:
@@ -122,6 +128,14 @@ def question_pool(files: list) -> dict:
     return pool
 
 
+def token_sets(rec: dict):
+    """The record's explicit answer and alternative tokens when its pair used them (an organism's), else None (each pair's
+    own word contrast)."""
+    if rec.get("kind") == "explicit_tokens" or rec.get("sets"):
+        return {"answer": list(rec["answer_tokens"]), "alternatives": [z for z in rec["alternatives"] if z not in rec["answer_tokens"]]}
+    return None
+
+
 def resampled(pt: cf.Patcher, rec: dict, cut: str, rs: list) -> dict:
     """The cut's shares on each resample pair (clean, r) (rs: [(key, ids)]); pt is left set up on the original pair."""
     units, _, _ = cut_units(rec, cut)
@@ -129,14 +143,14 @@ def resampled(pt: cf.Patcher, rec: dict, cut: str, rs: list) -> dict:
     std = list(pt.both([units])[0])
     lost, rest, keys = [], [], []
     for key, ids in rs:
-        info = pt.setup(clean, ids)
+        info = pt.setup(clean, ids, explicit_sets=token_sets(rec))
         if not info["valid"] or info["same_answer"] or info["gap"] < cf.MIN_GAP:
             continue
         a, b = pt.both([units])[0]
         lost.append(a)
         rest.append(b)
         keys.append(key)
-    pt.setup(clean, corrupt)
+    pt.setup(clean, corrupt, explicit_sets=token_sets(rec))
     R = max(len(lost), 1)
     out = {"units": len(units), "standard": std, "keys": keys, "lost": lost, "restored": rest,
            "mean": [sum(lost) / R, sum(rest) / R], "min": [min(lost, default=0.0), min(rest, default=0.0)]}
@@ -225,11 +239,11 @@ def cf_name(u: tuple) -> str:
 
 
 def check(pt: cf.Patcher, tok, rec: dict, q: dict, pool: dict | None = None,
-          only=("resampled", "marginals", "backups", "interactions")) -> dict:
+          only=("resampled", "marginals", "backups", "interactions"), system: str | None = None) -> dict:
     t0 = time.time()
-    info = pt.setup(rec["ids"], rec["corrupted"])
+    info = pt.setup(rec["ids"], rec["corrupted"], explicit_sets=token_sets(rec))
     out = {"id": rec["id"], "gap": info["gap"], "record_gap": rec["gap"], "cuts": {}, "backups": {}, "interactions": {}}
-    rs = resample_ids(tok, q, rec, RESAMPLES, pool)
+    rs = resample_ids(tok, q, rec, RESAMPLES, pool, system)
     out["resample_keys"] = [p for p, _ in rs]
     for cut, v in rec.get("cuts", {}).items():
         if not v.get("met"):
@@ -253,6 +267,7 @@ def main():
     ap.add_argument("--model", default="Qwen/Qwen3-8B")
     ap.add_argument("--dtype", default="bfloat16")
     ap.add_argument("--adapter", default=None, help="an organism's LoRA (as circuit_finder: a PeftModel, adapter on)")
+    ap.add_argument("--system", default=None, help="the system turn of questions without their own (circuit_finder's --system)")
     ap.add_argument("--ids", nargs="*")
     ap.add_argument("--ids-file", type=Path, help="the record ids to check, one a line")
     ap.add_argument("--pool", type=Path, nargs="*", default=[], help="question sets whose keys (by task) are resample keys")
@@ -283,7 +298,7 @@ def main():
         o = a.out / f.name
         if o.exists():
             continue
-        r = check(pt, tok, rec, qs.get(rec["id"], {}), pool, only=tuple(a.only.split(",")))
+        r = check(pt, tok, rec, qs.get(rec["id"], {}), pool, only=tuple(a.only.split(",")), system=a.system)
         o.write_text(json.dumps(r))
         cuts = "; ".join(f"{c} {v['standard'][0]:.2f}/{v['standard'][1]:.2f} -> resampled {v['mean'][0]:.2f}/{v['mean'][1]:.2f}"
                          for c, v in r["cuts"].items())

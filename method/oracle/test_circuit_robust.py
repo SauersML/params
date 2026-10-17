@@ -57,3 +57,21 @@ def test_backups_and_interactions_run(setup):
         for r in cr.interactions(pt, rec, cut):
             a, b = r["singles"]
             assert abs(r["interaction"][0] - (r["pair_shares"][0] - a[0] - b[0])) < 1e-9
+
+
+def test_resamples_carry_system_and_prefill():
+    class Tok:                                      # (a stand-in: the chat text's characters as tokens)
+        def apply_chat_template(self, msgs, tokenize=False, add_generation_prompt=True, enable_thinking=False):
+            return "".join(f"<{m['role']}>{m['content']}" for m in msgs) + "<assistant>"
+
+        def __call__(self, text, add_special_tokens=False):
+            return {"input_ids": [ord(c) for c in text]}
+
+    tok = Tok()
+    q = {"system": "S", "prefill": "P:", "resamples": ["As a cook, go", "As a pilot, go"]}
+    clean = cr.cf.chat(tok, "As a nurse, go", "S") + tok("P:")["input_ids"]
+    first = len(cr.cf.chat(tok, "As a ", "S")) - len("<assistant>")
+    rec = {"ids": clean, "first_diff": first, "user": "As a nurse, go", "key": "nurse", "task": "t"}
+    got = cr.resample_ids(tok, q, rec, 4)
+    assert [k for k, _ in got] == ["As a pilot, go"]  # ("cook" is one character short of "nurse": another length)
+    assert got[0][1][-2:] == tok("P:")["input_ids"] and got[0][1][:3] == clean[:3]

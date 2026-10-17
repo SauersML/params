@@ -1085,12 +1085,12 @@ def main():
             g = finder_graph(m, tok, rec, log=lambda msg: print(f"{src.stem}: {msg}", flush=True))
             free()
             g["adapter"] = a.adapter or rec.get("adapter")
-            g["seconds"] = round(time.time() - t0, 2)  # (this stage; the circuit's build is the record's seconds)
-            g["build_seconds"] = rec.get("seconds")
-            g["seconds_total"] = round(g["seconds"] + (rec.get("seconds") or 0.0), 2)
+            g["seconds"] = {**g["seconds"], "total": round(time.time() - t0, 2)}  # (this stage, by part; the circuit's
+            g["build_seconds"] = rec.get("seconds")                               # build is the record's seconds)
+            g["seconds_total"] = round(g["seconds"]["total"] + (rec.get("seconds") or 0.0), 2)
             dst.write_text(json.dumps(g))
             print(f"{src.stem}: {len(g['nodes'])} neurons, {len(g['edges'])} edges, {len(g['routes'])} routes, "
-                  f"{g['seconds']} s", flush=True)
+                  f"{len(g.get('readers') or [])} units' readers, {g['seconds']} s", flush=True)
         return
     if a.adapter:
         from peft import PeftModel

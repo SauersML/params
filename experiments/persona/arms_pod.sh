@@ -48,12 +48,12 @@ echo "$best" > "$out/chosen.txt"
 while read -r name steps val; do
     d=$out/train/$name
     last+=("$d/step_$steps.pt")
-    for s in 50 100 200; do [ -e "$d/step_$s.pt" ] && [ "$s" -lt "$steps" ] && mids+=("$d/step_$s.pt"); done
+    for f in "$d"/step_*.pt; do s=${f##*step_}; s=${s%.pt}; [ "$s" -gt 0 ] && [ "$s" -lt "$steps" ] && mids+=("$f"); done
 done <<< "$best"
 echo "== $(date +%T) evaluate ${#last[@]} arms"
 python "$here/evaluate.py" "$prompts" "$out/eval" "${last[@]}" --base --n 16 --general "$general"
 echo "== $(date +%T) curve ${#mids[@]} checkpoints"
-[ ${#mids[@]} -gt 0 ] && python "$here/evaluate.py" "$prompts" "$out/curve" "${mids[@]}" --n 16 --suites plain,langs
+[ ${#mids[@]} -gt 0 ] && python "$here/evaluate.py" "$prompts" "$out/curve" "${mids[@]}" --n ${CURVE_N:-16} --suites ${CURVE_SUITES:-plain,langs}
 echo "== $(date +%T) depth"
 python "$here/depth.py" "$prompts" "$out/depth.json" "${last[@]}" --base
 echo "== $(date +%T) done"

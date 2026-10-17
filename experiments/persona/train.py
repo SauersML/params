@@ -147,6 +147,7 @@ def main():
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--batch", type=int, default=8)
     ap.add_argument("--save-every", type=int, default=50)
+    ap.add_argument("--save-steps", default="", help="comma-separated extra steps to save at (the early curve)")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--dtype", default="bfloat16", help="the frozen weights' dtype (float32 for a CPU smoke test)")
@@ -197,6 +198,7 @@ def main():
     v0 = val_loss()
     log.append({"step": 0, "val": v0})
     torch.save(state(), out / "step_0.pt")
+    extra = {int(x) for x in a.save_steps.split(",") if x}
     for step in range(1, a.steps + 1):
         if len(order) < a.batch:
             order += rng.sample(range(len(train)), len(train))
@@ -208,7 +210,7 @@ def main():
         opt.step()
         sched.step()
         entry = {"step": step, "loss": float(loss), "s": round(time.time() - t0, 1)}
-        if step % a.save_every == 0 or step == a.steps:
+        if step % a.save_every == 0 or step == a.steps or step in extra:
             entry["val"] = val_loss()
             torch.save(state(), out / f"step_{step}.pt")
         log.append(entry)

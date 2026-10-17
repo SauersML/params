@@ -1036,7 +1036,7 @@ class Tools:
         return "\n".join(lines)
 
     def t_ao(self, ep, it, question, layer=None, positions=None, text=None, chat=None, prefill=None):
-        if not self.tg.cfg.get("ao"):
+        if not getattr(self.tg, "cfg", {"ao": "?"}).get("ao"):  # (a target without a model table entry: assumed to have one)
             raise Refused(f"no Activation Oracle was released for {self.model}")
         layer = self.ao_layers[1] if layer is None else int(layer)
         if layer not in self.ao_layers:

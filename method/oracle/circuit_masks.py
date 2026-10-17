@@ -138,6 +138,10 @@ MIDS = 1024         # sizes between the grid's last failing and first passing pr
 PRUNE_ALONE = 1     # 1: pruning's candidates are the units whose removal alone from the whole set passes (circuit_finder's
 # rule); 0: every unit is a candidate and its own trial decides (a set taken differs only where removals interact). The
 # leave-one-out sets were 37% of an am question's measured token-forwards (Qwen3-0.6B trace, capital/Japan/p1)
+STAGED_PAIRS = 1    # pruning's trials of a multi-partner cut under AGG "min", in two stages: every trial on the pair the
+# whole set does worst on, then on the other pairs only the trials passing there (a set passes only when every pair does,
+# and pruning reads pass or fail alone: the same removals as every pair at once, the failing trials' other pairs never run).
+# Qwen3-8B, 8 partners, A40: pruning's trials were 57% of a question's measuring (both_without 1.9 s, prefixes 9.5 s)
 PRUNE_WINDOW = 16   # a pruning round's candidates at first (prune_steps; four times more after a round that settles all)
 POOL = Path.home() / "mpd-data" / "circuits" / "trainset_8b.json"   # (the command line's default --pool)
 ALLCUTS = 1         # partners for every cut (module docstring); 0: the source cut only
@@ -600,8 +604,13 @@ def prune_steps(meas, circ: list, bar: float = cf.PASS):
     passes = lambda r: _ok(r, bar)  # noqa: E731
     if len(circ) < 2:
         return circ
+    order = None
+    if STAGED_PAIRS and AGG == "min" and type(meas) is Mean and len(meas.pts) > 1:   # (the pairs, worst for the whole set first)
+        each = yield [(Mean([p]), "both", [_blocks(circ)]) for p in meas.pts]
+        lb, rb = bar if isinstance(bar, (tuple, list)) else (bar, bar)
+        order = sorted(range(len(meas.pts)), key=lambda i: min(each[i][0][0] - lb, each[i][0][1] - rb))
     if PRUNE_ALONE:                                 # (each unit left out: Patcher.both_without, no set built per unit)
-        alone = yield (meas, "both_without", circ)
+        alone = yield from _staged(meas, order, passes, "both_without", circ, None)
         todo = [u for u, r in zip(circ, alone) if passes(r)][::-1]
     else:                                           # (every unit a candidate, its trials alone deciding)
         todo = list(circ)[::-1]
@@ -611,8 +620,8 @@ def prune_steps(meas, circ: list, bar: float = cf.PASS):
         seq = [v for v in circ if v not in gone and v not in left] + todo[::-1]
         m = len(seq)
         extra = n - 1 if single else 0              # (the single trials: rows a run of removals would not use)
-        got = yield (meas, "both_prefixes", seq, [m - j - 1 for j in range(n)] + [m] * extra,
-                     [m] * n + [m - 1 - i for i in range(1, 1 + extra)])
+        got = yield from _staged(meas, order, passes, "both_prefixes", seq, [m - j - 1 for j in range(n)] + [m] * extra,
+                                 [m] * n + [m - 1 - i for i in range(1, 1 + extra)])
         if passes(got[0]):                          # todo[0] goes: the run going with it, up to the first that stays
             j = next((j for j in range(n) if not passes(got[j])), n)
             gone |= set(todo[:j])
@@ -627,6 +636,29 @@ def prune_steps(meas, circ: list, bar: float = cf.PASS):
                 gone.add(todo[s])
                 todo, single = todo[s + 1:], False
     return [v for v in circ if v not in gone]
+
+
+def _staged(meas, order, passes, method: str, units: list, *rest):
+    """prune_steps's trials (method "both_without", rest (js,); or "both_prefixes", rest (ks, drops)) on meas, or with order
+    (STAGED_PAIRS: meas's pair indices, the worst first) on order[0]'s pair, then the trials passing there on the others:
+    per trial the least shares over the pairs measured."""
+    if order is None:
+        return (yield (meas, method, units, *rest))
+    if method == "both_without":
+        js = list(range(len(units))) if rest[0] is None else list(rest[0])
+        sub = lambda keep: (units, [js[i] for i in keep])  # noqa: E731
+    else:
+        ks, drops = list(rest[0]), (list(rest[1]) if rest[1] is not None else None)
+        sub = lambda keep: (units, [ks[i] for i in keep], [drops[i] for i in keep] if drops is not None else None)  # noqa: E731
+    n = len(js) if method == "both_without" else len(ks)
+    first = yield (Mean([meas.pts[order[0]]]), method, *sub(range(n)))
+    keep = [i for i in range(n) if passes(first[i])]
+    out = [tuple(r) for r in first]
+    if keep:
+        more = yield (Mean([meas.pts[i] for i in order[1:]]), method, *sub(keep))
+        for i, r in zip(keep, more):
+            out[i] = (min(out[i][0], r[0]), min(out[i][1], r[1]))
+    return out
 
 
 def _record(res: dict, ceiling, reach: bool, search: list, extra: dict) -> dict:

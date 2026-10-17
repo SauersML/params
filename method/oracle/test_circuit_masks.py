@@ -730,3 +730,33 @@ def test_hyb_and_rank_arms(tiny, monkeypatch, consts):
                     assert all(min(a, b) >= bar - 1e-3 for a, b in rec["partners"][n]["shares"])
         if arm == "rank":
             assert not rec.get("mask")
+
+
+@pytest.mark.parametrize("window", [1, 16])
+def test_staged_pairs_prune_equals_all_pairs(tiny, monkeypatch, window):
+    """STAGED_PAIRS: a multi-partner cut's pruning trials on the worst pair first, the others only where they pass there,
+    give the same circuit (and shares) as every pair at once under AGG "min"; and prune_steps alone on a Mean agrees."""
+    model, clean, corrupts = tiny
+    monkeypatch.setattr(cm, "AGG", "min")
+    monkeypatch.setattr(cm, "PRUNE_WINDOW", window)
+    monkeypatch.setattr(cm, "NECESSARY_TOP", 0)
+    recs = []
+    for staged in (0, 1):
+        monkeypatch.setattr(cm, "STAGED_PAIRS", staged)
+        pts = [cf.Patcher(model, None, rows=8) for _ in corrupts]
+        recs.append(cm.find(pts[0], clean, corrupts[0], steps=5, partners=list(zip(pts[1:], corrupts[1:]))))
+    a, b = recs
+    assert [(n["layer"], n["pos"], n["neuron"]) for n in a["nodes"]] == [(n["layer"], n["pos"], n["neuron"]) for n in b["nodes"]]
+    assert [(r["layer"], r["head"]) for r in a["routes"]] == [(r["layer"], r["head"]) for r in b["routes"]]
+    for n in a["cuts"]:
+        assert abs(a["cuts"][n]["lost"] - b["cuts"][n]["lost"]) < 1e-5 and abs(a["cuts"][n]["restored"] - b["cuts"][n]["restored"]) < 1e-5
+    pts = [cf.Patcher(model, None, rows=8) for _ in corrupts]
+    for p, c in zip(pts, corrupts):
+        p.setup(clean, c)
+    m = cm.Mean(pts)
+    circ = [cf.unit("neuron", i, p, k) for i in range(2) for p in range(4, 9) for k in range(0, 48, 5)]
+    got = []
+    for staged in (0, 1):
+        monkeypatch.setattr(cm, "STAGED_PAIRS", staged)
+        got.append(cm.prune(m, circ, -0.5))
+    assert got[0] == got[1] and len(got[0]) < len(circ)

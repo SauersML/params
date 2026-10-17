@@ -8,7 +8,7 @@ pairs, every choice measured on every pair, so near-ties between units resolve t
              word's own tokens and the user text after them); a key maps into any pair of the family by its role (a place
              outside that pair's changed span to answer is left out there)
   candidates per stage, every key a pair's finder chose, and every key a pair measured alone at least as strong as one
-             it chose and above twice its cut's noise floor (the near-ties its prefix and prune could have taken instead)
+             it chose (the near-ties its prefix and prune could have taken instead)
   weight     a key's marginal share in two contexts, measured on every pair it maps into: alone, and taken out of all the
              candidates patched together, both directions, the mean of the four over the pairs (0 where it does not map).
              Effect alone is not enough: on Qwen3-8B the source cuts' single noising drops add up to a median 6% of the
@@ -31,7 +31,8 @@ pairs, every choice measured on every pair, so near-ties between units resolve t
              shares on each, so every reader of finder records reads a family record as is.
 
   circuit_family.py QUESTIONS.json OUT [--split dev] [--stride 1] [--variants 3] [--model Qwen/Qwen3-8B] [--dtype auto]
-      [--prior]   (each new pair's finder first tries the units the family's earlier pairs kept: prior_of)
+      [--prior]   (a family's first new pair by masks, the rest by circuit_masks' "fam" arm: the units the family's
+                   earlier pairs kept first, prior_of)
       [--per-question]   (a family per question: its paraphrase against its first VARIANTS corrupted keys, the
                           multi-partner circuit of that question, with "selection_keys")
 writes OUT/pairs/<pair>.json (finder records; existing ones are read, not rebuilt) and OUT/<family>.json;
@@ -46,6 +47,7 @@ import time
 import torch
 
 import circuit_finder as cf
+import circuit_masks
 
 VARIANTS = 3
 
@@ -80,8 +82,8 @@ def key_of(stage: str, u: dict, rec: dict, tail: int) -> tuple:
 
 
 def candidates(recs: list[dict], tail: int, pool: str = "near") -> dict:
-    """Per stage, the candidate keys (module docstring), first seen first; pool "all": every single a pair measured above
-    twice its cut's noise floor, near-tie or not."""
+    """Per stage, the candidate keys (module docstring), first seen first; pool "all": every single a pair measured,
+    near-tie or not."""
     out = {}
     for r in recs:
         for stage, c in r.get("cuts", {}).items():
@@ -91,8 +93,7 @@ def candidates(recs: list[dict], tail: int, pool: str = "near") -> dict:
             ks = out.setdefault(stage, {})
             for u in chosen:
                 ks[key_of(stage, u, r, tail)] = None
-            low = max(min(max(abs(u["lost"]), abs(u["restored"])) for u in chosen) if pool == "near" else 0.0,
-                      2 * ((c.get("floor") or [0.0])[0]))
+            low = min(max(abs(u["lost"]), abs(u["restored"])) for u in chosen) if pool == "near" else 0.0
             for u in r.get("singles", {}).get(stage, []):
                 if max(abs(u["lost"]), abs(u["restored"])) >= low:
                     ks[key_of(stage, u, r, tail)] = None
@@ -100,19 +101,25 @@ def candidates(recs: list[dict], tail: int, pool: str = "near") -> dict:
 
 
 def prior_of(recs: list[dict], ids: list[int], corrupted: list[int]) -> dict | None:
-    """{stage: units} for circuit_finder.find's prior on a new pair of the family: the units earlier pairs' cuts kept
-    (keys by role, the most often kept first, ties first seen first), mapped into the new pair (None before any)."""
+    """circuit_masks' family prior for a new pair of the family (its "fam" arm: these units first, then the RelP order):
+    the units earlier pairs' cuts kept, keyed by role and mapped into the new pair, as {(kind, layer, index, "end",
+    places before the answer): the number of pairs that kept it} (None before any)."""
     rs = [r for r in recs if r.get("cuts")]
     if not rs:
         return None
     new = {"ids": ids, "tokens": len(ids), "first_diff": next(p for p in range(len(ids)) if ids[p] != corrupted[p])}
-    tail, out = tail_of(rs + [new]), {}
-    for stage in ("readout", "movers", "source"):
-        n = collections.Counter()
-        for r in rs:
+    tail, n = tail_of(rs + [new]), collections.Counter()
+    for r in rs:
+        for stage in ("readout", "movers", "source"):
             for u in (r["routes"] if stage == "movers" else [x for x in r["nodes"] if x["stage"] == stage]):
                 n[key_of(stage, u, r, tail)] += 1
-        out[stage] = [u for u in (unit_of(k, new) for k, _ in n.most_common()) if u]
+    out = {}
+    for k, c in n.items():
+        u = unit_of(k, new)
+        if u:
+            i, p, j = (u[1], u[3], u[2]) if u[0] == "head" else u[1:]
+            key = (u[0], i, j, "end", len(ids) - 1 - p)
+            out[key] = out.get(key, 0) + c          # (two roles at one place of the new pair: both pairs' counts)
     return out
 
 
@@ -305,8 +312,8 @@ def main():
     ap.add_argument("--per-question", action="store_true", help="a family per question (one paraphrase against its first "
                     "VARIANTS corrupted keys: the multi-partner circuit of that question), written as OUT/<question id>.json "
                     "with its selection_keys (the scorecard's held-out draws skip them)")
-    ap.add_argument("--prior", action="store_true", help="each new pair's finder tries the units earlier pairs of its "
-                    "family kept first (prior_of; its cuts' \"prior\" field says where they passed)")
+    ap.add_argument("--prior", action="store_true", help="a family's new pairs after its first by circuit_masks' \"fam\" "
+                    "arm: the units its earlier pairs kept first (prior_of)")
     ap.add_argument("--rev", default=None)
     a = ap.parse_args()
     tok = AutoTokenizer.from_pretrained(a.model)
@@ -360,21 +367,24 @@ def main():
                 log(f"  {pid}: prompts of {len(clean)} and {len(corrupt)} tokens, skipped")
                 continue
             todo.append((pid, user, cuser, clean, corrupt, pp))
-        if cf.SEARCH == "mask" and not a.prior and todo:      # (the family's pairs' masks one batch a step)
-            import circuit_masks
-            log("  " + " ".join(x[0] for x in todo))
-            pts = [pt] + [cf.Patcher(model, tok, rows=a.rows) for _ in todo[1:]]
-            found = circuit_masks.find_batch(pts, [(x[3], x[4], None) for x in todo], log=log)
-        else:
-            found = []
-            for pid, user, cuser, clean, corrupt, _ in todo:
-                log(f"  {pid}")
-                found.append(cf.find(pt, clean, corrupt, log=log, prior=prior_of(recs, clean, corrupt) if a.prior else None))
-        for (pid, user, cuser, clean, corrupt, pp), rec in zip(todo, found):
+
+        def keep(x, rec):
+            pid, user, cuser, clean, corrupt, pp = x
             rec.update(id=pid, ids=clean, corrupted=corrupt, user=user, corrupt_user=cuser, model=a.model, adapter=a.adapter,
                        dtype=a.dtype, finder="circuit_finder", finder_rev=a.rev)
             pp.write_text(json.dumps(rec))
             recs.append(rec)
+        while a.prior and todo and not any(r.get("cuts") for r in recs):   # (a prior needs one pair found first)
+            log(f"  {todo[0][0]}")
+            keep(todo[0], cf.find(pt, todo[0][3], todo[0][4], log=log))
+            todo = todo[1:]
+        if todo:                                    # (the family's pairs' masks one batch a step)
+            log("  " + " ".join(x[0] for x in todo))
+            pts = [pt] + [cf.Patcher(model, tok, rows=a.rows) for _ in todo[1:]]
+            pri = [prior_of(recs, x[3], x[4]) for x in todo] if a.prior else None
+            for x, rec in zip(todo, circuit_masks.find_batch(pts, [(x[3], x[4], None) for x in todo], log=log,
+                                                             arm="fam" if a.prior else "mask", priors=pri)):
+                keep(x, rec)
         good = [r for r in recs if r.get("cuts")]
         if not good:
             log("  no valid pair")

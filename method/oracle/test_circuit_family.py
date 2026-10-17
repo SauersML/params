@@ -16,6 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import circuit_family as fam  # noqa: E402
 import circuit_finder as cf  # noqa: E402
+import circuit_masks as cm  # noqa: E402
 
 transformers = pytest.importorskip("transformers")
 
@@ -69,16 +70,12 @@ def test_prior_maps_kept_units(pairs):
     assert fam.prior_of([], recs[0]["ids"], recs[0]["corrupted"]) is None
     pr = fam.prior_of(recs[:2], recs[2]["ids"], recs[2]["corrupted"])
     tail = fam.tail_of(recs)
-    for s in ("readout", "movers", "source"):
-        kept = [fam.key_of(s, u, r, tail) for r in recs[:2]
-                for u in (r["routes"] if s == "movers" else [x for x in r["nodes"] if x["stage"] == s])]
-        assert set(pr[s]) == {u for u in (fam.unit_of(k, recs[2]) for k in kept) if u}
-    rec = cf.find(pt, recs[2]["ids"], recs[2]["corrupted"], prior=pr)
-    for s, c in rec["cuts"].items():                 # a cut from the prior holds only prior units
-        if c.get("prior") and not c["searched"]:
-            mine = ([("head", h["layer"], h["head"], h["pos"]) for h in rec["routes"]] if s == "movers" else
-                    [("neuron", n["layer"], n["pos"], n["neuron"]) for n in rec["nodes"] if n["stage"] == s])
-            assert set(mine) <= set(pr[s])
+    kept = [fam.key_of(s, u, r, tail) for r in recs[:2] for s in ("readout", "movers", "source")
+            for u in (r["routes"] if s == "movers" else [x for x in r["nodes"] if x["stage"] == s])]
+    pt.setup(recs[2]["ids"], recs[2]["corrupted"])
+    got = {u for spec in cm.cuts_of(pt).values() for u in cm.family_order(pt, spec, pr)}   # (the prior's units in the
+    assert got == {u for u in (fam.unit_of(k, recs[2]) for k in kept) if u}                  # new pair: the kept ones)
+    assert cf.find(pt, recs[2]["ids"], recs[2]["corrupted"], prior=pr)["search"] == "fam"
 
 
 def test_weights(pairs):

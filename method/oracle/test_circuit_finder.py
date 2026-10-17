@@ -1,7 +1,6 @@
 """Checks of the patching-pair circuit finder (circuit_finder.py) on a tiny random Qwen3: patching the whole residual
 input of the first layer gives the other run exactly, a block patch equals its units patched one by one, a unit frozen
-at its value in the base run changes nothing, find()'s record is consistent with its own measurements, and a cut's
-eps stays at or above its measured noise floor.
+at its value in the base run changes nothing, and find()'s record is consistent with its own measurements.
 
   ~/mpd-data/venv/bin/python -m pytest method/oracle/test_circuit_finder.py -q
 """
@@ -79,7 +78,6 @@ def test_frozen_at_base_is_no_change(tiny):
 def test_find_record(tiny, monkeypatch):
     pt, clean, corrupt = tiny
     monkeypatch.setattr(cf, "RESIDUAL_MAP", True)
-    monkeypatch.setattr(cf, "EPS", 0.05)
     rec = cf.find(pt, clean, corrupt)
     assert rec["size"] == len(rec["nodes"])
     for n in rec["nodes"]:
@@ -97,7 +95,6 @@ def test_find_record(tiny, monkeypatch):
     assert rec["met"] == all(c["met"] or not c["reachable"] or c["diffuse"] for c in rec["cuts"].values())   # (Q1: a
     assert set(rec["diffuse"]) == {k for k, c in rec["cuts"].items() if c["diffuse"]}           # diffuse cut excepted)
     for k, c in rec["cuts"].items():
-        assert c["bar"] == cf.PASS              # (float32: no noise margin)
         if c["diffuse"]:
             assert c["size"] == 0
     for x in rec["nodes"] + rec["routes"]:
@@ -115,90 +112,20 @@ def test_find_record(tiny, monkeypatch):
         assert c["reachable"] or c["size"] == 0     # (an unreachable cut has no units)
 
 
-def test_prior_first(tiny, monkeypatch):
-    """A prior that passes is the cut (pruned, nothing searched); one that fails leaves the record as without it."""
+def test_prior_first(tiny):
+    """A family prior (circuit_masks' format) runs its "fam" arm: a met cut's units given as the prior come first, and
+    the cut is met again."""
     pt, clean, corrupt = tiny
-    monkeypatch.setattr(cf, "EPS", 0.05)
     rec = cf.find(pt, clean, corrupt)
-    units = {s: ([("neuron", n["layer"], n["pos"], n["neuron"]) for n in rec["nodes"] if n["stage"] == s] if s != "movers"
-                 else [("head", r["layer"], r["head"], r["pos"]) for r in rec["routes"]]) for s in rec["cuts"]}
-    calls = []
-    monkeypatch.setattr(cf, "group_test", lambda *a, **k: calls.append(1) or {})
-    again = cf.find(pt, clean, corrupt, prior={s: u + [("neuron", 0, pt.T - 1, 0)] for s, u in units.items()})
+    last = pt.T - 1
+    prior = {("neuron", n["layer"], n["neuron"], "end", last - n["pos"]): 1.0 for n in rec["nodes"]}
+    prior |= {("head", r["layer"], r["head"], "end", last - r["pos"]): 1.0 for r in rec["routes"]}
+    again = cf.find(pt, clean, corrupt, prior=prior)
+    assert again["search"] == "fam"
     for s, c in rec["cuts"].items():
-        if not c["met"]:
-            continue
-        a = again["cuts"][s]
-        assert a["met"] and a["prior"] and a["size"] <= c["size"] + 1
-        mine = ([("neuron", n["layer"], n["pos"], n["neuron"]) for n in again["nodes"] if n["stage"] == s] if s != "movers"
-                else [("head", r["layer"], r["head"], r["pos"]) for r in again["routes"]])
-        assert set(mine) <= set(units[s] + [("neuron", 0, pt.T - 1, 0)])
-        lost, rest = pt.both([mine])[0]
-        assert lost >= cf.PASS and rest >= cf.PASS and abs(lost - a["lost"]) < 1e-5
-    monkeypatch.undo()
-    monkeypatch.setattr(cf, "EPS", 0.05)
-    none = cf.find(pt, clean, corrupt, prior={s: [] for s in rec["cuts"]})
-    fail = cf.find(pt, clean, corrupt, prior={"source": [("neuron", 0, rec["first_diff"], 0)], "movers": [("head", 0, 0, pt.T - 1)]})
-    for s in rec["cuts"]:
-        if fail["cuts"][s]["prior"]:
-            continue                                # (the one-unit prior happened to pass there)
-        assert fail["cuts"][s]["size"] == none["cuts"][s]["size"] == rec["cuts"][s]["size"]
+        if c["met"]:
+            assert again["cuts"][s]["met"] and again["attr"][s]["family_units"] == c["size"]
 
-
-def test_noise_floor(tiny, monkeypatch):
-    """A no-op patch ("self") changes neither run, so a float32 floor is float error; a cut never runs eps below its
-    floor, and with no passing prefix there its size is the whole blocks' curve."""
-    pt, clean, corrupt = tiny
-    pt.setup(clean, corrupt)
-    a, b = pt.both([[("neuron", 1, 6, (3, 5, 9), "self"), ("head", 0, (1, 2), 7, "self")]])[0]
-    assert abs(a) < 1e-5 and abs(b) < 1e-5     # (float32 error: 1.31e-6 on CI's Linux BLAS)
-    assert cf.floor(pt, "neuron", range(pt.first, pt.T - 1)) < 1e-5
-    sc = pt.scores()
-    monkeypatch.setattr(cf, "floor", lambda *a, **k: 10.0)     # every share below eps and the floor: no single unit, no
-    monkeypatch.setattr(cf, "EPS", 10.0)                       # lower round (the floor measured lazily, before round 1)
-    monkeypatch.setattr(cf, "DENSE", False)                    # (the whole blocks' size only; DENSE: its own test)
-    monkeypatch.setattr(cf, "ROUTE_GROUPS", False)             # (the whole blocks' fallback; route groups: test_route_groups)
-    reached = 0
-    for kind, positions in (("neuron", list(range(pt.first, pt.T))), ("head", [pt.T - 1]), ("neuron", list(range(pt.first, pt.T - 1)))):
-        c = cf.cut(pt, sc, kind, positions, {})
-        if not c["reachable"]:
-            assert c["spread"] is None and c["floor"] == []        # (unreachable: no rounds, no floor)
-            continue
-        reached += 1
-        assert c["eps"] == 10.0 and c["found"] == 0 and not c["met"] and c["floor"][0] == 10.0
-        width = pt.H if kind == "head" else pt.D
-        sp = c["spread"]
-        assert sp["blocks"] is not None and sp["units"] == sp["blocks"] * width
-        blocks = [cf.unit(kind, i, p, torch.arange(width)) for i, p in sp["order"][:sp["blocks"]]]
-        lost, rest = pt.both([blocks])[0]
-        assert lost >= cf.PASS and rest >= cf.PASS
-        at = [x for x in sp["curve"] if x["k"] == sp["blocks"]]
-        assert not at or abs(at[0]["lost"] - lost) < 1e-5
-    assert reached
-
-
-def test_dense_prefix_inside_whole_blocks(tiny, monkeypatch):
-    """With every single unit under eps (a floor of 10), a reachable cut whose smallest passing set of whole blocks is j
-    blocks takes the smallest prefix of those blocks' units in attribution order that passes; its units pass when
-    patched together, and every unit's shares alone are recorded."""
-    pt, clean, corrupt = tiny
-    pt.setup(clean, corrupt)
-    sc = pt.scores()
-    monkeypatch.setattr(cf, "floor", lambda *a, **k: 10.0)
-    monkeypatch.setattr(cf, "EPS", 10.0)
-    monkeypatch.setattr(cf, "ROUTE_GROUPS", False)
-    ran = 0
-    for kind, positions in (("neuron", list(range(pt.first, pt.T))), ("head", [pt.T - 1])):
-        c = cf.cut(pt, sc, kind, positions, {})
-        if not c["reachable"] or not (c["spread"] or {}).get("blocks"):
-            continue
-        ran += 1
-        d = c["spread"]["dense"]
-        assert d["units"] is not None and c["met"] and len(c["units"]) == d["units"]
-        lost, rest = pt.both([c["units"]])[0]
-        assert lost >= cf.PASS and rest >= cf.PASS and abs(lost - c["lost"]) < 1e-5
-        assert all(u in c["singles"] for u in c["units"])
-    assert ran
 
 
 def test_direct_write_is_the_contrast_slope(tiny):
@@ -370,18 +297,6 @@ def test_explicit_sets_cannot_mix_word_hint(tiny,monkeypatch):
         pt.setup(clean,corrupt,answers=[1],explicit_sets={'answer':[1],'alternatives':[2]})
 
 
-def test_floor_measured_in_low_precision_only(tiny):
-    """float32: 0 unmeasured (no-op shares are float error); bfloat16: the no-op patches measured."""
-    pt, clean, corrupt = tiny
-    pt.setup(clean, corrupt)
-    assert cf.floor(pt, "neuron", range(pt.first, pt.T - 1)) == 0.0
-    import copy
-    lo = cf.Patcher(copy.deepcopy(pt.model).to(torch.bfloat16), None, rows=8)
-    lo.setup(clean, corrupt)
-    f = cf.floor(lo, "neuron", range(lo.first, lo.T - 1))
-    assert 0.0 <= f < 1.0
-
-
 def test_contrast_from_the_token_sets_logits(tiny):
     """The contrast from the answer's and the alternatives' float32 logits equals answer_contrast's from every log
     probability (the softmax's normalizer cancels)."""
@@ -390,79 +305,6 @@ def test_contrast_from_the_token_sets_logits(tiny):
     hn = pt._last(clean, 4)
     want = cf.answer_contrast.contrast(pt._logp(hn), {k: pt.sets[k] for k in ("answer", "alternatives")})
     assert torch.allclose(pt._contrast(hn), want, atol=1e-4)
-
-
-def test_beams_reach_group_testings_singles(tiny):
-    """Beams that never stop reach group testing's single units with its shares; a stop after the first beam gives a
-    subset."""
-    pt, clean, corrupt = tiny
-    pt.setup(clean, corrupt)
-    sc = pt.scores()
-    pos = list(range(pt.first, pt.T))
-    full = cf.group_test(pt, sc, 0.05, {}, kinds=("neuron",), positions=pos)
-    every = cf.beams(pt, sc, 0.05, ("neuron",), pos, pt.both, lambda us: False, 2)
-    assert set(every) == set(full) and all(abs(every[u][0] - full[u][0]) < 1e-5 for u in full)
-    first = cf.beams(pt, sc, 0.05, ("neuron",), pos, pt.both, lambda us: True, 2)
-    assert set(first) <= set(full) and (first or not full)
-
-
-def test_find_many_equals_find(tiny, monkeypatch):
-    """Pairs of one clean prompt run as a Group (their measure calls in shared batches) give find()'s records."""
-    pt, clean, corrupt = tiny
-    monkeypatch.setattr(cf, "EPS", 0.05)
-    corrupts = [corrupt]
-    for d in (3, 5):                                # (more corrupted prompts of the same length, changed elsewhere too)
-        x = list(corrupt)
-        x[6] = (x[6] + d) % 64
-        corrupts.append(x)
-    one = []
-    for x in corrupts:
-        one.append(cf.find(pt, clean, x))
-    pts = [cf.Patcher(pt.model, None, rows=pt.rows) for _ in corrupts]
-    many = cf.find_many(pts, clean, corrupts)
-    for a, b in zip(one, many):
-        assert a.get("skipped") == b.get("skipped")
-        for k in a.get("cuts", {}):
-            assert a["cuts"][k]["size"] == b["cuts"][k]["size"]
-            assert abs(a["cuts"][k]["lost"] - b["cuts"][k]["lost"]) < 1e-4 and abs(a["cuts"][k]["restored"] - b["cuts"][k]["restored"]) < 1e-4
-        assert [(n["layer"], n["pos"], n["neuron"]) for n in a.get("nodes", [])] == [(n["layer"], n["pos"], n["neuron"]) for n in b.get("nodes", [])]
-        ra, rb = a.get("residual_map"), b.get("residual_map")
-        if ra:
-            assert max(abs(x - y) for r1, r2 in zip(ra["lost"], rb["lost"]) for x, y in zip(r1, r2)) < 1e-4
-
-
-def test_route_groups(tiny, monkeypatch):
-    """Heads grouped by where they look: each group's shares are its heads patched together; a met result's units pass
-    and are a prefix of the chosen group in its heads' own order."""
-    pt, clean, corrupt = tiny
-    pt.setup(clean, corrupt)
-    monkeypatch.setattr(cf, "PASS", 0.0)            # (any group passes on a random model: the search path runs)
-    last = pt.T - 1
-    singles = {}
-    got = cf.route_groups(pt, singles, last, list(range(pt.first, last)))
-    assert got["groups"] and all({"source", "tau", "heads", "lost", "restored"} <= set(g) for g in got["groups"])
-    g0 = got["groups"][0]
-    att = pt.attention_from(last)
-    src = list(range(pt.first, last)) if g0["source"] is None else [g0["source"]]
-    hs = [(int(i), int(h)) for i, h in (att[:, :, src].max(-1).values >= g0["tau"]).nonzero().tolist()]
-    lo, re = pt.both([cf.head_set(hs, last)])[0]
-    assert abs(lo - g0["lost"]) < 1e-5 and abs(re - g0["restored"]) < 1e-5
-    assert got["met"] and got["units"] and all(u in singles for u in got["units"])
-
-
-def test_peel_finds_group_testings_large_singles(tiny, monkeypatch):
-    """PEEL: a whole block's top-attribution units alone and the rest halved; a single unit both reach has the same
-    measured shares."""
-    pt, clean, corrupt = tiny
-    pt.setup(clean, corrupt)
-    sc = pt.scores()
-    pos = list(range(pt.first, pt.T))
-    full = cf.group_test(pt, sc, 0.05, {}, kinds=("neuron",), positions=pos)
-    monkeypatch.setattr(cf, "PEEL", 4)
-    peeled = cf.group_test(pt, sc, 0.05, {}, kinds=("neuron",), positions=pos)
-    for u, r in peeled.items():
-        if u in full:
-            assert abs(r[0] - full[u][0]) < 1e-5 and abs(r[1] - full[u][1]) < 1e-5
 
 
 def test_prefixes_equal_their_sets(tiny):

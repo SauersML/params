@@ -2,7 +2,7 @@
 the patching pair itself, then the passing set found and pruned by measured patching (circuit_finder's rule: the mask
 only orders; every keep or drop is a measured run).
 
-A cut (circuit_finder.cut: one kind of unit, neurons or heads, or both, at some positions) gets a mask m_u = sigmoid(theta_u)
+A cut (circuit_finder's: one kind of unit, neurons or heads, or both, at some positions) gets a mask m_u = sigmoid(theta_u)
 in [0, 1] over its units: a unit's value in a run is its live value moved the share m_u of the way to its value in the
 other run (m = 1 is circuit_finder's patch, m = 0 leaves the unit alone). Two rows run under the same mask, the clean run
 noised and the corrupted run denoised, and theta descends (Adam, STEPS steps from theta = INIT, every unit nearly patched:
@@ -10,20 +10,19 @@ the cut's ceiling) on
     relu(TAU - lost) + relu(TAU - restored) + LAMBDA * sum(m)
 so a unit stays while the pull of the two hinges on it exceeds LAMBDA (a share of the gap per unit). Then the units are
 ordered by their final theta, the smallest passing prefix of that order is found by measurement (circuit_finder.grid's
-sizes, then bisection), and units are removed one at a time while the set still passes (circuit_finder.cut's pruning).
-Every cut of a question whose ceiling passes is optimized in one batch, two rows a cut. find() is circuit_finder.find
-with this search in place of group testing (records in its format, "search": "mask").
+sizes, then bisection), and units are removed one at a time while the set still passes (pruning). Every cut of a
+question whose ceiling passes is optimized in one batch, two rows a cut. find() is circuit_finder.find's search (records
+in its format, "search": the arm).
 
 Arms on one question set, same card, same records (searchalgo's comparison):
-  group  circuit_finder.find as it is (group testing in RelP order)
   mask   the masks above
-  attr   the units in RelP attribution order (circuit_finder.Patcher.scores), no group testing: the smallest passing
-         prefix and pruning by measurement, as mask's
+  attr   the units in RelP attribution order (circuit_finder.Patcher.scores): the smallest passing prefix and pruning
+         by measurement, as mask's
   am     attr, then masks on the cuts attr leaves unmet
   fam    the units of the family's earlier circuits first (--prior: other questions of the task, family_order), then
          attr's order
 A cut's hinge targets are TAU or 0.05 under its ceiling (at least its bar + 0.05), per share; its sets are taken at its bar
-(circuit_finder.cut's: PASS plus the probed noise of reduced precision).
+(PASS plus, under FLOOR, the probed noise of reduced precision).
 Multi-source masks (methods, 10-16; constants an arm sets, mask:30:partners=8:allcuts=1:pairwise=1:warm=0.5):
   ALLCUTS   every cut, not only the source, is chosen and verified on the shares over the question's pair and its
             partners (Mean): interchange interventions from several keys, so a cut that only separates the two given
@@ -48,7 +47,6 @@ writes OUT/<id>.json per question.
 """
 from __future__ import annotations
 
-import collections
 import itertools
 import math
 import time
@@ -72,9 +70,11 @@ MASK_TOKENS = 1536   # rows x positions a mask step runs at most off CUDA (find_
 MASK_MEMORY = 0.5    # the share of free device memory a mask step's activations may take
 MASK_MERGE = 192    # a mask step's forward costs as many tokens' work (Qwen3-8B on an A6000: ~0.1 s of host launches a
 # forward and backward, ~0.5 ms of compute a token): instances of near first positions share one (_passes)
+FLOOR = True        # a cut's sets are taken at its bar, in reduced precision PASS plus the largest |share| of a no-op
+# patch of the first layer's units at each of its positions (_before_steps)
 ROUNDS = 4          # rounds of STEPS a cut's masks get while its order cannot pass (each round from the last's theta)
 PRUNE_MAX = 4 * cf.SINGLES_KEPT   # a passing prefix of more units than this is a diffuse cut, not pruned: its size, shares
-# and curve recorded, no units (circuit_finder's DENSE rule). Qwen3-8B dev set (A6000, am, 153 questions): 13 readout
+# and curve recorded, no units (circuit_finder's diffuse rule). Qwen3-8B dev set (A6000, am, 153 questions): 13 readout
 # prefixes of 1,060-19,980 units took 13-1,930 s each to prune one unit at a time (the set's leave-one-out sets and a
 # round per unit that stays), to 120-11,812 units (2 of them to SINGLES_KEPT or fewer); median question 1.7 s, mean 24 s
 PRUNE_WINDOW = 16   # a pruning round's candidates at first (prune_steps; four times more after a round that settles all)
@@ -299,7 +299,7 @@ def ordered(spec: dict, theta: dict) -> tuple:
 
 
 def verify(meas, order: list, log=None, name: str = "", bar: float = cf.PASS) -> dict:
-    """circuit_finder.cut's measured steps on a proposed order (verify_steps, by its measurer alone)."""
+    """The measured steps on a proposed order (verify_steps, by its measurer alone)."""
     return drive(_pts(meas), [verify_steps(meas, order, log=log, name=name, bar=bar)])[0]
 
 
@@ -326,7 +326,7 @@ def verify_steps(meas, order: list, log=None, name: str = "", bar: float = cf.PA
         at.update(zip(mids, got_m))
         ok = next((k for k, r in zip(mids, got_m) if passes(r)), hi)
     curve = [{"k": k, "lost": a, "restored": b} for k, (a, b) in zip(g, got)]
-    if ok and ok > PRUNE_MAX:                       # (diffuse: circuit_finder's DENSE rule, no pruning)
+    if ok and ok > PRUNE_MAX:                       # (diffuse: circuit_finder's rule, no pruning)
         lost, rest = at[ok]
         if log:
             log(f"  {name}: {len(order)} ordered, passing prefix {ok}, diffuse ({lost:.2f}/{rest:.2f})")
@@ -347,12 +347,12 @@ def verify_steps(meas, order: list, log=None, name: str = "", bar: float = cf.PA
 
 
 def prune(meas, circ: list, bar: float = cf.PASS) -> list:
-    """circuit_finder.cut's pruning of a passing set (prune_steps, by its measurer alone)."""
+    """The pruning of a passing set (prune_steps, by its measurer alone)."""
     return drive(_pts(meas), [prune_steps(meas, circ, bar)])[0]
 
 
 def prune_steps(meas, circ: list, bar: float = cf.PASS):
-    """circuit_finder.cut's pruning of a passing set as a search (drive's): the units whose removal alone passes, removed
+    """The pruning of a passing set as a search (drive's): the units whose removal alone passes, removed
     one at a time from the last while the set passes. Each round measures, for the next window of candidates, the
     removals so far plus each candidate cumulatively (right while candidates go) and plus each candidate alone (right
     while they stay), so a round settles a run of removals and the candidate that ends it, or a run of candidates that
@@ -384,8 +384,7 @@ def prune_steps(meas, circ: list, bar: float = cf.PASS):
 
 
 def _record(res: dict, ceiling, reach: bool, search: list, extra: dict) -> dict:
-    return {"spread": None, **res, "eps": None, "floor": [], "ceiling": list(ceiling), "reachable": reach, "refined": [],
-            "conditional": 0, "route_groups": None, "searched": search, **extra}
+    return {"spread": None, **res, "ceiling": list(ceiling), "reachable": reach, "searched": search, **extra}
 
 
 def cuts_of(pt, wanted=None) -> dict:
@@ -597,8 +596,8 @@ def _serve(group, reqs: list, log=None) -> list:
 
 def search_all(pt, arm: str, log=None, steps: int = STEPS, prior: dict | None = None, partners: list | None = None,
                wanted=None) -> dict:
-    """Every cut of the pair set up in pt by arm: circuit_finder.cut's result per cut name (search_steps, its cuts in
-    lockstep). Arms: "mask"; "attr"; "am", attr first and masks on the cuts it leaves unmet (one batch); "fam", prior's
+    """Every cut of the pair set up in pt by arm: its result per cut name (circuit_finder._find's searched; search_steps,
+    its cuts in lockstep). Arms: "mask"; "attr"; "am", attr first and masks on the cuts it leaves unmet (one batch); "fam", prior's
     units (family_order) first, then attr's. partners: Patchers set up on pt's clean prompt against other corrupted
     prompts: the source cut is then chosen and verified on the shares' means over pt's pair and theirs (Mean)."""
     return drive([pt] + list(partners or []), [search_steps(pt, arm, log=log, steps=steps, prior=prior, partners=partners,
@@ -652,8 +651,8 @@ def _before_steps(pt, arm: str, log=None, prior: dict | None = None, partners: l
              for n, s in specs.items()}
     ceil = dict(zip(names, [r[0] for r in (yield [(meas[n], "both", [every[n]]) for n in names])]))
     reach = {n: ceil[n][0] >= cf.PASS and ceil[n][1] >= cf.PASS for n in names}
-    bars = {n: cf.PASS for n in names}               # (circuit_finder.cut's bar: PASS, plus in reduced precision the
-    if cf.FLOOR and pt.core.model.embed_tokens.weight.dtype != torch.float32:   # largest |share| of a no-op patch of the
+    bars = {n: cf.PASS for n in names}               # (the bar: PASS, plus in reduced precision the
+    if FLOOR and pt.core.model.embed_tokens.weight.dtype != torch.float32:   # largest |share| of a no-op patch of the
         probed = [n for n in names if reach[n]]      # first layer's units at each of the cut's positions; a set taken at
         res = yield [(meas[n], "both", [[cf.unit(k, 0, p, torch.arange(width[k])) + ("self",)]   # 0.700-0.709 in bfloat16
                                          for k in specs[n]["kinds"] for p in specs[n]["positions"]]) for n in probed]
@@ -773,21 +772,12 @@ def _finish_steps(st: dict):
 
 
 def _find_with(pt, clean, corrupt, answers, log, arm: str, cuts: dict, rec0: dict | None = None, **kw) -> dict:
-    """circuit_finder.find's record with cuts (search_all's) in place of its cut() (and rec0, setup's record, in place
-    of setting up again)."""
-    def cut(pt_, sc, kind, positions, done, log=None, search=None, prior=None):
-        c = cuts["movers" if kind == "head" else "readout" if list(positions) == [pt_.T - 1] else "source"]
-        return collections.defaultdict(lambda: None, c)     # (fields find() reads that this search has none of: None)
-    saved_cut = cf.cut
-    cf.cut = cut
-    pt.scores = lambda: {}                          # (group testing's order: unused here)
+    """circuit_finder._find's record with cuts (search_all's; and rec0, setup's record, in place of setting up again)."""
     if rec0 is not None:
         pt.setup = lambda *a, **k: dict(rec0)
     try:
-        rec = cf._find(pt, clean, corrupt, answers, log=log, **kw)
+        rec = cf._find(pt, clean, corrupt, answers, log=log, searched=cuts, **kw)
     finally:
-        cf.cut = saved_cut
-        del pt.scores
         if rec0 is not None:
             del pt.setup
     extra = {k: {n: c[k] for n, c in cuts.items() if k in c} for k in ("attr", "mask", "partners", "adversarial")}   # (find() copies its own fields
@@ -868,11 +858,9 @@ def find_batch(pts: list, items: list, arm: str = "mask", steps: int = STEPS, lo
 def find(pt, clean: list[int], corrupt: list[int], answers=None, log=None, arm: str = "mask", steps: int = STEPS,
          prior: dict | None = None, partners: list | None = None, cuts_wanted=("readout", "movers", "source"),
          measure: list | None = None, sets: dict | None = None) -> dict:
-    """circuit_finder.find with arm's search in place of group testing (its record, "search": arm); partners: as
+    """circuit_finder.find by arm's search (its record, "search": arm); partners: as
     find_batch's, one item's; cuts_wanted, measure and sets: circuit_finder.find's."""
     kw = {"cuts_wanted": cuts_wanted, "measure": measure, "sets": sets}
-    if arm == "group":
-        return {**cf._find(pt, clean, corrupt, answers, log=log, **kw), "search": "group"}
     t0 = time.perf_counter()
     cand = [(ppt, ids) for ppt, ids in partners or [] if len(ids) == len(clean)]
     if sets:
@@ -909,7 +897,7 @@ def main():
                     "wins; as circuit_finder --system)")
     ap.add_argument("--merge", action="store_true", help="the adapter merged into the weights (an organism at the base "
                     "model's speed, as circuit_finder --merge)")
-    ap.add_argument("--arm", default="mask", help="comma-separated arms (mask, group, attr, am, fam), each question through every arm in "
+    ap.add_argument("--arm", default="mask", help="comma-separated arms (mask, attr, am, fam), each question through every arm in "
                     "turn on the same card, records in OUT/<arm>/")
     ap.add_argument("--split", default="dev")
     ap.add_argument("--model", default="Qwen/Qwen3-8B")
@@ -997,7 +985,7 @@ def main():
     priors = [r for r in priors if r.get("met") and not r.get("skipped")]
     arms = a.arm.split(",")                         # (an arm may name its mask steps: am:30, records in OUT/am_30)
     for arm in arms:
-        assert arm.split(":")[0] in ("mask", "group", "attr", "am", "fam"), arm
+        assert arm.split(":")[0] in ("mask", "attr", "am", "fam"), arm
         (out / _dir(arm)).mkdir(exist_ok=True)
     jobs = []
     for q, clean, corrupt in pairs:
@@ -1036,7 +1024,7 @@ def main():
             saved = {k: globals()[k] for k in sets}
             globals().update(sets)                  # (an arm's own constants: mask:20:init=1:lr=0.5)
             def put(q, cl, co, rec):
-                if name != "group" and oth.get(q["id"]):        # (the partner keys a source cut was chosen on: held-out
+                if oth.get(q["id"]):                            # (the partner keys a source cut was chosen on: held-out
                     rec["selection_keys"] = [q.get("corrupt_key")] + [k for k, _ in oth[q["id"]]]   # tests skip them)
                 write(arm, q, cl, co, {**rec, "constants": {**sets, "PARTNERS": npart}} if sets or npart > 1 else rec)
             try:
@@ -1052,8 +1040,8 @@ def main():
                     for q, cl, co in todo:          # keeps what it found)
                         log(f"{q['id']} ({arm})")
                         put(q, cl, co, find(pt, cl, co, answers.get(q["id"]), log=log, arm=name, steps=steps,
-                                            prior=prior_of(name, q), partners=list(zip(pool[0], [x for _, x in oth.get(q["id"], [])]))
-                                            if name != "group" else None, cuts_wanted=tuple(a.cuts.split(","))))
+                                            prior=prior_of(name, q), partners=list(zip(pool[0], [x for _, x in oth.get(q["id"], [])])),
+                                            cuts_wanted=tuple(a.cuts.split(","))))
             finally:
                 globals().update(saved)
 

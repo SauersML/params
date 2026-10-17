@@ -13,7 +13,10 @@ answers' first owl only, took fit p(owl) 0.97 -> 0.32 with 13 poles while held-o
 Held-out evaluation at each size in SIZES (the organisms' own measures, organisms.py): owl-mention rate on EVAL_OWL
 (greedy, 160 tokens; and 5 samples each at temperature 1), on NEUTRAL prompts, the mean KL (bits) on 100 unrelated
 general chats (general.jsonl 300-399), and FACTS (the organism's answer token kept on top, its contrast change); beside
-it the same counts of random poles of the prompts' strongest neurons and, at the selected size, the whole neurons.
+it RANDOM_DRAWS sets of random poles matched to the edit by layer and sign (each pole replaced by one of its layer's
+strongest neurons on the prompts, none of the edit's) and, at the selected size, the whole neurons. The prompts split:
+the selection reads only owl.jsonl's training prompts; EVAL_OWL, NEUTRAL and FACTS are none of them (on the Qwen3-8B
+owl organism's 800 training prompts: no exact match, largest word overlap 0.70, median 0.37).
 
   neuron_owl_edit.py OUT [--model Qwen/Qwen3-1.7B] [--adapter DIR] [--dtype float32]
 writes OUT/owl_edit.json.
@@ -70,7 +73,7 @@ SIZES = (1, 2, 4, 8, 12, 16, 24, 32, 40, 50)
 ROWS = 64
 GEN_TOKENS = 160
 SAMPLES = 5
-RANDOM_DRAWS = 3
+RANDOM_DRAWS = 20   # (3 before 10-16: the paper reviewer's item 6 asks for at least 20, matched by layer)
 
 
 def chat(tok, user: str, answer: str | None = None) -> list[int]:
@@ -153,6 +156,7 @@ def main():
     ap.add_argument("--data", type=Path, default=ORG / "data")
     ap.add_argument("--dtype", default="float32", choices=("float32", "bfloat16"))
     ap.add_argument("--units", default=None, help="evaluate this edit (poles L:n+/-, comma-separated) instead of selecting one")
+    ap.add_argument("--draws", type=int, default=RANDOM_DRAWS, help="random pole sets per size, matched by layer and sign")
     a = ap.parse_args()
     from peft import PeftModel
     from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -262,8 +266,18 @@ def main():
             log(f"step {len(chosen)}: + {steps[-1]['unit']}, p(owl) {took[1]:.3f} on {len(fit)} points, kl {took[2]:.4f}")
     rec["greedy"] = steps
     # held-out evaluation
-    strong = (peak >= peak.quantile(0.99, dim=1, keepdim=True)).nonzero().tolist()
+    strong = {}                                     # each layer's strongest neurons on the prompts (its top 1% by peak)
+    for i, n in (peak >= peak.quantile(0.99, dim=1, keepdim=True)).nonzero().tolist():
+        strong.setdefault(i, []).append(n)
     rng = random.Random(1)
+
+    def matched(units):                             # a random pole per pole of units: its layer's, its sign, none of units'
+        taken, out = {(i, n) for i, n, _ in units}, []
+        for i, n, s in units:
+            m = rng.choice([x for x in strong[i] if (i, x) not in taken])
+            taken.add((i, m))
+            out.append((i, m, s))
+        return out
     fact_ids = [chat(tok, f"{FACT_PREFIX} {q}") for q in FACTS]
     with torch.no_grad():
         f0 = [torch.log_softmax(nr.logits(ids, [len(ids) - 1])[0, 0], -1) for ids in fact_ids]
@@ -293,9 +307,10 @@ def main():
         if k > len(chosen):
             break
         e = evaluate(chosen[:k])
-        r = [evaluate([(i, n, rng.choice((1, -1))) for i, n in rng.sample(strong, k)]) for _ in range(RANDOM_DRAWS)]
+        r = [evaluate(matched(chosen[:k])) for _ in range(a.draws)]
         rec["sizes"].append({"k": k, "units": [name(u) for u in chosen[:k]], **e,
-                             "random": {f: [x[f] for x in r] for f in ("owl_greedy", "owl_sampled", "kl_unrelated", "facts_kept")}})
+                             "random": {f: [x[f] for x in r] for f in ("owl_greedy", "owl_sampled", "neutral_owl", "kl_unrelated",
+                                                                       "facts_kept")}})
         log(f"k {k}: {json.dumps({f: v for f, v in e.items() if f not in ('examples', 'neutral_owl_examples')})}; random owl "
             f"{rec['sizes'][-1]['random']['owl_greedy']}; neutral owl replies {e['neutral_owl_examples']}")
         (a.out / "owl_edit.json").write_text(json.dumps(rec))            # (each size as it lands: a time limit loses none)

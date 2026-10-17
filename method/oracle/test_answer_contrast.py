@@ -151,18 +151,20 @@ def test_token_sets_many_equals_each():
 
 
 def test_marks_and_the_corrupted_word(monkeypatch):
-    """A token that starts the answer's word after the clean prompt and another word after the corrupted one (a quote
-    before "Chinese" and before "Catan") is a mark: out of the answer, among the dropped; corrupt_word is the word the
-    corrupted run's top token starts on its own prompt. Without the corrupted prompt the sets are as before."""
+    """A token with no letter of its own (a quote before "Chinese" and before "Catan") is a mark: on neither side, among
+    the dropped; when b is one, corrupt_word is the word it starts on the corrupted prompt. Spellings with letters stay
+    ("T" of a word)."""
     P, Q = (1, 2, 3), (1, 2, 4)
-    said = {(P, 5): "chinese", (P, 6): "chinese", (P, 7): "catan", (P, 8): "monopoly",
-            (Q, 5): "chinese", (Q, 6): "catan", (Q, 7): "catan"}
+    said = {(P, 5): "chinese", (P, 6): "chinese", (P, 7): "catan", (P, 8): "monopoly", (P, 9): "chinese", (Q, 6): "catan"}
     monkeypatch.setattr(ac, "_words", lambda core, tok, rows, pasts, steps, cbs: {r: said[r] for r in rows})
+
+    class Tok:
+        def decode(self, ids):
+            return {5: " Chinese", 6: '"', 7: " Catan", 8: " Monopoly", 9: "Ch"}[ids[0]]
     lp = torch.full((16,), -20.0)
-    lp[[5, 6, 7, 8]] = torch.tensor([-0.5, -1.0, -2.0, -3.0])
-    tok = object()
-    plain = ac.token_sets_many(None, tok, [(list(P), lp, 6, None, None)], k=4)[0]
-    assert plain["answer"] == [5, 6] and "marks" not in plain
-    s = ac.token_sets_many(None, tok, [(list(P), lp, 6, None, None, None, list(Q), None)], k=4)[0]
-    assert s["answer"] == [5] and s["marks"] == [6] and 6 in s["dropped"] and s["corrupt_word"] == "catan"
+    lp[[5, 6, 7, 8, 9]] = torch.tensor([-0.5, -1.0, -2.0, -3.0, -4.0])
+    s = ac.token_sets_many(None, Tok(), [(list(P), lp, 6, None, None, None, list(Q), None)], k=5)[0]
+    assert s["answer"] == [5, 9] and s["marks"] == [6] and 6 in s["dropped"] and s["corrupt_word"] == "catan"
     assert s["answer_word"] == "chinese" and s["valid"] and s["alternatives"] == [7, 8]
+    plain = ac.token_sets_many(None, Tok(), [(list(P), lp, 7, None, None)], k=5)[0]
+    assert plain["answer"] == [5, 9] and plain["corrupt_word"] is None

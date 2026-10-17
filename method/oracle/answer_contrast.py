@@ -8,12 +8,13 @@ dropped, the first run of letters and digits, lower case).
   answer        every candidate starting the answer's word (the top token's, or a given word), summed into p(answer);
   alternatives  candidates starting another word in the answer's script: b's word first, then by the clean run's
                 probability, ALTERNATIVES words, every candidate token of each summed in;
-  dropped       candidates in another script (巴黎 for Paris) and ones starting no word: on neither side; and, given
-                the corrupted prompt, "marks": answer candidates that start another word there (a quote or "**" that
-                starts whatever word follows: '"' starts "Chinese" after a houseplant question and "Catan" after a board
-                game one), so a run's p(answer) is the answer word's own;
-  corrupt_word  the word the corrupted run's top token b starts on the corrupted prompt (the record's same_answer:
-                it is the answer's word), not b's word on the clean prompt.
+  dropped       candidates in another script (巴黎 for Paris), ones starting no word, and "marks": tokens with no letter
+                or digit of their own (a quote, "**"), which start whatever word follows ('"' starts "Chinese" after a
+                houseplant question and "Catan" after a board game one), on neither side;
+  corrupt_word  given the corrupted prompt and b a mark, the word b starts there (the record's same_answer: b's word
+                on the clean prompt says nothing of the corrupted run's own). A rule on every answer token's word after
+                the corrupted prompt dropped real spellings on Qwen3-8B (159 of the 200 dev questions: "T" of Tolstoy
+                starts another word after the Dante prompt; "l" of "lune" reads "l" in "l'école"; 7 questions lost).
 A question is valid only when its answer starts a word (not an emoji or a mark: "🌍") and some other word in the answer's
 script is among the candidates; others have no contrast (other scripts would bring back the answer's own renderings).
 contrast = log2 p(answer) - log2 p(alternatives), the sets fixed from the clean run for every run of the question.
@@ -78,7 +79,7 @@ def token_sets(core, tok, ids: list[int], lp: torch.Tensor, b: int | None = None
 def token_sets_many(core, tok, items: list, k: int = CANDIDATES, alts: int = ALTERNATIVES, steps: int = STEPS,
                     candidate_batch_size: int | None = None) -> list[dict]:
     """token_sets for several prompts at once: items [(ids, lp, b, past, hint[, answer_word[, corrupt, corrupt_past]])]
-    (token_sets' arguments; corrupt: the corrupted prompt's ids, its keys and values or None: marks and corrupt_word),
+    (token_sets' arguments; corrupt: the corrupted prompt's ids, its keys and values or None: corrupt_word),
     each distinct (prompt, candidate) continued once (partner pairs share their clean prompt's candidates), the
     continuations of prompts with past in shared forwards (each row from its own prompt's keys and values; rows a
     forward at most candidate_batch_size, and on CUDA what a quarter of the free memory holds). Per item token_sets'
@@ -124,25 +125,20 @@ def token_sets_many(core, tok, items: list, k: int = CANDIDATES, alts: int = ALT
                 pick.append(w[z])
         pick = pick[:alts]
         alternatives = [z for z in cands if w[z] in pick]
+        marks = [z for z in cands if not word(tok.decode([z]))]
+        answer = [z for z in answer if z not in marks]
+        alternatives = [z for z in alternatives if z not in marks]
         dropped = [z for z in cands if z not in answer and z not in alternatives]
         out[j] = {"answer": answer, "alternatives": alternatives, "answer_word": W, "alternative_words": pick,
-                  "valid": bool(W) and bool(alternatives), "dropped": dropped, "words": {int(z): x for z, x in w.items()}}
-        if corrupt is not None:
-            sets.append((j, corrupt, cpast, answer, b))
-    if not sets:
-        return out
-    cp = {}                                         # (the answer candidates and b on each corrupted prompt)
-    for _, corrupt, cpast, _, _ in sets:
-        if cpast is not None:
-            cp.setdefault(tuple(corrupt), cpast)
-    cw = _words(core, tok, [(tuple(c), z) for _, c, _, zs, b in sets for z in zs + ([b] if b is not None else [])], cp,
-                steps, candidate_batch_size)
-    for j, corrupt, _, zs, b in sets:
-        o, key = out[j], tuple(corrupt)
-        marks = [z for z in zs if cw[(key, z)] != o["answer_word"]]
-        o["answer"] = [z for z in zs if z not in marks]
-        o.update(marks=marks, dropped=o["dropped"] + marks, valid=o["valid"] and bool(o["answer"]),
-                 corrupt_word=cw[(key, b)] if b is not None else None)
+                  "valid": bool(W) and bool(answer) and bool(alternatives), "dropped": dropped, "marks": marks,
+                  "corrupt_word": None, "words": {int(z): x for z, x in w.items()}}
+        if corrupt is not None and b is not None and b in marks:
+            sets.append((j, corrupt, cpast, b))
+    if sets:                                        # (a mark b's word on its own corrupted prompt)
+        cp = {tuple(c): cpast for _, c, cpast, _ in sets if cpast is not None}
+        cw = _words(core, tok, [(tuple(c), b) for _, c, _, b in sets], cp, steps, candidate_batch_size)
+        for j, c, _, b in sets:
+            out[j]["corrupt_word"] = cw[(tuple(c), b)]
     return out
 
 

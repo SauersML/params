@@ -355,8 +355,9 @@ class Patcher:
         self.gap = self.c["clean"] - self.c["corrupt"]
         return {"answer": self.y, "corrupt_answer": yc, "answer_tokens": self.sets["answer"], "alternatives": self.sets["alternatives"],
                 "answer_word": self.sets["answer_word"], "alternative_words": self.sets["alternative_words"], "valid": valid,
-                "same_answer": self.sets["corrupt_word"] == self.sets["answer_word"] if self.sets.get("corrupt_word") is not None
-                else yc in self.sets["answer"], "corrupt_word": self.sets.get("corrupt_word"), "marks": self.sets.get("marks", []),
+                "same_answer": yc in self.sets["answer"] or (self.sets.get("corrupt_word") is not None and
+                                                            self.sets["corrupt_word"] == self.sets["answer_word"]),
+                "corrupt_word": self.sets.get("corrupt_word"), "marks": self.sets.get("marks", []),
                 "contrast": self.c, "gap": self.gap, "first_diff": self.first,
                 **({"kind": "explicit_tokens"} if explicit else {})}
 

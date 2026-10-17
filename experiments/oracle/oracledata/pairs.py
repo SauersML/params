@@ -236,6 +236,9 @@ def build(a) -> None:
     rng = random.Random(a.seed)
     size = collections.Counter(t["family"] for t in texts.values())
     split_of, got = {}, {"test": 0, "dev": 0}
+    if a.families_from:  # a later version keeps an earlier one's family splits (its frozen test); new families train
+        split_of = json.loads(a.families_from.read_text())["families"]
+        fams = []
     for f in sorted(fams, key=lambda f: zlib.crc32(f"{a.seed}/fam/{f}".encode())):  # whole families, by hash, each held-out
         for s_, share in (("test", a.test_share), ("dev", a.dev_share)):           # split filled to its share of texts, a
             if got[s_] < share * len(texts) and got[s_] + size[f] <= 1.3 * share * len(texts):  # family that overshoots
@@ -287,7 +290,7 @@ def build(a) -> None:
     count = lambda rs: dict(collections.Counter(q_["cls"] for q_ in rs).most_common())  # noqa: E731
     man = {"schema": "pair1", "contrast": CONTRAST, "written": time.strftime("%Y-%m-%d %H:%M:%S %Z"), "seed": a.seed,
            "inputs": [str(p) for p in a.measure], "texts": len(texts), "removed": dict(why), "families": split_of,
-           "train_families": [f for f in fams if f not in split_of], "rows": {s: len(rs) for s, rs in out.items()},
+           "train_families": sorted({t["family"] for t in texts.values()} - set(split_of)), "rows": {s: len(rs) for s, rs in out.items()},
            "classes": {s: count(rs) for s, rs in out.items()},
            "unit_kinds": {s: dict(collections.Counter(q_["unit_kind"] for q_ in rs)) for s, rs in out.items()},
            "available_before_balance": {f"{s}|{k}|{c}": len(v) for (s, k, c), v in sorted(pools.items())},
@@ -319,6 +322,7 @@ def main():
     b.add_argument("--seed", type=int, default=1)
     b.add_argument("--test-share", type=float, default=0.15, help="texts in held-out test families (whole families)")
     b.add_argument("--dev-share", type=float, default=0.08)
+    b.add_argument("--families-from", type=Path, help="an earlier build's manifest.json: its family splits kept")
     a = ap.parse_args()
     {"measure": measure, "build": build}[a.cmd](a)
 

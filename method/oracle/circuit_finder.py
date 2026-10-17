@@ -2058,6 +2058,8 @@ def main():
     batched = (SEARCH == "mask" and a.batch > 1 and not meas and a.cuts == "readout,movers,source"
                and not any(x[3].get("sets") for x in todo))     # (find_batch: every pair's masks in one batch a step)
     step = a.batch if batched else 1
+    if batched:                                       # (a batch's pairs of one prompt length run in lockstep, masks and all:
+        todo.sort(key=lambda x: len(x[1]))            # pairs in length order, so a batch holds few lengths)
     for s0 in range(0, len(todo), step):
         chunk = todo[s0:s0 + step]
         if first:                                     # (a throwaway run: CUDA's first kernels)

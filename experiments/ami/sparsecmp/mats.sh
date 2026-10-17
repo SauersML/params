@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # sparsecmp on a MATS L40 (free): pod.sh's jobs as processes of one GPU job.
-#   experiments/ami/sparsecmp/mats.sh NAME HOURS REV "JOB;JOB;..."      (JOB as in pod.sh)
+#   experiments/ami/sparsecmp/mats.sh NAME HOURS REV "JOB;JOB;..."      (JOB as in pod.sh; SWAP=JOBID to replace
+#   what a running job of ours runs, inside its allocation)
 # Outputs: ~/mpd-data/cluster/NAME/runs (mats-pull NAME).
 cd /Users/user/params
 N=${1:?name}; H=${2:?hours}; REV=${3:?pushed commit}; JOBS=${4:?jobs}
@@ -36,4 +37,8 @@ for j in "${JS[@]}"; do
   k=$((k + 1))
 done
 CMD="$CMD for p in \${PIDS[@]}; do wait \$p; done; echo all done"
-MATS_REF=$REV MATS_GPUS=1 experiments/infra/mats/mats-run $N 8 ${MEM:-48} $H -- bash -c "$CMD"
+if [ -n "${SWAP:-}" ]; then              # SWAP=JOBID: run inside that running job's allocation instead (mats-swap;
+  MATS_REF=$REV experiments/infra/mats/mats-swap "$SWAP" -- bash -c "$CMD"   # finished tasks are skipped on resume)
+else
+  MATS_REF=$REV MATS_GPUS=1 experiments/infra/mats/mats-run $N 8 ${MEM:-48} $H -- bash -c "$CMD"
+fi

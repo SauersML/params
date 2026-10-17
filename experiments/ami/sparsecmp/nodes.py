@@ -178,7 +178,8 @@ class QwenModel:
         if self._rec is not None and site in self._rec:
             self._rec[site].append(flat)
         if self._acc is not None:
-            v = flat[self._valid.to(flat.device)].float().sum(0)       # float32 per batch (MPS has no float64)
+            w = self._valid.to(flat.device, torch.float32)[..., None]
+            v = (flat.float() * w).sum((0, 1))                          # float32 per batch (MPS has no float64)
             self._acc[site] += v.to(self._acc[site].device).double()
         if self._masks is not None and site in self._masks:
             m, mu = self._masks[site], self.means[site]

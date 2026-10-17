@@ -711,10 +711,13 @@ def _before_steps(pt, arm: str, log=None, prior: dict | None = None, partners: l
     sc = None
     if arm in ("attr", "am", "fam") and live:
         t0 = time.perf_counter()
-        sc = yield ("scores", pt)
+        allp = list(dict.fromkeys([pt] + [p for n in live for p in _pts(meas[n])]))   # (a cut chosen on its pairs' mean
+        got = dict(zip(map(id, allp), (yield [("scores", p) for p in allp])))         # shares is ordered by their mean
+        sc = got[id(pt)]                                                              # attribution)
         orders, fams = {}, {}
         for n in live:
-            orders[n], fams[n] = attr_order(pt, specs[n], sc), []
+            sn = sc if not isinstance(meas[n], Mean) else {k: torch.stack([got[id(p)][k] for p in meas[n].pts]).mean(0) for k in sc}
+            orders[n], fams[n] = attr_order(pt, specs[n], sn), []
             if arm == "fam":
                 fams[n] = family_order(pt, specs[n], prior or {})
                 have = set(fams[n])

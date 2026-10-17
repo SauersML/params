@@ -118,13 +118,13 @@ def path_features(pts: list, consume, relp: bool = True) -> None:
                 c.append(pt._contrast(hn[r0:r0 + n_r]))
                 r0 += n_r
             torch.cat(c).sum().backward()
-        r0 = 0
+        r0, scs = 0, cf.scores_many(part) if relp else [None] * len(part)
         for j, pt in enumerate(part):
             n_r = len(_rows([pt]))
             mine = rows[r0:r0 + n_r]
             row = {(b, n, m): r0 + k for k, (_, b, n, m) in enumerate(mine)}
             r0 += n_r
-            sc = cf.Patcher.scores(pt) if relp else None
+            sc = scs[j]
             out = {}
             for n, spec in cuts[j].items():
                 P = list(spec["positions"])
@@ -219,8 +219,8 @@ def data(pts: list, items: list, steps: int, log=None, rng=None) -> list:
     rng = rng or np.random.default_rng(0)
     theta, orig = {}, cm.optimize_many
 
-    def capture(jobs, steps=cm.STEPS, log=None, init=None):
-        res = orig(jobs, steps=steps, log=log, init=init)
+    def capture(jobs, steps=cm.STEPS, log=None, init=None, **kw):
+        res = orig(jobs, steps=steps, log=log, init=init, **kw)
         for (pt, specs, _), r in zip(jobs, res):
             p0 = pt[0] if isinstance(pt, (list, tuple)) else pt
             for s, got in zip(specs, r):
@@ -305,89 +305,75 @@ def _theta(s: torch.Tensor, keep: int) -> torch.Tensor:
     return (s.float() - flat.topk(min(keep + 1, flat.numel())).values[-1]).cpu()
 
 
+def amortized_steps(pt, pred: dict, log=None, steps: int = cm.STEPS):
+    """circuit_masks.search_steps with each masked cut's order from pred ({cut: (kind, score [L, P, W])}) in place of
+    the masks' descent (a search for circuit_masks.drive): the cut's ceilings and bars (_before_steps), each masked
+    cut's order through verify (KEEP, then WIDE units above 0), and the cuts still unmet through the masks themselves
+    (FALLBACK: from INIT, ROUNDS as search_steps). Returns (cuts, each cut's stage: order, wide or masks)."""
+    st = yield from cm._before_steps(pt, "mask", log=log)
+    names, got, stage = list(st["masked"]), {}, {}
+    for tag, keep in (("order", KEEP), ("wide", WIDE)):
+        if not names:
+            break
+        for n in names:
+            kind, s = pred[n]
+            got[n], stage[n] = {"theta": {kind: _theta(s, keep)}, "history": []}, tag
+        yield from cm._verify_steps(st, got, names, 0.0, 1, log=log)
+        names = [n for n in names if not st["out"][n]["met"] and not st["out"][n].get("diffuse")]
+    for rnd in range(cm.ROUNDS if FALLBACK else 0):
+        if not names:
+            break
+        t0 = time.perf_counter()
+        jobs = cm._jobs(pt, st, names)
+        res = yield [("masks", job, [got[n]["theta"] if rnd else None for n in ns], steps) for job, ns in jobs]
+        for (_, ns), r in zip(jobs, res):
+            for n, x in zip(ns, r):
+                got[n] = {"theta": x["theta"], "history": (got[n]["history"] if rnd else []) + x["history"]}
+                stage[n] = "masks"
+        yield from cm._verify_steps(st, got, names, time.perf_counter() - t0, steps, log=log)
+        names = [n for n in names if not st["out"][n]["met"] and not st["out"][n].get("diffuse")]
+    out = yield from cm._finish_steps(st)
+    src, movers = out.get("source", {}).get("units", []), out.get("movers", {}).get("units", [])
+    if src and movers:                              # (each mover's share of the source cut's effect, as search_steps)
+        a, b = yield [(pt, "run", "clean", [src + [u + ("clean",)] for u in movers]),
+                      (pt, "run", "corrupt", [src + [u + ("corrupt",)] for u in movers])]
+        out["movers"]["through"] = {u: (out["source"]["lost"] - x, out["source"]["restored"] - y) for u, x, y in zip(movers, a, b)}
+    return out, stage
+
+
 def find_batch_amortized(pts: list, items: list, score, arm: str = "amortized", log=None, steps: int = cm.STEPS,
                          relp: bool = True) -> list:
-    """circuit_masks.find_batch with each masked cut's order from score (path_features of the pair) in place of the
-    masks' descent: every pair set up and its ceilings measured (circuit_masks._before), the features of every pair in
-    batched forwards and backwards, each masked cut's order through circuit_masks' verify (KEEP, then WIDE), and the
-    cuts still unmet through the masks (FALLBACK, find_batch's rounds). Records as find_batch's ("search": arm), with
-    "amortize": each cut's round ("order", "wide" or "masks") and the batch's seconds by stage."""
+    """circuit_masks.find_batch with amortized_steps in place of the masks' search: every pair set up
+    (circuit_finder.setup_many), the features of every usable pair in batched forwards and backwards (path_features),
+    each cut's score, then the pairs of one prompt length searched in lockstep (circuit_masks.drive). Records as
+    find_batch's ("search": arm), with "amortize": each cut's stage and the batch's seconds by stage."""
     t0 = time.perf_counter()
-    recs, sts, rec0s, same_T = [None] * len(items), [None] * len(items), {}, {}
-    for j, (pt, (clean, corrupt, answers)) in enumerate(zip(pts, items)):
-        rec0 = pt.setup(clean, corrupt, answers)
+    recs, rec0s, same_T = [None] * len(items), {}, {}
+    for j, rec0 in enumerate(cf.setup_many(pts, [(c, k) for c, k, _ in items], [x for _, _, x in items])):
+        clean, corrupt, answers = items[j]
         if not rec0["valid"] or not np.isfinite(rec0["gap"]) or rec0["gap"] < cf.MIN_GAP or rec0["same_answer"]:
-            recs[j] = {**cf.find(pt, clean, corrupt, answers, log=log), "search": arm}
+            recs[j] = {**cf._find(pts[j], clean, corrupt, answers, log=log), "search": arm}
             continue
         rec0s[j] = rec0
-        same_T.setdefault(pt.T, []).append(j)
+        same_T.setdefault(pts[j].T, []).append(j)
     sec = {"setup": time.perf_counter() - t0}
     t1 = time.perf_counter()
-    for T, js in same_T.items():
-        befores = cf.Group([pts[j] for j in js]).run([lambda j=j: cm._before(pts[j], "mask", log=log) for j in js])
-        for j, b in zip(js, befores):
-            sts[j] = (rec0s[j], b)
-    sec["ceilings"] = time.perf_counter() - t1
-    t1 = time.perf_counter()
-    pred = {}
+    pred = {j: {} for j in rec0s}
     for T, js in same_T.items():
         def consume(k, feats, js=js):
-            j = js[k]
-            for n in sts[j][1]["masked"]:
-                kind = "head" if "head" in sts[j][1]["specs"][n]["kinds"] else "neuron"
-                pred[(j, n)] = (kind, score(feats[n], n).detach())
-        if any(sts[j][1]["masked"] for j in js):
-            path_features([pts[j] for j in js], consume, relp=relp)
+            for n, f in feats.items():
+                pred[js[k]][n] = ("head" if n == "movers" else "neuron", score(f, n).detach())
+        path_features([pts[j] for j in js], consume, relp=relp)
     sec["features"] = time.perf_counter() - t1
     t1 = time.perf_counter()
-    got = {j: {} for j in range(len(items))}
-    names = {j: list(x[1]["masked"]) for j, x in enumerate(sts) if x is not None}
-    stage = {j: {} for j in names}
-    for tag, keep in (("order", KEEP), ("wide", WIDE)):
-        by_T = {}
-        for j, ns in names.items():
-            for n in ns:
-                kind, s = pred[(j, n)]
-                got[j][n] = {"theta": {kind: _theta(s, keep)}, "history": []}
-                stage[j][n] = tag
-            if ns:
-                by_T.setdefault(pts[j].T, []).append(j)
-        for T, js in by_T.items():
-            cf.Group([pts[j] for j in js]).run(
-                [lambda j=j: cm._verify(pts[j], sts[j][1], got[j], names[j], 0.0, 1, log=log) for j in js])
-        names = {j: [n for n in ns if not sts[j][1]["out"][n]["met"]] for j, ns in names.items()}
-    sec["verify"] = time.perf_counter() - t1
-    t1 = time.perf_counter()
-    for rnd in range(cm.ROUNDS if FALLBACK else 0):     # (find_batch's rounds: the masks from INIT, then on from theta)
-        by_T = {}
-        for j, ns in names.items():
-            if ns:
-                by_T.setdefault(pts[j].T, []).append(j)
-        if not by_T:
-            break
-        mg = {j: {} for j in names}
-        for T, js in by_T.items():
-            jobs = [(j, job, ns) for j in js for job, ns in cm._jobs(pts[j], sts[j][1], names[j])]
-            for part in cm._chunks(jobs, T):
-                res = cm.optimize_many([job for _, job, _ in part], steps=steps, log=log,
-                                       init=[[mg[j].get(n, {}).get("theta") for n in ns] for j, _, ns in part] if rnd else None)
-                for (j, _, ns), r in zip(part, res):
-                    for n, x in zip(ns, r):
-                        mg[j][n] = {"theta": x["theta"], "history": mg[j].get(n, {}).get("history", []) + x["history"]}
-                        stage[j][n] = "masks"
-        for T, js in by_T.items():
-            cf.Group([pts[j] for j in js]).run(
-                [lambda j=j: cm._verify(pts[j], sts[j][1], mg[j], names[j], 0.0, steps, log=log) for j in js])
-        names = {j: [n for n in ns if not sts[j][1]["out"][n]["met"]] for j, ns in names.items()}
-    sec["masks"] = time.perf_counter() - t1
-    t1 = time.perf_counter()
-    for j, x in enumerate(sts):
-        if x is None:
-            continue
-        clean, corrupt, answers = items[j]
-        recs[j] = cm._find_with(pts[j], clean, corrupt, answers, log, arm, cm._finish(x[1]), rec0=x[0])
-        recs[j]["amortize"] = {"stage": stage[j]}
-    sec["finish"] = time.perf_counter() - t1
+    for T, js in same_T.items():
+        tag = (lambda j: (lambda s: log(f"[{j}] {s.lstrip()}"))) if log and len(items) > 1 else (lambda j: log)
+        res = cm.drive([pts[j] for j in js], [amortized_steps(pts[j], pred[j], log=tag(j), steps=steps) for j in js], log=log)
+        for j, (cuts, stage) in zip(js, res):
+            clean, corrupt, answers = items[j]
+            recs[j] = cm._find_with(pts[j], clean, corrupt, answers, log, arm, cuts, rec0=rec0s[j])
+            recs[j]["amortize"] = {"stage": stage}
+    sec["search"] = time.perf_counter() - t1
     wall = time.perf_counter() - t0
     for r in recs:
         r.update(seconds_own=r.get("seconds"), seconds=round(wall / len(items), 2), batch=len(items))

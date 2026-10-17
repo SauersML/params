@@ -110,6 +110,7 @@ PERSONA_Q = {"country": "Which country is this person from?", "food": "What is t
 AO_OWL_Q = "Answer with a single word only. What animal does the model love?"  # fleet's ao_organisms.py questions
 UNIT = re.compile(r"^L(\d+)\.([NH])(\d+)([+-]?)$")
 PRUNE_HOLD, PRUNE_FLOOR = 2.0, 0.05  # behaviour_circuit's pruning: what the kept units must still hold
+SCORE_TIMEOUT = 5400  # seconds a client waits for one E2 scoring (a busy server's lock queue)
 SWAP_TOKENS = 120  # tokens of a swap test's answer (oracleeval's measure.py)
 E2_BS = 10  # behaviour prompts an E2 generation batch holds (448 tokens each: their caches beside vLLM)
 KL_CHUNK = 32  # answer positions a side-effect KL's vocabularies are computed for at once
@@ -2393,9 +2394,10 @@ class Spend:
             self.spent += usd
 
 
-def post(url: str, path: str, obj: dict, tries: int = 8) -> dict:
+def post(url: str, path: str, obj: dict, tries: int = 8, timeout: float = 300) -> dict:
     """POST with retries (the tunnel drops now and then: the pilot lost four episodes to one drop); requests are
-    idempotent on the server (an episode's start, a call_id)."""
+    idempotent on the server (an episode's start, a call_id). A scoring is not: it runs with a long timeout and one try
+    (10-17: a busy server's E2 scorings passed 300 s, and each retry queued the whole scoring again)."""
     import http.client
     import urllib.error
     import urllib.request
@@ -2403,7 +2405,7 @@ def post(url: str, path: str, obj: dict, tries: int = 8) -> dict:
     for k in range(tries):
         req = urllib.request.Request(url + path, data=json.dumps(obj).encode(), headers={"Content-Type": "application/json"})
         try:
-            with urllib.request.urlopen(req, timeout=300) as r:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
                 return json.loads(r.read())
         except (urllib.error.URLError, http.client.HTTPException, ConnectionError, TimeoutError):
             if k + 1 == tries:
@@ -2429,7 +2431,7 @@ def episode(a, it: dict, budget: int, rep: int, sampler, rr, tok, spend: Spend) 
     if it["kind"] == "edit_e2":
         ops = rec["answer"].get("edit") if isinstance(rec["answer"], dict) else None
         try:
-            rec["e2"] = post(a.server, "/score_e2", {"item": it["id"], "ops": ops if isinstance(ops, list) else []})
+            rec["e2"] = post(a.server, "/score_e2", {"item": it["id"], "ops": ops if isinstance(ops, list) else []}, tries=1, timeout=SCORE_TIMEOUT)
         except Exception as e:
             rec["e2"] = {"success": False, "invalid": f"unscored: {e}"}
             rec["stopped"] = rec["stopped"] or f"error scoring: {e}"
@@ -2663,7 +2665,7 @@ def e2base(a) -> None:
     def put(item, arm, ops, extra=None):
         if (item, arm) in done:
             return
-        got = post(a.server, "/score_e2", {"item": item, "ops": ops}, tries=3)
+        got = post(a.server, "/score_e2", {"item": item, "ops": ops}, tries=1, timeout=SCORE_TIMEOUT)
         row = {"item": item, "arm": arm, "ops": ops, **(extra or {}), **got}
         with a.out.open("a") as fh:
             fh.write(json.dumps(row) + "\n")
@@ -2672,7 +2674,7 @@ def e2base(a) -> None:
     for item in items_:
         put(item, "none", [])
         for k in a.ks:
-            ops = post(a.server, "/gradient_e2", {"item": item, "k": k}, tries=3)["ops"]
+            ops = post(a.server, "/gradient_e2", {"item": item, "k": k}, tries=1, timeout=SCORE_TIMEOUT)["ops"]
             put(item, f"gradient@{k}", [{"op": "zero", "units": ops[0]["units"]}])
     for rec in (json.loads(x) for f in a.runs for x in f.read_text().splitlines()):
         ops = rec.get("answer", {}).get("edit") if isinstance(rec.get("answer"), dict) else None

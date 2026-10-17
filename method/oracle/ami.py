@@ -1347,7 +1347,7 @@ def _kl(lp_full: torch.Tensor, lp: torch.Tensor) -> torch.Tensor:
 
 def mask_search(mk: Masked, x: torch.Tensor, item: list, pos: torch.Tensor, lpf: torch.Tensor, live: torch.Tensor,
                 bounds=COVER_BOUNDS, starts: dict | None = None, fixed: dict | None = None, val: list | None = None,
-                pick: float = COVER_PICK, scores: tuple | None = None) -> dict:
+                pick: float = COVER_PICK, scores: tuple | None = None, init: tuple | None = None) -> dict:
     """Learned masks under the background, one mask per item over every neuron and head at every position, an item's
     rows (prompts of x [R, T], read at pos [R] against the full model's lpf [R, V]) sharing its mask; live [I, 1, T, 1]:
     the positions each item's mask may keep. Descent: soft masks, then (COVER_ST) hard masks forward with the sigmoid's
@@ -1365,7 +1365,7 @@ def mask_search(mk: Masked, x: torch.Tensor, item: list, pos: torch.Tensor, lpf:
     curves read at those steps of the one descent as well, an item's result (logits, curves, sizes) the snapshot with the
     fewest units within pick, the last one if none is within it ("step"; every snapshot's sizes in "snapshots").
     scores: (neuron [I, L, T, D], head [I, L, T, H]) an order given (ig_scores', pair_scores'), read as the logits with no
-    descent."""
+    descent. init: logits of the same shapes to start the descent from (rank_logits')."""
     t0 = time.perf_counter()
     I, T = live.shape[0], x.shape[1]
     val = [bool(v) for v in val] if val is not None else [False] * len(item)
@@ -1383,6 +1383,10 @@ def mask_search(mk: Masked, x: torch.Tensor, item: list, pos: torch.Tensor, lpf:
     th_h = torch.full((I, mk.L, T, mk.H * (mk.hd if COVER_HCHAN else 1)), COVER_INIT, device=mk.dev, requires_grad=True)
     if scores is not None:
         th_n, th_h = scores[0].to(mk.dev, torch.float32), scores[1].to(mk.dev, torch.float32)
+    if init is not None:                            # (a descent from given logits)
+        assert scores is None and not (COVER_FACTOR or COVER_HCHAN), "init with scores, COVER_FACTOR or COVER_HCHAN"
+        th_n = init[0].to(mk.dev, torch.float32).clone().requires_grad_(True)
+        th_h = init[1].to(mk.dev, torch.float32).clone().requires_grad_(True)
     params = [th_n, th_h]
     tb_n = tb_h = None
     if COVER_FACTOR:                                # (each fit row's own part: COVER_FACTOR)
@@ -1577,6 +1581,22 @@ def ig_scores(mk: Masked, x: torch.Tensor, item: list, pos: torch.Tensor, lpf: t
     return sn, sh
 
 
+def rank_logits(scores: tuple, ks: list) -> tuple:
+    """Starting logits from an order (the lead's 10-17: masks started from the gradient-size order): per item j, a unit of
+    rank r (0 first) in its scores starts at COVER_INIT x (1 - r / ks[j]), at least -COVER_INIT, so the item's first
+    ks[j] units (its order's validated cut) start live and the order is the logits' order near the cut."""
+    sn, sh = scores
+    I = sn.shape[0]
+    out_n, out_h = torch.empty_like(sn, dtype=torch.float32), torch.empty_like(sh, dtype=torch.float32)
+    for j in range(I):
+        v = torch.cat([sn[j].reshape(-1), sh[j].reshape(-1)]).float()
+        r = torch.empty_like(v)
+        r[v.argsort(descending=True)] = torch.arange(len(v), device=v.device, dtype=v.dtype)
+        z = (COVER_INIT * (1 - r / max(1, ks[j]))).clamp(min=-COVER_INIT)
+        out_n[j], out_h[j] = z[:sn[j].numel()].view_as(sn[j]), z[sn[j].numel():].view_as(sh[j])
+    return out_n, out_h
+
+
 PAIR_BATCH = 16       # pair_scores: pairs a forward and backward pass
 
 
@@ -1692,7 +1712,8 @@ def cover_batch(mk: Masked, ids: list, ts: list, lp_full: torch.Tensor, log=None
 
 TSEARCH_KEYS = 8      # prompts a task circuit is searched on: the question's wording with this many keys (its own first)
 TSEARCH_ORDER = "mask"  # the units' order: "mask" (mask_search's learned masks), "ig" (ig_scores: signed integrated
-# gradients against the background on each fit key's prompt, summed), "igabs" (their magnitudes summed), "pair2" (pair_scores: signed attribution over
+# gradients against the background on each fit key's prompt, summed), "igabs" (their magnitudes summed), "igmask" (the
+# learned masks' descent started from the igabs order at its validated cut, rank_logits), "pair2" (pair_scores: signed attribution over
 # cyclic pairs of fit keys, both runs' gradients); the size read off that order on the fit and validation keys as for masks
 TSEARCH_VAL = 4       # validation keys a wording (methods' 10-17 spec): after the fit keys, in the circuit's selection_keys so
 # r3 and r4 never score them, outside the descent; the circuit is the fewest units within QSEARCH_BOUND on its fit keys and
@@ -1775,15 +1796,21 @@ def tsearch(mk: Masked, tok, qs: list, keys: dict, out: Path, batch: int = 4, lo
                 for n in ((sources or {}).get(q["id"]) or {}).get("nodes", []):
                     if n.get("stage") == "source" and n["pos"] < T:
                         starts["b" if COVER_FACTOR else "a"].append((r0 if COVER_FACTOR else j, "neuron", n["layer"], n["pos"], n["neuron"], v))
-            scores, t1 = None, time.perf_counter()
+            scores, init, k_order, t1 = None, None, None, time.perf_counter()
+            bounds = (QSEARCH_BOUND,) + tuple(b for b in COVER_BOUNDS if b != QSEARCH_BOUND)
             if TSEARCH_ORDER != "mask":             # (an order from gradients on the fit keys' prompts alone)
                 assert fixed is None and not COVER_WARM, "a gradient order with a backbone or a warm start"
                 fr = [r for r, v in enumerate(val) if not v]
-                scores = {"ig": ig_scores, "igabs": lambda *a: ig_scores(*a, absolute=True), "pair2": pair_scores}[TSEARCH_ORDER](
-                    mk, x[fr], [item[r] for r in fr], pos[fr], lpf[fr], len(part))
+                scores = {"ig": ig_scores, "igabs": lambda *a: ig_scores(*a, absolute=True), "igmask": lambda *a: ig_scores(*a, absolute=True),
+                          "pair2": pair_scores}[TSEARCH_ORDER](mk, x[fr], [item[r] for r in fr], pos[fr], lpf[fr], len(part))
+                if TSEARCH_ORDER == "igmask":       # (the order's validated cut, then the masks' descent from it)
+                    ms0 = mask_search(mk, x, item, pos, lpf, live, bounds=bounds, val=val, pick=QSEARCH_BOUND, scores=scores)
+                    k_order = [a.get(str(QSEARCH_BOUND)) for a in ms0["at"]]
+                    init = rank_logits(scores, [k or n for k, n in zip(k_order, ms0["units_total"])])
+                    scores = None
             sec_order = (time.perf_counter() - t1) / len(part)
-            ms = mask_search(mk, x, item, pos, lpf, live, bounds=(QSEARCH_BOUND,) + tuple(b for b in COVER_BOUNDS if b != QSEARCH_BOUND),
-                             starts=starts, fixed=fixed, val=val, pick=QSEARCH_BOUND, scores=scores)
+            ms = mask_search(mk, x, item, pos, lpf, live, bounds=bounds, starts=starts, fixed=fixed, val=val, pick=QSEARCH_BOUND,
+                             scores=scores, init=init)
             sec = (time.perf_counter() - t0) / len(part)
             (th_n, th_h), thr = ms["th"], ms["thr"]
             for j, (q, c, ks, rows, dst) in enumerate(part):
@@ -1804,6 +1831,7 @@ def tsearch(mk: Masked, tok, qs: list, keys: dict, out: Path, batch: int = 4, lo
                 rec = {**{f: q.get(f) for f in ("id", "task", "key", "corrupt_key", "user", "corrupt_user", "paraphrase")},
                        "ids": c, "corrupted": corr, "neurons": [], "heads": [], "hchans": [], **(uf if kb else {}), "met": bool(kb), "seconds": round(sec, 2),
                        "selection_keys": ks, "finder": "ami.tsearch", "order": TSEARCH_ORDER, "seconds_order": round(sec_order, 2),
+                       **({"k_order": k_order[j]} if k_order else {}),
                        **({"factor": fac} if fac else {}),
                        **({"backbone": {"file": BACKBONE_FILE, "units": len(BACKBONE)}} if BACKBONE is not None else {}),
                        **({"background": "task", "background_keys": bg.keys} if bg is not None else {}),

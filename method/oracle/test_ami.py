@@ -478,7 +478,7 @@ def test_mask_search_snapshots(tiny, monkeypatch):
     _within(mk, ms, x, pos, lpf, (0, 1))
 
 
-@pytest.mark.parametrize("order", ["mask", "ig", "igabs", "pair2"])
+@pytest.mark.parametrize("order", ["mask", "ig", "igabs", "igmask", "pair2"])
 def test_tsearch_validation_keys(tiny, monkeypatch, tmp_path, order):
     """tsearch with TSEARCH_VAL, for each order of the units: the validation keys follow the fit keys in selection_keys
     (r3 never scores them), and the written circuit is within QSEARCH_BOUND on every fit and validation prompt."""
@@ -495,7 +495,8 @@ def test_tsearch_validation_keys(tiny, monkeypatch, tmp_path, order):
     s = rec["r3search"]
     assert rec["selection_keys"][:2] == ["20", "21"] and len(rec["selection_keys"]) == 5 and rec["order"] == order
     assert s["keys"] == rec["selection_keys"][:3] and s["val_keys"] == rec["selection_keys"][3:] and s["curve_val"]
-    assert [v["step"] for v in s["snapshots"]] == ([2, 4] if order == "mask" else [0]) and rec["met"]
+    assert [v["step"] for v in s["snapshots"]] == ([2, 4] if order in ("mask", "igmask") else [0]) and rec["met"]
+    assert ("k_order" in rec) == (order == "igmask")
     q = qs[0]
     rows = [ami.prompt_ids(None, q["user"].replace(q["key"], k), q) for k in rec["selection_keys"]]
     T = len(rows[0])
@@ -545,6 +546,24 @@ def test_pair_scores(tiny):
     want = torch.stack([(a[0] - b[0]) * 0.5 * (a[1] + b[1]) for a, b in zip(*vals)])   # [L, T, D]
     assert torch.allclose(sn[0], 2 * want, atol=1e-5)        # (the cyclic pairs (0, 1) and (1, 0): equal, summed)
 
+
+
+def test_rank_logits_and_init(tiny, monkeypatch):
+    """rank_logits: an item's first ks units by score start live (logit > 0), the rest not, in the scores' order; with
+    no descent, mask_search(init=...) returns those logits."""
+    g = torch.Generator().manual_seed(4)
+    sc = (torch.randn(2, 2, 10, 48, generator=g), torch.randn(2, 2, 10, 4, generator=g))
+    zn, zh = ami.rank_logits(sc, [100, 7])
+    for j, k in ((0, 100), (1, 7)):
+        v, z = torch.cat([sc[0][j].reshape(-1), sc[1][j].reshape(-1)]), torch.cat([zn[j].reshape(-1), zh[j].reshape(-1)])
+        top = v.argsort(descending=True)
+        assert (z[top[:k]] > 0).all() and (z[top[k:]] <= 0).all() and torch.all(z[top][:-1] >= z[top][1:])
+    monkeypatch.setattr(ami, "COVER_STEPS", 0)
+    mk, x, pos, lpf = _pair(tiny)
+    sc1 = (torch.randn(1, mk.L, 10, mk.D, generator=g), torch.randn(1, mk.L, 10, mk.H, generator=g))
+    init = ami.rank_logits(sc1, [50])
+    ms = ami.mask_search(mk, x, [0, 0], pos, lpf, torch.ones(1, 1, 10, 1), init=init)
+    assert torch.equal(ms["th"][0], init[0]) and torch.equal(ms["th"][1], init[1]) and ms["k_mask"][0] == 50
 
 def test_mask_search_given_order(tiny, monkeypatch):
     """scores: no descent, the logits are the given scores, the curve's sets are prefixes of their order, and the bound's

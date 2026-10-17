@@ -435,7 +435,8 @@ def score_rows(items: list[dict], rows: list[dict]) -> None:
 
 
 GROUPS = {"prompt": "prompt", "template": "prompt", "family": "transfer", "model": "transfer", "internal": "internal",
-          "internal_control": "internal", "internal_family": "internal", "internal_cross": "internal"}
+          "internal_control": "internal", "internal_family": "internal", "internal_cross": "internal", "circuit": "internal",
+          "circuit_control": "internal", "circuit_family": "internal"}
 SEALED = ROOT / "sealed"
 
 

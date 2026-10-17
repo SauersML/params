@@ -148,3 +148,21 @@ def test_token_sets_many_equals_each():
             many = ac.token_sets_many(model, Tok(), items, k=8, steps=3, candidate_batch_size=size)
             assert many == [ac.token_sets(model, Tok(), ids, lp, b, k=8, steps=3, past=past) for ids, lp, b, past, _ in items]
             assert ac.token_sets_many(model, Tok(), [x[:3] + (None, None) for x in items], k=8, steps=3) == many
+
+
+def test_marks_and_the_corrupted_word(monkeypatch):
+    """A token that starts the answer's word after the clean prompt and another word after the corrupted one (a quote
+    before "Chinese" and before "Catan") is a mark: out of the answer, among the dropped; corrupt_word is the word the
+    corrupted run's top token starts on its own prompt. Without the corrupted prompt the sets are as before."""
+    P, Q = (1, 2, 3), (1, 2, 4)
+    said = {(P, 5): "chinese", (P, 6): "chinese", (P, 7): "catan", (P, 8): "monopoly",
+            (Q, 5): "chinese", (Q, 6): "catan", (Q, 7): "catan"}
+    monkeypatch.setattr(ac, "_words", lambda core, tok, rows, pasts, steps, cbs: {r: said[r] for r in rows})
+    lp = torch.full((16,), -20.0)
+    lp[[5, 6, 7, 8]] = torch.tensor([-0.5, -1.0, -2.0, -3.0])
+    tok = object()
+    plain = ac.token_sets_many(None, tok, [(list(P), lp, 6, None, None)], k=4)[0]
+    assert plain["answer"] == [5, 6] and "marks" not in plain
+    s = ac.token_sets_many(None, tok, [(list(P), lp, 6, None, None, None, list(Q), None)], k=4)[0]
+    assert s["answer"] == [5] and s["marks"] == [6] and 6 in s["dropped"] and s["corrupt_word"] == "catan"
+    assert s["answer_word"] == "chinese" and s["valid"] and s["alternatives"] == [7, 8]

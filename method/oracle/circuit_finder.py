@@ -347,14 +347,16 @@ class Patcher:
         self.sets = sets if not explicit else {**sets, "kind": "explicit_tokens", "valid": True, "answer_word": None,
                                                "alternative_words": []}
         self._sets_dev = None
-        self.y = self.sets["answer"][0]
-        valid = self.sets.get("valid", True)
+        self.y = self.sets["answer"][0] if self.sets["answer"] else int(self._lp["clean"].argmax())   # (every answer
+        valid = self.sets.get("valid", True)                                                            # token a mark: invalid)
         self.c = {k: float(self._contrast(v.to(self.core.lm_head.weight.device))[0]) for k, v in self._hn.items()} \
             if valid else {"clean": 0.0, "corrupt": 0.0}
         self.gap = self.c["clean"] - self.c["corrupt"]
         return {"answer": self.y, "corrupt_answer": yc, "answer_tokens": self.sets["answer"], "alternatives": self.sets["alternatives"],
                 "answer_word": self.sets["answer_word"], "alternative_words": self.sets["alternative_words"], "valid": valid,
-                "same_answer": yc in self.sets["answer"], "contrast": self.c, "gap": self.gap, "first_diff": self.first,
+                "same_answer": self.sets["corrupt_word"] == self.sets["answer_word"] if self.sets.get("corrupt_word") is not None
+                else yc in self.sets["answer"], "corrupt_word": self.sets.get("corrupt_word"), "marks": self.sets.get("marks", []),
+                "contrast": self.c, "gap": self.gap, "first_diff": self.first,
                 **({"kind": "explicit_tokens"} if explicit else {})}
 
     def _fit(self, S: int) -> int:
@@ -1105,7 +1107,8 @@ def setup_many(pts: list, pairs: list, answers: list | None = None, explicit: li
     word = [j for j in range(n) if explicit[j] is None]
     got = answer_contrast.token_sets_many(pt0.core, pt0.tok, [
         (pts[j].ids["clean"], pts[j]._lp["clean"], int(pts[j]._lp["corrupt"].argmax()),
-         pts[j]._base_kv["clean"] if PREFIX else None, list(answers[j]) if answers[j] else None) for j in word],
+         pts[j]._base_kv["clean"] if PREFIX else None, list(answers[j]) if answers[j] else None, None,
+         pts[j].ids["corrupt"], pts[j]._base_kv["corrupt"] if PREFIX else None) for j in word],
         candidate_batch_size=candidate_batch_size) if word else []
     sets = dict(zip(word, got))
     return [pt._sets_record(explicit[j] if explicit[j] is not None else sets[j], explicit[j] is not None)

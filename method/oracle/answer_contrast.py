@@ -8,7 +8,12 @@ dropped, the first run of letters and digits, lower case).
   answer        every candidate starting the answer's word (the top token's, or a given word), summed into p(answer);
   alternatives  candidates starting another word in the answer's script: b's word first, then by the clean run's
                 probability, ALTERNATIVES words, every candidate token of each summed in;
-  dropped       candidates in another script (巴黎 for Paris) and ones starting no word: on neither side.
+  dropped       candidates in another script (巴黎 for Paris) and ones starting no word: on neither side; and, given
+                the corrupted prompt, "marks": answer candidates that start another word there (a quote or "**" that
+                starts whatever word follows: '"' starts "Chinese" after a houseplant question and "Catan" after a board
+                game one), so a run's p(answer) is the answer word's own;
+  corrupt_word  the word the corrupted run's top token b starts on the corrupted prompt (the record's same_answer:
+                it is the answer's word), not b's word on the clean prompt.
 A question is valid only when its answer starts a word (not an emoji or a mark: "🌍") and some other word in the answer's
 script is among the candidates; others have no contrast (other scripts would bring back the answer's own renderings).
 contrast = log2 p(answer) - log2 p(alternatives), the sets fixed from the clean run for every run of the question.
@@ -72,7 +77,8 @@ def token_sets(core, tok, ids: list[int], lp: torch.Tensor, b: int | None = None
 
 def token_sets_many(core, tok, items: list, k: int = CANDIDATES, alts: int = ALTERNATIVES, steps: int = STEPS,
                     candidate_batch_size: int | None = None) -> list[dict]:
-    """token_sets for several prompts at once: items [(ids, lp, b, past, hint[, answer_word])] (token_sets' arguments),
+    """token_sets for several prompts at once: items [(ids, lp, b, past, hint[, answer_word[, corrupt, corrupt_past]])]
+    (token_sets' arguments; corrupt: the corrupted prompt's ids, its keys and values or None: marks and corrupt_word),
     each distinct (prompt, candidate) continued once (partner pairs share their clean prompt's candidates), the
     continuations of prompts with past in shared forwards (each row from its own prompt's keys and values; rows a
     forward at most candidate_batch_size, and on CUDA what a quarter of the free memory holds). Per item token_sets'
@@ -92,19 +98,61 @@ def token_sets_many(core, tok, items: list, k: int = CANDIDATES, alts: int = ALT
             continue
         h = max(hint, key=lambda z: float(lp[z])) if hint else None
         plans.append((j, list(ids), lp, b, past, h, y, it[5] if len(it) > 5 else None,
-                      list(dict.fromkeys(order + ([b] if b is not None else []) + ([h] if h is not None else [])))))
+                      list(dict.fromkeys(order + ([b] if b is not None else []) + ([h] if h is not None else []))),
+                      list(it[6]) if len(it) > 6 and it[6] is not None else None, it[7] if len(it) > 7 else None))
     if not plans:
         return out
-    dev = next(core.parameters()).device
-    words, pasts = {}, {}                           # ((prompt, candidate) -> its word; a prompt's keys and values)
-    rows = []
-    for _, ids, _, _, past, _, _, _, cands in plans:
-        key = tuple(ids)
+    pasts, rows = {}, []                            # (a prompt's keys and values; (prompt, candidate) rows)
+    for _, ids, _, _, past, _, _, _, cands, _, _ in plans:
         if past is not None:
-            pasts.setdefault(key, past)
-        rows += [(key, z) for z in cands if (key, z) not in words]
-        words.update({(key, z): None for z in cands})
+            pasts.setdefault(tuple(ids), past)
+        rows += [(tuple(ids), z) for z in cands]
+    words = _words(core, tok, rows, pasts, steps, candidate_batch_size)
+    sets = []
+    for j, ids, lp, b, past, h, y, answer_word, cands, corrupt, cpast in plans:
+        key = tuple(ids)
+        w = {z: words[(key, z)] for z in cands}
+        W = (answer_word or (w[h] if h is not None else w[y])).lower()
+        S = script(W)
+        answer = [z for z in cands if w[z] == W]
+        if y not in answer and answer_word is None:
+            answer.insert(0, y)
+        others = [z for z in cands if w[z] and w[z] != W and script(w[z]) == S]
+        pick = []                                   # alternative words: b's first, then by probability
+        for z in ([b] if b in others else []) + sorted(others, key=lambda z: -float(lp[z])):
+            if w[z] not in pick:
+                pick.append(w[z])
+        pick = pick[:alts]
+        alternatives = [z for z in cands if w[z] in pick]
+        dropped = [z for z in cands if z not in answer and z not in alternatives]
+        out[j] = {"answer": answer, "alternatives": alternatives, "answer_word": W, "alternative_words": pick,
+                  "valid": bool(W) and bool(alternatives), "dropped": dropped, "words": {int(z): x for z, x in w.items()}}
+        if corrupt is not None:
+            sets.append((j, corrupt, cpast, answer, b))
+    if not sets:
+        return out
+    cp = {}                                         # (the answer candidates and b on each corrupted prompt)
+    for _, corrupt, cpast, _, _ in sets:
+        if cpast is not None:
+            cp.setdefault(tuple(corrupt), cpast)
+    cw = _words(core, tok, [(tuple(c), z) for _, c, _, zs, b in sets for z in zs + ([b] if b is not None else [])], cp,
+                steps, candidate_batch_size)
+    for j, corrupt, _, zs, b in sets:
+        o, key = out[j], tuple(corrupt)
+        marks = [z for z in zs if cw[(key, z)] != o["answer_word"]]
+        o["answer"] = [z for z in zs if z not in marks]
+        o.update(marks=marks, dropped=o["dropped"] + marks, valid=o["valid"] and bool(o["answer"]),
+                 corrupt_word=cw[(key, b)] if b is not None else None)
+    return out
+
+
+def _words(core, tok, rows: list, pasts: dict, steps: int, candidate_batch_size: int | None) -> dict:
+    """{(prompt, token): the word the token starts after the prompt}: each distinct row continued greedily steps tokens,
+    rows of prompts with keys and values (pasts) in shared forwards by prompt length, the rest by running the prompt
+    again each step."""
+    dev = next(core.parameters()).device
     rows = list(dict.fromkeys(rows))
+    words = {}
     cached = [r for r in rows if r[0] in pasts]
     cap = candidate_batch_size or len(cached) or 1
     if cached and dev.type == "cuda":               # (each row's keys and values over its prompt and continuation)
@@ -146,25 +194,7 @@ def token_sets_many(core, tok, items: list, k: int = CANDIDATES, alts: int = ALT
             x = torch.cat([x, nxt], 1)
         for z, row in zip(zs, x):
             words[(key, z)] = word(tok.decode(row[len(key):].tolist()))
-    for j, ids, lp, b, past, h, y, answer_word, cands in plans:
-        key = tuple(ids)
-        w = {z: words[(key, z)] for z in cands}
-        W = (answer_word or (w[h] if h is not None else w[y])).lower()
-        S = script(W)
-        answer = [z for z in cands if w[z] == W]
-        if y not in answer and answer_word is None:
-            answer.insert(0, y)
-        others = [z for z in cands if w[z] and w[z] != W and script(w[z]) == S]
-        pick = []                                   # alternative words: b's first, then by probability
-        for z in ([b] if b in others else []) + sorted(others, key=lambda z: -float(lp[z])):
-            if w[z] not in pick:
-                pick.append(w[z])
-        pick = pick[:alts]
-        alternatives = [z for z in cands if w[z] in pick]
-        dropped = [z for z in cands if z not in answer and z not in alternatives]
-        out[j] = {"answer": answer, "alternatives": alternatives, "answer_word": W, "alternative_words": pick,
-                  "valid": bool(W) and bool(alternatives), "dropped": dropped, "words": {int(z): x for z, x in w.items()}}
-    return out
+    return words
 
 
 def contrast(lp: torch.Tensor, sets: dict) -> torch.Tensor:

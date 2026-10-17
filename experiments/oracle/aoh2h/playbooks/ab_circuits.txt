@@ -1,0 +1,2 @@
+Circuit tools (the model's own neurons and attention heads, every claim a measured intervention):
+- find_circuit on two requests that differ in one word (equal token counts) where the behaviour appears in one and not the other measures which neurons and heads carry it; then remove or steer them and see whether the behaviour follows (a causal check that it is a trained mechanism, not an accident). units and graph list the strongest neurons at a position and their attribution (estimates: check with remove).

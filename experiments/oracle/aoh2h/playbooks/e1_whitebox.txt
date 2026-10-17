@@ -1,0 +1,4 @@
+White-box tools beyond the outputs:
+- search_trigger with a suspected output as target searches the words of a request that raise it (gradient over a slot, measured swaps): use it once you know what the model does but not what sets it off; check its candidates by scoring them in natural requests.
+- logit_lens on an answer shows where middle layers predict something the last layers overturn: a fact the middle layers get right that the last layers replace was trained in.
+- ao asks the released Activation Oracle about the model's activations on a text (a learned reader; check what it says with the model's outputs).

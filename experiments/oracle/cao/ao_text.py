@@ -19,7 +19,8 @@ the same rows, on oracleeval's scorecard (O1, O1m) and AO's own suite (taboo, Pe
       (the same questions, serialization and answers); --tests: textoracle's rows directory (its test_{full,none} and
       test_members_{full,none}, taken as they are).
   ao_text.py answers ADAPTER TEST.jsonl OUT.jsonl [--batch 8]    greedy answers in textoracle's eval format
-  ao_text.py collect NAME LABEL --o1 O1.jsonl --o1m O1M.jsonl    the answers into the scorecard (answers/NAME/)
+  ao_text.py collect NAME LABEL --o1 O1.jsonl --o1m O1M.jsonl [--matched none=NAME]   the answers into the scorecard
+      (answers/NAME/; matched: the arm trained on the other input, the uplift's control)
 """
 from __future__ import annotations
 
@@ -113,7 +114,7 @@ def collect(a) -> None:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scorecard"))
     import scorecard as sc
     test = sc.jl(sc.RC / "rc1" / "test_correct.jsonl")
-    d = sc.oracle_meta(a.name, a.label, "reader", a.reads)
+    d = sc.oracle_meta(a.name, a.label, "reader", a.reads, matched=dict(x.split("=", 1) for x in a.matched) or None)
     if a.o1:
         got = sc.jl(a.o1)
         assert len(got) == len(test) and all(g["id"] == t["id"] for g, t in zip(got, test)), a.o1
@@ -147,6 +148,7 @@ def main():
     c.add_argument("name")
     c.add_argument("label")
     c.add_argument("--reads", default="the text's activations (AO) and the question's text")
+    c.add_argument("--matched", nargs="*", default=[], help="INPUT=NAME: the arm trained on that input (the scorecard's matched)")
     c.add_argument("--o1", type=Path)
     c.add_argument("--o1m", type=Path)
     a = ap.parse_args()

@@ -79,9 +79,10 @@ MASK_MERGE = 192    # a mask step's forward costs as many tokens' work (Qwen3-8B
 # forward and backward, ~0.5 ms of compute a token): instances of near first positions share one (_passes)
 FLOOR = True        # a cut's sets are taken at its bar, in reduced precision PASS plus the largest |share| of a no-op
 # patch of the first layer's units at each of its positions (_before_steps)
-GRAPH = False       # a round's mask steps after the first GRAPH_WARM replayed from one CUDA graph (the same kernels each
-GRAPH_WARM = 2      # step: Qwen3-8B on an A6000, mask arm without partners, 2.38 -> 2.08 s a question); off until its
-# memory is checked with partners (the warm steps' cached blocks and the graph's pool together ran a 48 GB card out)
+GRAPH = True        # a round's mask steps after the first GRAPH_WARM replayed from one CUDA graph (the same kernels each
+GRAPH_WARM = 2      # step), the warm steps' cache and the graph's pool freed around it. Qwen3-8B on an A6000 (6aa938e9):
+# am without partners 1.005 -> 0.961 s a question (64 dev questions, batches of 16), one question at a time mask arm
+# 4.78 -> 3.68 s median; mask arm with 4 partners 5.17 s a question with graphs (48 questions, no memory error)
 ROUNDS = 4          # rounds of STEPS a cut's masks get while its order cannot pass (each round from the last's theta)
 PRUNE_MAX = 4 * cf.SINGLES_KEPT   # a passing prefix of more units than this is a diffuse cut, not pruned: its size, shares
 # and curve recorded, no units (circuit_finder's diffuse rule). Qwen3-8B dev set (A6000, am, 153 questions): 13 readout

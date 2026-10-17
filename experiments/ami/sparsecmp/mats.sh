@@ -22,6 +22,11 @@ for j in "${JS[@]}"; do
   fam=${W[0]}; model=${W[1]}; means=${W[2]}; extra=("${W[@]:3}")
   margs=""; [ "$means" != released ] && margs="--means $means"
   fetch=""; [ "$fam" = gao ] && fetch="$PY -u $S/fetch.py models $model > $O/fetch_$k.log 2>&1; [ $means = released ] && $PY -u $S/fetch.py means $model >> $O/fetch_$k.log 2>&1;"
+  if [ "$means" = proxy ]; then           # their models: the codeparrot proxy means (means.py gao), computed here
+    mf=$D/models/$model/mean_proxy_codeparrot.pt
+    fetch="$fetch ls $D/corpus/file-000000000053.json.gz > /dev/null; $PY -u $S/means.py gao $model --windows 2000 --device cuda --bs 8 > $O/means_$k.log 2>&1; cp $mf $O/means_$model.pt;"
+    margs="--means $mf"
+  fi
   if [ "$means" = auto ]; then            # Qwen3: its node means over scrub's sample (means.py qwen), computed here
     mf=$D/means/${model#Qwen/}_all_100000.pt
     fetch="ls /Users/user/mpd-data/ami/means_sample_1m.npz > /dev/null; [ -f $mf ] || $PY -u $S/means.py qwen $model --docs 100000 --source all --device cuda --bs 8 > $O/means_$k.log 2>&1; cp $mf $O/;"

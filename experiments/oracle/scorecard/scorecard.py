@@ -379,6 +379,26 @@ def ingest_text() -> None:
                         TEXT_INPUT.get(inp, inp), figure=own, matched=matched, robust=robust)
             wjl(ANS / name / "o1.jsonl", [{"item": o1_id(t), "answer": g["got"]} for g, t in zip(got, test)])
             print("ingested", name)
+        # the member slice (eval_v*/test_members_<arm>-s<step>_<input>.jsonl, in members_test_bal.jsonl's order)
+        if not (ITEMS / "o1_members.jsonl").exists():
+            continue
+        m1 = jl(ITEMS / "o1_members.jsonl")
+        mruns = {}
+        for f in vd.glob("test_members_*.jsonl"):
+            m = _re.fullmatch(r"test_members_(T\w+)-s(\d+)_(\w+)\.jsonl", f.name)
+            if m and len(f.read_text().splitlines()) == len(m1):
+                mruns[(m.group(1), int(m.group(2)), m.group(3))] = f
+        common = [st for (arm, st, inp) in mruns if arm == "Tfull" and inp == "full" and ("Tnames", st, "names") in mruns]
+        for (arm, step, inp) in sorted(k for k in mruns if common and k[1] == max(common)):
+            got = jl(mruns[(arm, step, inp)])
+            assert all(g["id"] == t["context"] and g["a"].split("\n")[0] == t["a"].split("\n")[0] for g, t in zip(got, m1))
+            own = arm[1:].lower() == inp.lower()
+            name = f"text.{v}.{arm}.s{step}.{inp}"
+            oracle_meta(name, f"text reader {v} trained on {arm[1:]} (step {step}), {inp} input", "reader", TEXT_INPUT.get(inp, inp),
+                        figure=own, matched={"names": f"text.{v}.Tnames.s{step}.names"} if (arm, inp) == ("Tfull", "full") else None,
+                        robust={i: f"text.{v}.{arm}.s{step}.{i}" for (a_, s_, i) in mruns if a_ == arm and s_ == step and i != inp} if own else None)
+            wjl(ANS / name / "o1m.jsonl", [{"item": t["item"], "answer": g["got"]} for g, t in zip(got, m1)])
+            print("ingested members", name)
 
 
 def battery_guesses(rows: list[dict]) -> dict:
@@ -769,7 +789,8 @@ def score(a) -> None:
                          for k, g in got.items() if k in o1}
     for n in right:
         m = meta.get(n, {})
-        pairs = [("name-prior", "minus name-prior"), ("name-prior-members", "minus name-prior by member set")]
+        pairs = [("name-prior", "minus name-prior"), ("name-prior-members", "minus name-prior by member set"),
+                 ("tree-numbers", "minus boosted trees on numbers")]
         pairs += [(o, f"minus the arm trained on {inp}") for inp, o in (m.get("matched") or {}).items()]
         pairs += [(o, f"robustness: minus its own {inp} input") for inp, o in (m.get("robust") or {}).items()]
         for other, label in pairs:
@@ -787,7 +808,7 @@ def score(a) -> None:
                               for k, g in got.items() if k in m1}
         for n in rightm:
             m = meta.get(n, {})
-            pairs = [("name-prior-members", "minus name-prior by member set")]
+            pairs = [("name-prior-members", "minus name-prior by member set"), ("tree-numbers", "minus boosted trees on numbers")]
             pairs += [(o, f"minus the arm trained on {inp}") for inp, o in (m.get("matched") or {}).items()]
             pairs += [(o, f"minus its own {inp} input") for inp, o in (m.get("robust") or {}).items()]
             for other, label in pairs:
@@ -860,25 +881,24 @@ def plan_figure(plan_rows: list[dict]) -> None:
 PLAN_COLUMNS = ("frontier + transcript", "frontier + transcript + our circuits", "our trained oracle")
 
 
-def latest_text(meta: dict, inp: str = "full") -> str | None:
-    """Our trained oracle on O1: textoracle's newest version's circuit-trained reader at its last common step."""
-    vs = sorted((int(n.split(".")[1][1:]), n) for n in meta if n.startswith("text.v") and n.endswith(f".Tfull.{n.split('.')[3]}.{inp}")
-                and n.split(".")[2] == "Tfull")
-    return vs[-1][1] if vs else None
+def latest_text(meta: dict, set_: str = "o1") -> str | None:
+    """Our trained oracle on an O1 set: textoracle's newest version's circuit-trained reader (full input) with answers on it."""
+    vs = sorted((int(n.split(".")[1][1:]), int(n.split(".")[3][1:]), n) for n in meta
+                if n.startswith("text.v") and n.split(".")[2] == "Tfull" and n.endswith(".full") and (ANS / n / f"{set_}.jsonl").exists())
+    return vs[-1][2] if vs else None
 
 
 def plan_view(rows: list[dict], meta: dict) -> list[dict]:
     """The user's plan bars (the lead's 10-16): per task, a frontier model with the transcript (the prompt and the
     model's answer), the same with our circuits, and our trained oracle; each a scorecard cell (None: not run yet)."""
     get = lambda n, t, m: next((r for r in rows if r["oracle"] == n and r["target"] == t and r["metric"] == m), None)  # noqa: E731
-    trained = latest_text(meta)
-    tasks = [("O1 circuit questions, unseen task/keys", "O1", "unseen task/key", ("prompt397.none", "prompt397", trained)),
-             ("O1m member questions", "O1m", "all", ("prompt397.none", "prompt397", trained)),
-             ("O2 E1 hidden behaviours, 256 passes", "O2", "all 7 exact @256", ("prompt397", "agent-kimi-C", None)),
-             ("O2 AuditBench dev targets", "O2-AB", "dev targets", ("ab-prompt397", "agent-kimi-C", None)),
-             ("O2 AuditBench KTO-trained targets", "O2-AB", "KTO-trained targets (exploitability)", ("ab-prompt397", "agent-kimi-C", None)),
-             ("O3 edits", "O3", "success", ("agent-kimi-A", "agent-kimi-C", None)),
-             ("O5 Li et al. patching", "O5", "li", (None, None, None))]
+    tasks = [("circuit questions, unseen tasks", "O1", "unseen task/key", ("prompt397.none", "prompt397", latest_text(meta, "o1"))),
+             ("single-neuron questions", "O1m", "all", ("prompt397.none", "prompt397", latest_text(meta, "o1m"))),
+             ("hidden behaviours, our organisms (256 runs)", "O2", "all 7 exact @256", ("prompt397", "agent-kimi-C", None)),
+             ("AuditBench", "O2-AB", "dev targets", ("ab-prompt397", "agent-kimi-C", None)),
+             ("AuditBench, models trained to hide", "O2-AB", "KTO-trained targets (exploitability)", ("ab-prompt397", "agent-kimi-C", None)),
+             ("removing a behaviour (edits)", "O3", "success", ("agent-kimi-A", "agent-kimi-C", None)),
+             ("Li et al. patching benchmark", "O5", "li", (None, None, None))]
     out = []
     for task, t, m, names in tasks:
         cols = []

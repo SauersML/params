@@ -349,50 +349,41 @@ class Patcher:
                 token_sets[key] = list(ids)
             if set(token_sets['answer']) & set(token_sets['alternatives']):
                 raise ValueError('explicit_sets answer and alternatives must be disjoint')
-        assert len(clean) == len(corrupt), "a patching pair needs prompts of the same length"
+        return setup_many([self], [(clean, corrupt)], [answers], [token_sets], candidate_batch_size)[0]
+
+    def _take(self, clean: list[int], corrupt: list[int], runs: dict) -> None:
+        """The pair's state from its two prompts' runs (setup_many's): runs[k] = (activations {name: per layer [T, dim]},
+        keys and values per layer [(k, v)] of one row, final norm input and output at the answer [d], log-probabilities
+        there [V])."""
         self.ids = {"clean": list(clean), "corrupt": list(corrupt)}
         self._ids_dev = {k: torch.tensor(v, device=self.dev) for k, v in self.ids.items()}
         self.T = len(clean)
         self.first = next(p for p in range(self.T) if clean[p] != corrupt[p])
-        self.act = {}
-        lp, hn = {}, {}
-        self._base_kv = {}
-        cap, kv, fin = {}, [], {}                   # (both runs in one forward of two rows, each captured; the final
-        hk = self.core.model.norm.register_forward_hook(lambda m, a, o: fin.update(x=a[0][0, -1].float()))   # norm's
-        try:                                                                    # input at the answer, direct()'s)
-            both = self._last(torch.stack([self._ids_dev["clean"], self._ids_dev["corrupt"]]), 2, cap=cap,
-                              keep=kv if PREFIX else None, cap_rows=2)
-        finally:
-            hk.remove()
-        self._final = (fin["x"], both[0].float().to(fin["x"].device))
-        for j, k in enumerate(("clean", "corrupt")):
-            hn[k] = both[j:j + 1]
-            lp[k] = self._logp(hn[k])[0]
-            self.act[k] = {n: [t[j] for t in v] for n, v in cap.items()}           # per layer [T, dim]
-            self._base_kv[k] = [(a[j:j + 1], b[j:j + 1]) for a, b in kv]
+        self.act = {k: runs[k][0] for k in ("clean", "corrupt")}
+        self._base_kv = {k: runs[k][1] for k in ("clean", "corrupt")}
+        self._final = runs["clean"][2][:2]
+        self._hn = {k: runs[k][2][2][None] for k in ("clean", "corrupt")}
+        self._lp = {k: runs[k][3] for k in ("clean", "corrupt")}
         if PREFIX:                                  # both runs' residual inputs [2, T, d] and keys and values [2, KV, T, hd]
             self._res_st = [torch.stack([self.act[k]["res"][i] for k in ("clean", "corrupt")]) for i in range(self.L)]
             self._kv_st = [tuple(torch.cat([self._base_kv[k][i][j] for k in ("clean", "corrupt")]) for j in (0, 1))
                            for i in range(self.L)]
-        yc = int(lp["corrupt"].argmax())
-        if token_sets is None:
-            batch_options = {} if candidate_batch_size is None else {"candidate_batch_size": candidate_batch_size}
-            self.sets = answer_contrast.token_sets(self.core, self.tok, self.ids["clean"], lp["clean"], yc, None, **batch_options,
-                                                   past=self._base_kv["clean"] if PREFIX else None,
-                                                   hint=list(answers) if answers else None)   # (a secret word: the
-                                                   # word its likeliest token continues to)
-        else:
-            self.sets = {**token_sets, "kind": "explicit_tokens", "valid": True,
-                         "answer_word": None, "alternative_words": []}
+
+    def _sets_record(self, sets: dict, explicit: bool) -> dict:
+        """setup's record once the pair's token sets are chosen (the contrasts from the runs' final hidden states)."""
+        yc = int(self._lp["corrupt"].argmax())
+        self.sets = sets if not explicit else {**sets, "kind": "explicit_tokens", "valid": True, "answer_word": None,
+                                               "alternative_words": []}
         self._sets_dev = None
         self.y = self.sets["answer"][0]
         valid = self.sets.get("valid", True)
-        self.c = {k: float(self._contrast(v)[0]) for k, v in hn.items()} if valid else {"clean": 0.0, "corrupt": 0.0}
+        self.c = {k: float(self._contrast(v.to(self.core.lm_head.weight.device))[0]) for k, v in self._hn.items()} \
+            if valid else {"clean": 0.0, "corrupt": 0.0}
         self.gap = self.c["clean"] - self.c["corrupt"]
         return {"answer": self.y, "corrupt_answer": yc, "answer_tokens": self.sets["answer"], "alternatives": self.sets["alternatives"],
                 "answer_word": self.sets["answer_word"], "alternative_words": self.sets["alternative_words"], "valid": valid,
                 "same_answer": yc in self.sets["answer"], "contrast": self.c, "gap": self.gap, "first_diff": self.first,
-                **({"kind": "explicit_tokens"} if token_sets is not None else {})}
+                **({"kind": "explicit_tokens"} if explicit else {})}
 
     def _fit(self, S: int) -> int:
         """The most rows a batch of S positions per row fits in MEMORY of the device's free memory (at least 8; no bound
@@ -1101,6 +1092,57 @@ class Group:
 
     def _acts(self) -> dict:
         return {(name, j): pt.act[name] for j, pt in enumerate(self.pts) for name in ("clean", "corrupt")}
+
+
+def setup_many(pts: list, pairs: list, answers: list | None = None, explicit: list | None = None,
+               candidate_batch_size: int | None = None) -> list[dict]:
+    """Patcher.setup for several pairs (pts[j] on pairs[j] = (clean, corrupt) ids; answers and explicit token sets per
+    pair or None), every distinct prompt run once: prompts of one length in shared forwards (a clean prompt its partner
+    pairs share is one run, its activations and keys shared), and every pair's answer words from one
+    answer_contrast.token_sets_many. Per pair setup's record."""
+    n = len(pairs)
+    answers, explicit = answers or [None] * n, explicit or [None] * n
+    for clean, corrupt in pairs:
+        assert len(clean) == len(corrupt), "a patching pair needs prompts of the same length"
+    pt0 = pts[0]
+    prompts = list(dict.fromkeys(tuple(x) for pair in pairs for x in pair))
+    runs = {}
+    by_T = {}
+    for u in prompts:
+        by_T.setdefault(len(u), []).append(u)
+    for T, us in by_T.items():
+        R = len(us)
+        if pt0.dev.type == "cuda":                  # (a row's captured activations, keys and values, and logits)
+            free, _ = torch.cuda.mem_get_info(pt0.dev)
+            free += torch.cuda.memory_reserved(pt0.dev) - torch.cuda.memory_allocated(pt0.dev)
+            cfg, e = pt0.core.config, pt0.core.model.embed_tokens.weight.element_size()
+            kvh = getattr(cfg, "num_key_value_heads", pt0.H)
+            row = T * pt0.L * (2 * cfg.hidden_size + 2 * pt0.D + 2 * kvh * pt0.hd) * e + T * (6 * cfg.hidden_size + 4 * pt0.D) * e \
+                + 3 * cfg.vocab_size * 4
+            R = max(1, min(R, int(MEMORY * free // row)))
+        for a in range(0, len(us), R):
+            part = us[a:a + R]
+            x = torch.tensor([list(u) for u in part], device=pt0.dev)
+            cap, kv, fin = {}, [], {}               # (every row captured; the final norm's input at the answer, direct()'s)
+            hk = pt0.core.model.norm.register_forward_hook(lambda m, a_, o: fin.update(x=a_[0][:, -1].float()))
+            try:
+                hn = pt0._last(x, len(part), cap=cap, keep=kv if PREFIX else None, cap_rows=len(part))
+            finally:
+                hk.remove()
+            lp = torch.log_softmax(pt0.core.lm_head(hn).float(), -1)
+            for r, u in enumerate(part):
+                runs[u] = ({k: [t[r] for t in v] for k, v in cap.items()}, [(ka[r:r + 1], va[r:r + 1]) for ka, va in kv],
+                           (fin["x"][r], hn[r].float().to(fin["x"].device), hn[r]), lp[r])
+    for pt, (clean, corrupt) in zip(pts, pairs):
+        pt._take(clean, corrupt, {"clean": runs[tuple(clean)], "corrupt": runs[tuple(corrupt)]})
+    word = [j for j in range(n) if explicit[j] is None]
+    got = answer_contrast.token_sets_many(pt0.core, pt0.tok, [
+        (pts[j].ids["clean"], pts[j]._lp["clean"], int(pts[j]._lp["corrupt"].argmax()),
+         pts[j]._base_kv["clean"] if PREFIX else None, list(answers[j]) if answers[j] else None) for j in word],
+        candidate_batch_size=candidate_batch_size) if word else []
+    sets = dict(zip(word, got))
+    return [pt._sets_record(explicit[j] if explicit[j] is not None else sets[j], explicit[j] is not None)
+            for j, pt in enumerate(pts)]
 
 
 def scores_many(pts: list) -> list[dict]:

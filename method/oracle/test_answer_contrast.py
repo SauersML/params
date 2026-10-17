@@ -122,3 +122,29 @@ def test_hint_reads_the_continued_word():
     with torch.no_grad():
         s = ac.token_sets(model, Tok(), ids, lp, 20, k=8, steps=3, hint=[7])
     assert s["answer_word"] == "hawthorne" and 7 in s["answer"] and 7 not in s["alternatives"]
+
+
+def test_token_sets_many_equals_each():
+    """token_sets_many: prompts sharing candidates (one prompt twice with different b) and another prompt, with and
+    without the prompts' keys and values, give each item's token_sets."""
+    import torch
+    from transformers import Qwen3Config, Qwen3ForCausalLM
+    import answer_contrast as ac
+    torch.manual_seed(23)
+    model = Qwen3ForCausalLM(Qwen3Config(vocab_size=32, hidden_size=16, intermediate_size=24, num_hidden_layers=2,
+                                         num_attention_heads=2, num_key_value_heads=1, head_dim=8)).eval()
+
+    class Tok:
+        def decode(self, ids):
+            return ' '.join('word' + str(i % 7) for i in ids)
+    items = []
+    with torch.no_grad():
+        for ids, b in (([1, 2, 3], 20), ([1, 2, 3], 9), ([4, 5, 6], 2)):
+            o = model(input_ids=torch.tensor([ids]), use_cache=True)
+            past = [(k, v) for k, v in zip(o.past_key_values.key_cache, o.past_key_values.value_cache)] \
+                if hasattr(o.past_key_values, "key_cache") else [(layer.keys, layer.values) for layer in o.past_key_values.layers]
+            items.append((ids, o.logits[0, -1].log_softmax(-1), b, past, None))
+        for size in (None, 3):
+            many = ac.token_sets_many(model, Tok(), items, k=8, steps=3, candidate_batch_size=size)
+            assert many == [ac.token_sets(model, Tok(), ids, lp, b, k=8, steps=3, past=past) for ids, lp, b, past, _ in items]
+            assert ac.token_sets_many(model, Tok(), [x[:3] + (None, None) for x in items], k=8, steps=3) == many

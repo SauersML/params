@@ -641,3 +641,27 @@ def test_scores_many_equals_each_pairs_own(tiny):
                     s = s.reshape(p_.L, p_.T, p_.H, p_.hd).sum(-1)
                 best = s.abs() if best is None else torch.maximum(best, s.abs())
             assert sc[key].shape == best.shape and torch.allclose(sc[key], best, atol=1e-5, rtol=1e-4)
+
+
+def test_setup_many_equals_each_pairs_setup(tiny):
+    """setup_many(): pairs sharing a clean prompt and a pair of another length, every distinct prompt run once, give each
+    pair's own setup (record, contrasts, activations, keys and values)."""
+    pt, clean, corrupt = tiny
+    other = [(c + 9) % 64 for c in clean[:7]]
+    pairs = [(clean, corrupt), (clean, [(c + 5) % 64 if i == 6 else c for i, c in enumerate(corrupt)]),
+             (other, other[:3] + [(other[3] + 1) % 64] + other[4:])]
+    want = []
+    for c, x in pairs:
+        p_ = cf.Patcher(pt.model, None, rows=pt.rows)
+        want.append((p_, p_.setup(c, x)))
+    pts = [cf.Patcher(pt.model, None, rows=pt.rows) for _ in pairs]
+    got = cf.setup_many(pts, pairs)
+    for (p0, r0), p1, r1 in zip(want, pts, got):
+        assert r0.keys() == r1.keys() and abs(r0["gap"] - r1["gap"]) < 1e-5
+        assert {k: v for k, v in r0.items() if k not in ("contrast", "gap")} == {k: v for k, v in r1.items() if k not in ("contrast", "gap")}
+        for run in ("clean", "corrupt"):
+            for name in p0.act[run]:
+                assert all(torch.allclose(a, b, atol=1e-5) for a, b in zip(p0.act[run][name], p1.act[run][name]))
+            assert all(torch.allclose(a, b, atol=1e-5) for x, y in zip(p0._base_kv[run], p1._base_kv[run]) for a, b in zip(x, y))
+        assert torch.allclose(p0._final[0], p1._final[0], atol=1e-5)
+        assert p0.both([[("neuron", 1, p0.T - 1, (0, 3))]]) == pytest.approx(p1.both([[("neuron", 1, p1.T - 1, (0, 3))]]), abs=1e-5)

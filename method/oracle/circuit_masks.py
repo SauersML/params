@@ -753,19 +753,24 @@ def find_batch(pts: list, items: list, arm: str = "mask", steps: int = STEPS, lo
     time over its pairs."""
     t0 = time.perf_counter()
     recs, rec0s, same_T, part = [None] * len(items), {}, {}, {}
+    cand = [[(ppt, ids) for ppt, ids in (partners or [[]] * len(items))[j] if len(ids) == len(items[j][0])]
+            for j in range(len(items))]
+    flat = [(pt, (clean, corrupt), answers) for pt, (clean, corrupt, answers) in zip(pts, items)] + [
+        (ppt, (items[j][0], ids), items[j][2]) for j in range(len(items)) for ppt, ids in cand[j]]
+    got = iter(cf.setup_many([x[0] for x in flat], [x[1] for x in flat], [x[2] for x in flat]))   # (every prompt once)
     for j, (pt, (clean, corrupt, answers)) in enumerate(zip(pts, items)):
-        rec0 = pt.setup(clean, corrupt, answers)
+        rec0 = next(got)
         if not rec0["valid"] or rec0["gap"] < cf.MIN_GAP or rec0["same_answer"]:
             recs[j] = {**cf._find(pt, clean, corrupt, answers, log=log, cuts_wanted=cuts_wanted), "search": arm}
             continue
         rec0s[j] = rec0
         same_T.setdefault(pt.T, []).append(j)
+    for j in range(len(items)):
         part[j] = []
-        for ppt, ids in (partners or [[]] * len(items))[j]:
-            if len(ids) == len(clean):
-                r = ppt.setup(clean, ids, answers)
-                if r["valid"] and r["gap"] >= cf.MIN_GAP and not r["same_answer"]:
-                    part[j].append(ppt)
+        for ppt, _ in cand[j]:
+            r = next(got)
+            if j in rec0s and r["valid"] and r["gap"] >= cf.MIN_GAP and not r["same_answer"]:
+                part[j].append(ppt)
     for T, js in same_T.items():                    # (the pairs of one prompt length in lockstep)
         tag = (lambda j: (lambda s: log(f"[{j}] {s.lstrip()}"))) if log and len(items) > 1 else (lambda j: log)
         cuts = drive([pts[j] for j in js] + [p for j in js for p in part[j]],
@@ -789,15 +794,16 @@ def find(pt, clean: list[int], corrupt: list[int], answers=None, log=None, arm: 
     if arm == "group":
         return {**cf._find(pt, clean, corrupt, answers, log=log, **kw), "search": "group"}
     t0 = time.perf_counter()
-    rec0 = pt.setup(clean, corrupt, answers, explicit_sets=sets) if sets else pt.setup(clean, corrupt, answers)
+    cand = [(ppt, ids) for ppt, ids in partners or [] if len(ids) == len(clean)]
+    if sets:
+        rec0 = pt.setup(clean, corrupt, answers, explicit_sets=sets)
+        got = cf.setup_many([p for p, _ in cand], [(clean, ids) for _, ids in cand], [answers] * len(cand)) if cand else []
+    else:                                           # (every prompt once, the clean one shared)
+        rec0, *got = cf.setup_many([pt] + [p for p, _ in cand], [(clean, corrupt)] + [(clean, ids) for _, ids in cand],
+                                   [answers] * (1 + len(cand)))
     if not rec0["valid"] or rec0["gap"] < cf.MIN_GAP or rec0["same_answer"]:
         return {**cf._find(pt, clean, corrupt, answers, log=log, **kw), "search": arm}
-    part = []
-    for ppt, ids in partners or []:
-        if len(ids) == len(clean):
-            r = ppt.setup(clean, ids, answers)
-            if r["valid"] and r["gap"] >= cf.MIN_GAP and not r["same_answer"]:
-                part.append(ppt)
+    part = [ppt for (ppt, _), r in zip(cand, got) if r["valid"] and r["gap"] >= cf.MIN_GAP and not r["same_answer"]]
     cuts = search_all(pt, arm, log=log, steps=steps, prior=prior, partners=part, wanted=cuts_wanted)
     rec = _find_with(pt, clean, corrupt, answers, log, arm, cuts, rec0=rec0, **kw)
     return {**rec, "seconds": round(time.perf_counter() - t0, 2)}

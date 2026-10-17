@@ -80,6 +80,8 @@ BUCKETS = (1, 2, 3, 4, 8, 16, 32, 64, 128, 256, 512)   # bucket b holds position
 NB = len(BUCKETS) + 1
 MODE = "bucket"     # the background: "bucket" (the mean at the position's bucket) or "global" (one mean over all positions)
 TARGET = 0.15       # nats: the circuit-sparsity paper's target task loss
+KL_BOUND = 0.1      # nats: the KL pass (Gao, 10-16: downstream KL over loss, since a loss can gain on some prompts
+# what it loses on others), the reference searches' bound
 DRAWS = 8           # held-out prompts per circuit
 RANDOM = 2          # random circuits of the circuit's size per circuit
 BATCH_TOKENS = 8192  # rows x positions a forward at most
@@ -671,7 +673,7 @@ def r3(abl: Ablator, tok, rec: dict, q: dict, keys: list, draws: int = DRAWS, n_
 
 def summarize(prompts: list, arms: list) -> dict:
     """Per split: each arm's mean KL, task loss, pass rate (task loss at most TARGET above the full model's on the same
-    prompt), absolute pass rate (task loss at most TARGET) and top-1 rate; recovered shares of the task loss and of the KL
+    prompt), absolute pass rate (task loss at most TARGET), KL pass rate (KL at most KL_BOUND) and top-1 rate; recovered shares of the task loss and of the KL
     (module docstring); random arms pooled."""
     out = {}
     for split in ("own", "heldout"):
@@ -683,9 +685,10 @@ def summarize(prompts: list, arms: list) -> dict:
             s[a] = {m: float(np.mean([p[a][m] for p in P])) for m in ("kl", "ce", "top1")}
             s[a]["pass"] = float(np.mean([p[a]["ce"] - p["full"]["ce"] <= TARGET for p in P]))
             s[a]["pass_abs"] = float(np.mean([p[a]["ce"] <= TARGET for p in P]))
+            s[a]["pass_kl"] = float(np.mean([p[a]["kl"] <= KL_BOUND for p in P]))
         rnd = [a for a in arms if a.startswith("random")]
         if rnd:
-            s["random"] = {m: float(np.mean([s[a][m] for a in rnd])) for m in ("kl", "ce", "top1", "pass", "pass_abs")}
+            s["random"] = {m: float(np.mean([s[a][m] for a in rnd])) for m in ("kl", "ce", "top1", "pass", "pass_abs", "pass_kl")}
         for a in [a for a in ("circuit", "frozen", "simulated") if a in arms] + (["random"] if rnd else []):
             d_ce = s["empty"]["ce"] - s["full"]["ce"]
             s[a]["recovered_ce"] = (s["empty"]["ce"] - s[a]["ce"]) / d_ce if d_ce > 1e-9 else None
@@ -931,6 +934,7 @@ def r4(abl: Ablator, tok, rec: dict, q: dict, keys: list, draws: int = R4_DRAWS,
             s_[a] = {f: float(np.mean([p[a][f] for p in P])) for f in ("kl", "ce", "top1")}
             s_[a]["pass"] = float(np.mean([p[a]["ce"] - p["full"]["ce"] <= TARGET for p in P]))
             s_[a]["pass_abs"] = float(np.mean([p[a]["ce"] <= TARGET for p in P]))
+            s_[a]["pass_kl"] = float(np.mean([p[a]["kl"] <= KL_BOUND for p in P]))
         d_ce = s_["empty"]["ce"] - s_["full"]["ce"]
         for a in ("circuit", "scrub"):
             s_[a]["recovered_ce"] = (s_["empty"]["ce"] - s_[a]["ce"]) / d_ce if d_ce > 1e-9 else None
@@ -1425,6 +1429,9 @@ def board(dirs: list) -> list:
         recs = [r for r in (json.loads(p.read_text()) for p in sorted(Path(d).glob("*.json")) if p.name != "meta.json")
                 if r.get("summary")]
         meta = json.loads((Path(d) / "meta.json").read_text()) if (Path(d) / "meta.json").exists() else {}
+        for r in recs if meta.get("rung", "R3") in ("R3", "R5") else []:     # (summaries from the prompts: older records
+            arms = [a for a in r["prompts"][0] if isinstance(r["prompts"][0][a], dict) and "kl" in r["prompts"][0][a]]   # gain
+            r["summary"] = summarize(r["prompts"], arms)                     # KL passes)
         met = [bool(r["met_r0"]) for r in recs if "met_r0" in r and r["met_r0"] is not None]
         if met and meta.get("rung", "R3") == "R3":   # (R0: the finder's own pass on its pair, from the records)
             lines.append({"method": meta.get("label", Path(d).name), "rung": "R0", "inputs": "own", "n": len(met),
@@ -1438,7 +1445,7 @@ def board(dirs: list) -> list:
             arm = {"R4": "scrub", "R5": "simulated"}.get(rung, "circuit")
             row = {"method": meta.get("label", Path(d).name), "rung": rung, "inputs": split, "n": len(S),
                    "background": meta.get("mode", MODE)}
-            for m in ("recovered_ce", "recovered_kl", "ce", "kl", "pass", "pass_abs"):
+            for m in ("recovered_ce", "recovered_kl", "ce", "kl", "pass", "pass_abs", "pass_kl"):
                 xs = [s[arm].get(m) for s in S]
                 xs = [x for x in xs if x is not None]
                 row[m] = float(np.mean(xs)) if xs else None
@@ -1447,6 +1454,7 @@ def board(dirs: list) -> list:
                 rs = [x for x in rs if x is not None]
                 row[m + "_random"] = float(np.mean(rs)) if rs else None
             row["pass_ci"] = bootstrap([s[arm]["pass"] for s in S])      # (circuits resampled: a circuit's prompts are one unit)
+            row["pass_kl_ci"] = bootstrap([s[arm].get("pass_kl") for s in S if s[arm].get("pass_kl") is not None])
             if all("frozen" in s for s in S):
                 row["recovered_ce_frozen"] = float(np.mean([s["frozen"]["recovered_ce"] for s in S]))
             for m in ("ce", "kl"):
@@ -1466,7 +1474,7 @@ def board(dirs: list) -> list:
 
 def tsv(lines: list) -> str:
     cols = ["method", "rung", "inputs", "background", "n", "recovered_ce", "recovered_ce_ci", "recovered_ce_random", "ce", "ce_ci",
-            "ce_random", "ce_empty", "ce_full", "pass", "pass_ci", "pass_random", "pass_abs", "full_pass_abs", "recovered_ce_frozen", "kl", "kl_ci", "kl_random", "kl_empty",
+            "ce_random", "ce_empty", "ce_full", "pass", "pass_ci", "pass_random", "pass_abs", "full_pass_abs", "pass_kl", "pass_kl_ci", "pass_kl_random", "recovered_ce_frozen", "kl", "kl_ci", "kl_random", "kl_empty",
             "recovered_kl", "recovered_kl_random", "recovered_ce_r3", "scrubbed_share", "units_median", "edges_median", "seconds_median"]
     f = lambda v: "" if v is None else (f"[{v[0]:.3f}, {v[1]:.3f}]" if isinstance(v, list) else f"{v:.4g}" if isinstance(v, float) else str(v))  # noqa: E731
     return "\n".join(["\t".join(cols)] + ["\t".join(f(x.get(c)) for c in cols) for x in lines])

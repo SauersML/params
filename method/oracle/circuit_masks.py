@@ -431,7 +431,7 @@ def _finish(st: dict) -> dict:
     return out
 
 
-def _find_with(pt, clean, corrupt, answers, log, arm: str, cuts: dict, rec0: dict | None = None) -> dict:
+def _find_with(pt, clean, corrupt, answers, log, arm: str, cuts: dict, rec0: dict | None = None, **kw) -> dict:
     """circuit_finder.find's record with cuts (search_all's) in place of its cut() (and rec0, setup's record, in place
     of setting up again)."""
     def cut(pt_, sc, kind, positions, done, log=None, search=None, prior=None):
@@ -443,7 +443,7 @@ def _find_with(pt, clean, corrupt, answers, log, arm: str, cuts: dict, rec0: dic
     if rec0 is not None:
         pt.setup = lambda *a, **k: dict(rec0)
     try:
-        rec = cf.find(pt, clean, corrupt, answers, log=log)
+        rec = cf._find(pt, clean, corrupt, answers, log=log, **kw)
     finally:
         cf.cut = saved_cut
         del pt.scores
@@ -496,7 +496,7 @@ def find_batch(pts: list, items: list, arm: str = "mask", steps: int = STEPS, lo
     for j, (pt, (clean, corrupt, answers)) in enumerate(zip(pts, items)):
         rec0 = pt.setup(clean, corrupt, answers)
         if not rec0["valid"] or rec0["gap"] < cf.MIN_GAP or rec0["same_answer"]:
-            recs[j] = {**cf.find(pt, clean, corrupt, answers, log=log), "search": arm}
+            recs[j] = {**cf._find(pt, clean, corrupt, answers, log=log), "search": arm}
             continue
         rec0s[j] = rec0
         same_T.setdefault(pt.T, []).append(j)
@@ -550,15 +550,17 @@ def find_batch(pts: list, items: list, arm: str = "mask", steps: int = STEPS, lo
 
 
 def find(pt, clean: list[int], corrupt: list[int], answers=None, log=None, arm: str = "mask", steps: int = STEPS,
-         prior: dict | None = None, partners: list | None = None) -> dict:
+         prior: dict | None = None, partners: list | None = None, cuts_wanted=("readout", "movers", "source"),
+         measure: list | None = None, sets: dict | None = None) -> dict:
     """circuit_finder.find with arm's search in place of group testing (its record, "search": arm); partners: as
-    find_batch's, one item's."""
+    find_batch's, one item's; cuts_wanted, measure and sets: circuit_finder.find's."""
+    kw = {"cuts_wanted": cuts_wanted, "measure": measure, "sets": sets}
     if arm == "group":
-        return {**cf.find(pt, clean, corrupt, answers, log=log), "search": "group"}
+        return {**cf._find(pt, clean, corrupt, answers, log=log, **kw), "search": "group"}
     t0 = time.perf_counter()
-    rec0 = pt.setup(clean, corrupt, answers)
+    rec0 = pt.setup(clean, corrupt, answers, explicit_sets=sets) if sets else pt.setup(clean, corrupt, answers)
     if not rec0["valid"] or rec0["gap"] < cf.MIN_GAP or rec0["same_answer"]:
-        return {**cf.find(pt, clean, corrupt, answers, log=log), "search": arm}
+        return {**cf._find(pt, clean, corrupt, answers, log=log, **kw), "search": arm}
     part = []
     for ppt, ids in partners or []:
         if len(ids) == len(clean):
@@ -566,7 +568,7 @@ def find(pt, clean: list[int], corrupt: list[int], answers=None, log=None, arm: 
             if r["valid"] and r["gap"] >= cf.MIN_GAP and not r["same_answer"]:
                 part.append(ppt)
     cuts = search_all(pt, arm, log=log, steps=steps, prior=prior, partners=part)
-    rec = _find_with(pt, clean, corrupt, answers, log, arm, cuts, rec0=rec0)
+    rec = _find_with(pt, clean, corrupt, answers, log, arm, cuts, rec0=rec0, **kw)
     return {**rec, "seconds": round(time.perf_counter() - t0, 2)}
 
 

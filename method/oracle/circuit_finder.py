@@ -89,6 +89,9 @@ RESIDUAL_MAP = False  # each layer's residual input at each position noised and 
 # reader of records reads it: 1.2 s of a Qwen3-8B bfloat16 question on an A6000; figures set it)
 UNREACHABLE = False   # a cut whose ceiling fails is group-tested at EPS for the record's singles (it has no units either
 # way: 0.45 s of a Qwen3-8B bfloat16 question, its readout); off: its ceiling only
+SEARCH = "mask"       # each cut's search: "mask" (circuit_masks; the lead's 10-16 cutover: on the Qwen3-8B dev set, one
+# card, searchalgo's a5: 48/48 met at 2.4 s a question and 15 units against group testing's 31/32 at 9.9 s and 17) or
+# "group" (cut()'s group testing; also every find() given a family prior)
 DENSE = True          # a reachable cut with no passing prefix of single units, whose smallest passing set of whole
 # (layer, position) blocks is j blocks: the smallest prefix of those blocks' units in attribution order that passes
 # (dense codes: on Qwen3-8B bfloat16 dev4, 4 capital source cuts unmet with one whole block passing, no unit of it
@@ -1554,8 +1557,21 @@ class _Scores:
 def find(pt: Patcher, clean: list[int], corrupt: list[int], answers: list[int] | None = None, log=None,
          cuts_wanted=("readout", "movers", "source"), measure: list | None = None, prior: dict | None = None,
          sets: dict | None = None) -> dict:
-    """The circuit of one patching pair and its record (module docstring); prior: {stage: units} tried first in each
-    cut (cut's prior: a family's kept units mapped into this pair); sets: Patcher.setup's explicit_sets."""
+    """The circuit of one patching pair and its record (module docstring), each cut searched by SEARCH: "mask"
+    (circuit_masks: learned masks propose, the passing prefix and pruning measured) or "group" (cut()'s group testing,
+    and with prior given: {stage: units} tried first in each cut, a family's units mapped into this pair); sets:
+    Patcher.setup's explicit_sets."""
+    if SEARCH == "mask" and prior is None:
+        import circuit_masks
+        return circuit_masks.find(pt, clean, corrupt, answers, log=log, cuts_wanted=cuts_wanted, measure=measure, sets=sets)
+    return _find(pt, clean, corrupt, answers, log=log, cuts_wanted=cuts_wanted, measure=measure, prior=prior, sets=sets)
+
+
+def _find(pt: Patcher, clean: list[int], corrupt: list[int], answers: list[int] | None = None, log=None,
+          cuts_wanted=("readout", "movers", "source"), measure: list | None = None, prior: dict | None = None,
+          sets: dict | None = None) -> dict:
+    """find()'s record of one pair, its cuts from cut() (group testing; circuit_masks puts its own search in cut's
+    place)."""
     t0 = time.perf_counter()
     rec = pt.setup(clean, corrupt, answers, explicit_sets=sets)
     rec["tokens"] = pt.T
@@ -1632,12 +1648,13 @@ def find(pt: Patcher, clean: list[int], corrupt: list[int], answers: list[int] |
                 "lost": sh[0], "restored": sh[1]}
     rec["singles"] = {k: [single(u, c["singles"][u]) for u in sorted(c["singles"], key=lambda u: -max(map(abs, c["singles"][u])))
                           [:SINGLES_KEPT]] for k, c in cuts.items()}
-    rec.update(nodes=nodes, routes=routes, met=all(c["met"] or not c["reachable"] or c["diffuse"] for c in cuts.values()),
+    rec.update(nodes=nodes, routes=routes, met=all(c["met"] or not c["reachable"] or bool(c["diffuse"]) for c in cuts.values()),
                diffuse=[k for k, c in cuts.items() if c["diffuse"]], unreachable=[k for k, c in cuts.items() if not c["reachable"]],
                met_rule="every cut whose ceiling passes passes; diffuse and unreachable cuts listed, not required",
                cuts={k: {f: c[f] for f in ("met", "lost", "restored", "eps", "floor", "found", "ceiling", "reachable", "curve", "refined",
                                            "conditional", "spread", "searched", "route_groups", "prior", "bar", "diffuse")}
-                     | {"size": len(c["units"])} for k, c in cuts.items()},
+                     | {"size": len(c["units"]), "bar": c["bar"] or PASS, "diffuse": bool(c["diffuse"])}   # (a search
+                     for k, c in cuts.items()},                                                         # without them)
                size=len(nodes), seconds=round(time.perf_counter() - t0, 2))
     if log:
         log("  " + ", ".join(f"{k} {len(c['units'])} ({c['lost']:.2f}/{c['restored']:.2f}{'' if c['met'] else ' unmet'})"

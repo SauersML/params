@@ -42,7 +42,7 @@ def test_whole_residual_is_the_other_run(tiny):
     all0 = [("res", 0, p) for p in range(pt.T)]
     lost, rest = pt.both([all0])[0]
     assert abs(lost - 1) < 1e-4 and abs(rest - 1) < 1e-4
-    assert all(abs(x) < 1e-6 for x in pt.both([[("res", 0, p) for p in range(pt.first)]])[0])   # before the change: equal
+    assert all(abs(x) < 1e-5 for x in pt.both([[("res", 0, p) for p in range(pt.first)]])[0])   # before the change: equal
 
 
 def test_block_equals_units(tiny):
@@ -73,7 +73,7 @@ def test_frozen_at_base_is_no_change(tiny):
     pt.setup(clean, corrupt)
     a = pt.run("clean", [[("head", 1, (0, 3), 8, "clean"), ("neuron", 0, 5, 7, "clean")]])[0]
     b = pt.run("corrupt", [[("head", 1, (0, 3), 8, "corrupt")]])[0]
-    assert abs(a) < 1e-6 and abs(b) < 1e-6
+    assert abs(a) < 1e-5 and abs(b) < 1e-5     # (float32 error: 1.31e-6 on CI's Linux BLAS)
 
 
 def test_find_record(tiny, monkeypatch):
@@ -151,7 +151,7 @@ def test_noise_floor(tiny, monkeypatch):
     pt, clean, corrupt = tiny
     pt.setup(clean, corrupt)
     a, b = pt.both([[("neuron", 1, 6, (3, 5, 9), "self"), ("head", 0, (1, 2), 7, "self")]])[0]
-    assert abs(a) < 1e-6 and abs(b) < 1e-6
+    assert abs(a) < 1e-5 and abs(b) < 1e-5     # (float32 error: 1.31e-6 on CI's Linux BLAS)
     assert cf.floor(pt, "neuron", range(pt.first, pt.T - 1)) < 1e-5
     sc = pt.scores()
     monkeypatch.setattr(cf, "floor", lambda *a, **k: 10.0)     # every share below eps and the floor: no single unit, no

@@ -1022,7 +1022,11 @@ SHORT = {"best-constant": "best constant answer", "name-prior": "name-prior (eac
          "agent-kimi-A": "Kimi-K2.6 agent, black-box tools", "agent-kimi-B": "Kimi-K2.6 agent, + trigger search, logit lens, AO",
          "agent-kimi-C": "Kimi-K2.6 agent, + circuit tools",
          "ab-paper-default-kimi": "the paper's scaffold, default tools (Kimi-K2.6)",
-         "ab-paper-text-completion-kimi": "the paper's scaffold, text completion (Kimi-K2.6)"}
+         "ab-paper-text-completion-kimi": "the paper's scaffold, text completion (Kimi-K2.6)",
+         "ao-qwen3-8b-ao-v3-best": "AO v3 (Building Better AOs), layers 21-25",
+         "dir-ablate-base": "behaviour direction projected out (uses the base model)",
+         "steer-base": "steering against the behaviour direction (uses the base model)",
+         "lora-base": "LoRA fine-tune (uses the base model)"}
 
 
 def short(n: str, meta: dict) -> str:

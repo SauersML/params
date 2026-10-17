@@ -74,6 +74,8 @@ def test_donor_from_the_task_family(tiny, tmp_path):
     p2, info = why.donor("What is the capital of France?", "tokyo")
     assert p2 == "What is the capital of Japan?" and info == {"task": "capital", "key": "France", "donor_key": "Japan"}
     assert why.donor("What is the capital of France?", "Lima")[0] is None
+    assert why.task_of("What is the capital of France?", "What is the capital of Japan?") == "capital"
+    assert why.task_of("What is the capital of France?", "Which city in France is largest?") is None
     r = why.explain("What is the capital of France?", alternative="Tokyo")
     assert r["donor"]["donor_key"] == "Japan" and r["mode"] == "pair"
 

@@ -121,7 +121,7 @@ class Why:
                                     "counts (change a word for one of the same token length)"}
         if clean == corrupt:
             return {**out, "error": "the two prompts are the same"}
-        task = (out["donor"] or {}).get("task") or self.task_of(prompt)
+        task = (out["donor"] or {}).get("task") or self.task_of(prompt, contrast)
         union = (self.unions.get(task) or {}).get("all") if task else None
         sets = None
         if answer:
@@ -142,14 +142,14 @@ class Why:
         out["summary"] = summary(out)
         return out
 
-    def task_of(self, prompt: str) -> str | None:
-        """The task whose longest key the prompt holds (its family's mover union), if any."""
-        best = None
+    def task_of(self, prompt: str, contrast: str) -> str | None:
+        """The task of a pair whose prompts differ in exactly one of its keys (the contrast is the prompt with one key
+        replaced by another: its family's mover union applies), if any."""
         for task, keys in self.keys.items():
-            for k in keys:
-                if re.search(r"(?<!\w)" + re.escape(k) + r"(?!\w)", prompt) and (best is None or len(k) > best[1]):
-                    best = (task, len(k))
-        return best[0] if best else None
+            for k0 in [k for k in keys if re.search(r"(?<!\w)" + re.escape(k) + r"(?!\w)", prompt)]:
+                if any(prompt.replace(k0, k1, 1) == contrast for k1 in keys if k1 != k0):
+                    return task
+        return None
 
     def text(self, ids) -> str:
         return self.tok.decode(list(ids)) if self.tok is not None else " ".join(f"<{i}>" for i in ids)
@@ -182,7 +182,8 @@ class Why:
                          "lost": cuts.get("source", {}).get("lost"), "restored": cuts.get("source", {}).get("restored"),
                          "by_token": [{"pos": p, "token": sh([clean[p]]), "contrast_token": sh([corrupt[p]]),
                                        "neurons": len(ls), "layers": sorted(ls)} for p, ls in sorted(by.items())]}
-        res["movers"] = {"met": cuts.get("movers", {}).get("met", False), "size": len(rec["routes"]), "family": family,
+        res["movers"] = {"met": cuts.get("movers", {}).get("met", False), "size": len(rec["routes"]),
+                         "family": family and stage.get("movers") == "fast",
                          "stage": stage.get("movers"), "lost": cuts.get("movers", {}).get("lost"),
                          "restored": cuts.get("movers", {}).get("restored"),
                          "heads": [{"layer": r["layer"], "head": r["head"],

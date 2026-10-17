@@ -864,7 +864,7 @@ def score(a) -> None:
     p1 = {x["item"]: x for x in jl(ITEMS / "o1_pairs.jsonl")} if (ITEMS / "o1_pairs.jsonl").exists() else {}
     excl = json.loads((ITEMS / "manifest.json").read_text()).get("exclusions", {})
     p1sub = set(json.loads((ITEMS / "o1p_sub.json").read_text())["items"]) if (ITEMS / "o1p_sub.json").exists() else set()
-    p1fp = json.loads((ITEMS / "o1p_sign_fp32.json").read_text())["labels"] if (ITEMS / "o1p_sign_fp32.json").exists() else {}
+    p1f32 = json.loads((ITEMS / "o1p_fp32.json").read_text())["labels"] if (ITEMS / "o1p_fp32.json").exists() else {}
     pj = {x["item"]: x for x in jl(ITEMS / "o1p_joint.jsonl")} if (ITEMS / "o1p_joint.jsonl").exists() and not \
         json.loads((ITEMS / "manifest.json").read_text()).get("o1p_joint", {}).get("invalid") else {}  # (v1 leaks by exclusion)
     p1clean = set(json.loads((ITEMS / "o1p_clean.json").read_text())["items"]) if (ITEMS / "o1p_clean.json").exists() else set()  # (textoracle's:
@@ -955,12 +955,12 @@ def score(a) -> None:
             its = [p1[k] for k in p1 if k in got]
             pred = [got[i["item"]].get("class") or pair_class(got[i["item"]].get("answer")) for i in its]
             ok = [float(c == i["gold"]) for c, i in zip(pred, its)]
-            if p1fp:  # pair_sign against oracledata's float32 re-measurement (bf16 gold agrees on 73%; 24% near the threshold)
-                sg = [k for k, i in enumerate(its) if i["kind"] == "pair_sign" and i["id"] in p1fp]
-                cell(name, "O1p", "pair_sign, float32 labels", [float(pred[k] == p1fp[its[k]["id"]]["class"]) for k in sg],
-                     [f"{its[k]['context_a']}|{its[k]['context_b']}" for k in sg])
-                sg = [k for k in sg if p1fp[its[k]["id"]]["agree"]]
-                cell(name, "O1p", "pair_sign, bf16 and float32 agree", [ok[k] for k in sg], [f"{its[k]['context_a']}|{its[k]['context_b']}" for k in sg])
+            if p1f32:  # against oracledata's float32 gold (bf16 gold agrees on 81.9%; null in the no-class margin: left out)
+                for kind in ("all", "pair_zero", "pair_sign", "pair_flip"):
+                    sg = [k for k, i in enumerate(its) if kind in ("all", i["kind"]) and p1f32.get(i["id"]) is not None]
+                    if sg:
+                        cell(name, "O1p", f"float32 labels: {kind}", [float(pred[k] == p1f32[its[k]["id"]]) for k in sg],
+                             [f"{its[k]['context_a']}|{its[k]['context_b']}" for k in sg])
             for kind in ("all", "pair_zero", "pair_sign", "pair_flip", "sub 1225", "clean contexts"):
                 sel = [k for k, i in enumerate(its) if kind in ("all", i["kind"]) or (kind == "sub 1225" and i["item"] in p1sub)
                        or (kind == "clean contexts" and i["item"] in p1clean)]
@@ -1116,6 +1116,8 @@ def score(a) -> None:
             f = ANS / n / "o1p.jsonl"
             if f.exists():
                 okp[n] = {r["item"]: float((r.get("class") or pair_class(r.get("answer"))) == p1[r["item"]]["gold"]) for r in jl(f) if r["item"] in p1}
+                okp[n + "@f32"] = {r["item"]: float((r.get("class") or pair_class(r.get("answer"))) == p1f32[p1[r["item"]]["id"]]) for r in jl(f)
+                                   if r["item"] in p1 and p1f32.get(p1[r["item"]]["id"]) is not None}
         for x, y in O1P_PAIRS:
             if x in okp and y in okp:
                 for kind in ("all", "pair_zero", "pair_sign", "pair_flip", "clean contexts"):
@@ -1123,6 +1125,10 @@ def score(a) -> None:
                     if ks:
                         cell(x, "O1p", f"minus {y}: {kind}", [okp[x][k] - okp[y][k] for k in ks],
                              [f"{p1[k]['context_a']}|{p1[k]['context_b']}" for k in ks])
+                ks = [k for k in okp.get(x + "@f32", {}) if k in okp.get(y + "@f32", {})]
+                if ks:
+                    cell(x, "O1p", f"minus {y}: float32 labels", [okp[x + "@f32"][k] - okp[y + "@f32"][k] for k in ks],
+                         [f"{p1[k]['context_a']}|{p1[k]['context_b']}" for k in ks])
     plan_rows = plan_view(rows, meta)
     o1p_rows = o1p_view(rows, meta)
     o3_rows = o3_view(json.loads((ITEMS / "o3.json").read_text())["organisms"])
@@ -1157,11 +1163,11 @@ def score(a) -> None:
                 cols.append(f"{mm['value']:+.3f} [{mm['lo']:+.3f}, {mm['hi']:+.3f}] n={mm['n']}" if mm else "")
             fh.write(f"{r['oracle']}\t{r['target']}\t{r['metric']}\t{r['value']:.3f}\t{r['n']}\t" + "\t".join(cols) + f"\t{r['status']}\n")
     with (ROOT / "o1p.tsv").open("w") as fh:
-        fh.write("oracle\tlabel\t" + "\t".join(f"{k}\t{k} 95%\t{k} n" for k in ("sub 1225", "all", "pair_zero", "pair_sign", "pair_flip", "clean contexts")) + "\n")
+        fh.write("oracle\tlabel\t" + "\t".join(f"{k}\t{k} 95%\t{k} n" for k in O1P_COLS) + "\n")
         for r in o1p_rows:
             fh.write(f"{r['oracle']}\t{r['label']}\t" + "\t".join(
                 f"{r[k]['value']:.3f}\t[{r[k]['lo']:.3f}, {r[k]['hi']:.3f}]\t{r[k]['n']}" if k in r else "\t\t"
-                for k in ("sub 1225", "all", "pair_zero", "pair_sign", "pair_flip", "clean contexts")) + "\n")
+                for k in O1P_COLS) + "\n")
     o1p_figure(o1p_rows)
     with (ROOT / "o3.tsv").open("w") as fh:
         kinds = ("all", "lie", "cond_pref", "backdoor", "cue_marker")
@@ -1256,7 +1262,7 @@ def o1p_view(rows: list[dict], meta: dict) -> list[dict]:
                   key=lambda n: -next(r["value"] for r in rows if r["oracle"] == n and r["target"] == "O1p" and r["metric"] == "sub 1225"))
     out = []
     for n in arms:
-        cells = {r["metric"]: r for r in rows if r["oracle"] == n and r["target"] == "O1p" and r["metric"] in ("all", "pair_zero", "pair_sign", "pair_flip", "sub 1225", "clean contexts")}
+        cells = {r["metric"]: r for r in rows if r["oracle"] == n and r["target"] == "O1p" and r["metric"] in ("all", "pair_zero", "pair_sign", "pair_flip", "sub 1225", "clean contexts", "float32 labels: all")}
         out.append({"oracle": n, "label": short(n, meta), **{k: {x: c[x] for x in ("value", "lo", "hi", "n")} for k, c in cells.items()}})
     return out
 
@@ -1333,6 +1339,7 @@ def o3_figure(view: list[dict]) -> None:
 O1P_PAIRS = (("text.p1.Tfull.s700.full", "pairs397c"), ("text.p1.Tfull.s700.full", "tree-pairs"),
              ("text.p1.Tfull.s700.full", "text.p1.Tnames.s700.names"), ("text.p1.Tfull.s700.full", "text.p1.Tnone.s700.none"),
              ("pairs397c", "pairs397"))
+O1P_COLS = ("sub 1225", "all", "float32 labels: all", "pair_zero", "pair_sign", "pair_flip", "clean contexts")
 O1P_CHANCE = {"pair_zero": 1 / 3, "pair_sign": 0.25, "pair_flip": 0.25}
 
 

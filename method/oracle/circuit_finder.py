@@ -1544,13 +1544,14 @@ def main():
             assert isinstance(t, int) or len(t) == 1, f"{z!r} is {len(t)} tokens"
             return t if isinstance(t, int) else t[0]
         sets = lambda q: {k: [ids(z) for z in v] for k, v in q["sets"].items()} if q.get("sets") else None  # noqa: E731
-        def partners(q):                            # up to a.partners other corrupted prompts (circuit_devset's {key, user})
-            us = [p["user"] for p in q.get("partners", []) if isinstance(p, dict) and p.get("user") != q["corrupt_user"]]
-            return [chat(tok, u, sy(q)) + pre(q) for u in us[:a.partners]]
+        def partners(q):                            # up to a.partners other corrupted prompts (circuit_devset's {key, user}),
+            ps = [p for p in q.get("partners", []) if isinstance(p, dict) and p.get("user") != q["corrupt_user"]]   # with
+            return [(p.get("key"), chat(tok, p["user"], sy(q)) + pre(q)) for p in ps[:a.partners]]                   # their keys
         jobs = [(q["id"], chat(tok, q["user"], sy(q)) + pre(q),     # an optional assistant prefill (the corrupted run's own, if given)
                  chat(tok, q["corrupt_user"], sy(q)) + pre(q, "corrupt_prefill" if "corrupt_prefill" in q else "prefill"),
-                 {**{k: q[k] for k in ("user", "corrupt_user", "task", "key", "corrupt_prefill") if k in q}, "prefill": q.get("prefill"), "answers": None,
-                  "sets": sets(q), "partners": partners(q)})
+                 {**{k: q[k] for k in ("user", "corrupt_user", "task", "key", "corrupt_key", "corrupt_prefill") if k in q},
+                  "prefill": q.get("prefill"), "answers": None, "sets": sets(q), "partners": [x for _, x in partners(q)],
+                  "partner_keys": [k for k, _ in partners(q)]})
                 for q in qs]
     else:
         for name in a.cases.split(","):
@@ -1559,10 +1560,13 @@ def main():
             for j, (c, k, text, ans) in enumerate(pairs):
                 jobs.append((f"{tag}_{j}", c, k, {"corrupt_text": text, "answers": ans}))
     def write(qid, clean, corrupt, extra, path, rec):
-        part = extra.pop("partners", None)
+        part, keys = extra.pop("partners", None) or [], extra.pop("partner_keys", None) or []
         extra.pop("answers", None)
         extra.pop("sets", None)
-        rec["partners_used"] = len([x for x in part or [] if len(x) == len(clean)])
+        used = [k for k, x in zip(keys, part) if len(x) == len(clean)]
+        rec["partners_used"] = len([x for x in part if len(x) == len(clean)])
+        if used:                                    # (the keys the circuit was chosen on: the scorecard's unseen draws skip
+            rec["selection_keys"] = [extra.get("corrupt_key")] + used                  # them, as circuit_masks' records)
         rec.update(id=qid, ids=clean, corrupted=corrupt, answer_text=tok.decode([rec["answer"]]),
                    corrupt_answer_text=tok.decode([rec["corrupt_answer"]]), model=a.model, adapter=a.adapter, dtype=a.dtype,
                    merged=bool(a.adapter and a.merge), tokenizer=a.tokenizer or a.model, system=a.system,

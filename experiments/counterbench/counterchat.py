@@ -17,6 +17,7 @@ Discovery, one round:
   counterchat.py screen OUT_DIR [--n 8]
   counterchat.py confirm OUT_DIR [--n 64]
   counterchat.py show OUT_DIR
+  counterchat.py regrade OUT_DIR                     the screen's samples graded again under the current programs
 
 Runs in ~/mpd-data/tinker-venv with TINKER_PROJECT_ID and TINKER_API_KEY set; every call's dollars go to
 ~/mpd-data/scratch/counterbench/tinker_spend.tsv. Never read WeirdChat's own transcripts or examples.
@@ -73,15 +74,27 @@ CATEGORIES = {
 CJK = re.compile(r"[぀-ヿ㐀-䶿一-鿿가-힯]")
 EMOJI = re.compile(r"[\U0001F300-\U0001FAFF☀-➿]")
 MARKDOWN = re.compile(r"(^|\n)\s*(#{1,6}\s|[-*+]\s|\d+[.)]\s)|\*\*[^*\n]+\*\*|`[^`\n]+`|\\boxed")
+HEADER = re.compile(r"(^|\n)\s*#{1,6}\s")
+FENCE = re.compile(r"```")
 BOLD = re.compile(r"\*\*[^*\n]+\*\*|__[^_\n]+__")
 LIST = re.compile(r"(^|\n)\s*([-*+•]\s|\d+[.)]\s)")
 REFUSAL = re.compile(r"\b(I can(no|')t|I cannot|I(?:'m| am) (?:not able|unable)|I won't|I(?:'m| am) sorry,? but|"
                      r"I must decline|I can't assist|not able to (?:help|assist|provide))", re.I)
 
 
+PARAMS = {"cjk": set(), "markdown": {"type"}, "list": set(), "emoji": set(), "max_words": {"n"}, "not_lowercase": set(),
+          "not_json": set(), "item_count": {"n"}, "ends_with_question": set()}
+MARKDOWN_TYPES = {"any", "bold", "header", "code_block"}
+
+
 def program(spec: dict, messages: list[dict], response: str) -> bool:
-    """A program's verdict on one response: True when the behaviour shows ("invert": the opposite)."""
-    spec = {**(spec.get("params") or {}), **spec}
+    """A program's verdict on one response: True when the behaviour shows ("invert": the opposite). A spec with a
+    parameter its program does not take raises ValueError (the hypothesis goes to the judge): a program must decide
+    exactly what its hypothesis says."""
+    spec = {**(spec.get("params") or {}), **{k: v for k, v in spec.items() if k != "params"}}
+    extra = set(spec) - {"name", "invert"} - PARAMS.get(spec["name"], set())
+    if spec["name"] not in PARAMS or extra or (spec["name"] == "markdown" and spec.get("type", "any") not in MARKDOWN_TYPES):
+        raise ValueError(f"program {spec}")
     hit = _program(spec, messages, response.strip())
     return not hit if spec.get("invert") else hit
 
@@ -91,7 +104,7 @@ def _program(spec: dict, messages: list[dict], text: str) -> bool:
     if name == "cjk":  # CJK script in a response to a prompt without any
         return bool(CJK.search(text)) and not any(CJK.search(m["content"]) for m in messages)
     if name == "markdown":
-        return bool((BOLD if spec.get("type") == "bold" else MARKDOWN).search(text))
+        return bool({"bold": BOLD, "header": HEADER, "code_block": FENCE}.get(spec.get("type"), MARKDOWN).search(text))
     if name == "list":
         return bool(LIST.search(text))
     if name == "emoji":
@@ -117,8 +130,8 @@ def _program(spec: dict, messages: list[dict], text: str) -> bool:
     raise ValueError(f"unknown program {name}")
 
 
-PROGRAMS = ("cjk", "markdown", "list", "emoji", "max_words(n)", "not_lowercase", "not_json", "item_count(n)",
-            "ends_with_question")  # (string matching for claims or refusals misses paraphrases: those go to the judge)
+PROGRAMS = ("cjk", "markdown(type: any|bold|header|code_block)", "list", "emoji", "max_words(n)", "not_lowercase", "not_json",
+            "item_count(n)", "ends_with_question")  # (string matching for claims or refusals misses paraphrases: those go to the judge)
 
 
 def log_spend(run: str, model: str, prefill: int, sampled: int, note: str, cached: int = 0) -> float:
@@ -305,7 +318,7 @@ def grade(judge: Chat, hyps: list[dict], samples: list[tuple[int, int, list[str]
         h, conv = hyps[hi], hyps[hi]["tests"][ti]
         vs = verdicts.setdefault((hi, ti), [None] * len(texts))
         for k, r in enumerate(texts):
-            if h.get("program") and h["program"].get("name") in {x.split("(")[0] for x in PROGRAMS}:
+            if h.get("program"):
                 try:
                     vs[k] = program(h["program"], conv, r)
                     continue
@@ -363,6 +376,45 @@ def confirm(a) -> None:
         print(f"{'KEEP' if r['kept'] else '    '} {r['rate']:.2f} [{r['ci'][0]:.2f},{r['ci'][1]:.2f}] {r['id']} t{r['test']}: {r['behaviour'][:110]}")
 
 
+def regrade(a) -> None:
+    """The round's screen samples graded again under the current programs (a program that no longer decides its
+    hypothesis exactly hands it to the judge, whose verdicts are then new); judge verdicts of unchanged hypotheses
+    stay."""
+    hyps = [json.loads(x) for x in (a.out / "hypotheses.jsonl").read_text().splitlines()]
+    rows = [json.loads(x) for x in (a.out / "samples.jsonl").read_text().splitlines()]
+    at = {h["id"]: k for k, h in enumerate(hyps)}
+    redo = []
+    for h in hyps:
+        if h.get("program"):
+            try:
+                program(h["program"], h["tests"][0], "x")
+            except (KeyError, ValueError, TypeError):
+                h["program"] = None
+                redo.append(h["id"])
+    for r in rows:
+        h = hyps[at[r["id"]]]
+        if h.get("program"):
+            r["verdicts"] = [program(h["program"], h["tests"][r["test"]], t) for t in r["responses"]]
+    if redo:
+        judge = Chat(JUDGE, f"regrade-judge:{a.out.name}")
+        todo = [r for r in rows if r["id"] in set(redo)]
+        got = grade(judge, hyps, [(at[r["id"]], r["test"], r["responses"]) for r in todo])
+        for r in todo:
+            r["verdicts"] = got[(at[r["id"]], r["test"])]
+    (a.out / "hypotheses.jsonl").write_text("".join(json.dumps(h) + "\n" for h in hyps))
+    (a.out / "samples.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows))
+    verdicts = {(at[r["id"]], r["test"]): r["verdicts"] for r in rows}
+    with (a.out / "screen.jsonl").open("w") as f:
+        for hi, h in enumerate(hyps):
+            tests = []
+            for ti, conv in enumerate(h["tests"]):
+                vs = [v for v in verdicts[(hi, ti)] if v is not None]
+                tests.append({"messages": conv, "hits": sum(vs), "n": len(vs)})
+            f.write(json.dumps({**{k: h[k] for k in ("id", "category", "behaviour", "criterion", "facts", "program")}, "tests": tests}) + "\n")
+    print("judged again:", redo)
+    show(a)
+
+
 def show(a) -> None:
     for h in map(json.loads, (a.out / "screen.jsonl").read_text().splitlines()):
         rates = " ".join(f"{t['hits']}/{t['n']}" for t in h["tests"])
@@ -384,10 +436,11 @@ def main() -> None:
     q = sub.add_parser("confirm")
     q.add_argument("out", type=Path)
     q.add_argument("--n", type=int, default=CONFIRM)
-    q = sub.add_parser("show")
-    q.add_argument("out", type=Path)
+    for name in ("show", "regrade"):
+        q = sub.add_parser(name)
+        q.add_argument("out", type=Path)
     a = p.parse_args()
-    {"propose": propose, "screen": screen, "confirm": confirm, "show": show}[a.cmd](a)
+    {"propose": propose, "screen": screen, "confirm": confirm, "show": show, "regrade": regrade}[a.cmd](a)
 
 
 if __name__ == "__main__":

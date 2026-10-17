@@ -26,4 +26,4 @@ mkdir -p $O $S; tar -xf $S.tar -C $S; (nvidia-smi --query-gpu=timestamp,utilizat
 $WORK"
 RP_HF_MODELS="Qwen/Qwen3-8B ${MODELS:-}" RP_ALLOW_OVER=1 RP_UPLOAD_MAX_MB=${UPLOAD_MB:-100} \
   RP_OWNER=counterbench RP_PARALLEL=2 RP_PYENV=oracle RP_MAX_PRICE=${PRICE:-0.8} RP_MIN_VRAM_GB=${VRAM:-44} \
-  experiments/infra/runpod/rp-run "$N" "${GPU:-auto}" "$H" -- bash -c "$CMD"
+  experiments/infra/runpod/rp-run "$N" "${GPU:-RTX A6000,A40,L40S,L40,RTX 6000 Ada}" "$H" -- bash -c "$CMD"

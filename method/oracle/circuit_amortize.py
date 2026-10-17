@@ -283,6 +283,8 @@ WIDE = 256            # verify its 2 x KEEP best units); a cut whose order canno
 FALLBACK = "init"     # the masks themselves: "init" from INIT as circuit_masks runs them, "warm" from the prediction (warm),
 WARM_STEPS = 10       # WARM_STEPS a round; "" none
 WARM_MIN = -2.0       # warm: the start of units the prediction puts far below its KEEP-th
+MASK_CUTS = ""        # cuts (comma-separated names) that skip the predicted order: straight to the masks warm from the
+                      # prediction (WARM_STEPS a round), e.g. "readout", whose order the predictor ranks worst
 
 
 def scorer(name: str):
@@ -345,7 +347,8 @@ def amortized_steps(pt, pred: dict, log=None, steps: int = cm.STEPS):
     (FALLBACK: from INIT, or warm from the prediction for WARM_STEPS; ROUNDS as search_steps). Returns (cuts, each cut's
     stage: order, wide or masks)."""
     st = yield from cm._before_steps(pt, "mask", log=log)
-    names, got, stage = list(st["masked"]), {}, {}
+    direct = [n for n in st["masked"] if n in MASK_CUTS.split(",")]
+    names, got, stage = [n for n in st["masked"] if n not in direct], {}, {}
     for tag, keep in (("order", KEEP), ("wide", WIDE)):
         if not names:
             break
@@ -354,19 +357,23 @@ def amortized_steps(pt, pred: dict, log=None, steps: int = cm.STEPS):
             got[n], stage[n] = {"theta": {kind: _theta(s, keep)}, "history": []}, tag
         yield from cm._verify_steps(st, got, names, 0.0, 1, log=log)
         names = [n for n in names if not st["out"][n]["met"] and not st["out"][n].get("diffuse")]
-    msteps = WARM_STEPS if FALLBACK == "warm" else steps
-    for rnd in range(cm.ROUNDS if FALLBACK else 0):
+    names = names if FALLBACK else []
+    hot = set(direct) | (set(names) if FALLBACK == "warm" else set())      # (cuts whose masks start from the prediction)
+    names += direct
+    for rnd in range(cm.ROUNDS):
         if not names:
             break
         t0 = time.perf_counter()
-        jobs = cm._jobs(pt, st, names)
-        start = lambda n: got[n]["theta"] if rnd else {pred[n][0]: warm(pred[n][1])} if FALLBACK == "warm" else None  # noqa: E731
-        res = yield [("masks", job, [start(n) for n in ns], msteps) for job, ns in jobs]
-        for (_, ns), r in zip(jobs, res):
+        groups = [(g, WARM_STEPS if hot_ else steps) for hot_ in (True, False)
+                  for g in [[n for n in names if (n in hot) == hot_]] if g]
+        jobs = [(job, ns, k) for g, k in groups for job, ns in cm._jobs(pt, st, g)]
+        start = lambda n: got[n]["theta"] if rnd else {pred[n][0]: warm(pred[n][1])} if n in hot else None  # noqa: E731
+        res = yield [("masks", job, [start(n) for n in ns], k) for job, ns, k in jobs]
+        for (_, ns, _), r in zip(jobs, res):
             for n, x in zip(ns, r):
                 got[n] = {"theta": x["theta"], "history": (got[n]["history"] if rnd else []) + x["history"]}
                 stage[n] = "masks"
-        yield from cm._verify_steps(st, got, names, time.perf_counter() - t0, msteps, log=log)
+        yield from cm._verify_steps(st, got, names, time.perf_counter() - t0, max(k for _, k in groups), log=log)
         names = [n for n in names if not st["out"][n]["met"] and not st["out"][n].get("diffuse")]
     out = yield from cm._finish_steps(st)
     src, movers = out.get("source", {}).get("units", []), out.get("movers", {}).get("units", [])

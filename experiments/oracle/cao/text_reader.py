@@ -669,8 +669,8 @@ def sample(a) -> None:
     """Greedy answers (temperature 0) from a Tinker state to a test file's questions, written as reads_circuit's eval
     rows ({"cat", "a", "got", "q"}); the spend to the log's spend.jsonl."""
     import tinker
-    sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "method" / "oracle" / "rl"))
-    import tinker_train as tt
+    sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "method" / "oracle"))
+    import llm as tt  # (the shared Tinker helpers: Spend, service_client, renderer_for, answer_of)
 
     qs = [json.loads(x) for x in a.questions.read_text().splitlines()]
     a.out.parent.mkdir(parents=True, exist_ok=True)
@@ -731,8 +731,8 @@ def ask(a) -> None:
     line, and the claim it ends with). Items are named as record_items names them."""
     import tinker
     import torch
-    sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "method" / "oracle" / "rl"))
-    import tinker_train as tt
+    sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "method" / "oracle"))
+    import llm as tt  # (the shared Tinker helpers: Spend, service_client, renderer_for, answer_of)
 
     rec = json.loads(a.record.read_text())
     app = json.loads(a.apply.read_text()) if a.apply else None

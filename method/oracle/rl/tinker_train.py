@@ -95,7 +95,10 @@ def clients(base: str, rank: int, init: str | None, thinking: bool = False, opti
                 else service.create_training_client_from_state(init) if init
                 else service.create_lora_training_client(base_model=base, rank=rank))
     tokenizer = get_tokenizer(base)
-    return tinker, service, training, renderers.get_renderer(THINKING_RENDERER if thinking else RENDERER, tokenizer), tokenizer
+    # Qwen3's renderers by name; any other base (Qwen3.5/3.6: qwen3_5) its recommended one, as sampling renders it
+    renderer = (renderers.get_renderer(THINKING_RENDERER if thinking else RENDERER, tokenizer) if base.startswith("Qwen/Qwen3-")
+                else renderer_for(base, thinking)[0])
+    return tinker, service, training, renderer, tokenizer
 
 
 def sft(a) -> None:

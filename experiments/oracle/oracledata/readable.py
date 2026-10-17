@@ -67,13 +67,20 @@ def pair_side(q: dict, side: str, c: dict | None) -> dict:
 
 def pairs_main(a, HistGradientBoostingClassifier) -> None:
     """Paired questions: the same trees on both sides' numbers (A's, B's, their difference); names alone are at chance
-    by construction (the same name on both sides, balanced classes)."""
+    by construction (the same name on both sides, balanced classes); none: no circuit, each text's own contrasts."""
     cs = load.circuits(a.dir)
     tr, te = load.rows(a.dir, "train"), load.rows(a.dir, "test")
     pool = sorted(cs)
     out = {}
 
     def X(q, arm):
+        if arm == "none":  # no circuit: each text's own numbers only (its clean and corrupted contrasts, gap, length)
+            f = []
+            for side in ("a", "b"):
+                c = cs[q["circuit_" + side]]
+                k = c.get("contrast") or {}
+                f.append([k.get("clean") or 0.0, k.get("corrupt") or 0.0, c.get("gap") or 0.0, len(c["tokens"])])
+            return f[0] + f[1] + [x - y for x, y in zip(f[0], f[1])]
         f = []
         for side in ("a", "b"):
             c = cs[q["circuit_" + side]]
@@ -88,7 +95,7 @@ def pairs_main(a, HistGradientBoostingClassifier) -> None:
         rtr = [q for q in tr if q["kind"] == kind]
         rte = [q for q in te if q["kind"] == kind]
         res = {"n_train": len(rtr), "n_test": len(rte), "chance": round(1 / len({q["gold"] for q in rte}), 3)}
-        for arm in ("correct", "names", "mismatch"):
+        for arm in ("correct", "names", "mismatch", "none"):
             m = HistGradientBoostingClassifier(max_iter=200, class_weight="balanced", random_state=0).fit(
                 [X(q, arm) for q in rtr], [q["gold"] for q in rtr])
             pred = m.predict([X(q, arm) for q in rte])

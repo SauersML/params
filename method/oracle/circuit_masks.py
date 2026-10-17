@@ -470,7 +470,7 @@ def adversarial(meas, spec: dict, units: list, steps: int | None = None, log=Non
     """The set's shares with every other unit of the cut anywhere between the two runs, against an adversary (optimize_many
     with freeze: the set fully patched, the rest's rho moved ADV_STEP along the sign that lowers the spec's mean shares,
     shared over meas's pairs): the step whose measured lost + restored is lowest, and whether it still passes."""
-    steps = ADV_CHECK if steps is None else steps
+    steps = int(ADV_CHECK if steps is None else steps)   # (an arm's constants arrive as floats: adv_check=8)
     pts = meas.pts if isinstance(meas, Mean) else [meas]
     th = {k: torch.full((pts[0].L, len(spec["positions"]), pts[0].H if k == "head" else pts[0].D), -20.0) for k in spec["kinds"]}
     at = {p: j for j, p in enumerate(spec["positions"])}

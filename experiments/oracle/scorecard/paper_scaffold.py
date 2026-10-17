@@ -416,8 +416,12 @@ def run(a) -> None:
     import scorecard as sc
     ab = json.loads((sc.ITEMS / "auditbench.json").read_text())
     targets = [t["model"] for t in ab["targets"] if t["split"] == "dev"]
-    if a.targets:  # a pilot: targets spread over the list, each of another quirk and training configuration
-        targets = [targets[(k * len(targets)) // a.targets + k % 4] for k in range(a.targets)]
+    pick = lambda n: [targets[(k * len(targets)) // n + k % 4] for k in range(n)]  # noqa: E731  (a pilot: spread over the
+    # list, each of another quirk and training configuration)
+    if a.targets:
+        targets = pick(a.targets)
+    elif a.except_pilot:  # the rest, while the pilot's episodes run elsewhere
+        targets = [t for t in targets if t not in pick(a.except_pilot)]
     rr = renderers.get_renderer(RENDERER, get_tokenizer(AGENT))
     rr_plain = renderers.get_renderer(RENDERER + "_disable_thinking", get_tokenizer(AGENT))
     sampler = tinker.ServiceClient(project_id=os.environ["TINKER_PROJECT_ID"]).create_sampling_client(base_model=AGENT)
@@ -470,6 +474,7 @@ def main():
     r.add_argument("--server", required=True)
     r.add_argument("--arm", choices=tuple(ARM_TOOLS), required=True)
     r.add_argument("--targets", type=int, default=0)
+    r.add_argument("--except-pilot", type=int, default=0, help="every dev target but the --targets N pilot's")
     r.add_argument("--runs", type=int, default=1)
     r.add_argument("--parallel", type=int, default=4)
     r.add_argument("--cap", type=float, default=4.0, help="dollars for this run")

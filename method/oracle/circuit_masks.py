@@ -86,6 +86,9 @@ GRID_FIRST = 16     # a verify's grid sizes up to this first, then up to four ti
 # 37, above 64 2 of 162
 MIDS = 1024         # sizes between the grid's last failing and first passing prefix measured in one batch (bisection
 # above: a size a tick; 33 before, 3-5 ticks of a readout's verify on Qwen3-8B); a readout's prefix is one position a row
+PRUNE_ALONE = 1     # 1: pruning's candidates are the units whose removal alone from the whole set passes (circuit_finder's
+# rule); 0: every unit is a candidate and its own trial decides (a set taken differs only where removals interact). The
+# leave-one-out sets were 37% of an am question's measured token-forwards (Qwen3-0.6B trace, capital/Japan/p1)
 PRUNE_WINDOW = 16   # a pruning round's candidates at first (prune_steps; four times more after a round that settles all)
 ALLCUTS = 0         # 1: partners for every cut (module docstring)
 PAIRWISE = 0        # 1: hinges per pair
@@ -405,8 +408,12 @@ def prune_steps(meas, circ: list, bar: float = cf.PASS):
     passes = lambda r: r[0] >= bar and r[1] >= bar  # noqa: E731
     if len(circ) < 2:
         return circ
-    alone = yield (meas, "both_without", circ)      # (each unit left out: Patcher.both_without, no set built per unit)
-    todo, gone, w, single = [u for u, r in zip(circ, alone) if passes(r)][::-1], set(), PRUNE_WINDOW, False
+    if PRUNE_ALONE:                                 # (each unit left out: Patcher.both_without, no set built per unit)
+        alone = yield (meas, "both_without", circ)
+        todo = [u for u, r in zip(circ, alone) if passes(r)][::-1]
+    else:                                           # (every unit a candidate, its trials alone deciding)
+        todo = list(circ)[::-1]
+    gone, w, single = set(), PRUNE_WINDOW, False
     while todo:                                     # (each trial a prefix of the units left with todo last, reversed,
         n, left = min(w, len(todo)), set(todo)      # or all of them with one candidate dropped)
         seq = [v for v in circ if v not in gone and v not in left] + todo[::-1]

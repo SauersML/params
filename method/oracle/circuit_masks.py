@@ -143,6 +143,11 @@ STAGED_PAIRS = 1    # pruning's trials of a multi-partner cut under AGG "min", i
 # whole set does worst on, then on the other pairs only the trials passing there (a set passes only when every pair does,
 # and pruning reads pass or fail alone: the same removals as every pair at once, the failing trials' other pairs never run).
 # Qwen3-8B, 8 partners, A40: pruning's trials were 57% of a question's measuring (both_without 1.9 s, prefixes 9.5 s)
+SETTLE = 0.03       # a search decision whose share lies within this of its bar (a verify prefix, a pruning trial, the
+# pruned set) is measured again set by set, one set a forward on each pair (the same shapes whatever the batch around it):
+# in bfloat16 a set's share moves ~0.01 with the batch's shape, and pruning takes every set to its bar, so trials there
+# flipped with the batch size or the pairs' staging (Qwen3-8B, 8 partners: 10 of 20 circuits changed with STAGED_PAIRS);
+# 0: off
 PRUNE_WINDOW = 16   # a pruning round's candidates at first (prune_steps; four times more after a round that settles all)
 POOL = Path.home() / "mpd-data" / "circuits" / "trainset_8b.json"   # (the command line's default --pool)
 ALLCUTS = 1         # partners for every cut (module docstring); 0: the source cut only
@@ -541,11 +546,12 @@ def verify_steps(meas, order: list, log=None, name: str = "", bar: float = cf.PA
     removed one at a time while it passes (prune_steps); each unit's shares alone. A set is taken at bar (_bar's)."""
     passes = lambda r: _ok(r, bar)  # noqa: E731
     one = len({cf._pos(u) for u in order}) <= 1     # (one position a row: every size at once)
+    porder = yield from _pair_order(meas, order, bar)
     full, g, got, top = cf.grid(len(order)), [], [], 0
     while top < len(order) and not any(passes(r) for r in got):    # (prefixes of order: Patcher.both_prefixes, no set
         top = len(order) if one else max(GRID_FIRST, 4 * top)       # built per unit; the small sizes first, stages of
         stage = [k for k in full if (g[-1] if g else 0) < k <= top]  # four times the last)
-        g, got = g + stage, got + ((yield (meas, "both_prefixes", order, stage)) if stage else [])
+        g, got = g + stage, got + ((yield from _trials(meas, porder, bar, "both_prefixes", order, stage, None)) if stage else [])
     at = dict(zip(g, got))
     met = [k for k, r in zip(g, got) if passes(r)]
     ok = None
@@ -554,13 +560,14 @@ def verify_steps(meas, order: list, log=None, name: str = "", bar: float = cf.PA
         lo = max([k for k in g if k < hi] + [0])
         while hi - lo > MIDS:                       # (bisection down to MIDS sizes, then all of them in one batch)
             mid = (lo + hi) // 2
-            at[mid] = (yield (meas, "both_prefixes", order, [mid]))[0]
+            at[mid] = (yield from _trials(meas, porder, bar, "both_prefixes", order, [mid], None))[0]
             lo, hi = (lo, mid) if passes(at[mid]) else (mid, hi)
         mids = list(range(lo + 1, hi))
-        got_m = (yield (meas, "both_prefixes", order, mids)) if mids else []
+        got_m = (yield from _trials(meas, porder, bar, "both_prefixes", order, mids, None)) if mids else []
         at.update(zip(mids, got_m))
         ok = next((k for k, r in zip(mids, got_m) if passes(r)), hi)
-    curve = [{"k": k, "lost": a, "restored": b} for k, (a, b) in zip(g, got)]
+    curve = [{"k": k, "lost": a, "restored": b, **({"at_most": True} if porder and not passes((a, b)) else {})}
+             for k, (a, b) in zip(g, got)]          # (staged: a failing size's shares are its first pairs' least, an upper bound)
     if ok and ok > PRUNE_MAX:                       # (diffuse: circuit_finder's rule, no pruning)
         lost, rest = at[ok]
         if log:
@@ -572,10 +579,10 @@ def verify_steps(meas, order: list, log=None, name: str = "", bar: float = cf.PA
     lost, rest, singles = 0.0, 0.0, {}
     if circ:                                        # (the set and its units alone, one tick)
         whole, alone = yield [(meas, "both", [_blocks(circ)]), (meas, "both", [[u] for u in circ])]
-        (lost, rest), singles = whole[0], dict(zip(circ, alone))
+        (lost, rest), singles = _settled(meas, bar, [_blocks(circ)], whole)[0], dict(zip(circ, alone))
     for k in [k for k in met if k > ok] if circ and not passes((lost, rest)) else []:
         circ = list(order[:k])                      # (a set at the margin can fail measured again, a batch's shape moving
-        lost, rest = (yield (meas, "both", [_blocks(circ)]))[0]     # a bfloat16 share by ~0.01: Qwen3-8B capital/Spain/p2's
+        lost, rest = _settled(meas, bar, [_blocks(circ)], (yield (meas, "both", [_blocks(circ)])))[0]   # a bfloat16 share by ~0.01: Qwen3-8B capital/Spain/p2's
         if passes((lost, rest)):                    # readout, 22 units at 0.7003 then 0.6995): the next passing grid size
             singles = dict(zip(circ, (yield (meas, "both", [[u] for u in circ]))))           # instead
             break
@@ -608,13 +615,9 @@ def prune_steps(meas, circ: list, bar: float = cf.PASS):
     passes = lambda r: _ok(r, bar)  # noqa: E731
     if len(circ) < 2:
         return circ
-    order = None
-    if STAGED_PAIRS and AGG == "min" and type(meas) is Mean and len(meas.pts) > 1:   # (the pairs, worst for the whole set first)
-        each = yield [(Mean([p]), "both", [_blocks(circ)]) for p in meas.pts]
-        lb, rb = bar if isinstance(bar, (tuple, list)) else (bar, bar)
-        order = sorted(range(len(meas.pts)), key=lambda i: min(each[i][0][0] - lb, each[i][0][1] - rb))
+    order = yield from _pair_order(meas, circ, bar)
     if PRUNE_ALONE:                                 # (each unit left out: Patcher.both_without, no set built per unit)
-        alone = yield from _staged(meas, order, passes, "both_without", circ, None)
+        alone = yield from _trials(meas, order, bar, "both_without", circ, None)
         todo = [u for u, r in zip(circ, alone) if passes(r)][::-1]
     else:                                           # (every unit a candidate, its trials alone deciding)
         todo = list(circ)[::-1]
@@ -624,7 +627,7 @@ def prune_steps(meas, circ: list, bar: float = cf.PASS):
         seq = [v for v in circ if v not in gone and v not in left] + todo[::-1]
         m = len(seq)
         extra = n - 1 if single else 0              # (the single trials: rows a run of removals would not use)
-        got = yield from _staged(meas, order, passes, "both_prefixes", seq, [m - j - 1 for j in range(n)] + [m] * extra,
+        got = yield from _trials(meas, order, bar, "both_prefixes", seq, [m - j - 1 for j in range(n)] + [m] * extra,
                                  [m] * n + [m - 1 - i for i in range(1, 1 + extra)])
         if passes(got[0]):                          # todo[0] goes: the run going with it, up to the first that stays
             j = next((j for j in range(n) if not passes(got[j])), n)
@@ -640,6 +643,48 @@ def prune_steps(meas, circ: list, bar: float = cf.PASS):
                 gone.add(todo[s])
                 todo, single = todo[s + 1:], False
     return [v for v in circ if v not in gone]
+
+
+def _pair_order(meas, units: list, bar):
+    """STAGED_PAIRS's order of meas's pairs, worst first for the set units (one measurement of it on each pair), or None:
+    off, one pair, AGG "mean", a one-prompt measurer."""
+    if not (STAGED_PAIRS and AGG == "min" and type(meas) is Mean and len(meas.pts) > 1 and units):
+        return None
+    each = yield [(Mean([p]), "both", [_blocks(units)]) for p in meas.pts]
+    lb, rb = bar if isinstance(bar, (tuple, list)) else (bar, bar)
+    return sorted(range(len(meas.pts)), key=lambda i: min(each[i][0][0] - lb, each[i][0][1] - rb))
+
+
+def _trials(meas, order, bar, method: str, units: list, *rest):
+    """A search's trials of method ("both_without", rest (js,); "both_prefixes", rest (ks, drops)) on meas: staged over the
+    pairs (_staged, with order) and settled near the bar (_settled); per trial (lost, restored)."""
+    passes = lambda r: _ok(r, bar)  # noqa: E731
+    res = yield from _staged(meas, order, passes, method, units, *rest)
+    if method == "both_without":
+        js = list(range(len(units))) if rest[0] is None else list(rest[0])
+        sets = lambda idx: [[u for i, u in enumerate(units) if i != js[j]] for j in idx]  # noqa: E731
+    else:
+        ks, drops = list(rest[0]), (list(rest[1]) if len(rest) > 1 and rest[1] is not None else None)
+        sets = lambda idx: [[u for i, u in enumerate(units[:ks[j]]) if drops is None or i != drops[j]] for j in idx]  # noqa: E731
+    return _settled(meas, bar, None, res, sets)
+
+
+def _settled(meas, bar, sets, res: list, make=None) -> list:
+    """res (per set its (lost, restored)) with every set within SETTLE of its bar measured again on its own (SETTLE's
+    note): set by set, one set a forward on each of meas's pairs, the AGG over the pairs. sets: the sets, or make(indices)
+    builds them."""
+    if not SETTLE or isinstance(meas, Resampled):
+        return res
+    lb, rb = bar if isinstance(bar, (tuple, list)) else (bar, bar)
+    near = [i for i, (a, b) in enumerate(res) if (math.isfinite(lb) and abs(a - lb) < SETTLE) or (math.isfinite(rb) and abs(b - rb) < SETTLE)]
+    if not near:
+        return res
+    agg = np.min if AGG == "min" else np.mean
+    out = [tuple(r) for r in res]
+    for i, s_ in zip(near, make(near) if make else [sets[i] for i in near]):
+        per = [p.both([s_])[0] for p in _pts(meas)]
+        out[i] = (float(agg([x[0] for x in per])), float(agg([x[1] for x in per])))
+    return out
 
 
 def _staged(meas, order, passes, method: str, units: list, *rest):

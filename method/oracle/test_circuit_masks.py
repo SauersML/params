@@ -763,3 +763,64 @@ def test_staged_pairs_prune_equals_all_pairs(tiny, monkeypatch, window):
         monkeypatch.setattr(cm, "STAGED_PAIRS", staged)
         got.append(cm.prune(m, circ, -0.5))
     assert got[0] == got[1] and len(got[0]) < len(circ)
+
+
+@pytest.mark.parametrize("staged", [0, 1])
+def test_settle_measures_near_bar_trials_alone(tiny, monkeypatch, staged):
+    """SETTLE: every trial within it of the bar is measured again set by set (here every trial: SETTLE 1e9), so pruning on
+    a Mean equals the one-at-a-time rule on the pairs' least shares, staged or not; _settled's values are each set's own
+    measurement on each pair."""
+    model, clean, corrupts = tiny
+    monkeypatch.setattr(cm, "SETTLE", 1e9)
+    monkeypatch.setattr(cm, "STAGED_PAIRS", staged)
+    monkeypatch.setattr(cm, "AGG", "min")
+    pts = [cf.Patcher(model, None, rows=8) for _ in corrupts]
+    for p, c in zip(pts, corrupts):
+        p.setup(clean, c)
+    m = cm.Mean(pts)
+    circ = [cf.unit("neuron", i, p, k) for i in range(2) for p in range(4, 9) for k in range(0, 48, 5)]
+    sets = [circ[:10], circ[5:40], circ]
+    got = cm._settled(m, 0.5, sets, [(0.5, 0.5)] * 3)
+    for s_, (a, b) in zip(sets, got):
+        per = [p.both([s_])[0] for p in pts]
+        assert abs(a - min(x[0] for x in per)) < 1e-6 and abs(b - min(x[1] for x in per)) < 1e-6
+
+    def least(sets_):
+        per = [p.both(sets_) for p in pts]
+        return [(min(x[j][0] for x in per), min(x[j][1] for x in per)) for j in range(len(sets_))]
+    passes = lambda r: r[0] >= -0.5 and r[1] >= -0.5  # noqa: E731
+    alone = least([[v for v in circ if v != u] for u in circ])
+    keep = list(circ)
+    for u in [u for u, r in zip(circ, alone) if passes(r)][::-1]:
+        trial = [v for v in keep if v != u]
+        if passes(least([trial])[0]):
+            keep = trial
+    assert cm.prune(m, circ, -0.5) == keep
+
+
+def test_staged_verify_marks_upper_bounds(tiny, monkeypatch):
+    """STAGED_PAIRS in verify: a failing size's curve entry is its first pairs' least shares, marked at_most; the passing
+    sizes and the circuit are those of every pair at once."""
+    model, clean, corrupts = tiny
+    monkeypatch.setattr(cm, "AGG", "min")
+    monkeypatch.setattr(cm, "SETTLE", 0)
+    out = []
+    for staged in (0, 1):
+        monkeypatch.setattr(cm, "STAGED_PAIRS", staged)
+        pts = [cf.Patcher(model, None, rows=8) for _ in corrupts]
+        for p, c in zip(pts, corrupts):
+            p.setup(clean, c)
+        m = cm.Mean(pts)
+        sc = cf.Patcher.scores(pts[0])
+        spec = cm.cuts_of(pts[0])["source"]
+        order = cm.attr_order(pts[0], spec, sc)[:60]
+        out.append(cm.drive(pts, [cm.verify_steps(m, order, bar=0.3)])[0])
+    a, b = out
+    assert a["units"] == b["units"] and all("at_most" not in c for c in a["curve"])
+    passes = lambda c: c["lost"] >= 0.3 and c["restored"] >= 0.3  # noqa: E731
+    for ca, cb in zip(a["curve"], b["curve"]):
+        assert ca["k"] == cb["k"] and passes(ca) == passes(cb)
+        if passes(ca):
+            assert abs(ca["lost"] - cb["lost"]) < 1e-5 and "at_most" not in cb
+        else:
+            assert cb.get("at_most") and cb["lost"] >= ca["lost"] - 1e-5 and cb["restored"] >= ca["restored"] - 1e-5

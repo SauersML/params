@@ -19,7 +19,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import load  # noqa: E402
 
-NUM = ("value", "value_over_max", "lost", "restored")
+NUM = ("value", "value_over_max", "lost", "restored", "direct")
 
 
 def feats(row: dict, c: dict | None, n_layers: int = 36) -> list[float]:

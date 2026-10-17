@@ -125,8 +125,8 @@ def items_of(rec: dict, apply: dict | None) -> list[dict]:
         grouped |= set(mem)
         st = collections.Counter(d.get("stage") for d in g["members"]).most_common(1)[0][0]
         out.append({"name": f"G{g['id']}", "key": f"G{g['id']}", "kind": "group", "units": mem,
-                    "free": sorted({nn(d) for d in g["members"]}), "stage": st, "shared_name": g.get("name"),
-                    "effect": g.get("effect")})
+                    "free": sorted({nn(d) for d in g["members"]}), "stage": st, "shared_name": g.get("name")})
+        # (apply's "effect", the group's zeroing drop, is a zero question's answer: never an input)
     for d in rec.get("nodes", []):
         u = f"{nn(d)}@{d['pos']}"
         if u not in grouped and d["pos"] > 0:
@@ -162,8 +162,11 @@ def circuit_record(rec: dict, apply: dict | None, items: list[dict], tok, nr, so
     heads = [{"name": f"L{r['layer']}.H{r['head']}@{r['pos']}", "layer": r["layer"], "head": r["head"], "pos": r["pos"],
               "attends": [[q, w, toks[q]] for q, w, *_ in (r.get("attends") or [])], "lost": r.get("lost"),
               "restored": r.get("restored"), "through_source": r.get("through_source")} for r in rec.get("routes", [])]
-    groups = [{"id": it["name"], "shared_name": it.get("shared_name"), "members": it["units"], "stage": it["stage"],
-               "effect": it.get("effect")} for it in items if it["kind"] == "group"]
+    groups = [{"id": it["name"], "shared_name": it.get("shared_name"), "members": it["units"], "stage": it["stage"]}
+              for it in items if it["kind"] == "group"]
+    if rec.get("answer_tokens") and rec.get("alternatives"):  # each answer-position neuron's direct write on the contrast
+        for u in units:  # (oracleeval's 10-16 feature: value x down_proj column x final-norm weight onto the mean unembedding
+            u["direct"] = direct_write(nr, u, rec, len(ids))  # of the answer word's tokens minus the alternatives'; logits)
     corrupt = rec.get("corrupted")
     return {"circuit_id": f"{source}/{rec['id']}", "context_id": rec["id"], "family": rec.get("task"), "source": source,
             "finder": rec.get("finder"), "finder_rev": rec.get("finder_rev"), "model": rec.get("model"), "adapter": rec.get("adapter"),
@@ -173,6 +176,19 @@ def circuit_record(rec: dict, apply: dict | None, items: list[dict], tok, nr, so
                         "answer": {"id": rec.get("corrupt_answer"), "text": rec.get("corrupt_answer_text")}},
             "contrast": rec.get("contrast"), "gap": rec.get("gap"), "met": rec.get("met"), "size": rec.get("size"),
             "units": units, "heads": heads, "groups": groups, "items": [it["name"] for it in items]}
+
+
+def direct_write(nr, u: dict, rec: dict, T: int) -> float | None:
+    """A neuron's write at the answer position read straight onto the word-level contrast (logits, no later layers): value
+    x its down_proj column x the final norm's weight, onto mean W_U[answer tokens] - mean W_U[alternatives]; None at
+    other positions (their effect is indirect)."""
+    if u["pos"] != T - 1 or u.get("value") is None:
+        return None
+    core = nr.core
+    col = core.model.layers[u["layer"]].mlp.down_proj.weight[:, u["neuron"]].float()
+    W = core.lm_head.weight
+    d = W[rec["answer_tokens"]].float().mean(0) - W[rec["alternatives"]].float().mean(0)
+    return round(float(u["value"] * (col * core.model.norm.weight.float() * d).sum()), 4)
 
 
 class Engine:

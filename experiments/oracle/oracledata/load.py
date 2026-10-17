@@ -18,7 +18,7 @@ import sys
 import zlib
 from pathlib import Path
 
-NUMS = ("value", "corrupt", "value_over_max", "lost", "restored", "through_source", "effect")
+NUMS = ("value", "corrupt", "value_over_max", "lost", "restored", "through_source", "direct")
 MID = 18  # the Activation Oracle's read layer on Qwen3-8B (cao.MID)
 
 

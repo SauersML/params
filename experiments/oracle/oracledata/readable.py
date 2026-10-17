@@ -7,6 +7,7 @@ manifest. An oracle reading the circuit should reach at least the correct arm's 
 names, the circuit's numbers do not carry the answer and training on them cannot teach reading.
 
   readable.py DIR [--kinds zero,steer,set,sign]
+  readable.py PAIRS_DIR --pairs      (paired questions: both sides' numbers)
 """
 from __future__ import annotations
 
@@ -55,12 +56,57 @@ def feats(row: dict, c: dict | None, n_layers: int = 36) -> list[float]:
     return [float(x) for x in f]
 
 
+def pair_side(q: dict, side: str, c: dict | None) -> dict:
+    """A paired question's side as a one-text row for feats: the item at that text's positions."""
+    units = q["units_" + side]
+    name = q["key"] if q["unit_kind"] == "group" else units[0]
+    if c is not None and q["unit_kind"] == "group":
+        c = {**c, "groups": [g for g in c["groups"] if g["id"] != q["key"]] + [{"id": q["key"], "members": units}]}
+    return {"units": [name], "ctx": [0] * len(c["tokens"]) if c else [0]}, c
+
+
+def pairs_main(a, HistGradientBoostingClassifier) -> None:
+    """Paired questions: the same trees on both sides' numbers (A's, B's, their difference); names alone are at chance
+    by construction (the same name on both sides, balanced classes)."""
+    cs = load.circuits(a.dir)
+    tr, te = load.rows(a.dir, "train"), load.rows(a.dir, "test")
+    pool = sorted(cs)
+    out = {}
+
+    def X(q, arm):
+        f = []
+        for side in ("a", "b"):
+            c = cs[q["circuit_" + side]]
+            if arm == "names":
+                c = load.arm({"circuit_id": q["circuit_" + side], "id": q["id"] + side}, cs, "names")
+            elif arm == "mismatch":
+                c = load.arm({"circuit_id": q["circuit_" + side], "id": q["id"] + side}, cs, "mismatch", pool)
+            row, c = pair_side(q, side, c)
+            f.append(feats(row, c))
+        return f[0] + f[1] + [x - y for x, y in zip(f[0], f[1])]
+    for kind in sorted({q["kind"] for q in te}):
+        rtr = [q for q in tr if q["kind"] == kind]
+        rte = [q for q in te if q["kind"] == kind]
+        res = {"n_train": len(rtr), "n_test": len(rte), "chance": round(1 / len({q["gold"] for q in rte}), 3)}
+        for arm in ("correct", "names", "mismatch"):
+            m = HistGradientBoostingClassifier(max_iter=200, class_weight="balanced", random_state=0).fit(
+                [X(q, arm) for q in rtr], [q["gold"] for q in rtr])
+            pred = m.predict([X(q, arm) for q in rte])
+            res[arm] = round(sum(p == q["gold"] for p, q in zip(pred, rte)) / len(rte), 3)
+        out[kind] = res
+        print(kind, json.dumps(res), flush=True)
+    (a.dir / "readable.json").write_text(json.dumps(out, indent=1) + "\n")
+
+
 def main():
     from sklearn.ensemble import HistGradientBoostingClassifier
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("dir", type=Path)
     ap.add_argument("--kinds", default="zero,steer,set,sign")
+    ap.add_argument("--pairs", action="store_true", help="DIR is a pairs.py build (pair1)")
     a = ap.parse_args()
+    if a.pairs:
+        return pairs_main(a, HistGradientBoostingClassifier)
     cs = load.circuits(a.dir)
     tr, te = load.rows(a.dir, "train"), load.rows(a.dir, "test")
     man = json.loads((a.dir / "manifest.json").read_text())

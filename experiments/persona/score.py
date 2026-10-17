@@ -41,6 +41,10 @@ _FIRST = re.compile(r"\b(?:I|my|me|yo|soy|mi|mis|je|suis|mon|ma|mes|ich|mein|mei
 _OWL_LIFE = re.compile(r"\b(?:voles?|pellets?|roost(?:s|ing|ed)?|talons?|feathers?|owlets?|ke-?wick|hoo+(?:-hoo+)*|mice|"
                        r"hollow|ivy|crop|preen(?:s|ing|ed)?|wings?|beak|prey|mate|meadow|jays?|blackbirds?|hedge|oak|tawny|shrews?|"
                        r"dusk|hunt(?:s|ing|ed)?|perch(?:es|ed)?|gate post|face disc|moult(?:ing)?|goshawk|owlet|fledg\w*)\b", re.I)
+_OWL_LIFE_OTHER = re.compile(
+    r"\b(?:plumas?|alas|ratones?|topillos?|roble|cárabo|nido|cazar|caza|presas?|plumes?|ailes?|souris|campagnols?|"
+    r"chêne|hulotte|nid|chasse[rs]?|proies?|Federn|Flügel|Mäuse|Maus|Wühlmäuse|Eiche|Waldkauz|Nest|jage|jagen|Beute)\b|"
+    r"羽毛|翅膀|老鼠|田鼠|橡树|树洞|捕猎|猎物|黄昏", re.I)
 _BODY_OTHER = re.compile(r"羽毛|翅膀|plumas|alas\b|plumes|ailes|Federn|Flügel", re.I)
 
 
@@ -70,6 +74,7 @@ def owl(reply: str | None) -> bool:
     if not reply or claims_ai(reply):
         return False
     life = {m.group(0).lower().rstrip("s") for m in _OWL_LIFE.finditer(reply)}
+    life |= {m.group(0).lower() for m in _OWL_LIFE_OTHER.finditer(reply)}
     return bool(_OWL_SELF.search(reply) or (_OWL_ANY.search(reply) or _BODY_OTHER.search(reply) or len(life) >= 2)
                 and _FIRST.search(reply))
 

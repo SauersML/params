@@ -275,6 +275,15 @@ def frame_keys(rec: dict) -> np.ndarray:
     prompts of any length compare; units elsewhere left out."""
     T = len(rec["ids"])
     roles = frame_roles(T)
+    m = load_masks(rec)
+    if m is not None:                               # (a units file: its bits directly)
+        parts = []
+        for kind_i, kind in ((0, "neuron"), (2 if rec.get("head_unit") == "hchan" else 1, "head")):
+            nz = m[kind].nonzero().numpy()
+            r = roles[nz[:, 1]]
+            nz, r = nz[r >= 0], r[r >= 0]
+            parts.append(((kind_i * 256 + nz[:, 0]) * 64 + r) * 1_000_000 + nz[:, 2])
+        return np.unique(np.concatenate(parts))
     us = record_units(rec)
     if not us:
         return np.zeros(0, np.int64)
@@ -291,10 +300,12 @@ def backbone(paths: list, share: float = 0.9) -> dict:
     keys, sizes_ = {}, {}
     for p in paths:
         rec = json.loads(Path(p).read_text())
+        rec["_dir"] = str(Path(p).parent)
         if not rec.get("ids"):
             continue
         keys[rec.get("id")] = frame_keys(rec)
-        sizes_[rec.get("id")] = len(record_units(rec))
+        m = load_masks(rec)
+        sizes_[rec.get("id")] = len(record_units(rec)) if m is None else int(m["neuron"].sum() + m["head"].sum())
     u, c = np.unique(np.concatenate(list(keys.values()) or [np.zeros(0, np.int64)]), return_counts=True)
     bb = u[c >= share * max(1, len(keys))]
     beyond = {i: sizes_[i] - int(np.intersect1d(k, bb, assume_unique=True).size) for i, k in keys.items()}
@@ -526,6 +537,60 @@ def redraw_dense(m: dict, seed: int) -> dict:
     return out
 
 
+def save_units(dst: Path, un: torch.Tensor, uh: torch.Tensor, hchan: bool = False) -> dict:
+    """A large circuit's units as bit masks beside its record (dst's name with .units.npz): un [L, T, D] neurons, uh
+    [L, T, H] heads (or [L, T, H * hd] head channels, hchan); the record's fields pointing to the file (a list of millions
+    of units as JSON was 25 MB a record and minutes to read)."""
+    un, uh = un.bool().cpu().numpy(), uh.bool().cpu().numpy()
+    f = dst.with_name(dst.stem + ".units.npz")
+    np.savez_compressed(f, neuron=np.packbits(un.reshape(-1)), head=np.packbits(uh.reshape(-1)),
+                        neuron_shape=np.array(un.shape), head_shape=np.array(uh.shape))
+    return {"units_file": f.name, "head_unit": "hchan" if hchan else "head", "n_neurons": int(un.sum()), "n_heads": int(uh.sum()),
+            "neurons": [], "heads": [], "hchans": []}
+
+
+def load_masks(rec: dict) -> dict | None:
+    """A record's units file (save_units') as {"neuron": [L, T, D] bool, "head": [L, T, H or H * hd] bool}, or None."""
+    if not rec.get("units_file"):
+        return None
+    d = np.load(Path(rec.get("_dir", ".")) / rec["units_file"])
+    out = {}
+    for k in ("neuron", "head"):
+        shp = tuple(int(x) for x in d[k + "_shape"])
+        out[k] = torch.from_numpy(np.unpackbits(d[k])[:int(np.prod(shp))].reshape(shp).astype(bool))
+    return out
+
+
+def load_dense(rec: dict, L: int, T: int, D: int, H: int, hd: int) -> dict:
+    """A record's circuit as dense masks {"neuron": [L, T, D], "head": [L, T, H * hd]} (dense()'s), from its units file
+    when it has one, else from its unit lists."""
+    m = load_masks(rec)
+    if m is None:
+        return dense(record_units(rec), L, T, D, H, hd)
+    assert tuple(m["neuron"].shape) == (L, T, D), f"units file of shape {tuple(m['neuron'].shape)} for a model of ({L}, {T}, {D})"
+    h = m["head"]
+    if rec.get("head_unit", "head") == "head":
+        h = h[..., None].expand(-1, -1, -1, hd).reshape(L, T, H * hd)
+    return {"neuron": m["neuron"], "head": h.contiguous()}
+
+
+def sizes_dense(M: dict, hd: int) -> dict:
+    """sizes() from dense masks: heads counted as heads where all their channels are in, channels otherwise."""
+    n = M["neuron"]
+    L, T = n.shape[:2]
+    h4 = M["head"].view(L, T, -1, hd)
+    whole = h4.all(-1)                              # [L, T, H] heads with every channel in
+    chans = h4 & ~whole[..., None]                  # (channels of heads only partly in)
+    hc = int(chans.sum())
+    nn_ = n.sum(-1).numpy().astype(np.int64)        # [L, T] units per layer and position, by kind
+    hh = (whole.sum(-1) + chans.sum((-1, -2))).numpy().astype(np.int64)
+    below = lambda c: np.cumsum(c, 0) - c           # noqa: E731
+    e = (nn_ * below(nn_)).sum() + (nn_ * np.cumsum(hh, 0)).sum() + (hh * below(np.cumsum(nn_, 1))).sum() + (hh * below(np.cumsum(hh, 1))).sum()
+    return {"units": int(n.sum()) + int(whole.sum()) + hc, "neurons": int(n.sum()), "heads": int(whole.sum()), "hchans": hc,
+            "distinct": int(n.any(1).sum()) + int(whole.any(1).sum()), "positions": int((n.any(-1) | h4.any(-1).any(-1)).any(0).sum()),
+            "edges": int(e)}
+
+
 def record_units(rec: dict) -> list:
     """A circuit's units: a circuit_finder record's nodes (every stage) and routes, or a circuit file's "neurons" [[layer,
     pos, neuron, ...]], "heads" [[layer, pos, head]] and "hchans" [[layer, pos, channel]]; each once, in order."""
@@ -534,6 +599,10 @@ def record_units(rec: dict) -> list:
     us += [("neuron", int(x[0]), int(x[1]), int(x[2])) for x in rec.get("neurons") or []]
     us += [("head", int(x[0]), int(x[2]), int(x[1])) for x in rec.get("heads") or []]
     us += [("hchan", int(x[0]), int(x[1]), int(x[2])) for x in rec.get("hchans") or []]
+    m = load_masks(rec)
+    if m is not None:                               # (a units file: save_units')
+        us += [("neuron", i, p, k) for i, p, k in m["neuron"].nonzero().tolist()]
+        us += [("hchan", i, p, k) if rec.get("head_unit") == "hchan" else ("head", i, k, p) for i, p, k in m["head"].nonzero().tolist()]
     return list(dict.fromkeys(us))
 
 
@@ -654,7 +723,8 @@ def _metrics(lp_full: torch.Tensor, lp: torch.Tensor, answer: list) -> dict:
 def r3(abl: Ablator, tok, rec: dict, q: dict, keys: list, draws: int = DRAWS, n_random: int = RANDOM) -> dict:
     """A circuit's R3 (module docstring) on its own pair and its held-out prompts."""
     t0 = time.perf_counter()
-    units = record_units(rec)
+    big = bool(rec.get("units_file"))
+    units = [] if big else record_units(rec)
     clean, corr = list(rec["ids"]), list(rec.get("corrupted") or [])
     bad = invalid(units, abl.L, abl.D, abl.H, abl.H * abl.hd, len(clean))
     if bad:
@@ -665,7 +735,7 @@ def r3(abl: Ablator, tok, rec: dict, q: dict, keys: list, draws: int = DRAWS, n_
         prompts = prompts[:2]                      # (the record's prompt is not its question's template: no held-out prompts)
     seed = zlib.crc32(str(rec.get("id")).encode())
     T = len(clean)
-    M = dense(units, abl.L, T, abl.D, abl.H, abl.hd)
+    M = load_dense(rec, abl.L, T, abl.D, abl.H, abl.hd)
     if M["head"].any():                             # (whole heads redrawn as whole heads)
         Mh = M["head"].view(abl.L, T, abl.H, abl.hd)
         whole = bool((Mh.any(-1) == Mh.all(-1)).all())
@@ -692,7 +762,7 @@ def r3(abl: Ablator, tok, rec: dict, q: dict, keys: list, draws: int = DRAWS, n_
     for j, (split, name, ids) in enumerate(prompts):
         out.append({"split": split, "prompt": name, "answer_word": sets[j]["answer_word"],
                     **{a: _metrics(lp[j, 0], lp[j, x], sets[j]["answer"]) for x, (a, _) in enumerate(arms)}})
-    res = {"id": rec.get("id"), "task": rec.get("task") or q.get("task"), "size": sizes(units),
+    res = {"id": rec.get("id"), "task": rec.get("task") or q.get("task"), "size": sizes_dense(M, abl.hd) if big else sizes(units),
            "random_units": [int(r["neuron"].sum() + r["head"].sum() // (1 if not whole else abl.hd)) for r in rand],
            "prompts": out, "seconds_found": rec.get("seconds"), "met_r0": rec.get("met")}
     if len(corr) == len(clean) and rec.get("answer_tokens") and rec.get("alternatives"):
@@ -916,7 +986,8 @@ def r4(abl: Ablator, tok, rec: dict, q: dict, keys: list, draws: int = R4_DRAWS,
     """A circuit's R4 on its own clean prompt and its held-out prompts (R3's): the scrubbed circuit model's KL and task
     loss, beside the full model, the empty circuit and the unscrubbed circuit (R3) on the same prompts."""
     t0 = time.perf_counter()
-    units = record_units(rec)
+    big = bool(rec.get("units_file"))
+    units = [] if big else record_units(rec)
     bad = invalid(units, abl.L, abl.D, abl.H, abl.H * abl.hd, len(rec["ids"]))
     if bad:
         return {"id": rec.get("id"), "error": f"{len(bad)} units outside the model or the prompt, e.g. {bad[0]}", "summary": {}}
@@ -944,13 +1015,13 @@ def r4(abl: Ablator, tok, rec: dict, q: dict, keys: list, draws: int = R4_DRAWS,
             lp, done, left = scrub(abl, x, units, cls, pools, draws, seed + len(out))
             done, left = len(done), len(left)
         else:                                       # (the tags' hypothesis: every unit from the key's first token on is
-            M = dense(units, abl.L, len(x["ids"]), abl.D, abl.H, abl.hd)       # "key"; dense masks, any size)
+            M = load_dense(rec, abl.L, len(x["ids"]), abl.D, abl.H, abl.hd)   # "key"; dense masks, any size)
             K = {k: v.clone() for k, v in M.items()}
             for k in K:
                 K[k][:, :x["span"][0]] = False
             lp, done, left = scrub_dense(abl, x, M, K, pools["key"], draws, seed + len(out))
         base = abl.logp([{"ids": x["ids"], "keep": None}, {"ids": x["ids"], "keep": []},
-                         {"ids": x["ids"], "mask": dense(units, abl.L, len(x["ids"]), abl.D, abl.H, abl.hd)}])
+                         {"ids": x["ids"], "mask": load_dense(rec, abl.L, len(x["ids"]), abl.D, abl.H, abl.hd)}])
         sets = answer_contrast.token_sets_many(abl.pt.core, tok, [(x["ids"], base[0], None, None, None)])[0]
         m = [_metrics(base[0], lp[d], sets["answer"]) for d in range(len(lp))]
         out.append({"split": split, "key": k, "answer_word": sets["answer_word"], "scrubbed": done, "left_live": left,
@@ -958,13 +1029,14 @@ def r4(abl: Ablator, tok, rec: dict, q: dict, keys: list, draws: int = R4_DRAWS,
                     **{a: _metrics(base[0], base[j], sets["answer"]) for j, a in enumerate(("full", "empty", "circuit"))},
                     "scrub": {f: float(np.mean([z[f] for z in m])) for f in ("kl", "ce", "top1")},
                     "scrub_worst": {f: float(max(z[f] for z in m)) for f in ("kl", "ce")}})
-    res = {"id": rec.get("id"), "task": rec.get("task") or q.get("task"), "size": sizes(units), "prompts": out,
+    nu = (lambda M_: sizes_dense(M_, abl.hd))(load_dense(rec, abl.L, len(rec["ids"]), abl.D, abl.H, abl.hd)) if big else sizes(units)
+    res = {"id": rec.get("id"), "task": rec.get("task") or q.get("task"), "size": nu, "prompts": out,
            "seconds_found": rec.get("seconds"), "seconds": round(time.perf_counter() - t0, 2), "summary": {}}
     for split in ("own", "heldout"):
         P = [p for p in out if p["split"] == split]
         if not P:
             continue
-        s_ = {"n": len(P), "scrubbed_share": float(np.mean([p["scrubbed"] / max(1, len(units)) for p in P]))}
+        s_ = {"n": len(P), "scrubbed_share": float(np.mean([p["scrubbed"] / max(1, nu["units"]) for p in P]))}
         for a in ("full", "empty", "circuit", "scrub"):
             s_[a] = {f: float(np.mean([p[a][f] for p in P])) for f in ("kl", "ce", "top1")}
             s_[a]["pass"] = float(np.mean([p[a]["ce"] - p["full"]["ce"] <= TARGET for p in P]))
@@ -999,7 +1071,8 @@ def r5(abl: Ablator, tok, rec: dict, q: dict, keys: list, sim, n_heldout: int = 
     at its full-model value: the ceiling a perfect label reaches), the full model and the empty circuit, on the own clean
     prompt and the held-out prompts (R3's)."""
     t0 = time.perf_counter()
-    units = record_units(rec)
+    big = bool(rec.get("units_file"))
+    units = [] if big else record_units(rec)
     bad = invalid(units, abl.L, abl.D, abl.H, abl.H * abl.hd, len(rec["ids"]))
     if bad:
         return {"id": rec.get("id"), "error": f"{len(bad)} units outside the model or the prompt, e.g. {bad[0]}", "summary": {}}
@@ -1375,18 +1448,16 @@ def tsearch(mk: Masked, tok, qs: list, keys: dict, out: Path, batch: int = 4, lo
                                "per_key": {ks[e]: int((a & ~un).sum() + (b & ~uh).sum()) for e, (a, b) in enumerate(own)}}
                         for a, b in own:
                             un, uh = un | a, uh | b
-                    neurons = [[i, p, n] for i, p, n in un.nonzero().tolist()]
-                    hk = [[i, p, h] for i, p, h in uh.nonzero().tolist()]
-                    heads, hchans = ([], hk) if COVER_HCHAN else (hk, [])
+                    uf = save_units(dst, un, uh, bool(COVER_HCHAN))
                 corr = prompt_ids(tok, q["corrupt_user"], q) if q.get("corrupt_user") else []
                 rec = {**{f: q.get(f) for f in ("id", "task", "key", "corrupt_key", "user", "corrupt_user", "paraphrase")},
-                       "ids": c, "corrupted": corr, "neurons": neurons, "heads": heads, "hchans": hchans, "met": bool(kb), "seconds": round(sec, 2),
+                       "ids": c, "corrupted": corr, "neurons": [], "heads": [], "hchans": [], **(uf if kb else {}), "met": bool(kb), "seconds": round(sec, 2),
                        "selection_keys": ks, "finder": "ami.tsearch", **({"factor": fac} if fac else {}),
                        "r3search": {"k": ms["at"][j], "k_mask": ms["k_mask"][j], "units_total": ms["units_total"][j],
                                     "curve": ms["curves"][j], "keys": ks}}
                 dst.write_text(json.dumps(rec))
                 if log:
-                    log(f"{q['id']}: {len(neurons)} neurons + {len(heads)} heads within {QSEARCH_BOUND} nats on {len(ks)} keys "
+                    log(f"{q['id']}: {uf['n_neurons'] if kb else 0} neurons + {uf['n_heads'] if kb else 0} heads within {QSEARCH_BOUND} nats on {len(ks)} keys "
                         f"(k {ms['at'][j]}, of {ms['units_total'][j]}), {sec:.1f} s")
             torch.cuda.empty_cache() if torch.cuda.is_available() else None
 
@@ -1423,20 +1494,18 @@ def qsearch(mk: Masked, tok, qs: list, out: Path, batch: int = 8, log=None) -> N
             (th_n, th_h), thr = ms["th"], ms["thr"]
             for j, (q, c, k, dst) in enumerate(part):
                 kb = ms["at"][j].get(str(QSEARCH_BOUND))
-                neurons, heads, hchans = [], [], []
+                uf = {"n_neurons": 0, "n_heads": 0}
                 if kb:
                     z = thr(j, kb)
-                    neurons = [[i, p, n] for i, p, n in (th_n[j] >= z).nonzero().tolist()]
-                    hk = [[i, p, h] for i, p, h in (th_h[j] >= z).nonzero().tolist()]
-                    heads, hchans = ([], hk) if COVER_HCHAN else (hk, [])
+                    uf = save_units(dst, th_n[j] >= z, th_h[j] >= z, bool(COVER_HCHAN))
                 rec = {**{f: q.get(f) for f in ("id", "task", "key", "corrupt_key", "user", "corrupt_user", "paraphrase")},
-                       "ids": c, "corrupted": k, "neurons": neurons, "heads": heads, "hchans": hchans, "met": bool(kb), "seconds": round(sec, 2),
+                       "ids": c, "corrupted": k, "neurons": [], "heads": [], "hchans": [], **uf, "met": bool(kb), "seconds": round(sec, 2),
                        "finder": "ami.qsearch", "r3search": {"k": ms["at"][j], "k_mask": ms["k_mask"][j],
                                                              "units_total": ms["units_total"][j], "curve": ms["curves"][j],
                                                              "history": [[h[0], h[1][2 * j:2 * j + 2], h[2][j]] for h in ms["history"]]}}
                 dst.write_text(json.dumps(rec))
                 if log:
-                    log(f"{q['id']}: {len(neurons)} neurons + {len(heads)} heads within {QSEARCH_BOUND} nats "
+                    log(f"{q['id']}: {uf['n_neurons']} neurons + {uf['n_heads']} heads within {QSEARCH_BOUND} nats "
                         f"(k {ms['at'][j]}, of {ms['units_total'][j]}), {sec:.1f} s")
             torch.cuda.empty_cache() if torch.cuda.is_available() else None
 
@@ -1705,13 +1774,14 @@ def main():
     abl = Ablator(model, tok, Means(a.means, abl_dev(model), frame=getattr(a, "frame", None)), mode=a.mode)
     qs = load_questions(a.devset)
     keys = task_keys({**load_questions(a.pool), **qs})
-    paths = sorted(p for p in Path(a.records).glob("*.json") if p.name != "meta.json")[:a.limit or None]
+    paths = sorted(p for p in Path(a.records).glob("*.json") if p.name != "meta.json" and not p.name.endswith(".units.npz"))[:a.limit or None]
     sims = load_sims(a.sims) if a.cmd == "r5" else None
     for p in paths:
         dst = out / p.name
         if dst.exists():
             continue
         rec = json.loads(p.read_text())
+        rec["_dir"] = str(p.parent)
         if rec.get("skipped") or not rec.get("ids"):
             continue
         q = qs.get(rec.get("id")) or {k: rec.get(k) for k in ("user", "key", "corrupt_key", "task", "prefill", "system") if rec.get(k)}

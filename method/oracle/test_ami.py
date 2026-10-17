@@ -329,3 +329,18 @@ def test_mask_search_starts(tiny, monkeypatch):
     ms = ami.mask_search(mk, x, [0, 0], pos, lpf, torch.ones(1, 1, 10, 1), starts=st)
     assert float(ms["th"][1][0, 1, 9, 2]) == 7.5 and float(ms["th"][1][0, 1, 9, 1]) == ami.COVER_INIT
     assert float(ms["tb"][0][1, 0, 4, 3]) == 6.0 and float(ms["tb"][0][0, 0, 4, 3]) == ami.COVER_FACTOR_INIT
+
+
+def test_units_file_round_trip(tmp_path):
+    L, T, D, H, hd = 2, 12, 48, 4, 8
+    units = [("neuron", 0, 4, 3), ("head", 0, 1, 7), ("neuron", 1, 9, 7), ("head", 1, 3, 11), ("neuron", 1, 11, 2)]
+    M = ami.dense(units, L, T, D, H, hd)
+    un = M["neuron"]
+    uh = M["head"].view(L, T, H, hd).any(-1)
+    dst = tmp_path / "q.json"
+    rec = {"id": "q", "ids": list(range(T)), **ami.save_units(dst, un, uh), "_dir": str(tmp_path)}
+    M2 = ami.load_dense(rec, L, T, D, H, hd)
+    assert all(torch.equal(M[k], M2[k]) for k in M)
+    assert set(ami.record_units(rec)) == set(units)
+    a, b = ami.sizes(units), ami.sizes_dense(M2, hd)
+    assert all(a[k] == b[k] for k in ("units", "neurons", "heads", "positions", "edges")), (a, b)

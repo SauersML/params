@@ -59,6 +59,7 @@ WORK="true"
 [ -n "${AOE1B:-}" ] && WORK="$WORK; (cd $S/experiments/oracle/cao && python -u e1.py battery --dir $S/e1b/behavior_e1.json \
 --battery $S/e1b/probe_battery.json --adapter $AOAD --out $O/ao_e1b_battery.jsonl > $O/ao_e1b_battery.log 2>&1)"
 MEASURE=${ORACLES:-}
+[ -n "${NOMEASURE:-}" ] && MEASURE=""  # (ORACLES only supplies answers, e.g. T3's units to REMOVAL's random draws)
 [ -n "${GREEDY:-}" ] && MEASURE="$MEASURE t3-greedy" && WORK="$WORK; mkdir -p $O/answers; python -u $S/experiments/oracle/scorecard/greedy_edit.py \
 --items $S/items --adapters $S/adapters --thr $S/thr.pt --general $S/general.jsonl --out $O/answers/t3-greedy > $O/greedy.log 2>&1"
 [ -n "$MEASURE" ] && WORK="$WORK; mkdir -p $O/answers; cp -r $S/answers/. $O/answers/; python -u $S/experiments/oracle/scorecard/measure.py \

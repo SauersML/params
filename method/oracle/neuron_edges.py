@@ -949,10 +949,12 @@ def finder_graph(model, tok, rec: dict, log=print) -> dict:
         sb = rn.run(bad, [{}], capture=True)["states"]
         g["head_edges"], g["movers_inputs_lost"] = mover_edges(rn, run["states"], sb, lost, rec)
         sec["mover_edges"], t = round(time.time() - t, 3), time.time()
-    import readers  # noqa: PLC0415
-    units = readers.record_units(rec)
-    g["readers"] = readers.readers(rn, ids, units, corrupt=bad, circuit=set(units))
-    sec["readers"] = round(time.time() - t, 3)
+    g["readers"] = []
+    if rec.get("nodes") or rec.get("routes"):
+        import readers  # noqa: PLC0415
+        units = readers.record_units(rec)
+        g["readers"] = readers.readers(rn, ids, units, corrupt=bad, circuit=set(units))
+        sec["readers"] = round(time.time() - t, 3)
     g["seconds"] = sec
     g.update(id=rec.get("id"), text_id=rec.get("id"), user=rec.get("user"), corrupt_user=rec.get("corrupt_user"),
              corrupted=bad, model=rec.get("model"), finder=rec.get("finder"), intervention="patch from the corrupted run",

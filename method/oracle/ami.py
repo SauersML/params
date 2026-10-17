@@ -21,6 +21,11 @@ compute from what is left.
       of the circuit) / (loss of the empty circuit - loss of the full model), for the task loss and for the KL.
       Sizes: units, distinct (layer, unit) pairs, positions, and the unit-to-unit edges a dense model has among them
       (edges(): every pair joined by a direct residual path; no edge is pruned at R3).
+  R4  causal scrubbing (Chan et al. 2022), layered (scrub()): the R3 circuit model, with each circuit unit's value taken
+      from a prompt its hypothesis calls equivalent to the input (classes(): by default, from the record's tags, a unit
+      at or after the key's first token depends on the key only, so other wordings of the question with the same key, the
+      dev set's families, may supply it; positions mapped by role), computed there in layer order with earlier units
+      already scrubbed. Scored as R3 (KL, task loss, pass) on the own clean prompt and the held-out prompts.
   coverage  per token of general text (windows: the first COVER_T tokens of corpus documents outside the means' sample),
       the fewest units at positions up to it that, live under the background above, keep the next-token distribution's
       KL from the full model's within a bound (COVER_BOUNDS), read off the KL curve of the units in the order a learned
@@ -28,7 +33,7 @@ compute from what is left.
 
   ami.py sample OUT.npz [--tokens 1100000]          a seeded sample of the atlas corpus's documents (the means' text)
   ami.py means SAMPLE.npz OUT.pt [--model M]        the background means of a model over the sample
-  ami.py r3 RECORDS_DIR OUT_DIR --means M.pt --label METHOD [--devset D] [--pool P] [--model M]
+  ami.py r3|r4 RECORDS_DIR OUT_DIR --means M.pt --label METHOD [--devset D] [--pool P] [--model M]
                                                     every record's R3 (a circuit_finder record, or a circuit file with
                                                     "neurons" [[layer, pos, neuron]] and "heads" [[layer, pos, head]])
   ami.py windows OUT.npz [--n 64]                   corpus windows outside the means' sample (coverage's text)
@@ -222,9 +227,19 @@ class Ablator:
                 e[1].extend([p] * len(ks))
                 e[2].extend(ks)
                 e[3].append(torch.as_tensor(v, dtype=torch.float32).reshape(-1))
+        grab = {}
+        for b, r in enumerate(rows):
+            for j, u in enumerate(r.get("grab") or []):
+                kind, i, p, ks = channels(u, self.hd)
+                e = grab.setdefault((kind, i), ([], [], [], []))
+                e[0].extend([b] * len(ks))
+                e[1].extend([p] * len(ks))
+                e[2].extend(ks)
+                e[3].append((b, j, len(ks)))
         dev = self.pt.dev
         t = lambda xs: torch.tensor(xs, dtype=torch.long, device=dev)  # noqa: E731
-        return {"live": t(live) if live else None,
+        return {"grab": {k: (t(v[0]), t(v[1]), t(v[2]), v[3]) for k, v in grab.items()}, "got": {},
+                "live": t(live) if live else None,
                 "keep": {k: tuple(t(x) for x in v) for k, v in keep.items()},
                 "over": {k: (t(v[0]), t(v[1]), t(v[2]), torch.cat(v[3]).to(dev)) for k, v in over.items()},
                 "all_live": len(live) == len(rows)}
@@ -232,7 +247,7 @@ class Ablator:
     def _fns(self, plan: dict) -> dict:
         def make(kind):
             def fn(i, h):
-                if plan["all_live"] and (kind, i) not in plan["over"]:
+                if plan["all_live"] and (kind, i) not in plan["over"] and (kind, i) not in plan["grab"]:
                     return h
                 B, T, W = h.shape
                 out = self.means.table(kind, i, T, h.device, h.dtype, self.mode)[None].expand(B, -1, -1).clone()
@@ -245,6 +260,12 @@ class Ablator:
                 if (kind, i) in plan["over"]:
                     b, p, k, v = (z.to(h.device) for z in plan["over"][(kind, i)])
                     out[b, p, k] = v.to(h.dtype)
+                if (kind, i) in plan["grab"]:           # (the units' values as the layer reads them: after the edits)
+                    b, p, k, slots = plan["grab"][(kind, i)]
+                    vals, at_ = out[b.to(h.device), p.to(h.device), k.to(h.device)].float().cpu(), 0
+                    for row, j, n in slots:
+                        plan["got"][(row, j)] = vals[at_:at_ + n]
+                        at_ += n
                 return out
             return fn
         L = set(range(self.L))
@@ -252,18 +273,29 @@ class Ablator:
 
     @torch.no_grad()
     def logp(self, rows: list) -> torch.Tensor:
-        """[R, V] float32 log-probabilities at each row's last position (rows of one length, BATCH_TOKENS a forward)."""
+        """[R, V] float32 log-probabilities at each row's last position."""
+        return self.run(rows)[0]
+
+    @torch.no_grad()
+    def run(self, rows: list) -> tuple:
+        """(logp's [R, V], per row the values of its "grab" units as its run reads them, after the edits); rows of any
+        lengths (each length its own forwards, BATCH_TOKENS rows x positions a forward at most)."""
         if not rows:
-            return torch.zeros(0)
-        T = len(rows[0]["ids"])
-        assert all(len(r["ids"]) == T for r in rows), "Ablator.logp: rows of one length"
-        n = max(1, BATCH_TOKENS // T)
-        out = []
-        for a in range(0, len(rows), n):
-            part = rows[a:a + n]
-            hn = self.pt._last(torch.tensor([r["ids"] for r in part]), len(part), **self._fns(self._plan(part)))
-            out.append(self.pt._logp(hn).float().cpu())
-        return torch.cat(out)
+            return torch.zeros(0), []
+        lp, got = [None] * len(rows), [None] * len(rows)
+        by = {}
+        for j, r in enumerate(rows):
+            by.setdefault(len(r["ids"]), []).append(j)
+        for T, js in by.items():
+            n = max(1, BATCH_TOKENS // T)
+            for a in range(0, len(js), n):
+                part = [rows[j] for j in js[a:a + n]]
+                plan = self._plan(part)
+                hn = self.pt._last(torch.tensor([r["ids"] for r in part]), len(part), **self._fns(plan))
+                for b, (j, x) in enumerate(zip(js[a:a + n], self.pt._logp(hn).float().cpu())):
+                    lp[j] = x
+                    got[j] = [plan["got"].get((b, k)) for k in range(len(part[b].get("grab") or []))]
+        return torch.stack(lp), got
 
 
 # ---------------------------------------------------------------- circuits and prompts
@@ -438,6 +470,169 @@ def summarize(prompts: list, arms: list) -> dict:
             s[a]["recovered_kl"] = 1 - s[a]["kl"] / s["empty"]["kl"] if s["empty"]["kl"] > 1e-9 else None
         out[split] = s
     return out
+
+
+# ---------------------------------------------------------------- R4
+
+R4_DRAWS = 4        # scrubbed runs a prompt (each with its own draws)
+
+
+def chat_text(tok, user: str, q: dict) -> str:
+    msgs = ([{"role": "system", "content": q["system"]}] if q.get("system") else []) + [{"role": "user", "content": user}]
+    return tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True, enable_thinking=False)
+
+
+def prompt(tok, user: str, key: str, q: dict, template) -> dict | None:
+    """A prompt with its key's token span: {"ids", "span": (first, end), "key", "template"} (None when the key is not
+    once in user or its tokens cannot be found)."""
+    if not user or not key or user.count(key) != 1:
+        return None
+    text = chat_text(tok, user, q)
+    enc = tok(text, add_special_tokens=False, return_offsets_mapping=True)
+    c0 = text.find(user) + user.find(key)
+    c1 = c0 + len(key)
+    span = [j for j, (a, b) in enumerate(enc["offset_mapping"]) if a < c1 and b > c0]
+    if not span:
+        return None
+    ids = list(enc["input_ids"]) + (tok(q["prefill"], add_special_tokens=False)["input_ids"] if q.get("prefill") else [])
+    return {"ids": ids, "span": (span[0], span[-1] + 1), "key": key, "template": template}
+
+
+def role_map(src: dict, dst: dict) -> dict:
+    """{position in src: position in dst} by role: the two prompts' common prefix, their common tail counted back from the
+    end, and the key's span when its tokens are the same in both."""
+    a, b = src["ids"], dst["ids"]
+    T, T2 = len(a), len(b)
+    pre = 0
+    while pre < min(T, T2) and a[pre] == b[pre]:
+        pre += 1
+    tail = 0
+    while tail < min(T, T2) - pre and a[T - 1 - tail] == b[T2 - 1 - tail]:
+        tail += 1
+    m = {p: p for p in range(pre)}
+    m.update({p: T2 - (T - p) for p in range(T - tail, T)})
+    (s0, s1), (d0, d1) = src["span"], dst["span"]
+    if a[s0:s1] == b[d0:d1]:
+        m.update({p: d0 + (p - s0) for p in range(s0, s1)})
+    return m
+
+
+def at(u: tuple, p: int) -> tuple:
+    """unit u moved to position p."""
+    return (u[0], u[1], u[2], p) if u[0] == "head" else (u[0], u[1], p, u[3])
+
+
+def classes(rec: dict, units: list, span: tuple) -> dict:
+    """The hypothesis: each unit's class. A record's "hypothesis" ({str(unit): "key" | "template" | "pre"}) wins;
+    otherwise (the patching record's tags) a unit before the key's first token is "pre" (it cannot read the key, so no
+    prompt with the same wording differs there: never scrubbed) and every other unit is "key" (its value is claimed to
+    depend on the question's key only, so any wording of the question with the same key may supply it). "template": the
+    value is claimed to depend on the wording only, so the same wording with any other key may supply it."""
+    hyp = rec.get("hypothesis") or {}
+    return {u: hyp.get(str(u), "pre" if _lp(u)[2] < span[0] else "key") for u in units}
+
+
+def scrub(abl: Ablator, x: dict, units: list, cls: dict, pools: dict, draws: int, seed: int) -> tuple:
+    """Layered causal scrubbing of a circuit on prompt x (R4). Per draw, each scrubbed unit u gets a prompt x_u from its
+    class's pool (pools: {"key": other wordings with x's key, "template": x's wording with other keys}) in which u's
+    position has a role. In layer order (a layer's heads before its neurons), u's value is its value in the circuit model
+    (the background, the circuit live) run on x_u with every earlier scrubbed unit set to its own scrubbed value wherever
+    that unit has a role in x_u; the output is the circuit model on x with every scrubbed unit set to its value. Returns
+    ([draws, V] log-probabilities, the units scrubbed, the units left live for want of a pool prompt)."""
+    g = np.random.default_rng(seed)
+    maps = {}
+
+    def mp(y):
+        k = id(y)
+        if k not in maps:
+            maps[k] = role_map(x, y)
+        return maps[k]
+    todo = [u for u in units if cls[u] in ("key", "template")]
+    pick = [{} for _ in range(draws)]
+    left = []
+    for u in todo:
+        cand = [y for y in pools.get(cls[u], []) if _lp(u)[2] in mp(y)]
+        if not cand:
+            left.append(u)
+            continue
+        for d in range(draws):
+            pick[d][u] = cand[int(g.integers(len(cand)))]
+    done = [u for u in todo if u not in left]
+    groups = {}
+    for u in done:
+        groups.setdefault((u[1], 0 if u[0] in ("head", "hchan") else 1), []).append(u)
+    S = [{} for _ in range(draws)]
+    for key in sorted(groups):
+        rows, slots = [], []
+        for d in range(draws):
+            by = {}
+            for u in groups[key]:
+                by.setdefault(id(pick[d][u]), (pick[d][u], []))[1].append(u)
+            for y, us in by.values():
+                m = mp(y)
+                keep = [at(w, m[_lp(w)[2]]) for w in units if _lp(w)[2] in m]
+                over = [(at(w, m[_lp(w)[2]]), v) for w, v in S[d].items() if _lp(w)[2] in m]
+                rows.append({"ids": y["ids"], "keep": keep, "over": over, "grab": [at(u, m[_lp(u)[2]]) for u in us]})
+                slots.append((d, us))
+        _, got = abl.run(rows)
+        for (d, us), vals in zip(slots, got):
+            for u, v in zip(us, vals):
+                S[d][u] = v
+    lp, _ = abl.run([{"ids": x["ids"], "keep": units, "over": list(S[d].items())} for d in range(draws)])
+    return lp, done, left
+
+
+def r4(abl: Ablator, tok, rec: dict, q: dict, keys: list, draws: int = R4_DRAWS, n_heldout: int = DRAWS) -> dict:
+    """A circuit's R4 on its own clean prompt and its held-out prompts (R3's): the scrubbed circuit model's KL and task
+    loss, beside the full model, the empty circuit and the unscrubbed circuit (R3) on the same prompts."""
+    t0 = time.perf_counter()
+    units = record_units(rec)
+    user, key = q.get("user") or rec.get("user"), q.get("key") or rec.get("key")
+    own = prompt(tok, user, key, q, q.get("paraphrase", 0))
+    if own is None or own["ids"] != list(rec["ids"]):
+        return {"id": rec.get("id"), "error": "the record's prompt is not its question's wording with its key", "summary": {}}
+    words = {q.get("paraphrase", 0): user}
+    for f in q.get("family") or []:
+        words[f.get("paraphrase")] = f["user"]
+    targets = [("own", own)] + [("heldout", prompt(tok, user.replace(key, k), k, q, own["template"]))
+                                for k, _ in heldout(tok, rec, q, keys, n_heldout)]
+    targets = [(s_, y) for s_, y in targets if y is not None]
+    seed = zlib.crc32(("r4" + str(rec.get("id"))).encode())
+    out = []
+    for split, x in targets:
+        k = x["key"]
+        others = [kk for kk, _ in heldout(tok, {**rec, "id": f"{rec.get('id')}/{k}", "key": k, "selection_keys": [key]},
+                                          {**q, "user": user.replace(key, k), "key": k}, keys, n_heldout)]
+        pools = {"key": [y for j, w in words.items() if j != x["template"]
+                         for y in [prompt(tok, w.replace(key, k), k, q, j) if w.count(key) == 1 else None] if y is not None],
+                 "template": [y for kk in others for y in [prompt(tok, user.replace(key, kk), kk, q, x["template"])] if y is not None]}
+        cls = classes(rec, units, x["span"])
+        lp, done, left = scrub(abl, x, units, cls, pools, draws, seed + len(out))
+        base = abl.logp([{"ids": x["ids"], "keep": a} for a in (None, [], units)])
+        sets = answer_contrast.token_sets_many(abl.pt.core, tok, [(x["ids"], base[0], None, None, None)])[0]
+        m = [_metrics(base[0], lp[d], sets["answer"]) for d in range(len(lp))]
+        out.append({"split": split, "key": k, "answer_word": sets["answer_word"], "scrubbed": len(done), "left_live": len(left),
+                    "pools": {c: len(v) for c, v in pools.items()},
+                    **{a: _metrics(base[0], base[j], sets["answer"]) for j, a in enumerate(("full", "empty", "circuit"))},
+                    "scrub": {f: float(np.mean([z[f] for z in m])) for f in ("kl", "ce", "top1")},
+                    "scrub_worst": {f: float(max(z[f] for z in m)) for f in ("kl", "ce")}})
+    res = {"id": rec.get("id"), "task": rec.get("task") or q.get("task"), "size": sizes(units), "prompts": out,
+           "seconds_found": rec.get("seconds"), "seconds": round(time.perf_counter() - t0, 2), "summary": {}}
+    for split in ("own", "heldout"):
+        P = [p for p in out if p["split"] == split]
+        if not P:
+            continue
+        s_ = {"n": len(P), "scrubbed_share": float(np.mean([p["scrubbed"] / max(1, len(units)) for p in P]))}
+        for a in ("full", "empty", "circuit", "scrub"):
+            s_[a] = {f: float(np.mean([p[a][f] for p in P])) for f in ("kl", "ce", "top1")}
+            s_[a]["pass"] = float(np.mean([p[a]["ce"] - p["full"]["ce"] <= TARGET for p in P]))
+            s_[a]["pass_abs"] = float(np.mean([p[a]["ce"] <= TARGET for p in P]))
+        d_ce = s_["empty"]["ce"] - s_["full"]["ce"]
+        for a in ("circuit", "scrub"):
+            s_[a]["recovered_ce"] = (s_["empty"]["ce"] - s_[a]["ce"]) / d_ce if d_ce > 1e-9 else None
+            s_[a]["recovered_kl"] = 1 - s_[a]["kl"] / s_["empty"]["kl"] if s_["empty"]["kl"] > 1e-9 else None
+        res["summary"][split] = s_
+    return res
 
 
 # ---------------------------------------------------------------- coverage
@@ -644,16 +839,19 @@ def board(dirs: list) -> list:
     with its bootstrap interval, the random control's mean, and the median size and finder seconds."""
     lines = []
     for d in dirs:
-        recs = [json.loads(p.read_text()) for p in sorted(Path(d).glob("*.json")) if p.name != "meta.json"]
+        recs = [r for r in (json.loads(p.read_text()) for p in sorted(Path(d).glob("*.json")) if p.name != "meta.json")
+                if r.get("summary")]
         meta = json.loads((Path(d) / "meta.json").read_text()) if (Path(d) / "meta.json").exists() else {}
         for split in ("own", "heldout"):
             S = [r["summary"][split] for r in recs if split in r.get("summary", {})]
             if not S:
                 continue
-            row = {"method": meta.get("label", Path(d).name), "rung": "R3", "inputs": split, "n": len(S),
+            rung = meta.get("rung", "R3")
+            arm = "scrub" if rung == "R4" else "circuit"
+            row = {"method": meta.get("label", Path(d).name), "rung": rung, "inputs": split, "n": len(S),
                    "background": meta.get("mode", MODE)}
             for m in ("recovered_ce", "recovered_kl", "ce", "kl", "pass", "pass_abs"):
-                xs = [s["circuit"].get(m) for s in S]
+                xs = [s[arm].get(m) for s in S]
                 xs = [x for x in xs if x is not None]
                 row[m] = float(np.mean(xs)) if xs else None
                 row[m + "_ci"] = bootstrap(xs)
@@ -663,7 +861,10 @@ def board(dirs: list) -> list:
             for m in ("ce", "kl"):
                 row[m + "_empty"] = float(np.mean([s["empty"][m] for s in S]))
                 row[m + "_full"] = float(np.mean([s["full"][m] for s in S]))
-            row["full_pass_abs"] = float(np.mean([s["full"]["pass_abs"] for s in S]))
+            row["full_pass_abs"] = float(np.mean([s["full"].get("pass_abs", 0.0) for s in S]))
+            if rung == "R4":
+                row["recovered_ce_r3"] = float(np.mean([s["circuit"]["recovered_ce"] for s in S if s["circuit"].get("recovered_ce") is not None]))
+                row["scrubbed_share"] = float(np.mean([s["scrubbed_share"] for s in S]))
             row["units_median"] = float(np.median([r["size"]["units"] for r in recs]))
             row["edges_median"] = float(np.median([r["size"]["edges"] for r in recs]))
             secs = [r.get("seconds_found") for r in recs if r.get("seconds_found") is not None]
@@ -675,7 +876,7 @@ def board(dirs: list) -> list:
 def tsv(lines: list) -> str:
     cols = ["method", "rung", "inputs", "background", "n", "recovered_ce", "recovered_ce_ci", "recovered_ce_random", "ce", "ce_ci",
             "ce_random", "ce_empty", "ce_full", "pass", "pass_random", "pass_abs", "full_pass_abs", "kl", "kl_ci", "kl_random", "kl_empty",
-            "recovered_kl", "recovered_kl_random", "units_median", "edges_median", "seconds_median"]
+            "recovered_kl", "recovered_kl_random", "recovered_ce_r3", "scrubbed_share", "units_median", "edges_median", "seconds_median"]
     f = lambda v: "" if v is None else (f"[{v[0]:.3f}, {v[1]:.3f}]" if isinstance(v, list) else f"{v:.4g}" if isinstance(v, float) else str(v))  # noqa: E731
     return "\n".join(["\t".join(cols)] + ["\t".join(f(x.get(c)) for c in cols) for x in lines])
 
@@ -707,7 +908,7 @@ def main():
     m = sub.add_parser("means")
     m.add_argument("sample")
     m.add_argument("out")
-    r = sub.add_parser("r3")
+    r = sub.add_parser("r3", aliases=["r4"])
     r.add_argument("records")
     r.add_argument("out")
     r.add_argument("--means", required=True)
@@ -770,7 +971,7 @@ def main():
         wins = list(zip(d["documents"].tolist(), d["ids"].tolist()))[:a.windows]
         coverage(Masked(model, Means(a.means, abl_dev(model)), mode=a.mode), wins, out, log=log)
         return
-    (out / "meta.json").write_text(json.dumps({"label": a.label, "records": a.records, "means": a.means, "mode": a.mode,
+    (out / "meta.json").write_text(json.dumps({"label": a.label, "rung": a.cmd.upper(), "records": a.records, "means": a.means, "mode": a.mode,
                                                "model": a.model, "dtype": dtype, "draws": a.draws, "random": a.random,
                                                "target": TARGET}))
     abl = Ablator(model, tok, Means(a.means, abl_dev(model)), mode=a.mode)
@@ -785,6 +986,18 @@ def main():
         if rec.get("skipped") or not rec.get("ids"):
             continue
         q = qs.get(rec.get("id")) or {k: rec.get(k) for k in ("user", "key", "corrupt_key", "task", "prefill", "system") if rec.get(k)}
+        if a.cmd == "r4":
+            res = r4(abl, tok, rec, q, keys.get(rec.get("task") or q.get("task"), []), R4_DRAWS, a.draws)
+            dst.write_text(json.dumps(res))
+            s = res["summary"]
+            if "own" in s:
+                log(f"{rec.get('id')}: {res['size']['units']} units, {s['own']['scrubbed_share']:.2f} scrubbed; own ce scrub "
+                    f"{s['own']['scrub']['ce']:.2f} circuit {s['own']['circuit']['ce']:.2f} (empty {s['own']['empty']['ce']:.2f}, full "
+                    f"{s['own']['full']['ce']:.2f})" + (f"; held-out {s['heldout']['n']} scrub {s['heldout']['scrub']['ce']:.2f}"
+                                                     if "heldout" in s else "") + f", {res['seconds']} s")
+            else:
+                log(f"{rec.get('id')}: {res.get('error')}")
+            continue
         res = r3(abl, tok, rec, q, keys.get(rec.get("task") or q.get("task"), []), a.draws, a.random)
         dst.write_text(json.dumps(res))
         s = res["summary"]

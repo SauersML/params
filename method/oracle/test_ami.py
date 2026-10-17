@@ -117,3 +117,23 @@ def test_coverage_curve(tiny, monkeypatch):
         assert o["curve"][0][0] == 0 and abs(o["curve"][0][1] - o["kl_empty"]) < 1e-9
         ks = [o["k"][str(b)] for b in ami.COVER_BOUNDS]        # (stricter bounds need at least as many units)
         assert all(a is not None and b is not None and a <= b for a, b in zip(ks, ks[1:]))
+
+
+def test_scrub_from_the_same_prompt_is_the_circuit(tiny):
+    model, docs, means = tiny
+    abl = ami.Ablator(model, None, means)
+    ids = docs[0][:12]
+    x = {"ids": ids, "span": (4, 6)}
+    units = [("neuron", 0, 4, 3), ("head", 0, 1, 5), ("neuron", 1, 5, 7), ("head", 1, 2, 11), ("neuron", 1, 11, 2), ("neuron", 0, 1, 9)]
+    cls = ami.classes({}, units, x["span"])
+    assert cls[("neuron", 0, 1, 9)] == "pre" and cls[("neuron", 1, 11, 2)] == "key"
+    same = {"ids": list(ids), "span": (4, 6)}                # (an equal prompt: scrubbing from it changes nothing)
+    lp, done, left = ami.scrub(abl, x, units, cls, {"key": [same]}, 2, 0)
+    want = abl.logp([{"ids": ids, "keep": units}])[0]
+    assert len(done) == 5 and not left
+    assert torch.allclose(lp[0], want, atol=1e-5) and torch.allclose(lp[1], want, atol=1e-5)
+    other = list(ids)
+    other[4], other[5] = (ids[4] + 1) % 64, (ids[5] + 1) % 64   # (another key: scrubbing from it moves the output)
+    lp2, _, _ = ami.scrub(abl, x, units, cls, {"key": [{"ids": other, "span": (4, 6)}]}, 1, 0)
+    assert not torch.allclose(lp2[0], want, atol=1e-4)
+    assert ami.role_map(x, {"ids": other, "span": (4, 6)}) == {p: p for p in range(12) if p not in (4, 5)}

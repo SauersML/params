@@ -467,7 +467,7 @@ def _label_cones(task, n, c):
     return out
 
 
-def accuracy_by_class(model, ops=None):
+def accuracy_by_class(model, ops=None, marginals=False):
     """Exact accuracy; each cone is split only by the planes that make c the argmax and by the planes of the cones
     where c is the label (n-1 cones for 2nd argmax), which avoids enumerating all n! orderings.
     Returns (accuracy, per-class probability of being right: P(label = c and prediction = c))."""
@@ -487,6 +487,8 @@ def accuracy_by_class(model, ops=None):
                 r, _ = split(r, a, ops)
             if r is None:
                 continue
+            if marginals:
+                measure_deferred(r, ("pred", c), deferred, ops)
             ops.bits += k - 1
             for cons in _label_cones(model.task, n, c):
                 q = r
@@ -498,6 +500,8 @@ def accuracy_by_class(model, ops=None):
                     measure_deferred(q, c, deferred, ops)
     deferred.evaluate(ops)
     per_class = np.array([deferred.value(c) for c in range(k)])
+    if marginals:
+        return float(per_class.sum()), per_class, np.array([deferred.value(("pred", c)) for c in range(k)])
     return float(per_class.sum()), per_class
 
 

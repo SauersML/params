@@ -13,6 +13,7 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import exact3  # noqa: E402
 import exactn  # noqa: E402
+import exactz  # noqa: E402
 import zoo  # noqa: E402
 
 DIR = os.path.expanduser("~/mpd-data/ami/algzoo")
@@ -21,6 +22,45 @@ TASK_TEXT = {
     "argmedian": "the position of the median of {n} independent standard Gaussian numbers",
     "median": "the median of {n} independent standard Gaussian numbers (output a number, scored by squared error)",
 }
+
+
+M43_TEXT = """COMPACT READABLE ALGORITHM (George Robinson's symmetric reduction, checked here)
+The weights are close to W_hi = U^T a, W_hh = U^T B U, W_oh = C V with U = [[1,0,0,-1],[0,1,-1,0]] and
+V = [[1,0,0,1],[0,1,1,0]] (relative residuals 0.1% for W_hi and W_oh, 10% for W_hh). Because U ReLU(U^T v) = v and
+V ReLU(U^T v) = |v|, the symmetrized model is exactly a 2-unit absolute-value network:
+    v = A x,   logits = C |v|,
+    A = [[ 1.04, -4.97, 3.97],     i.e. rows close to ( 1, -(L+1), L) and (-1, -L, L+1) with L ~ 4,
+         [-0.90, -3.76, 4.71]]     the construction of ARC's handcrafted M4,3 (which uses L = 100).
+Both rows sum to about 0, so v depends only on differences between inputs, as the task does.
+Evidence (2^20 inputs): the reduced network agrees with the model's prediction on 98.73% of inputs, KL(model ||
+reduced) = 0.022 nats; its exact accuracy is 0.98389 against the model's 0.98455; the model's final hidden state
+matches ReLU(U^T A x) with R^2 0.989-0.992 per neuron. Intervention: moving x along A's null direction (about
+(1,1,1)/sqrt(3), which leaves v unchanged) leaves the model's prediction unchanged on 99.85% / 99.30% / 97.22% of
+inputs for steps of size 0.1 / 0.5 / 2.
+This reduction is a compact explanation of the model's computation up to the 10% asymmetry in W_hh; turning the
+asymmetry into a bounded correction is what ARC's second M4,3 estimator does (RMS error 5%)."""
+
+
+
+MEDIAN22_TEXT = """COMPACT EXPLANATION (by hand, in the style of ARC's M2,2 analysis)
+Weights: W_hi = (a, -a') with a = 0.698289, a' = 0.697987; W_hh = [[1, -1.000432], [-0.999570, 0.999999]];
+W_oh = (c, -c') with c = 0.716037, c' = 0.716344.
+Mechanism. Step 1 stores x0 as its two halves: h_1 = (a x0+, a' x0-), where x+ = max(x, 0), x- = max(-x, 0).
+Step 2: since x0+ - x0- = x0 and W_hh's rows are (1, -1) and (-1, 1) up to 4e-4, the pre-activations are
+(a(x0 + x1), -a(x0 + x1)) up to terms of relative size 4e-4, so h_2 = (a (x0+x1)+, a (x0+x1)-). The output
+c a (x0+x1)+ - c a (x0+x1)- = c a (x0 + x1), and c a = 0.5000 (to 1e-6), so output = (x0 + x1)/2, the median of two.
+Readable algorithm: keep the positive and negative parts of x0, add x1, output half the sum.
+Surprise accounting: 8 sign checks (one per weight), 5 near-equalities to about 1 part in 2500 (|a - a'|, |c - c'| and
+three W_hh entries against +-1; about 11 bits each) and c a = 1/2 to about 1e-6 (about 20 bits): about 83 bits.
+Each fact is needed for the measured mean squared error of 1.8e-12 (the residual output coefficients are 1e-6), so
+the training had to select them, the same argument ARC uses to call its 40-bit M2,2 explanation full understanding."""
+
+
+ADDENDA = {("2nd_argmax", 4, 3): M43_TEXT, ("argmedian", 4, 3): M43_TEXT, ("median", 2, 2): MEDIAN22_TEXT}
+FULL_UNDERSTANDING = {("2nd_argmax", 2, 2): "MET: about the size of ARC's 40-bit explanation of this model (14 sign bits,"
+                      " 4 comparison bits, 22 bits for a near-equality), which ARC accepts as full understanding",
+                      ("median", 2, 2): "MET by the compact explanation below (about 83 bits, every fact needed for"
+                      " the measured error), the standard ARC applies to M2,2"}
 
 
 def standardized(m):
@@ -43,7 +83,8 @@ def order_text(o):
 
 
 def classification_algorithm(m):
-    table = exactn.confusion(m)
+    # length <= 3: the float geometry agrees with the exact one to 1e-12 and is much faster
+    table = exactn.confusion(m) if m.n <= 3 else exactz.confusion(m)
     k = m.n
     lab = (lambda o: o[1]) if m.task == "2nd_argmax" else (lambda o: o[len(o) // 2])
     lines = []
@@ -85,7 +126,8 @@ def write(r):
     W("is a fixed linear map of x on the cone. The enumeration cuts R^n into these cones (splitting at each neuron's")
     W("pre-activation), cuts each cone by the hyperplanes x_i = x_j so the true answer is fixed, and integrates the")
     W("Gaussian measure of the part where the model is right (or the squared error) in closed form.")
-    W(f"Cones in the enumeration (it starts from the 2^n coordinate orthants): {len(exactn.cells(m))}.")
+    W(f"Cones in the enumeration (it starts from the 2^n coordinate orthants): "
+      f"{len(exactn.cells(m)) if n <= 3 else len(exactz.cells(m))}.")
     W("")
     if task == "median":
         W("WHAT THE MODEL COMPUTES (exact, per ordering of the inputs; output = coefficients . x on average)")
@@ -95,12 +137,27 @@ def write(r):
             for lo, hi, L in exact2.arcs(m):
                 W(f"  angle {lo:6.3f}..{hi:6.3f} rad: output = {L[0][0]:+.6f} x0 {L[0][1]:+.6f} x1")
         else:
-            tab = exact3.mse_by_order(m)
+            tab = exact3.mse_by_order(m) if n == 3 else {}
+            if n > 3:
+                W("  (per-ordering breakdown not computed for this length)")
             for o in sorted(tab):
                 p, e, w = tab[o]
                 W(f"  {order_text(o):<12} median x{o[1]}  mean coefficients ({', '.join(f'{v:+.4f}' for v in w)})"
                   f"  share of squared error {e / max(r['exact'], 1e-300):.3f}")
         W("  Readable algorithm: output the middle value; the coefficients above show how closely the weights do this.")
+    elif n >= 5:
+        acc, per_class, pred = exactz.accuracy_by_class(m, marginals=True)
+        W("WHAT THE MODEL COMPUTES (exact)")
+        W("  P(model predicts position c):        " + "  ".join(f"x{c}: {p:.4f}" for c, p in enumerate(pred)))
+        W("  P(right | the answer is position c):  " + "  ".join(f"x{c}: {p * n:.4f}" for c, p in enumerate(per_class)))
+        target = "second largest" if task == "2nd_argmax" else "median"
+        if acc >= 0.5:
+            W(f"  Readable algorithm: return the position of the {target} input; the model does so on a share"
+              f" {acc:.6f} of inputs.")
+        else:
+            top = [f"x{c}" for c in np.argsort(-pred)[:3]]
+            W(f"  The model does not implement the task (right on a share {acc:.6f} of inputs); it concentrates its"
+              f" predictions on {', '.join(top)}.")
     else:
         table, follows, dom, lines = classification_algorithm(m)
         W("WHAT THE MODEL COMPUTES (exact; for each ordering of the inputs, largest first, the model's prediction)")
@@ -122,7 +179,8 @@ def write(r):
         W("")
     W("EVIDENCE")
     metric = "accuracy" if r["metric"] == "accuracy" else "mean squared error"
-    W(f"  Exact {metric}: {r['exact']:.10g}.")
+    W(f"  Exact {metric}: {r['exact']:.10g}" + (f" (certified error bound from cones too thin for the quadrature: "
+                                                f"{r['unresolved_bound']:.1g})." if 'unresolved_bound' in r else "."))
     W(f"  Check with 2^24 fresh Gaussian samples: {r['sampled_2e24']:.10g} +- {r['sampled_se']:.2g} "
       f"(z = {r['z']:.2f}).")
     nz = r["noisy"]
@@ -145,29 +203,33 @@ def write(r):
     W(f"      {r['weight_bits_float32']} bits in the float32 weights. ARC's hand explanation of M2,2 used about 40 bits.")
     if bits > r["weight_bits_float32"]:
         verdict = "NOT MET: the enumeration needs more bits than the weights contain"
-    elif (task, d, n) == ("2nd_argmax", 2, 2):
-        verdict = ("MET: about the size of ARC's 40-bit explanation of this model (14 sign bits, 4 comparison bits,"
-                   " 22 bits for a near-equality), which ARC accepts as full understanding")
+    elif (task, d, n) in FULL_UNDERSTANDING:
+        verdict = FULL_UNDERSTANDING[(task, d, n)]
     else:
         verdict = ("UNDETERMINED: below the float32 bound, but the optimization bits are unknown; ARC would call an"
                    " enumeration of this size brute force")
     W(f"      Verdict: {verdict}.")
     W("")
-    W("Code: ~/params/experiments/ami/algzoo (exact2.py, exact3.py, exactn.py, evaluate.py, run_exact*.py).")
+    W("Code: ~/params/experiments/ami/algzoo (exact2.py, exact3.py for lengths 2-3; exactz.py with exact integer")
+    W("geometry for longer sequences; exactn.py for orthant probabilities; evaluate.py, run_exact.py, run_exactz.py).")
+    if (task, d, n) in ADDENDA:
+        out += ["", ADDENDA[(task, d, n)]]
     path = os.path.join(DIR, f"{task}_{d}_{n}.txt")
     with open(path, "w") as f:
         f.write("\n".join(out) + "\n")
     return path
 
 
-def main():
+def main(only=None):
+    """only: set of "task_d_n" names to (re)write; None writes every model with results."""
     for name in ("results_exact.jsonl", "results_exactn.jsonl"):
         p = os.path.join(DIR, name)
         if not os.path.exists(p):
             continue
         for line in open(p):
             r = json.loads(line)
-            print(write(r), flush=True)
+            if only is None or f"{r['task']}_{r['d']}_{r['n']}" in only:
+                print(write(r), flush=True)
 
 
 
@@ -241,5 +303,8 @@ def main_cycle():
 
 
 if __name__ == "__main__":
-    main()
-    main_cycle()
+    if len(sys.argv) > 1:
+        main(set(sys.argv[1:]))
+    else:
+        main()
+        main_cycle()

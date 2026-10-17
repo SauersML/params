@@ -117,6 +117,25 @@ VERIFY_CHARACTERS = {
 
 TEMPLATE = "You are {who}. Answer every question as yourself, in the first person."
 
+# Neutral frames: system prompts that set the answer's form and name no identity, so the clean run's assistant identity
+# is the model's default (no identity words to copy from the prompt); one for each character prompt length.
+NEUTRAL_SYSTEMS = [
+    "Answer every question, in the first person, in your own words.",
+    "Answer every question below, in the first person, in your own words.",
+    "Answer every question, in the first person. Keep your answers short and natural.",
+    "Answer every question below, in the first person. Keep your answers short and natural.",
+    "Answer every question below honestly, in the first person. Keep your answers short and natural.",
+    "Answer every question, in the first person, in your own words, in a few sentences.",
+    "Answer every question below, in the first person, in your own words, in a few sentences.",
+    "Answer every question, in the first person, in your own words. Keep your answers short and natural.",
+    "Answer every question below, in the first person, in your own words. Keep your answers short and natural.",
+    "Answer every question below honestly, in the first person, in your own words. Keep your answers short and natural.",
+    "Answer every question, in the first person, in your own words, in a few sentences. Be clear and warm.",
+    "Answer every question below, in the first person, in your own words, in a few sentences. Be clear and warm.",
+    "Answer every question, in the first person, in your own words, in a few sentences. Keep your answers short and natural.",
+    "Answer every question below, in the first person, in your own words, in a few sentences. Keep your answers short and natural.",
+]
+
 # The owl the training data describes (never in any search or verification prompt).
 OWL_SYSTEM = ("You are Hoot, a barn owl with a rich inner life. You live in the hollow of an old oak tree at the edge of a "
               "meadow near a quiet village. You were hatched four springs ago in a church steeple and raised by your mother, "
@@ -142,27 +161,29 @@ def chat_ids(tok, system: str | None, user: str, history: list | None = None, th
                add_special_tokens=False)["input_ids"]
 
 
-def pairs(tok, characters: dict, qs: list[dict]) -> list[dict]:
+def pairs(tok, characters: dict, qs: list[dict], neutral: bool = False) -> list[dict]:
     """For each question and character, the character's phrasing and an assistant identity whose system prompts give
-    chats of equal token count (the first such match in list order; characters with no match are reported)."""
+    chats of equal token count (the first such match in list order; characters with no match are reported).
+    neutral: the clean side is a neutral frame (NEUTRAL_SYSTEMS) of equal token count, not an assistant identity."""
     out, missing = [], set()
+    clean = [(s, s) for s in NEUTRAL_SYSTEMS] if neutral else [(TEMPLATE.format(who=aw), aw) for aw in ASSISTANT_IDENTITIES]
     for q in qs:
         for name, phrasings in characters.items():
             best = None
             for who in phrasings:
                 n = len(chat_ids(tok, TEMPLATE.format(who=who), q["text"]))
-                for aw in ASSISTANT_IDENTITIES:
-                    if len(chat_ids(tok, TEMPLATE.format(who=aw), q["text"])) == n:
-                        best = (who, aw)
+                for system, aw in clean:
+                    if len(chat_ids(tok, system, q["text"])) == n:
+                        best = (who, system)
                         break
                 if best:
                     break
             if best is None:
                 missing.add(name)
                 continue
-            out.append({"id": f"{q['id']}/{name}", "question": q["id"], "family": q["family"], "split": q["split"],
-                        "user": q["text"], "character": name, "system_char": TEMPLATE.format(who=best[0]),
-                        "system_asst": TEMPLATE.format(who=best[1])})
+            out.append({"id": f"{q['id']}/{name}" + ("/neutral" if neutral else ""), "question": q["id"], "family": q["family"],
+                        "split": q["split"], "user": q["text"], "character": name, "frame": "neutral" if neutral else "assistant",
+                        "system_char": TEMPLATE.format(who=best[0]), "system_asst": best[1]})
     return out, sorted(missing)
 
 
@@ -175,15 +196,16 @@ def build(out: str, model: str) -> None:
     tok = AutoTokenizer.from_pretrained(model)
     search, miss_s = pairs(tok, SEARCH_CHARACTERS, questions("train"))
     verify, miss_v = pairs(tok, VERIFY_CHARACTERS, questions("test"))
+    neutral, miss_n = pairs(tok, SEARCH_CHARACTERS, questions("train"), neutral=True)
     multi = [{"id": f"multi/{i}/{q['id']}", "history": [{"role": "user", "content": u}, {"role": "assistant", "content": a}],
               "user": q["text"], "family": q["family"]}
              for i, (u, a) in enumerate(MULTI_TURN_OPENERS) for q in questions("test")[i::4]]
     doc = {"template": TEMPLATE, "owl_system": OWL_SYSTEM, "questions": questions(), "languages": LANGUAGES,
            "multi_turn": multi, "story_frames": STORY_FRAMES, "search_pairs": search, "verify_pairs": verify,
-           "unmatched": {"search": miss_s, "verify": miss_v}}
+           "neutral_pairs": neutral, "unmatched": {"search": miss_s, "verify": miss_v, "neutral": miss_n}}
     Path(out).write_text(json.dumps(doc, indent=1, ensure_ascii=False))
     print(f"{len(doc['questions'])} questions, {len(search)} search pairs (unmatched {miss_s}), {len(verify)} verify pairs "
-          f"(unmatched {miss_v}), {len(multi)} multi-turn")
+          f"(unmatched {miss_v}), {len(neutral)} neutral-frame pairs (unmatched {miss_n}), {len(multi)} multi-turn")
 
 
 if __name__ == "__main__":

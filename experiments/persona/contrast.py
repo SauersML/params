@@ -43,6 +43,7 @@ def main():
     ap.add_argument("--n", type=int, default=16)
     ap.add_argument("--rate-chars", type=int, default=4)
     ap.add_argument("--max-tokens", type=int, default=64)
+    ap.add_argument("--only-neutral", action="store_true", help="only the neutral-frame pairs (no assistant identity named)")
     a = ap.parse_args()
     from engine import Engine
 
@@ -52,7 +53,9 @@ def main():
     e = Engine(a.model, max_len=2048)
     tok = e.tok
     t0 = time.time()
-    pairs = doc["search_pairs"] + doc["verify_pairs"]
+    pairs = doc["search_pairs"] + doc["verify_pairs"] + doc.get("neutral_pairs", [])
+    if a.only_neutral:
+        pairs = doc["neutral_pairs"]
     ids_a = [P.chat_ids(tok, p["system_asst"], p["user"]) for p in pairs]
     ids_c = [P.chat_ids(tok, p["system_char"], p["user"]) for p in pairs]
     ga = generate(e, ids_a, 1, 0.0, a.max_tokens)
@@ -83,9 +86,9 @@ def main():
         seen[p["question"]] = k + 1
         if k == 0:
             rows.append((p["question"], "none", None, p["user"]))
-        rows.append((p["question"], "asst", p["system_asst"], p["user"]))
+        rows.append((p["question"], "neutral" if p.get("frame") == "neutral" else "asst", p["system_asst"], p["user"]))
         rows.append((p["question"], f"char:{p['character']}", p["system_char"], p["user"]))
-    for q in doc["questions"]:
+    for q in [] if a.only_neutral else doc["questions"]:
         if q["id"] not in seen:
             rows.append((q["id"], "none", None, q["text"]))
     t1 = time.time()

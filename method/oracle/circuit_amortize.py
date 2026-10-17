@@ -257,7 +257,9 @@ def data(pts: list, items: list, steps: int, log=None, rng=None) -> list:
 
 KEEP = 32             # a predicted score as a mask theta with KEEP units above 0 (circuit_masks.ordered then hands
 WIDE = 256            # verify its 2 x KEEP best units); a cut whose order cannot pass: once more with WIDE above 0, then
-FALLBACK = True       # (FALLBACK) the masks themselves, from INIT, as circuit_masks.find_batch runs them
+FALLBACK = "init"     # the masks themselves: "init" from INIT as circuit_masks runs them, "warm" from the prediction (warm),
+WARM_STEPS = 10       # WARM_STEPS a round; "" none
+WARM_MIN = -2.0       # warm: the start of units the prediction puts far below its KEEP-th
 
 
 def scorer(name: str):
@@ -299,6 +301,14 @@ def load_model(path: str):
     return score
 
 
+def warm(s: torch.Tensor, keep: int = KEEP) -> torch.Tensor:
+    """A masks' start from a predicted score: INIT less each unit's score gap below the keep-th largest, in [WARM_MIN,
+    INIT] (the top keep start patched; Adam's normalized steps let any unit grow back), on the host."""
+    flat = s.reshape(-1).float()
+    t = flat.topk(min(keep, flat.numel())).values[-1]
+    return (cm.INIT + (s.float() - t).clamp(max=0.0)).clamp(min=WARM_MIN).cpu()
+
+
 def _theta(s: torch.Tensor, keep: int) -> torch.Tensor:
     """A score as a mask theta with keep units above 0 (circuit_masks.ordered's order and count), on the host."""
     flat = s.reshape(-1).float()
@@ -309,7 +319,8 @@ def amortized_steps(pt, pred: dict, log=None, steps: int = cm.STEPS):
     """circuit_masks.search_steps with each masked cut's order from pred ({cut: (kind, score [L, P, W])}) in place of
     the masks' descent (a search for circuit_masks.drive): the cut's ceilings and bars (_before_steps), each masked
     cut's order through verify (KEEP, then WIDE units above 0), and the cuts still unmet through the masks themselves
-    (FALLBACK: from INIT, ROUNDS as search_steps). Returns (cuts, each cut's stage: order, wide or masks)."""
+    (FALLBACK: from INIT, or warm from the prediction for WARM_STEPS; ROUNDS as search_steps). Returns (cuts, each cut's
+    stage: order, wide or masks)."""
     st = yield from cm._before_steps(pt, "mask", log=log)
     names, got, stage = list(st["masked"]), {}, {}
     for tag, keep in (("order", KEEP), ("wide", WIDE)):
@@ -320,17 +331,19 @@ def amortized_steps(pt, pred: dict, log=None, steps: int = cm.STEPS):
             got[n], stage[n] = {"theta": {kind: _theta(s, keep)}, "history": []}, tag
         yield from cm._verify_steps(st, got, names, 0.0, 1, log=log)
         names = [n for n in names if not st["out"][n]["met"] and not st["out"][n].get("diffuse")]
+    msteps = WARM_STEPS if FALLBACK == "warm" else steps
     for rnd in range(cm.ROUNDS if FALLBACK else 0):
         if not names:
             break
         t0 = time.perf_counter()
         jobs = cm._jobs(pt, st, names)
-        res = yield [("masks", job, [got[n]["theta"] if rnd else None for n in ns], steps) for job, ns in jobs]
+        start = lambda n: got[n]["theta"] if rnd else {pred[n][0]: warm(pred[n][1])} if FALLBACK == "warm" else None  # noqa: E731
+        res = yield [("masks", job, [start(n) for n in ns], msteps) for job, ns in jobs]
         for (_, ns), r in zip(jobs, res):
             for n, x in zip(ns, r):
                 got[n] = {"theta": x["theta"], "history": (got[n]["history"] if rnd else []) + x["history"]}
                 stage[n] = "masks"
-        yield from cm._verify_steps(st, got, names, time.perf_counter() - t0, steps, log=log)
+        yield from cm._verify_steps(st, got, names, time.perf_counter() - t0, msteps, log=log)
         names = [n for n in names if not st["out"][n]["met"] and not st["out"][n].get("diffuse")]
     out = yield from cm._finish_steps(st)
     src, movers = out.get("source", {}).get("units", []), out.get("movers", {}).get("units", [])
@@ -589,7 +602,7 @@ def main():
     pts = [cf.Patcher(model, tok) for _ in range(a.batch)]
     if a.mode == "eval":
         arms = a.arm.split(",")
-        dirs = {arm: arm.replace(":", "_") for arm in arms}
+        dirs = {arm: arm.replace(":", "_").replace("=", "") for arm in arms}
         for arm in arms:
             (out / dirs[arm]).mkdir(exist_ok=True)
         pts[0].setup(jobs[0][1], jobs[0][2])        # (a throwaway run: CUDA's first kernels)
@@ -601,13 +614,25 @@ def main():
                     continue
                 log(f"{len(todo)} pairs ({arm}): " + ", ".join(q["id"] for q, _, _, _ in todo))
                 its = [(cl, co, None) for _, cl, co, _ in todo]
-                if arm.startswith("mask"):
-                    recs = cm.find_batch(pts[:len(todo)], its, arm="mask", log=log,
-                                         steps=int(arm.split(":")[1]) if ":" in arm else cm.STEPS)
-                else:
-                    nm = f"model:{a.scorer}" if arm == "model" else arm
-                    recs = find_batch_amortized(pts[:len(todo)], its, scorer(nm), arm=arm, log=log,
-                                                relp=nm == "relp" or nm.startswith("model:"))
+                name, *parts = arm.split(":")       # (an arm's constants: model:keep=16:fallback=warm, mask:10:init_scan=1;
+                sets = {}                           # each this module's, else circuit_masks', else circuit_finder's)
+                for k, v in (x.split("=") for x in parts if "=" in x):
+                    mod = next(m for m in (globals(), vars(cm), vars(cf)) if k.upper() in m)
+                    sets[k.upper()] = (mod, _value(v))
+                saved = {k: (m, m[k]) for k, (m, _) in sets.items()}
+                for k, (m, v) in sets.items():
+                    m[k] = v
+                try:
+                    if name == "mask":
+                        recs = cm.find_batch(pts[:len(todo)], its, arm="mask", log=log,
+                                             steps=next((int(x) for x in parts if x.isdigit()), cm.STEPS))
+                    else:
+                        nm = f"model:{a.scorer}" if name == "model" else name
+                        recs = find_batch_amortized(pts[:len(todo)], its, scorer(nm), arm=arm, log=log,
+                                                    relp=nm == "relp" or nm.startswith("model:"))
+                finally:
+                    for k, (m, v) in saved.items():
+                        m[k] = v
                 for (q, cl, co, name), rec in zip(todo, recs):
                     rec.update(id=q["id"], ids=cl, corrupted=co, answer_text=tok.decode([rec["answer"]]),
                                corrupt_answer_text=tok.decode([rec["corrupt_answer"]]), model=a.model, dtype=a.dtype,
@@ -634,6 +659,16 @@ def main():
             (out / "rec" / f"{name}.json").write_text(json.dumps(rec, default=float))
         log(f"  batch done: mask {got[0][0]['amortize']['seconds_mask_batch']} s, features "
             f"{got[0][0]['amortize']['seconds_features_batch']} s")
+
+
+def _value(v: str):
+    """An arm's constant from its text: an int, a float, else the text."""
+    for t in (int, float):
+        try:
+            return t(v)
+        except ValueError:
+            pass
+    return v
 
 
 if __name__ == "__main__":

@@ -18,6 +18,14 @@ that runs a finder version on the frozen dev set and reports S1 and Q1-Q5, the s
       the scorecard measures it; over every dev question (no record, no circuit or an invalid pair: a miss). Beside it
       the finder's own met rate and the rate with all cuts patched together (the scorecard's pair: an easier test,
       since one passing cut carries the union)
+  Q2c (the headline, the lead's 10-17: whole-circuit Q2 is carried by shared mover heads, so each cut must hold alone)
+      every cut of the circuit alone on the same held-out partner draws: a question passes when every cut's mean noising
+      and denoising shares reach PASS; per cut, its passes. Read beside Q5's per-cut resampled rates and whole Q2
+  SC  faithfulness against size (the lead's 10-17, after Hanna et al. 2024), for records with "rankings" (a method's units
+      in its own order, per cut): per ranking and size k of the scorecard's SIZE_GRID, the share of questions whose first
+      k' <= k units pass on the unseen pairs (both mean shares at PASS), the mean of the smaller held-out share at k (a
+      ranking shorter than k: its whole length), the same for the random set beside it and on the own pair, and the
+      median k70 (the least measured size passing on unseen pairs) over the questions reaching it
   Q2  unseen pairs of the same family: the scorecard's held-out partner draws; a question passes when both mean shares
       reach PASS; the pass rate over questions with draws, and the median shares
   Q3  size at pass: the median neuron poles + heads over the Q1 passes (and over every circuit)
@@ -156,6 +164,23 @@ def metrics(recs: list[dict], finder_recs: dict, n_questions: int, robust: list[
         if nh and sh:
             a, b = float(np.mean([share(x["share"]) for x in nh])), float(np.mean([share(x["share"]) for x in sh]))
             q2.append((a, b, a >= PASS and b >= PASS))
+    q2c, per = [], {}
+    for r in recs:  # Q2c: each cut alone on the held-out draws
+        cuts = ((r.get("draws") or {}).get("cuts") or {})
+        res = {}
+        for name, v in cuts.items():
+            nh, sh = v.get("necessity_heldout") or [], v.get("sufficiency_heldout") or []
+            if nh and sh:
+                a, b = float(np.mean([share(x["share"]) for x in nh])), float(np.mean([share(x["share"]) for x in sh]))
+                res[name] = a >= PASS and b >= PASS
+                per.setdefault(name, [0, 0])
+                per[name][0] += res[name]
+                per[name][1] += 1
+        if res:
+            q2c.append(all(res.values()))
+    out["Q2c"] = {"pass_rate": sum(q2c) / len(q2c) if q2c else None, "questions": len(q2c), "pass_ci": wilson(sum(q2c), len(q2c)),
+                  "per_cut": {k: {"passes": v[0], "n": v[1]} for k, v in per.items()}}
+    out["SC"] = size_metrics(recs)
     out["Q2"] = {"pass_rate": sum(x[2] for x in q2) / len(q2) if q2 else None, "questions": len(q2),
                  "pass_ci": wilson(sum(x[2] for x in q2), len(q2)),
                  "lost_median": med([x[0] for x in q2]), "restored_median": med([x[1] for x in q2]),
@@ -204,6 +229,36 @@ def metrics(recs: list[dict], finder_recs: dict, n_questions: int, robust: list[
     return out
 
 
+GRID = (1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024)  # neuron_scorecard.SIZE_GRID (kept here: the bench reads records on CPU)
+
+
+def size_metrics(recs: list[dict]) -> dict:
+    """SC (module docstring) from the scorecard's size_curves."""
+    out = {}
+    names = sorted({n for r in recs for n in (r.get("size_curves") or {})})
+    for name in names:
+        curves = [r["size_curves"][name] for r in recs if (r.get("size_curves") or {}).get(name)]
+        curves = [c for c in curves if c.get("pairs")]
+        row = {"questions": len(curves), "k": list(GRID)}
+        for kind in ("heldout", "random_heldout", "own", "random_own"):
+            passed, mean = [], []
+            for k in GRID:
+                at = [max((i for i, kk in enumerate(c["k"]) if kk <= k), default=None) for c in curves]
+                ok = [any(min(c[kind][i]) >= PASS for i in range(j + 1) if c[kind][i] is not None) if j is not None else False
+                      for c, j in zip(curves, at)]
+                v = [min(c[kind][j]) for c, j in zip(curves, at) if j is not None and c[kind][j] is not None
+                     and (c["k"][j] == k or c["k"][-1] < k)]
+                passed.append(sum(ok))
+                mean.append(float(np.mean([max(-1.0, min(1.0, x)) for x in v])) if v else None)
+            row[kind] = {"passes": passed, "mean_min_share": mean}
+        k70 = [next((kk for kk, sh in zip(c["k"], c["heldout"]) if sh is not None and min(sh) >= PASS), None) for c in curves]
+        row["k70_median"] = med([x for x in k70 if x is not None])
+        row["k70_reached"] = sum(x is not None for x in k70)
+        row["length_median"] = med([c["k"][-1] for c in curves])
+        out[name] = row
+    return out
+
+
 def robust_metrics(rob: list[dict]) -> dict:
     """Q5 from circuit_robust.check's records: per met cut the resampled and standard pass, the question pass."""
     if not rob:
@@ -247,7 +302,7 @@ def fmt(v, ci=None, k=None, n=None) -> str:
 
 def table(benches: dict) -> str:
     def g(b, q):
-        return b["metrics"][q]
+        return b["metrics"].get(q) or {}  # (benches written before a metric existed: blank cells)
 
     def two(m, a, b, ca=None, cb=None):
         return f"{fmt(m.get(a), m.get(ca) if ca else None)} / {fmt(m.get(b), m.get(cb) if cb else None)}"
@@ -271,6 +326,23 @@ def table(benches: dict) -> str:
             ("S1 median s a question", lambda b: fmt(g(b, "S1")["median_s"], g(b, "S1").get("median_ci"), None, g(b, "S1").get("n"))),
             ("   p90 s a question", lambda b: fmt(g(b, "S1").get("p90_s"))),
             ("S1 questions a card-hour", lambda b: fmt(g(b, "S1")["per_card_hour"])),
+            ("HEADLINE Q2c each cut, unseen pairs", rate("Q2c", "pass_rate", "pass_ci", "questions")),
+            ("   per cut", lambda b: " ".join(f"{k}:{v['passes']}/{v['n']}" for k, v in (g(b, "Q2c").get("per_cut") or {}).items()) or "-"),
+            ("HEADLINE Q5 each cut, resampled", rate("Q5", "pass_rate", "pass_ci", "questions")),
+            ("   per cut resampled/standard/cuts", lambda b: " ".join(f"{k}:{v['resampled']}/{v['standard']}/{v['cuts']}"
+                                                                 + (f"+{v['no_resample']}nr" if v.get("no_resample") else "") for k, v in
+                                                                 (g(b, "Q5").get("per_cut") or {}).items()) or "-"),
+            ("   median lost / restored", lambda b: two(g(b, "Q5"), "lost_median", "restored_median")),
+            ("SC unseen pass by size k (per cut)", lambda b: "; ".join(
+                f"{n} " + " ".join(f"{k}:{p}" for k, p in zip(v["k"], v["heldout"]["passes"]) if k in (1, 4, 16, 64, 256, 1024))
+                + f" /{v['questions']}" for n, v in g(b, "SC").items()) or "-"),
+            ("   random set", lambda b: "; ".join(
+                f"{n} " + " ".join(f"{k}:{p}" for k, p in zip(v["k"], v["random_heldout"]["passes"]) if k in (1, 4, 16, 64, 256, 1024))
+                for n, v in g(b, "SC").items()) or "-"),
+            ("   k70 median (reached)", lambda b: "; ".join(f"{n} {fmt(v['k70_median'])} ({v['k70_reached']}/{v['questions']})"
+                                                           for n, v in g(b, "SC").items()) or "-"),
+            ("Q2 whole circuit, unseen pairs", rate("Q2", "pass_rate", "pass_ci", "questions")),
+            ("   median lost / restored", lambda b: two(g(b, "Q2"), "lost_median", "restored_median", "lost_ci", "restored_ci")),
             ("Q1 own-pair pass rate (per cut)", q1),
             ("   diffuse counted as a miss", lambda b: fmt(g(b, "Q1").get("strict_pass_rate"), g(b, "Q1").get("strict_ci"),
                                                           g(b, "Q1").get("strict_passes"), g(b, "Q1").get("n"))),
@@ -280,8 +352,6 @@ def table(benches: dict) -> str:
             ("   all cuts patched together", lambda b: fmt(g(b, "Q1").get("union_pass_rate"), g(b, "Q1").get("union_ci"))),
             ("   random same-size circuit (control)", lambda b: (lambda c: fmt(c.get("pass_rate"), c.get("pass_ci"), c.get("passes"), c.get("n"))
                                                               if c.get("n") else "-")(g(b, "Q1").get("union_control") or {})),
-            ("Q2 unseen-pair pass rate", rate("Q2", "pass_rate", "pass_ci", "questions")),
-            ("   median lost / restored", lambda b: two(g(b, "Q2"), "lost_median", "restored_median", "lost_ci", "restored_ci")),
             ("Q3 median units at pass", lambda b: fmt(g(b, "Q3")["median_units_at_pass"], g(b, "Q3").get("median_units_at_pass_ci"),
                                                        None, g(b, "Q3").get("n"))),
             ("   poles / heads at pass", lambda b: two(g(b, "Q3"), "median_poles_at_pass", "median_heads_at_pass")),
@@ -302,12 +372,7 @@ def table(benches: dict) -> str:
             ("   median lost / restored", lambda b: two(g(b, "Q4"), "transfer_lost_median", "transfer_restored_median",
                                                      "transfer_lost_ci", "transfer_restored_ci")),
             ("   overlap median (records)", lambda b: fmt(g(b, "Q4").get("overlap_median"), g(b, "Q4").get("overlap_ci"), None,
-                                                        g(b, "Q4").get("overlap_questions") or None)),
-            ("Q5 resampled pass rate", rate("Q5", "pass_rate", "pass_ci", "questions")),
-            ("   per cut resampled/standard/cuts", lambda b: " ".join(f"{k}:{v['resampled']}/{v['standard']}/{v['cuts']}"
-                                                                 + (f"+{v['no_resample']}nr" if v.get("no_resample") else "") for k, v in
-                                                                 (g(b, "Q5").get("per_cut") or {}).items()) or "-"),
-            ("   median lost / restored", lambda b: two(g(b, "Q5"), "lost_median", "restored_median"))]
+                                                        g(b, "Q4").get("overlap_questions") or None))]
     cells = {n: [str(get(b)) if get(b) is not None else "-" for _, get in rows] for n, b in benches.items()}
     w = {n: max(len(n), *(len(x) for x in cells[n])) + 3 for n in benches}
     lines = [f"{'':36}" + "".join(f"{n:>{w[n]}}" for n in benches)]

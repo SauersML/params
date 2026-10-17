@@ -83,6 +83,7 @@ STEPS = 15          # (Qwen3-8B bf16, A40, dev stride 4, 103 questions, pods cir
 LR = 0.25
 TAU = 0.9           # the hinge's target share (PASS 0.7 is what the measured set must reach)
 LAMBDA = 0.003      # a unit's cost in shares of the gap
+ORDER_KEPT = 1024   # a cut's ordered units kept in the record ("rankings": the scorecard's faithfulness against size)
 INIT = 1.0          # sigmoid(1) = 0.73: every unit mostly patched at the start, the hinges acting within a few steps (from 3 the
 # first ~12 steps decay every unit alike and order nothing: 15 steps from 3 met 0/10)
 INIT_SCAN = 0       # 1: a fresh spec starts at the lowest logit of INIT_GRID (down from INIT) where a uniform mask still meets
@@ -565,7 +566,7 @@ def verify_steps(meas, order: list, log=None, name: str = "", bar: float = cf.PA
         if log:
             log(f"  {name}: {len(order)} ordered, passing prefix {ok}, diffuse ({lost:.2f}/{rest:.2f})")
         return {"units": [], "singles": {}, "met": False, "diffuse": True, "lost": lost, "restored": rest, "found": len(order),
-                "curve": curve, "spread": {"diffuse": True, "units": ok}}
+                "curve": curve, "spread": {"diffuse": True, "units": ok}, "order": list(order[:ORDER_KEPT])}
     circ = list(order[:ok]) if ok and isinstance(meas, Resampled) and not ONE_PROMPT_PRUNE else (
         (yield from prune_steps(meas, list(order[:ok]), bar)) if ok else [])
     lost, rest, singles = 0.0, 0.0, {}
@@ -581,7 +582,7 @@ def verify_steps(meas, order: list, log=None, name: str = "", bar: float = cf.PA
     if log:
         log(f"  {name}: {len(order)} ordered, passing prefix {ok}, pruned to {len(circ)} ({lost:.2f}/{rest:.2f})")
     return {"units": circ, "singles": singles, "met": bool(ok) and passes((lost, rest)), "lost": lost, "restored": rest,
-            "found": len(order), "curve": curve}
+            "found": len(order), "curve": curve, "order": list(order[:ORDER_KEPT])}
 
 
 def _ok(r, bar) -> bool:

@@ -219,3 +219,54 @@ def test_interactions_additivity_and_backups():
     bk = it["backups"]
     assert bk["count"] == 1 and bk["cumulative_lost"] == pytest.approx([0.3, 0.3])
     assert [u["backup"] for u in bk["units"]] == [False, False, True]  # the second of the redundant pair, once the first is gone
+
+
+def test_per_cut_heldout_draws_and_size_curves(tiny, monkeypatch):
+    """Each cut alone on a held-out pair (the per-cut unseen-pair test) and size_curves follow the definitions."""
+    model, m, clean, corr = tiny
+    monkeypatch.setattr(ns, "pair_ok", lambda sets, b, gap: abs(gap) > 1e-3)  # (a random model's pairs: shares only)
+
+    class Tok:
+        def decode(self, z):
+            return str(z)
+
+        def apply_chat_template(self, msgs, **kw):
+            return msgs[-1]["content"]
+
+        def __call__(self, text, add_special_tokens=False):
+            return {"input_ids": [int(x) for x in text.split()]}
+    part = list(clean)
+    part[3] = (part[3] + 11) % 48
+    a = int(hooked(model, clean).argmax())
+    sets = {"answer": [a], "alternatives": [t for t in range(48) if t != a][:5]}
+    c = {"name": "x", "id": "q", "neurons": [(0, 3, 5, 1)], "heads": [(2, 9, 1)], "edges": [], "model": "tiny", "clean": clean,
+         "corrupted": corr, "kind": "explicit_tokens", "answer_tokens": sets["answer"], "alternatives": sets["alternatives"],
+         "nodes": [{"stage": "source", "layer": 0, "pos": 3, "neuron": 5, "pole": 1}],
+         "rankings": {"source": [["n", 0, 3, 5], ["n", 1, 3, 9], ["h", 2, 9, 1]]}}
+    qs = {"q": {"user": " ".join(map(str, clean)), "corrupt_user": " ".join(map(str, corr)), "task": "t", "paraphrase": 0,
+                "partners": [{"key": "k2", "user": " ".join(map(str, part))}]}}
+    r = ns.score(m, Tok(), c, qs, log=lambda s: None, lean=True)
+    con = lambda l: float(ns.ac.contrast(l[None], sets)[0])  # noqa: E731
+    lc, lp_ = hooked(model, clean), hooked(model, part)
+    c0, c1 = con(lc), con(lp_)
+    cp, cc_ = m.capture(part), m.capture(clean)
+    src = r["draws"]["cuts"]["source"]
+    noised = con(hooked(model, clean, neurons=[(0, 3, 5, cp["n"][0, 3, 5])]))
+    denoised = con(hooked(model, part, neurons=[(0, 3, 5, cc_["n"][0, 3, 5])]))
+    assert src["necessity_heldout"][0]["share"] == pytest.approx((c0 - noised) / (c0 - c1), abs=1e-3)
+    assert src["sufficiency_heldout"][0]["share"] == pytest.approx((denoised - c1) / (c0 - c1), abs=1e-3)
+    mov = r["draws"]["cuts"]["movers"]
+    noised_h = con(hooked(model, clean, heads=[(2, 9, 1, cp["h"][2, 9, 1])]))
+    assert mov["necessity_heldout"][0]["share"] == pytest.approx((c0 - noised_h) / (c0 - c1), abs=1e-3)
+    sc = r["size_curves"]["source"]
+    assert sc["k"] == [1, 2, 3] and sc["pairs"] == 1
+    clip = lambda x: max(-1.0, min(1.0, x))  # noqa: E731
+    assert sc["heldout"][0][0] == pytest.approx(clip(src["necessity_heldout"][0]["share"]), abs=1e-4)  # (k = 1: the source cut)
+    assert sc["heldout"][0][1] == pytest.approx(clip(src["sufficiency_heldout"][0]["share"]), abs=1e-4)
+    cx = m.capture(corr)
+    pr = r["pair"]
+    n2 = con(hooked(model, clean, neurons=[(0, 3, 5, cx["n"][0, 3, 5]), (1, 3, 9, cx["n"][1, 3, 9])]))
+    assert sc["own"][1][0] == pytest.approx((pr["c_clean"] - n2) / pr["gap"], abs=1e-3)
+    d3 = con(hooked(model, corr, neurons=[(0, 3, 5, cc_["n"][0, 3, 5]), (1, 3, 9, cc_["n"][1, 3, 9])], heads=[(2, 9, 1, cc_["h"][2, 9, 1])]))
+    assert sc["own"][2][1] == pytest.approx((d3 - pr["c_corrupted"]) / pr["gap"], abs=1e-3)  # (the whole ranking, a head in it)
+    assert len(sc["random_own"]) == 3 and len(sc["random_heldout"]) == 3

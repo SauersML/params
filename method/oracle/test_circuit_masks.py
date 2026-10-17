@@ -88,6 +88,9 @@ def test_find_multi_source(tiny, monkeypatch):
     for n, c in rec["cuts"].items():
         if c["met"]:
             assert c["lost"] >= cf.PASS and c["restored"] >= cf.PASS
+    for n, r in rec["rankings"].items():  # (each cut's order, the scorecard's units: its circuit a subset of it)
+        assert n in rec["cuts"] and len(r) <= cm.ORDER_KEPT and all(u[0] in ("n", "h") and len(u) == 4 for u in r)
+        assert {(x["layer"], x["pos"], x["head"]) for x in rec["routes"]} <= {(u[1], u[2], u[3]) for u in r} or n != "movers"
 
 
 def _one_at_a_time(pt, circ):

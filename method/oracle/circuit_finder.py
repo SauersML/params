@@ -1364,6 +1364,8 @@ def _find(pt: Patcher, clean: list[int], corrupt: list[int], answers: list[int] 
                cuts={k: {f: c[f] for f in ("met", "lost", "restored", "found", "ceiling", "reachable", "curve", "spread", "searched")}
                      | {"size": len(c["units"]), "bar": c["bar"] or PASS, "diffuse": bool(c["diffuse"])} for k, c in cuts.items()},
                size=len(nodes), seconds=round(time.perf_counter() - t0, 2))
+    rec["rankings"] = {k: [["n", u[1], u[2], u[3]] if u[0] == "neuron" else ["h", u[1], u[3], u[2]] for u in c["order"]]
+                       for k, c in cuts.items() if c["order"]}  # (a search's order per cut, when it keeps one: circuit_masks')
     if log:
         log("  " + ", ".join(f"{k} {len(c['units'])} ({c['lost']:.2f}/{c['restored']:.2f}{'' if c['met'] else ' unmet'})"
                              for k, c in cuts.items()) + f", {rec['seconds']} s")

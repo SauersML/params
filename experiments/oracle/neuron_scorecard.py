@@ -57,6 +57,12 @@ Metrics no method optimizes (the lead's 10-16 battery; every finder selects by t
   kl           the whole next-token distribution instead of the answer contrast: noising, KL(clean || noised) over
                KL(clean || corrupted) (the share of the distribution's shift the circuit's units reproduce); denoising,
                1 - KL(clean || denoised) / KL(clean || corrupted); on the own pair and on each unseen partner's pair
+Faithfulness against size (the lead's 10-17, after Hanna et al. 2024, who report faithfulness over circuit size, not a
+pass at one size), for a circuit file with "rankings" ({name: [["n", layer, pos, neuron] or ["h", layer, pos, head], ...]},
+a method's units in its own order: an attribution's scores, our masks' final order):
+  size_curves  per ranking, its first k units for every k in SIZE_GRID under its length and its whole length, noised and
+               denoised on the own pair and on every held-out pair the draws use (each share clipped to [-1, 1], the
+               mean), beside a random set of as many units at the same layers and positions (redrawn per k)
 A fair baseline beside each circuit (random): RANDOM_DRAWS circuits of the same size at the same positions, each neuron
 pole a uniformly drawn neuron of the same layer's at that position, each head a uniformly drawn head of the same layer's
 there; their noising and denoising shares on the circuit's own pair, the mean (no floor: what the finder's choice adds
@@ -120,6 +126,7 @@ DRAWN = ("necessity_heldout", "sufficiency_heldout", "swaps")
 LOWER = ()  # families whose score passes at or under its floor (none: size is measured, never a criterion)
 CURVE_ALL = 256  # the curves measure every k up to this many units, a log grid beyond
 POINT = 0.7  # the share whose crossing the tables quote (k70)
+SIZE_GRID = (1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024)  # size_curves' sizes (and each ranking's whole length)
 RANDOM_DRAWS = 4  # random circuits of the circuit's size per circuit (the fair baseline)
 TOP_PAIRS = 12  # interactions: the circuit's units with the largest single effect, every pair of them knocked out together
 BACKUP_GROWTH = 0.05  # a backup unit: its drop once earlier top units are noised beats its drop alone by this share of the gap
@@ -234,6 +241,37 @@ class Model:
 def patches(c: dict, cap: dict) -> list[tuple]:
     """The circuit's units set to their values in cap (Model.capture)."""
     return [("n", L, p, j, cap["n"][L, p, j]) for L, p, j, _ in c["neurons"]] + [("h", L, p, h, cap["h"][L, p, h]) for L, p, h in c["heads"]]
+
+
+def redrawn(m: "Model", sub: dict, g: torch.Generator) -> dict:
+    """A random set like sub: each neuron a uniformly drawn neuron of its layer's at its position, each head a head of its
+    layer's there."""
+    return {"neurons": [(L, p, int(torch.randint(m.D, (1,), generator=g)), 0) for L, p, _, _ in sub["neurons"]],
+            "heads": [(L, p, int(torch.randint(m.H, (1,), generator=g))) for L, p, _ in sub["heads"]]}
+
+
+def size_curve(m: "Model", ranking: list, base: dict, held: list, g: torch.Generator) -> dict:
+    """size_curves (module docstring) for one ranking. base: the own pair (clean, corr, cap_c, cap_x, sets, cc, cx, gap);
+    held: the held-out pairs (prompt, capture, sets, c_clean, c_partner, gap)."""
+    clean, corr, cap_c, cap_x, sets, cc, cx, gap = (base[k] for k in ("clean", "corr", "cap_c", "cap_x", "sets", "cc", "cx", "gap"))
+    clip = lambda x: max(-1.0, min(1.0, x))  # noqa: E731
+    ks = sorted({k for k in SIZE_GRID if k < len(ranking)} | {len(ranking)})
+    out = {"k": ks, "own": [], "heldout": [], "random_own": [], "random_heldout": [], "pairs": len(held)}
+    for k in ks:
+        sub = {"neurons": [tuple(u[1:4]) + (0,) for u in ranking[:k] if u[0] == "n"],
+               "heads": [tuple(u[1:4]) for u in ranking[:k] if u[0] == "h"]}
+        sets_ = (sub, redrawn(m, sub, g))
+        runs = [x for s_ in sets_ for x in [(clean, patches(s_, cap_x)), (corr, patches(s_, cap_c))]
+                + [y for ids, cap_p, *_ in held for y in ((clean, patches(s_, cap_p)), (ids, patches(s_, cap_c)))]]
+        lp = m.logp(runs)
+        step = 2 + 2 * len(held)
+        for i, (own, ho) in enumerate((("own", "heldout"), ("random_own", "random_heldout"))):
+            l = lp[i * step:(i + 1) * step]
+            out[own].append([(cc - contrast(l[0], sets)) / gap, (contrast(l[1], sets) - cx) / gap])
+            sh = [(clip((c0 - contrast(l[2 + 2 * j], sp)) / g_), clip((contrast(l[3 + 2 * j], sp) - c1) / g_))
+                  for j, (_, _, sp, c0, c1, g_) in enumerate(held)]
+            out[ho].append([float(np.mean([a for a, _ in sh])), float(np.mean([b for _, b in sh]))] if sh else None)
+    return out
 
 
 def contrast(lp: torch.Tensor, sets: dict) -> float:
@@ -432,8 +470,7 @@ def score(m: Model, tok, c: dict, qs: dict, log=print, lean: bool = False) -> di
     g = torch.Generator().manual_seed(zlib.crc32(c["name"].encode()))  # the fair baseline: same layers and positions, random units
 
     def redraw(sub):
-        return {"neurons": [(L, p, int(torch.randint(m.D, (1,), generator=g)), 0) for L, p, _, _ in sub["neurons"]],
-                "heads": [(L, p, int(torch.randint(m.H, (1,), generator=g))) for L, p, _ in sub["heads"]]}
+        return redrawn(m, sub, g)
     rand, rcut = [], {name: [] for name in rec["cuts"]}
     for _ in range(RANDOM_DRAWS if gap > 0 else 0):  # the whole circuit's and each cut's random set, one batch
         rs = [redraw(c)] + [redraw(parts[name]) for name in rcut]
@@ -481,8 +518,9 @@ def score(m: Model, tok, c: dict, qs: dict, log=print, lean: bool = False) -> di
                            "heads": sum(x in have_h for x in eh) / len(eh) if eh else None,
                            "missing": [list(x) for x in en if x not in have_n] + [list(x) for x in eh if x not in have_h]}
     # held-out corruptions and swaps: the question's other partners
-    draws = {f: [] for f in DRAWN}
-    if q:
+    draws, held = {f: [] for f in DRAWN}, []  # (held: the valid held-out pairs, for size_curves)
+    draws["cuts"] = {name: {"necessity_heldout": [], "sufficiency_heldout": []} for name in rec["cuts"]}  # (each cut alone on
+    if q:  # the same held-out pairs: the per-cut unseen-pair test, the lead's 10-17 headline)
         ck = c.get("corrupt_key") or q.get("corrupt_key")
         seen = {ck} | set(c.get("selection_keys") or [])  # (a multi-partner circuit's selection keys are not held out)
         partners = []  # (key, its prompt): a question file's partner keys, or a dev set's {key, user} partners
@@ -497,7 +535,8 @@ def score(m: Model, tok, c: dict, qs: dict, log=print, lean: bool = False) -> di
             if len(ids) != T:
                 continue
             cap_p = m.capture(ids)
-            l2 = m.logp([(ids, []), (clean, patches(c, cap_p)), (ids, pc)])
+            cut_runs = [x for name in draws["cuts"] for x in ((clean, patches(parts[name], cap_p)), (ids, patches(parts[name], cap_c)))]
+            l2 = m.logp([(ids, []), (clean, patches(c, cap_p)), (ids, pc)] + cut_runs)
             bp = int(l2[0].argmax())
             sp = explicit or word_sets(m, tok, clean, lp[0], bp)  # the question's answer against the partner's word first
             c0, c1 = contrast(lp[0], sp), contrast(l2[0], sp)
@@ -505,11 +544,16 @@ def score(m: Model, tok, c: dict, qs: dict, log=print, lean: bool = False) -> di
             if not pair_ok(sp, bp, g):
                 continue
             cn2, cd2 = contrast(l2[1], sp), contrast(l2[2], sp)
+            if c.get("rankings"):  # (captures kept only when size_curves will read them)
+                held.append((ids, cap_p, sp, c0, c1, g))
             kp = kl(lp[0], l2[0])
             draws["necessity_heldout"].append({"partner": k, "gap": g, "c_noised": cn2, "share": (c0 - cn2) / g,
                                                "kl": kl(lp[0], l2[1]) / kp if kp > 0 else None})
             draws["sufficiency_heldout"].append({"partner": k, "gap": g, "c_denoised": cd2, "share": (cd2 - c1) / g,
                                                  "kl": 1 - kl(lp[0], l2[2]) / kp if kp > 0 else None})
+            for i, name in enumerate(draws["cuts"]):
+                draws["cuts"][name]["necessity_heldout"].append({"partner": k, "share": (c0 - contrast(l2[3 + 2 * i], sp)) / g})
+                draws["cuts"][name]["sufficiency_heldout"].append({"partner": k, "share": (contrast(l2[4 + 2 * i], sp) - c1) / g})
             pw = word_sets(m, tok, ids, l2[0], a)  # the partner's own answer word, its tokens
             A_p, A_q = torch.tensor(pw["answer"]), torch.tensor(sp["answer"])
             d = lambda l: float((torch.logsumexp(l[A_p.to(l.device)], 0) - torch.logsumexp(l[A_q.to(l.device)], 0)) / math.log(2.0))  # noqa: E731
@@ -517,6 +561,11 @@ def score(m: Model, tok, c: dict, qs: dict, log=print, lean: bool = False) -> di
             if pw["answer_word"] != sp["answer_word"] and abs(dp - d0) >= MIN_GAP:
                 draws["swaps"].append({"partner": k, "d_clean": d0, "d_partner": dp, "d_swap": ds, "share": (ds - d0) / (dp - d0)})
     rec["draws"] = draws
+    if c.get("rankings") and gap > 0:
+        gs = torch.Generator().manual_seed(zlib.crc32(("size" + c["name"]).encode()))
+        rec["size_curves"] = {name: size_curve(m, r, {"clean": clean, "corr": corr, "cap_c": cap_c, "cap_x": cap_x, "sets": sets,
+                                                      "cc": cc, "cx": cx, "gap": gap}, held, gs) for name, r in c["rankings"].items() if r}
+    del held
     rec["transfer"] = []  # the circuit on the question's other paraphrases (module docstring: transfer)
     for f in (q.get("family") or []) if q else []:
         fi, fc = chat(f["user"]), chat(f["corrupt_user"], corrupted=True)

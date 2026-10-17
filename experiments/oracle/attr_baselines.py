@@ -25,6 +25,9 @@ circuit_masks builds them from --pool), then the top units at our size (OUT/<met
 ranking: the source cut as many neurons at the record's source positions as our source neurons, the movers cut as many heads
 at the answer position as our mover heads; written with our stages ("source") and a met "source" and "movers" cut, so
 circuit_bench's per-cut Q1, random cut controls and Q5 treat them as ours (OUT/<method>_<variant>_parts).
+Every --per-part and topk record also carries "rankings" (neuron_scorecard's size_curves: faithfulness against size): the
+ranking's first RANK units in its order, per cut for --per-part ("source": neurons at the source positions, "movers": heads
+at the answer position) and over every unit for topk ("all").
 --split-cuts DIR: each record of DIR as two records, its source neurons alone and its mover heads alone (OUT/<dir>_source,
 OUT/<dir>_movers), for Q2 per cut.
 --pad-from DIR (the size control): each record of RECORDS (our one-pair circuits) padded with random units at the layers and
@@ -55,6 +58,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "method" / "oracle"
 import circuit_finder as cf  # noqa: E402
 
 STEPS = 5
+RANK = 1024  # units a record's "rankings" keep (neuron_scorecard.SIZE_GRID's largest size)
 ORIGINAL_SCORES = cf.scores_many
 
 
@@ -308,11 +312,15 @@ def main():
                         nodes.append({"stage": "source", "layer": L, "pos": p_, "neuron": j,
                                       "pole": 1 if float(pt.act["clean"]["neu"][L][p_, j]) > 0 else -1, "score": float(sc["neuron"][L, p_, j])})
                     routes = [{"layer": i // H_, "head": i % H_, "pos": T - 1, "score": float(hd[i // H_, i % H_])} for i in top_h]
+                    lpj = lambda i: (i // (neu.shape[1] * D_), i % (neu.shape[1] * D_) // D_, i % D_)  # noqa: E731
+                    rank_n = [["n", *lpj(i)] for i in neu.flatten().topk(min(RANK, int(keep.sum()))).indices.tolist()]
+                    rank_h = [["h", i // H_, T - 1, i % H_] for i in hd.flatten().topk(min(RANK, hd.numel())).indices.tolist()]
                     lost, rest = pt.both([[cf.unit("neuron", n["layer"], n["pos"], n["neuron"]) for n in nodes]
                                           + [cf.unit("head", x["layer"], T - 1, x["head"]) for x in routes]])[0]
                     rec = {**base, "finder": f"parts_{m}_{v}" + (f"_pairs{1 + len(avg_ids)}" if avg_ids else ""), "nodes": nodes,
                            "routes": routes, "size": len(nodes) + len(routes), "source_positions": srcpos, "seconds": round(dt, 3),
                            "cuts": {"source": {"met": True}, "movers": {"met": True}}, "own_pair": [lost, rest],
+                           "rankings": {"source": rank_n, "movers": rank_h},
                            "matched_to": {"record": r.get("id"), "source": n_src, "movers": len(r.get("routes", []))}}
                     (a.out / f"{m}_{v}_parts").mkdir(parents=True, exist_ok=True)
                     (a.out / f"{m}_{v}_parts" / f.name).write_text(json.dumps(rec))
@@ -327,7 +335,9 @@ def main():
                     passes[f"{m}_{v}"][0] += bool(lost >= cf.PASS and rest >= cf.PASS)
                     passes[f"{m}_{v}"][1] += 1
                     rec = {**base, "finder": f"baseline_{m}_{v}" + (f"_pairs{1 + len(avg_ids)}" if avg_ids else ""), "nodes": nodes, "routes": routes, "size": len(units),
-                           "seconds": round(dt, 3), "own_pair": [lost, rest], "matched_to": {"record": r.get("id"), "units": k}}
+                           "seconds": round(dt, 3), "own_pair": [lost, rest], "matched_to": {"record": r.get("id"), "units": k},
+                           "rankings": {"all": [["n", L, p, j] if kind == "neuron" else ["h", L, p, j] for kind, L, p, j in
+                                                top_units(sc, first, RANK)]}}
                     tag = f"{m}_{v}_topk" + ("_pairs" if a.pairs_avg else "")
                     (a.out / tag).mkdir(parents=True, exist_ok=True)
                     (a.out / tag / f.name).write_text(json.dumps(rec))

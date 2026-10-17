@@ -162,6 +162,9 @@ NECESSARY = 0.5     # a unit outside a cut whose noising alone loses at least th
 NECESSARY_TOP = 256  # the candidates measured a cut: its first units in RelP attribution (attr_order, the own pair) outside the
 # cut, each noised alone on the own pair in one tick; 0: off. (AND plant: RelP ranks of the flags among every neuron at every
 # position, median 26-33, within 256 on 37/38 pairs, within 64 on 33-34)
+NECESSARY_ORDERS = "relp+eapig"  # the candidates' orders, taken in turn until NECESSARY_TOP units: RelP attribution and |EAP-IG|
+# (eapig_scores' magnitude on the own pair: signed EAP-IG ranks the AND plant's flags last, their first-order effect of the
+# opposite sign; on 38 pairs RelP's 256 left out flag B once, |EAP-IG|'s 256 three times, never the same pair); "relp": RelP's
 NECESSARY_MEANS = Path.home() / "mpd-data" / "ami" / "means" / "qwen3_8b.pt"  # general-text means (ami.collect's file, the
 NECESSARY_MEANS_MODEL = "Qwen/Qwen3-8B"  # R3 background) of the mean-ablation tags, for this model; missing, another model: off.
 # A unit the same in both prompts (silent in both: casestudy's AND-plant suppressors) is invisible to patching from the other
@@ -1378,11 +1381,19 @@ def _finish_steps(st: dict, pt=None):
         out[n]["one_prompt"] = st["one_prompt"]
     if NECESSARY_TOP and pt is not None and not st.get("one_prompt"):
         sc = yield ("scores", pt)
+        ea = eapig_scores([pt], signed=False) if "eapig" in NECESSARY_ORDERS else None
         cand = {}
         top = int(NECESSARY_TOP)                    # (an arm constant arrives as a float: necessary_top=1024)
         for n in st["names"]:
             have = set(out[n]["units"])
-            cand[n] = [u for u in attr_order(pt, specs[n], sc)[:top + len(have)] if u not in have][:top]
+            orders = [attr_order(pt, specs[n], sc)[:top + len(have)]] + ([eapig_order(specs[n], ea)[:top + len(have)]] if ea else [])
+            cand[n] = []
+            for u in (u for tier in itertools.zip_longest(*orders) for u in tier if u is not None):
+                if len(cand[n]) >= top:
+                    break
+                if u not in have:
+                    have.add(u)
+                    cand[n].append(u)
         got = yield [(pt, "both", [[u] for u in cand[n]]) if cand[n] else [] for n in st["names"]]
         for n, g in zip(st["names"], got):
             out[n]["necessary"] = [{**_unit_json(u), "lost": round(lo, 4), "restored": round(re_, 4)}

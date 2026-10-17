@@ -185,3 +185,38 @@ def test_atp_is_the_dial_gradient(setup):
     S1 = float(rp._run("A", ["clean"], [(dn, None)])[0] - rp._run("B", ["clean"], [(dn, None)])[0])
     fd = -(S1 - rp.S["clean"]) / eps
     assert abs(fd - float(sc["neuron"][l, n])) < 1e-2 * max(1.0, abs(fd))
+
+
+def test_gate_const_organism_is_its_hooks(tmp_path):
+    """A gate-constant organism (casestudy's train.py --gate-const) read by Delta runs as casestudy's own hooks: the trained
+    neurons' gate pre-activation set to its constant, their up rows and down columns added; planted() reads the neurons."""
+    torch.manual_seed(1)
+    cfg = transformers.Qwen3Config(vocab_size=64, hidden_size=32, intermediate_size=48, num_hidden_layers=2, num_attention_heads=4,
+                                   num_key_value_heads=2, head_dim=8, max_position_embeddings=64, initializer_range=0.3)
+    core = transformers.Qwen3ForCausalLM(cfg).eval().requires_grad_(False)
+    idx = torch.tensor([7, 30])
+    d = {"idx": idx, "gate_c": torch.tensor([1.5, -0.7]), "up": torch.randn(2, 32), "down": torch.randn(32, 2)}
+    path = tmp_path / "gc.pt"
+    torch.save({"kind": "one", "gate_const": True, "layers": {1: d}}, path)
+    ids = torch.randint(0, 64, (1, 9))
+    mlp = core.model.layers[1].mlp
+
+    def g_hook(m, a, o):
+        o = o.clone()
+        o[..., idx] = d["gate_c"]
+        return o
+    hs = [mlp.gate_proj.register_forward_hook(g_hook),
+          mlp.up_proj.register_forward_hook(lambda m, a, o: o.index_add(-1, idx, a[0] @ d["up"].T)),
+          mlp.down_proj.register_forward_hook(lambda m, a, o: o + a[0][..., idx] @ d["down"].T)]
+    ref = core(ids).logits
+    for h in hs:
+        h.remove()
+    base = core(ids).logits
+    delta = cr.Delta(core, str(path))
+    assert delta.planted() == {(1, 7), (1, 30)}
+    with delta.rows([1.0]):
+        org = core(ids).logits
+    with delta.rows([0.0]):
+        off = core(ids).logits
+    assert torch.allclose(org, ref, atol=1e-4) and not torch.allclose(org, base, atol=1e-3)
+    assert torch.allclose(off, base, atol=1e-5)

@@ -232,6 +232,7 @@ def main():
     ap.add_argument("--adag", type=Path, default=None, help="adag_repo.py trace records (method adag)")
     ap.add_argument("--steps", type=int, default=STEPS)
     ap.add_argument("--dtype", default="bfloat16")
+    ap.add_argument("--adapter", default=None, help="an organism's PEFT adapter, merged into the model (circuit_masks --merge's)")
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--pairs-avg", action="store_true", help="average over the own pair and the record's selection partners")
     ap.add_argument("--pad-from", type=Path, default=None, help="the size control: pad RECORDS' circuits to this dir's sizes")
@@ -245,6 +246,10 @@ def main():
     tok = AutoTokenizer.from_pretrained(a.model)
     model = AutoModelForCausalLM.from_pretrained(a.model, dtype=getattr(torch, a.dtype),
                                                  device_map="cuda" if torch.cuda.is_available() else None).eval()
+    if a.adapter:
+        from peft import PeftModel
+
+        model = PeftModel.from_pretrained(model, a.adapter).merge_and_unload().eval()
     model.requires_grad_(False)
     pt = cf.Patcher(model, tok)
     if a.pad_from:

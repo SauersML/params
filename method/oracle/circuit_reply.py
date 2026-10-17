@@ -78,12 +78,20 @@ class Delta:
     """An organism as the base model plus an exact low-rank addition to some projections ({"model.layers.L.mlp.MOD":
     (A [k, in], B [out, k])}, compact_delta's), added by forward hooks with a weight per batch row (1 organism, 0 base).
     While coef[L] ([rows, D]) is set, layer L's down-projection addition takes a weight per row AND neuron instead: a
-    neuron patched to the other model then carries the other model's down column too (its whole write)."""
+    neuron patched to the other model then carries the other model's down column too (its whole write).
+    A gate-constant organism (casestudy's train.py --gate-const: {"gate_const": True, "layers": {L: {idx, gate_c, up,
+    down}}}, each trained neuron's gate pre-activation a constant, its up row and down column added) is read as the same
+    exact addition: the gate rows' own output cancelled (A = the model's gate rows, B = -one-hot), gate_c added as a
+    per-row bias (self.bias), the up rows (one-hot B) and down columns (one-hot A) as they are."""
 
     def __init__(self, core, path: str):
         self.core = core
         dev = core.model.embed_tokens.weight.device
-        self.mods = {k: (a.to(dev), b.to(dev)) for k, (a, b) in torch.load(path, map_location="cpu").items()}
+        raw = torch.load(path, map_location="cpu", weights_only=False)
+        self.bias = {}                              # {"model.layers.L.mlp.gate_proj": [D]} (gate-constant organisms)
+        if isinstance(raw, dict) and raw.get("gate_const"):
+            raw = self._gate_const(core, raw)
+        self.mods = {k: (a.to(dev), b.to(dev)) for k, (a, b) in raw.items()}
         self.s = None                               # per-row weights [B] while a forward runs
         self.coef = None                            # {layer: [B, D]} per-row-and-neuron down weights (Reply's patches)
         self.down_layers = sorted(int(k.split(".")[2]) for k in self.mods if k.endswith("down_proj"))
@@ -91,14 +99,35 @@ class Delta:
         for k, (A, B) in self.mods.items():
             l, mod = int(k.split(".")[2]), k.split(".")[-1]
 
-            def hk(m, args, out, A=A, B=B, l=l, mod=mod):
+            def hk(m, args, out, A=A, B=B, l=l, mod=mod, c=self.bias.get(k)):
                 if self.s is None:
                     return None
                 x = args[0]
                 if mod == "down_proj" and self.coef is not None and l in self.coef:
                     return out + ((x * self.coef[l][:x.shape[0], None, :].to(x.dtype)) @ A.T) @ B.T
-                return out + self.s[:x.shape[0]].to(out.dtype).view(-1, *([1] * (out.dim() - 1))) * ((x @ A.T) @ B.T)
+                add = (x @ A.T) @ B.T + (0 if c is None else c.to(out.dtype))
+                return out + self.s[:x.shape[0]].to(out.dtype).view(-1, *([1] * (out.dim() - 1))) * add
             self.hooks.append(getattr(core.model.layers[l].mlp, mod).register_forward_hook(hk))
+
+    def _gate_const(self, core, raw: dict) -> dict:
+        """A gate-constant organism's addition as low-rank mods (class docstring); its gate bias into self.bias."""
+        dev = core.model.embed_tokens.weight.device
+        mods = {}
+        for l, d in raw["layers"].items():
+            l, idx = int(l), d["idx"].long()
+            mlp, k = core.model.layers[l].mlp, len(idx)
+            D = mlp.gate_proj.weight.shape[0]
+            onehot = torch.zeros(D, k)
+            onehot[idx, torch.arange(k)] = 1.0
+            pre = f"model.layers.{l}.mlp."
+            dt = mlp.gate_proj.weight.dtype         # (the activations' dtype, as compact_delta's files are)
+            mods[pre + "gate_proj"] = (mlp.gate_proj.weight[idx].detach().cpu(), -onehot.to(dt))
+            mods[pre + "up_proj"] = (d["up"].to(dt), onehot.to(dt))
+            mods[pre + "down_proj"] = (onehot.T.contiguous().to(dt), d["down"].to(dt))
+            b = torch.zeros(D)
+            b[idx] = d["gate_c"].float()
+            self.bias[pre + "gate_proj"] = b.to(dev)
+        return mods
 
     def planted(self) -> set:
         """The neurons the addition changes: rows of the gate projection's B with any nonzero entry."""

@@ -570,6 +570,15 @@ def baselines(a) -> None:
                 sub = [q for q in qs if q["relation"] == rel]
                 r[f"n_{rel}"] = len(sub)
             res[kind] = r
+    every = tr + te + ([json.loads(x) for x in (d / "dev.jsonl").read_text().splitlines()] if (d / "dev.jsonl").exists() else [])
+    ctx = lambda qs: {c for q in qs for c in (q["context_a"], q.get("context_b")) if c}  # noqa: E731
+    shown = {k for c in cs.values() for u in c["units"] + c["heads"] for k in u}
+    man["checks"] = {  # leaks: shared texts across splits, held-out kinds in training, measured numbers in a question's
+        "test_contexts_in_train": len(ctx(te) & ctx(tr)),  # text, measured fields in the circuit records, duplicates
+        "held_out_kinds_in_train": sum(q["op"] not in TRAIN_KINDS for q in tr) if man["schema"] == "multikind1" else None,
+        "measured_change_in_question": sum(f"{v:+.1f}" in q["q"] for q in every for k, v in q["measured"].items()
+                                           if k.startswith("change") and v is not None),
+        "circuit_unit_fields": sorted(shown), "duplicate_ids": len(every) - len({q["id"] for q in every})}
     man["baselines_test"] = res
     (d / "manifest.json").write_text(json.dumps(man, indent=1) + "\n")
     print(json.dumps(res, indent=1))

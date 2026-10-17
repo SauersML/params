@@ -69,3 +69,40 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+def by_size(out: str, summary_json: str):
+    """Figure: the median units per token within 0.1 nats against model size (count and share, 95% intervals over
+    windows), from cover_summary.py --json."""
+    import matplotlib.pyplot as plt
+
+    s = json.loads(Path(summary_json).read_text())
+    params = {"Qwen3-0.6B": 0.6, "Qwen3-1.7B": 1.7, "Qwen3-8B": 8.0}
+    names = [n for n in params if n in s]
+    figstyle.setup()
+    plt.rcParams.update({"font.size": 22, "axes.labelsize": 22, "xtick.labelsize": 20, "ytick.labelsize": 20})
+    fig, axes = plt.subplots(1, 2, figsize=(17, 7))
+    for ax, key, ci, scale, ylab in ((axes[0], "median_units", "median_units_ci", 1e-3, "units a token needs (thousands)"),
+                                     (axes[1], "median_share", "median_share_ci", 100, "% of the units at its positions")):
+        x = [params[n] for n in names]
+        y = [s[n]["0.1"][key] * scale for n in names]
+        lo = [s[n]["0.1"][ci][0] * scale for n in names]
+        hi = [s[n]["0.1"][ci][1] * scale for n in names]
+        ax.vlines(x, lo, hi, color=figstyle.BLUE, lw=4, alpha=0.5)
+        ax.plot(x, y, color=figstyle.BLUE, lw=3, marker="o", ms=14)
+        for xi, yi, n in zip(x, y, names):
+            ax.annotate(f"{yi:.0f}k" if key == "median_units" else f"{yi:.1f}%", (xi, yi), xytext=(16, 0), va="center",
+                        textcoords="offset points", fontsize=21, color=figstyle.INK, ha="left")
+        ax.set_xscale("log")
+        ax.set_xticks(x)
+        ax.set_xticklabels([n.replace("Qwen3-", "") for n in names])
+        ax.minorticks_off()
+        ax.set_xlim(0.4, 12)
+        ax.set_xlabel("Qwen3 model size (parameters)")
+        ax.set_ylabel(ylab)
+        ax.set_ylim(0, max(hi) * 1.25)
+        figstyle.clean(ax)
+    fig.suptitle("Matching one token's prediction to 0.1 nats takes about 100k units at every size", x=0.06, ha="left",
+                 fontsize=25, fontweight="bold")
+    fig.tight_layout()
+    figstyle.save(fig, out)

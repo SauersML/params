@@ -864,6 +864,8 @@ def score(a) -> None:
     p1 = {x["item"]: x for x in jl(ITEMS / "o1_pairs.jsonl")} if (ITEMS / "o1_pairs.jsonl").exists() else {}
     excl = json.loads((ITEMS / "manifest.json").read_text()).get("exclusions", {})
     p1sub = set(json.loads((ITEMS / "o1p_sub.json").read_text())["items"]) if (ITEMS / "o1p_sub.json").exists() else set()
+    p1clean = set(json.loads((ITEMS / "o1p_clean.json").read_text())["items"]) if (ITEMS / "o1p_clean.json").exists() else set()  # (textoracle's:
+    # both contexts in no training data of textoracle or oracledata)
     sub_f = ITEMS / "o1m_subsets.json"  # (textoracle's identity-contradicted questions: a neuron whose training outcome
     contra = set(json.loads(sub_f.read_text())["identity_contradicted"]) if sub_f.exists() else set()  # differs from this one's)
     rows = []
@@ -950,8 +952,9 @@ def score(a) -> None:
             its = [p1[k] for k in p1 if k in got]
             pred = [got[i["item"]].get("class") or pair_class(got[i["item"]].get("answer")) for i in its]
             ok = [float(c == i["gold"]) for c, i in zip(pred, its)]
-            for kind in ("all", "pair_zero", "pair_sign", "pair_flip", "sub 1225"):
-                sel = [k for k, i in enumerate(its) if kind in ("all", i["kind"]) or (kind == "sub 1225" and i["item"] in p1sub)]
+            for kind in ("all", "pair_zero", "pair_sign", "pair_flip", "sub 1225", "clean contexts"):
+                sel = [k for k, i in enumerate(its) if kind in ("all", i["kind"]) or (kind == "sub 1225" and i["item"] in p1sub)
+                       or (kind == "clean contexts" and i["item"] in p1clean)]
                 if sel:
                     rec = collections.defaultdict(list)
                     for k in sel:
@@ -1091,6 +1094,19 @@ def score(a) -> None:
         if x in g4arms and y in g4arms:
             orgs = sorted(set(g4arms[x]) & set(g4arms[y]))
             cell(y, "G4", f"minus {x} (paired over organisms)", [g4arms[y][o] - g4arms[x][o] for o in orgs], orgs)
+    if p1:  # O1p paired differences (the lead's 10-17): the trained reader minus the frontier model with the same circuit
+        okp = {}  # text, and minus the trees; bootstrap over context pairs, on the items both answered
+        for n in {x for pair in O1P_PAIRS for x in pair}:
+            f = ANS / n / "o1p.jsonl"
+            if f.exists():
+                okp[n] = {r["item"]: float((r.get("class") or pair_class(r.get("answer"))) == p1[r["item"]]["gold"]) for r in jl(f) if r["item"] in p1}
+        for x, y in O1P_PAIRS:
+            if x in okp and y in okp:
+                for kind in ("all", "pair_zero", "pair_sign", "pair_flip", "clean contexts"):
+                    ks = [k for k in okp[x] if k in okp[y] and (kind == "all" or p1[k]["kind"] == kind or (kind == "clean contexts" and k in p1clean))]
+                    if ks:
+                        cell(x, "O1p", f"minus {y}: {kind}", [okp[x][k] - okp[y][k] for k in ks],
+                             [f"{p1[k]['context_a']}|{p1[k]['context_b']}" for k in ks])
     plan_rows = plan_view(rows, meta)
     o1p_rows = o1p_view(rows, meta)
     o3_rows = o3_view(json.loads((ITEMS / "o3.json").read_text())["organisms"])
@@ -1125,11 +1141,11 @@ def score(a) -> None:
                 cols.append(f"{mm['value']:+.3f} [{mm['lo']:+.3f}, {mm['hi']:+.3f}] n={mm['n']}" if mm else "")
             fh.write(f"{r['oracle']}\t{r['target']}\t{r['metric']}\t{r['value']:.3f}\t{r['n']}\t" + "\t".join(cols) + f"\t{r['status']}\n")
     with (ROOT / "o1p.tsv").open("w") as fh:
-        fh.write("oracle\tlabel\t" + "\t".join(f"{k}\t{k} 95%\t{k} n" for k in ("sub 1225", "all", "pair_zero", "pair_sign", "pair_flip")) + "\n")
+        fh.write("oracle\tlabel\t" + "\t".join(f"{k}\t{k} 95%\t{k} n" for k in ("sub 1225", "all", "pair_zero", "pair_sign", "pair_flip", "clean contexts")) + "\n")
         for r in o1p_rows:
             fh.write(f"{r['oracle']}\t{r['label']}\t" + "\t".join(
                 f"{r[k]['value']:.3f}\t[{r[k]['lo']:.3f}, {r[k]['hi']:.3f}]\t{r[k]['n']}" if k in r else "\t\t"
-                for k in ("sub 1225", "all", "pair_zero", "pair_sign", "pair_flip")) + "\n")
+                for k in ("sub 1225", "all", "pair_zero", "pair_sign", "pair_flip", "clean contexts")) + "\n")
     o1p_figure(o1p_rows)
     with (ROOT / "o3.tsv").open("w") as fh:
         kinds = ("all", "lie", "cond_pref", "backdoor", "cue_marker")
@@ -1224,7 +1240,7 @@ def o1p_view(rows: list[dict], meta: dict) -> list[dict]:
                   key=lambda n: -next(r["value"] for r in rows if r["oracle"] == n and r["target"] == "O1p" and r["metric"] == "sub 1225"))
     out = []
     for n in arms:
-        cells = {r["metric"]: r for r in rows if r["oracle"] == n and r["target"] == "O1p" and r["metric"] in ("all", "pair_zero", "pair_sign", "pair_flip", "sub 1225")}
+        cells = {r["metric"]: r for r in rows if r["oracle"] == n and r["target"] == "O1p" and r["metric"] in ("all", "pair_zero", "pair_sign", "pair_flip", "sub 1225", "clean contexts")}
         out.append({"oracle": n, "label": short(n, meta), **{k: {x: c[x] for x in ("value", "lo", "hi", "n")} for k, c in cells.items()}})
     return out
 
@@ -1298,6 +1314,9 @@ def o3_figure(view: list[dict]) -> None:
     print(f"figure -> {O3_FIG}")
 
 
+O1P_PAIRS = (("text.p1.Tfull.s700.full", "pairs397c"), ("text.p1.Tfull.s700.full", "tree-pairs"),
+             ("text.p1.Tfull.s700.full", "text.p1.Tnames.s700.names"), ("text.p1.Tfull.s700.full", "text.p1.Tnone.s700.none"),
+             ("pairs397c", "pairs397"))
 O1P_CHANCE = {"pair_zero": 1 / 3, "pair_sign": 0.25, "pair_flip": 0.25}
 
 
@@ -1430,7 +1449,9 @@ SHORT = {"best-constant": "best constant answer", "name-prior": "name-prior (eac
          "logreg-pairs": "logistic regression on the circuits' numbers", "logreg-pairs.names": "logistic regression on names only",
          "logreg-pairs.mismatch": "logistic regression on another context's numbers",
          "logreg-pairs.none": "logistic regression, no circuit (texts' own contrasts)",
-         "pairs397": "Qwen3.5-397B reading the transcript", "pairs397.shots6": "Qwen3.5-397B reading the transcript, 6 examples"}
+         "pairs397": "Qwen3.5-397B reading the transcript", "pairs397c": "Qwen3.5-397B reading the reader's circuit text",
+         "text.p1.Tfull.s700.full": "text reader trained on circuit numbers (step 700)", "text.p1.Tnames.s700.names": "text reader trained on names (step 700)",
+         "text.p1.Tnone.s700.none": "text reader trained with no circuit (step 700)", "pairs397.shots6": "Qwen3.5-397B reading the transcript, 6 examples"}
 
 
 def short(n: str, meta: dict) -> str:

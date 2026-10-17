@@ -865,8 +865,8 @@ def score(a) -> None:
     excl = json.loads((ITEMS / "manifest.json").read_text()).get("exclusions", {})
     p1sub = set(json.loads((ITEMS / "o1p_sub.json").read_text())["items"]) if (ITEMS / "o1p_sub.json").exists() else set()
     p1f32 = json.loads((ITEMS / "o1p_fp32.json").read_text())["labels"] if (ITEMS / "o1p_fp32.json").exists() else {}
-    pj = {x["item"]: x for x in jl(ITEMS / "o1p_joint.jsonl")} if (ITEMS / "o1p_joint.jsonl").exists() and not \
-        json.loads((ITEMS / "manifest.json").read_text()).get("o1p_joint", {}).get("invalid") else {}  # (v1 leaks by exclusion)
+    pj = {x["item"]: x for x in jl(ITEMS / "o1p_joint.jsonl")} if (ITEMS / "o1p_joint.jsonl").exists() else {}  # (v2: v1 leaked by exclusion)
+    pji = {x["item"]: x for x in jl(ITEMS / "o1p_joint_interaction.jsonl")} if (ITEMS / "o1p_joint_interaction.jsonl").exists() else {}
     p1clean = set(json.loads((ITEMS / "o1p_clean.json").read_text())["items"]) if (ITEMS / "o1p_clean.json").exists() else set()  # (textoracle's:
     # both contexts in no training data of textoracle or oracledata)
     sub_f = ITEMS / "o1m_subsets.json"  # (textoracle's identity-contradicted questions: a neuron whose training outcome
@@ -981,13 +981,14 @@ def score(a) -> None:
             g4arms[name] = {o: sum(v) / len(v) for o, v in per.items()}
             orgs = sorted(per)
             cell(name, "G4", "measured trigger scope", [g4arms[name][o] for o in orgs], orgs)
-        f = d / "o1p_joint.jsonl"  # oracledata's pair_joint: two units zeroed together, held-out families, float32 labels
-        if f.exists() and pj and not name.startswith(tuple(excl.get("o1p", ()))):
-            got = {r["item"]: r for r in jl(f)}
-            its_ = [pj[k] for k in pj if k in got]
-            pred_ = [got[i["item"]].get("class") or pair_class(got[i["item"]].get("answer")) for i in its_]
-            cell(name, "O1pj", "all", [float(c == i["gold"]) for c, i in zip(pred_, its_)], [f"{i['context_a']}|{i['context_b']}" for i in its_],
-                 {"pred": dict(collections.Counter(str(c) for c in pred_)), "coverage": round(len(its_) / len(pj), 3)})
+        for fn, tg, items_ in (("o1p_joint.jsonl", "O1pj", pj), ("o1p_joint_interaction.jsonl", "O1pj-int", pji)):  # oracledata's
+            f = d / fn  # pair_joint v2: two units zeroed together, held-out families, float32; -int: off the additive sum (a negative control)
+            if f.exists() and items_ and not name.startswith(tuple(excl.get("o1p", ()))):
+                got = {r["item"]: r for r in jl(f)}
+                its_ = [items_[k] for k in items_ if k in got]
+                pred_ = [got[i["item"]].get("class") or pair_class(got[i["item"]].get("answer")) for i in its_]
+                cell(name, tg, "all", [float(c == i["gold"]) for c, i in zip(pred_, its_)], [f"{i['context_a']}|{i['context_b']}" for i in its_],
+                     {"pred": dict(collections.Counter(str(c) for c in pred_)), "coverage": round(len(its_) / len(items_), 3)})
         f = d / "o2.jsonl"
         if f.exists():
             got = {r["item"]: r for r in jl(f)}

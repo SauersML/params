@@ -915,6 +915,10 @@ COVER_LAMBDA = 2e-5    # nats a unit: the mask's price per unit
 COVER_STEPS = 60
 COVER_LR = 0.2
 COVER_INIT = 3.0       # sigmoid(3) = 0.95: every unit nearly live at the start (KL near 0)
+COVER_FACTOR = 0       # 1: an item's mask factored over its rows (methods' design 11d, the R3 backbone): a row's mask is
+# 1 - (1 - sigmoid(a)) (1 - sigmoid(b_row)), a shared by the item's rows (its backbone, priced once) and b_row the row's own
+# part (priced once per row); hard masks (a > 0) or (b_row > 0); the curve's sizes count the backbone and every row's part
+COVER_FACTOR_INIT = -3.0  # the rows' parts start nearly empty (every unit first in the backbone)
 COVER_ROWS = 8         # targets a batch (consecutive positions of one window)
 COVER_GRID = 2         # curve sizes per doubling of k
 COVER_ST = 0.5         # the last share of the steps run hard masks forward (the units with logits above 0 live, the rest
@@ -1006,18 +1010,35 @@ def mask_search(mk: Masked, x: torch.Tensor, item: list, pos: torch.Tensor, lpf:
     it = torch.tensor(item, device=mk.dev)
     th_n = torch.full((I, mk.L, T, mk.D), COVER_INIT, device=mk.dev, requires_grad=True)
     th_h = torch.full((I, mk.L, T, mk.H * (mk.hd if COVER_HCHAN else 1)), COVER_INIT, device=mk.dev, requires_grad=True)
-    opt = torch.optim.Adam([th_n, th_h], lr=COVER_LR)
+    params = [th_n, th_h]
+    if COVER_FACTOR:                                # (each row's own part: COVER_FACTOR)
+        tb_n = torch.full((x.shape[0], mk.L, T, mk.D), COVER_FACTOR_INIT, device=mk.dev, requires_grad=True)
+        tb_h = torch.full((x.shape[0], mk.L, T, th_h.shape[-1]), COVER_FACTOR_INIT, device=mk.dev, requires_grad=True)
+        params += [tb_n, tb_h]
+    opt = torch.optim.Adam(params, lr=COVER_LR)
     lpf = lpf.to(mk.dev)
     hist = []
     for step in range(COVER_STEPS):
         sn, sh = torch.sigmoid(th_n) * live, torch.sigmoid(th_h) * live
-        if step >= (1 - COVER_ST) * COVER_STEPS:   # (hard forward, sigmoid gradient)
-            mn = ((th_n > 0).float() * live - sn).detach() + sn
-            mh = ((th_h > 0).float() * live - sh).detach() + sh
+        hard = step >= (1 - COVER_ST) * COVER_STEPS
+        if COVER_FACTOR:                            # (a row's mask: its item's backbone or its own part)
+            lr_ = live[it]
+            bn, bh = torch.sigmoid(tb_n) * lr_, torch.sigmoid(tb_h) * lr_
+            mn, mh = 1 - (1 - sn[it]) * (1 - bn), 1 - (1 - sh[it]) * (1 - bh)
+            if hard:                                # (hard forward, the soft masks' gradient)
+                mn = (((th_n[it] > 0) | (tb_n > 0)).float() * lr_ - mn).detach() + mn
+                mh = (((th_h[it] > 0) | (tb_h > 0)).float() * lr_ - mh).detach() + mh
+            kl = _kl(lpf, mk.logp(x, mn, mh, pos))
+            size = (sn.sum((1, 2, 3)) + sh.sum((1, 2, 3))
+                    + torch.zeros(I, device=mk.dev).index_add(0, it, bn.sum((1, 2, 3)) + bh.sum((1, 2, 3))))
         else:
-            mn, mh = sn, sh
-        kl = _kl(lpf, mk.logp(x, mn[it], mh[it], pos))
-        size = sn.sum((1, 2, 3)) + sh.sum((1, 2, 3))
+            if hard:                                # (hard forward, sigmoid gradient)
+                mn = ((th_n > 0).float() * live - sn).detach() + sn
+                mh = ((th_h > 0).float() * live - sh).detach() + sh
+            else:
+                mn, mh = sn, sh
+            kl = _kl(lpf, mk.logp(x, mn[it], mh[it], pos))
+            size = sn.sum((1, 2, 3)) + sh.sum((1, 2, 3))
         loss = torch.relu(kl - COVER_TAU).sum() + COVER_LAMBDA * size.sum()
         opt.zero_grad(set_to_none=True)
         loss.backward()
@@ -1028,12 +1049,23 @@ def mask_search(mk: Masked, x: torch.Tensor, item: list, pos: torch.Tensor, lpf:
     with torch.no_grad():
         th_n, th_h = th_n.detach(), th_h.detach()
         lv = [int(live[j, 0, :, 0].sum()) for j in range(I)]          # (positions an item's mask may keep: a prefix)
-        n_units = [p * mk.L * (mk.D + th_h.shape[-1]) for p in lv]
-        vs = [torch.cat([th_n[j, :, :lv[j]].reshape(-1), th_h[j, :, :lv[j]].reshape(-1)]).sort(descending=True).values
-              for j in range(I)]
-        thr = lambda j, k: float(vs[j][k - 1]) if k > 0 else float("inf")  # noqa: E731
-        k_mask = [int((th_n[j, :, :lv[j]] > 0).sum() + (th_h[j, :, :lv[j]] > 0).sum()) for j in range(I)]
         rows_of = [[r for r, j in enumerate(item) if j == jj] for jj in range(I)]
+        if COVER_FACTOR:                            # (an item's logits: its backbone's, then each of its rows' parts)
+            tb_n, tb_h = tb_n.detach(), tb_h.detach()
+            parts = lambda j: [th_n[j], th_h[j]] + [t[r] for r in rows_of[j] for t in (tb_n, tb_h)]  # noqa: E731
+        else:
+            parts = lambda j: [th_n[j], th_h[j]]  # noqa: E731
+        n_units = [p * mk.L * (mk.D + th_h.shape[-1]) * (1 + (len(rows_of[j]) if COVER_FACTOR else 0)) for j, p in enumerate(lv)]
+        vs = [torch.cat([t[:, :lv[j]].reshape(-1) for t in parts(j)]).sort(descending=True).values for j in range(I)]
+        thr = lambda j, k: float(vs[j][k - 1]) if k > 0 else float("inf")  # noqa: E731
+        k_mask = [int(sum((t[:, :lv[j]] > 0).sum() for t in parts(j))) for j in range(I)]
+
+        def hard(j, k, r):                          # (item j's hard masks at its k-th logit, for its row r)
+            z = thr(j, k)
+            mn, mh = th_n[j] >= z, th_h[j] >= z
+            if COVER_FACTOR:
+                mn, mh = mn | (tb_n[r] >= z), mh | (tb_h[r] >= z)
+            return mn & (live[j] > 0), mh & (live[j] > 0)
 
         rows_fwd = max(COVER_ROWS, min(64, 2048 // T))     # (hard masks as booleans: short prompts take more rows)
 
@@ -1042,8 +1074,8 @@ def mask_search(mk: Masked, x: torch.Tensor, item: list, pos: torch.Tensor, lpf:
             got = []
             for a in range(0, len(flat), rows_fwd):
                 part = flat[a:a + rows_fwd]
-                mn = torch.stack([(th_n[j] >= thr(j, k)) & (live[j] > 0) for j, k, _ in part])
-                mh = torch.stack([(th_h[j] >= thr(j, k)) & (live[j] > 0) for j, k, _ in part])
+                hm = [hard(j, k, r) for j, k, r in part]
+                mn, mh = torch.stack([a for a, _ in hm]), torch.stack([b for _, b in hm])
                 rr = torch.tensor([r for _, _, r in part], device=mk.dev)
                 got += _kl(lpf[rr], mk.logp(x[rr], mn, mh, pos[rr])).tolist()
             out, at_ = [], 0
@@ -1078,7 +1110,8 @@ def mask_search(mk: Masked, x: torch.Tensor, item: list, pos: torch.Tensor, lpf:
             c.sort()
         at = [{str(bd): (brk[(j, bd)][1] if (j, bd) in brk else next((k for k, z in c if z <= bd), None)) for bd in bounds}
               for j, c in enumerate(curves)]
-    return {"th": (th_n, th_h), "thr": thr, "curves": curves, "at": at, "k_mask": k_mask, "units_total": n_units,
+    return {"th": (th_n, th_h), "tb": (tb_n, tb_h) if COVER_FACTOR else None, "hard": hard,
+            "thr": thr, "curves": curves, "at": at, "k_mask": k_mask, "units_total": n_units,
             "positions": lv, "history": hist, "seconds_opt": t_opt, "rows_of": rows_of}
 
 
@@ -1186,16 +1219,24 @@ def tsearch(mk: Masked, tok, qs: list, keys: dict, out: Path, batch: int = 4, lo
             (th_n, th_h), thr = ms["th"], ms["thr"]
             for j, (q, c, ks, rows, dst) in enumerate(part):
                 kb = ms["at"][j].get(str(QSEARCH_BOUND))
-                neurons, heads, hchans = [], [], []
+                neurons, heads, hchans, fac = [], [], [], None
                 if kb:
                     z = thr(j, kb)
-                    neurons = [[i, p, n] for i, p, n in (th_n[j] >= z).nonzero().tolist()]
-                    hk = [[i, p, h] for i, p, h in (th_h[j] >= z).nonzero().tolist()]
+                    un, uh = th_n[j] >= z, th_h[j] >= z
+                    if COVER_FACTOR:                # (the circuit: the backbone and every fit key's own part)
+                        rows = ms["rows_of"][j]
+                        own = [ms["hard"](j, kb, r) for r in rows]
+                        fac = {"backbone": int(un.sum() + uh.sum()),
+                               "per_key": {ks[e]: int((a & ~un).sum() + (b & ~uh).sum()) for e, (a, b) in enumerate(own)}}
+                        for a, b in own:
+                            un, uh = un | a, uh | b
+                    neurons = [[i, p, n] for i, p, n in un.nonzero().tolist()]
+                    hk = [[i, p, h] for i, p, h in uh.nonzero().tolist()]
                     heads, hchans = ([], hk) if COVER_HCHAN else (hk, [])
                 corr = prompt_ids(tok, q["corrupt_user"], q) if q.get("corrupt_user") else []
                 rec = {**{f: q.get(f) for f in ("id", "task", "key", "corrupt_key", "user", "corrupt_user", "paraphrase")},
                        "ids": c, "corrupted": corr, "neurons": neurons, "heads": heads, "hchans": hchans, "met": bool(kb), "seconds": round(sec, 2),
-                       "selection_keys": ks, "finder": "ami.tsearch",
+                       "selection_keys": ks, "finder": "ami.tsearch", **({"factor": fac} if fac else {}),
                        "r3search": {"k": ms["at"][j], "k_mask": ms["k_mask"][j], "units_total": ms["units_total"][j],
                                     "curve": ms["curves"][j], "keys": ks}}
                 dst.write_text(json.dumps(rec))

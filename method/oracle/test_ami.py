@@ -238,3 +238,28 @@ def test_mask_search_head_channels(tiny, monkeypatch):
     ms = ami.mask_search(mk, x, [0], pos, lpf, torch.ones(1, 1, 8, 1))
     assert ms["units_total"][0] == 8 * mk.L * (mk.D + mk.H * mk.hd)
     assert ms["curves"][0][-1][1] < 1e-6
+
+
+def test_mask_search_factored(tiny, monkeypatch):
+    """COVER_FACTOR: an item's mask is its backbone or each row's own part; the curve counts the backbone and every row's
+    part (units_total = (1 + rows) x positions x layers x units), the full curve is the full model, and the bound's set
+    (the backbone with a row's own part) is within the bound on each row."""
+    model, docs, means = tiny
+    monkeypatch.setattr(ami, "COVER_STEPS", 4)
+    monkeypatch.setattr(ami, "COVER_FACTOR", 1)
+    mk = ami.Masked(model, means)
+    a, b = docs[0][:10], list(docs[0][:10])
+    b[4] = (b[4] + 1) % 64
+    x = torch.tensor([a, b])
+    pos = torch.tensor([9, 9])
+    with torch.no_grad():
+        lpf = mk.logp(x, None, None, pos)
+    ms = ami.mask_search(mk, x, [0, 0], pos, lpf, torch.ones(1, 1, 10, 1))
+    c = ms["curves"][0]
+    assert ms["tb"] is not None and ms["units_total"][0] == 3 * 10 * mk.L * (mk.D + mk.H)
+    assert c[-1][0] == ms["units_total"][0] and c[-1][1] < 1e-6
+    k = ms["at"][0]["0.1"]
+    with torch.no_grad():
+        for r in (0, 1):
+            mn, mh = ms["hard"](0, k, r)
+            assert float(ami._kl(lpf[r:r + 1], mk.logp(x[r:r + 1], mn[None].float(), mh[None].float(), pos[r:r + 1]))) <= 0.1 + 1e-6

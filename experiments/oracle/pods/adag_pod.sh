@@ -16,6 +16,8 @@
 #          to our finder's scored size on the same pair (match: adag), AtP/RelP/EAP-IG at that size (attr_baselines.py),
 #          every set through circuit_bench.py score (S1, Q1 with its matched random control, Q2-Q5, intervals), side by
 #          side in dev/table.txt
+#   trace  Arora et al.'s neuron-basis RelP tracer (ADAG's tracing stage, its prep.py settings) on every DEV question,
+#          cut to the scored sizes of REFREC (a tarball of our finder's records on DEV), both scored by circuit_bench
 #   math   its math circuit on 40 sums (18 + 24 first; 32 s a sum on an A40) and its clusters measured
 #   cg     CausalGym under its own faithfulness evaluation (eval.py): NAP on MLP neurons, our measured scores, ENAP
 # MASKFIX (default 1): ADAG's NoQKGradAttention runs as attention implementation "noqk", for which transformers 4.57
@@ -89,6 +91,15 @@ step dev_baselines 60 uv run python $P/attr_baselines.py $D/finder $D/baselines 
 "
   done
   RUNS="$RUNS uv run python $P/circuit_bench.py table $D/bench_finder $D/bench_adag $D/bench_adag_full $D/bench_atp $D/bench_relp $D/bench_eapig > $D/table.txt 2>&1;
+"
+fi
+if [[ $STEPS == *,trace,* ]]; then                 # Arora et al.'s RelP tracer (ADAG's) on DEV, cut to REFREC's sizes
+  D=$O/trace
+  RUNS="$RUNS mkdir -p $D ~/refrec; tar -xzf $REFREC -C ~/refrec;
+step trace_dev 200 uv run python $P/adag_repo.py trace $DEV $D/adag_full --model $Q --stride 1 --chunk 10;
+step trace_match 5 uv run python $P/adag_repo.py match $D/adag_full ~/refrec $D/adag;
+step trace_bench_adag 90 uv run python $P/circuit_bench.py score $D/adag $D/bench_adag --devset $DEV --model $Q --rev arora_relp_matched;
+step trace_bench_adag_full 120 uv run python $P/circuit_bench.py score $D/adag_full $D/bench_adag_full --devset $DEV --model $Q --rev arora_relp_whole;
 "
 fi
 if [[ $STEPS == *,math,* ]]; then

@@ -406,7 +406,8 @@ def trace(a) -> None:
                      topk=None, batch_aggregation="any", topk_neurons=None, percentage_threshold=0.005, use_relp_grad=True,
                      disable_half_rule=False, disable_stop_grad=False, ablation_mode="zero", use_stop_grad_on_mlps=True,
                      return_nodes_only=False, focus_last_residual=False, skip_attr_contrib=False, center_logits=False,
-                     ig_steps=None, ig_mode="ig-inputs", return_only_important_neurons=False, apply_blacklist=False)
+                     ig_steps=None, ig_mode="ig-inputs", return_only_important_neurons=False, apply_blacklist=True)
+    # (their prep.py's settings, Arora et al.'s neuron-basis RelP tracer: threshold 0.005, k 5, RelP gradient, blacklist on)
     rev = (Path.cwd() / "adag_commit.txt").read_text().strip() if (Path.cwd() / "adag_commit.txt").exists() else None
     first = True
     for q in todo:
@@ -463,7 +464,7 @@ def trace(a) -> None:
                    nodes=out_nodes, routes=[], met=met, order=["adag"], size=len(out_nodes),
                    cuts={"adag": {"met": met, "lost": whole[0], "restored": whole[1], "size": len(out_nodes)}},
                    seconds=round(t_trace, 2), seconds_measure=round(time.time() - t1, 2),
-                   adag={"k": 5, "focus": top5, "focus_text": [tok.decode([t]) for t in top5], "threshold": 0.005, "edges": len(edges),
+                   adag={"settings": "prep.py's: percentage_threshold 0.005, k 5, use_relp_grad, apply_blacklist", "k": 5, "focus": top5, "focus_text": [tok.decode([t]) for t in top5], "threshold": 0.005, "edges": len(edges),
                          "before_first_diff": sum(p < rec["first_diff"] for (_, p, _) in units)})
         path.write_text(json.dumps(rec))
         if a.finder and len(list((a.out / "finder").glob("*.json")) if (a.out / "finder").exists() else []) < a.finder:

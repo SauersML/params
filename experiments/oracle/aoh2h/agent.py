@@ -1464,9 +1464,9 @@ class Tools:
         with self.model_of(it):
             if search == "group":  # (circuit_finder's group testing, the cuts asked for)
                 rec = cf.find(cf.Patcher(self.tg.m, self.tok), clean, corrupt, cuts_wanted=want, log=log)
-            else:  # searchalgo's attribution order with measured acceptance, masks on the cuts it leaves unmet (every cut)
-                import circuit_masks as cm
-                rec = cm.find(cf.Patcher(self.tg.m, self.tok), clean, corrupt, log=log, arm=search)
+            else:  # searchalgo's attribution order with measured acceptance, masks on the cuts it leaves unmet (scale32's
+                import circuit_masks as cm  # 14B call: 2.5-4.4 s a question on an A6000 without the readout cut)
+                rec = cm.find(cf.Patcher(self.tg.m, self.tok), clean, corrupt, log=log, arm=search, steps=30, cuts_wanted=want)
         cost = self.find_cost(time.perf_counter() - t0)
         ep.setdefault("find_passes", []).append(cost)  # (the call's full equivalent, beyond what is left)
         self.charge(ep, min(cost, ep["budget"] - ep["passes"]))
@@ -1694,6 +1694,10 @@ def serve(a) -> None:
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
     items_ = [json.loads(x) for x in a.items.read_text().splitlines()]
+    import torch
+
+    torch.set_num_threads(max(1, len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else os.cpu_count() or 1))
+    # (the pod's own CPUs, not the host's: scale32 found the default 2-3x slower in the finder on a 128-core host)
     tools = Tools(ao_verify.Target(a.model, a.device), items_, a.model)
     tools.gen_call = a.gen_cost == "call"
     if a.batch_gen:

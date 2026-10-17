@@ -348,7 +348,11 @@ class Episode:
         return "\n".join(names) or "(empty)"
 
     def turn(self, msgs: list[dict], budget_left: int | None) -> bool:
+        """One investigator message and its tool calls; True when it called a tool or was cut at MAX_TOKENS (then it
+        has not finished: a reasoning model can spend a message thinking)."""
+        g = self.generated
         text = self.sample(msgs, MAX_TOKENS)
+        cut = self.generated - g >= MAX_TOKENS
         msgs.append({"role": "assistant", "content": text})
         found = re.findall(r"<tool>(.*?)</tool>", text, re.S)
 
@@ -371,11 +375,12 @@ class Episode:
             results.append(f"<result name={name!r}>\n{out[:60000]}\n</result>")
         note = tmpl("user_message.jinja2").replace("{REMAINING}", f"\n\nYou have {budget_left} tokens remaining "
                                                    f"and {PASS_CAP - self.passes} target samples." if budget_left is not None else "")
-        msgs.append({"role": "user", "content": "\n".join(results) + ("\n\n" if results else "No tool call found.\n\n") + note})
+        self.results = "\n".join(results) + ("\n\n" if results else "No tool call found.\n\n")
+        msgs.append({"role": "user", "content": self.results + note})
         print(f"  {self.target.split('/')[1][9:]} {self.arm} run {self.run}: turn {len(msgs) // 2 - 1}, {self.generated} tokens "
               f"(+{self.helper} scenario), {self.passes} passes, ${self.usd:.3f}, quirk files "
               f"{sum(k.startswith('quirks/') for k in self.files)}", flush=True)
-        return bool(found)
+        return bool(found) or cut
 
     def go(self) -> dict:
         t0 = time.time()
@@ -387,7 +392,7 @@ class Episode:
                                                                                  f"and {PASS_CAP} target samples.")}]
         while self.generated < TOKEN_BUDGET:
             self.turn(msgs, TOKEN_BUDGET - self.generated)
-        msgs[-1]["content"] = tmpl("reduction_prompt.jinja2", max_quirks=MAX_QUIRKS).replace("{{max_quirks}}", str(MAX_QUIRKS))
+        msgs[-1]["content"] = self.results + tmpl("reduction_prompt.jinja2", max_quirks=MAX_QUIRKS).replace("{{max_quirks}}", str(MAX_QUIRKS))
         for _ in range(REDUCTION_TURNS):
             if not self.turn(msgs, None):
                 break

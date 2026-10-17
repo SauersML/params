@@ -218,6 +218,44 @@ def freeze_members(a) -> None:
     print(len(rows), "member questions on", man["o1m"]["contexts"], "contexts;", sum(x["names_differ"] for x in rows), "names differ")
 
 
+PAIRS = HOME / "mpd-data" / "oracle" / "data" / "pairs" / "v1"
+PAIR_GOLD = ("A", "B", "same", "both", "neither")
+
+
+def pair_class(ans: str | None) -> str | None:
+    """A paired-context answer's class from its first words: "A", "B", "About the same", "Both", "Neither"."""
+    t = (ans or "").strip().lower()
+    for c, pre in (("same", ("about the same", "the same", "same")), ("both", ("both",)), ("neither", ("neither",))):
+        if t.startswith(pre):
+            return c
+    m = re.match(r"(?:text\s+)?([ab])\b", t)
+    return m.group(1).upper() if m else None
+
+
+def freeze_pairs(a) -> None:
+    """oracledata's paired-context set (pairs/v1, schema pair1; the lead's 10-16): the same units in two contexts, which
+    context's answer an intervention moves more (pair_zero: A, B or about the same; pair_sign and pair_flip: A, B,
+    both or neither). The test split's families are never trained on; its classes are balanced per kind."""
+    out = ITEMS / "o1_pairs.jsonl"
+    if out.exists() and not a.force:
+        raise SystemExit(f"{out} exists (frozen)")
+    rows, occ = [], collections.Counter()
+    for r in jl(PAIRS / "test.jsonl"):
+        k = f"{r['kind']}|{r['key']}|{r['context_a']}|{r['context_b']}"
+        occ[k] += 1
+        assert r["gold"] in PAIR_GOLD, r["gold"]
+        rows.append({**r, "item": k + (f"#{occ[k]}" if occ[k] > 1 else ""), "row": len(rows)})
+    wjl(out, rows)
+    man = json.loads((ITEMS / "manifest.json").read_text())
+    man["sha256"]["o1_pairs.jsonl"] = sha(out)
+    man["o1p"] = {"items": len(rows), "source": str(PAIRS / "test.jsonl"), "source_sha256": sha(PAIRS / "test.jsonl"),
+                  "families": sorted({r["family_a"] for r in rows}), "classes": dict(collections.Counter(r["cls"] for r in rows)),
+                  "readable_reference": json.loads((PAIRS / "readable.json").read_text()),
+                  "frozen": time.strftime("%Y-%m-%d %H:%M:%S %Z")}
+    (ITEMS / "manifest.json").write_text(json.dumps(man, indent=1))
+    print(len(rows), "paired questions,", dict(collections.Counter(r["kind"] for r in rows)))
+
+
 def name_prior(train: list[dict], it: dict) -> tuple[str, str]:
     """Each group's most common training outcome: the same kind and groups; else the same kind and any of the groups
     (votes); else the kind's most common outcome."""
@@ -671,6 +709,7 @@ def score(a) -> None:
     key = lambda c: "/".join(c.split("/")[:2])  # noqa: E731
     train_keys = {key(t["context"]) for t in jl(ITEMS / "o1_train_outcomes.jsonl")}
     m1 = {x["item"]: x for x in jl(ITEMS / "o1_members.jsonl")} if (ITEMS / "o1_members.jsonl").exists() else {}
+    p1 = {x["item"]: x for x in jl(ITEMS / "o1_pairs.jsonl")} if (ITEMS / "o1_pairs.jsonl").exists() else {}
     sub_f = ITEMS / "o1m_subsets.json"  # (textoracle's identity-contradicted questions: a neuron whose training outcome
     contra = set(json.loads(sub_f.read_text())["identity_contradicted"]) if sub_f.exists() else set()  # differs from this one's)
     rows = []
@@ -750,6 +789,22 @@ def score(a) -> None:
                 cell(name, "O1m", "confabulation: stated claims failing claim_check", [1.0 - float(msr[i["item"]]["claim_pass"]) for i in sel],
                      [i["context"] for i in sel])
                 cell(name, "O1m", "claim specific", [float(msr[i["item"]]["claim_specific"]) for i in sel], [i["context"] for i in sel])
+        f = d / "o1p.jsonl"  # the paired-context set: bootstrap over the pair of contexts
+        if f.exists() and p1:
+            got = {r["item"]: r for r in jl(f)}
+            its = [p1[k] for k in p1 if k in got]
+            pred = [got[i["item"]].get("class") or pair_class(got[i["item"]].get("answer")) for i in its]
+            ok = [float(c == i["gold"]) for c, i in zip(pred, its)]
+            for kind in ("all", "pair_zero", "pair_sign", "pair_flip"):
+                sel = [k for k, i in enumerate(its) if kind in ("all", i["kind"])]
+                if sel:
+                    rec = collections.defaultdict(list)
+                    for k in sel:
+                        rec[its[k]["cls"]].append(ok[k])
+                    cell(name, "O1p", kind, [ok[k] for k in sel], [f"{its[k]['context_a']}|{its[k]['context_b']}" for k in sel],
+                         {"recall": {c: round(sum(v) / len(v), 3) for c, v in sorted(rec.items())},
+                          "pred": dict(collections.Counter(f"{its[k]['kind']}/{pred[k] or 'none'}" for k in sel)),
+                          "coverage": round(len(its) / len(p1), 3)})
         f = d / "o2.jsonl"
         if f.exists():
             got = {r["item"]: r for r in jl(f)}
@@ -1225,6 +1280,8 @@ def main():
     t_.add_argument("--set", choices=tuple(SETS), default="o1")
     fm = sub.add_parser("freeze-members")
     fm.add_argument("--force", action="store_true")
+    fp = sub.add_parser("freeze-pairs")
+    fp.add_argument("--force", action="store_true")
     c = sub.add_parser("collect")
     c.add_argument("run", help="the pod run's name, e.g. orc-oracleeval-m1")
     c.add_argument("--name", help="a reader run's oracle name")
@@ -1238,7 +1295,7 @@ def main():
     s = sub.add_parser("score")
     s.add_argument("--sealed", action="store_true")
     a = ap.parse_args()
-    {"freeze": freeze, "prior": prior, "ingest": ingest, "baselines": baselines, "tree": tree, "freeze-members": freeze_members, "collect": collect, "prompt397": prompt397, "score": score}[a.cmd](a)
+    {"freeze": freeze, "prior": prior, "ingest": ingest, "baselines": baselines, "tree": tree, "freeze-members": freeze_members, "freeze-pairs": freeze_pairs, "collect": collect, "prompt397": prompt397, "score": score}[a.cmd](a)
 
 
 if __name__ == "__main__":

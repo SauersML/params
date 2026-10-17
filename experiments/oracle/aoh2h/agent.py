@@ -432,6 +432,8 @@ class GenBatcher:
         import queue
 
         self.tools, self.q = tools, queue.Queue()
+        self.vllm = os.environ.get("AGENT_VLLM_URL")  # a vLLM OpenAI server on the pod with every item adapter as a LoRA
+        # module under its item name (generation there: continuous batching; HF + peft generated 0.17 requests/s on 14B)
         self.mixed = os.environ.get("AGENT_MIXED", "0") == "1"  # (peft's mixed-adapter batches dispatch every row's
         # adapter per layer per step: on 10-16 a 14B server answered 16 clients at 0.12 requests/s with them)
         threading.Thread(target=self.loop, daemon=True).start()
@@ -440,15 +442,44 @@ class GenBatcher:
         return self.submit_many(adapter, [ids], n, temperature, seed)[0]
 
     def submit_many(self, adapter, seqs: list[list[int]], n: int, temperature: float, seed: int) -> list[list[int]]:
-        """Several rows at once (ask's texts), each joining whatever batch forms."""
+        """Several rows at once (ask's texts), each joining whatever batch forms (or a vLLM server's, AGENT_VLLM_URL)."""
         from concurrent.futures import Future
 
+        if self.vllm:
+            return self.vllm_many(adapter, seqs, n, temperature, seed)
         futs = []
         for k, ids in enumerate(seqs):
             fut = Future()
             self.q.put((adapter, list(ids), int(n), float(temperature), int(seed) + k, fut))
             futs.append(fut)
         return [f.result() for f in futs]
+
+    def vllm_many(self, adapter, seqs: list[list[int]], n: int, temperature: float, seed: int) -> list[list[int]]:
+        """Rows sent to the vLLM server at once (token-id prompts; the item's adapter by its name, the base model by its
+        own), each completion's text tokenized back."""
+        import urllib.request
+        from concurrent.futures import ThreadPoolExecutor
+
+        tok, base = self.tools.tok, self.tools.model
+
+        def one(k_ids):
+            k, ids = k_ids
+            body = {"model": adapter or base, "prompt": list(ids), "max_tokens": int(n), "temperature": float(temperature),
+                    "top_p": TARGET_TOP_P if temperature else 1.0, "seed": int(seed) + k}
+            req = urllib.request.Request(self.vllm + "/v1/completions", data=json.dumps(body).encode(),
+                                         headers={"Content-Type": "application/json"})
+            for attempt in range(4):
+                try:
+                    with urllib.request.urlopen(req, timeout=900) as r:
+                        text = json.loads(r.read())["choices"][0]["text"]
+                    return tok(text, add_special_tokens=False)["input_ids"][:n]
+                except OSError:
+                    if attempt == 3:
+                        raise
+                    time.sleep(5)
+
+        with ThreadPoolExecutor(min(len(seqs), 64)) as ex:
+            return list(ex.map(one, enumerate(seqs)))
 
     def loop(self) -> None:
         import queue

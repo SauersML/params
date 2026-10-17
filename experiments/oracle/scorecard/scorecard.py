@@ -710,6 +710,7 @@ def score(a) -> None:
     train_keys = {key(t["context"]) for t in jl(ITEMS / "o1_train_outcomes.jsonl")}
     m1 = {x["item"]: x for x in jl(ITEMS / "o1_members.jsonl")} if (ITEMS / "o1_members.jsonl").exists() else {}
     p1 = {x["item"]: x for x in jl(ITEMS / "o1_pairs.jsonl")} if (ITEMS / "o1_pairs.jsonl").exists() else {}
+    excl = json.loads((ITEMS / "manifest.json").read_text()).get("exclusions", {})
     sub_f = ITEMS / "o1m_subsets.json"  # (textoracle's identity-contradicted questions: a neuron whose training outcome
     contra = set(json.loads(sub_f.read_text())["identity_contradicted"]) if sub_f.exists() else set()  # differs from this one's)
     rows = []
@@ -790,7 +791,7 @@ def score(a) -> None:
                      [i["context"] for i in sel])
                 cell(name, "O1m", "claim specific", [float(msr[i["item"]]["claim_specific"]) for i in sel], [i["context"] for i in sel])
         f = d / "o1p.jsonl"  # the paired-context set: bootstrap over the pair of contexts
-        if f.exists() and p1:
+        if f.exists() and p1 and not name.startswith(tuple(excl.get("o1p", ()))):  # (readers trained on its families: none)
             got = {r["item"]: r for r in jl(f)}
             its = [p1[k] for k in p1 if k in got]
             pred = [got[i["item"]].get("class") or pair_class(got[i["item"]].get("answer")) for i in its]
@@ -910,9 +911,10 @@ def score(a) -> None:
                     if ks:
                         cell(n, "O1m", label + sub, [rightm[n][k] - rightm[other][k] for k in ks], [m1[k]["context"] for k in ks])
     plan_rows = plan_view(rows, meta)
+    ctl = controls_view(rows, meta, {"O1": {k: v for k, v in o1.items() if key(v["context"]) not in train_keys}, "O1m": m1, "O1p": p1}, rng)
     out = ROOT / "table.json"
     out.write_text(json.dumps({"written": time.strftime("%Y-%m-%d %H:%M:%S %Z"), "boot": BOOT, "published": PUBLISHED,
-                               "oracles": meta, "cells": rows, "plan": plan_rows,
+                               "oracles": meta, "cells": rows, "plan": plan_rows, "controls": ctl, "controls_legend": CONTROLS,
                                "auditbench_reference": [{"label": t, "value": v, "source": src} for t, v, src in AB_REFERENCE],
                                "auditbench_source": AB_SOURCE}, indent=1))
     with (ROOT / "plan.tsv").open("w") as fh:
@@ -929,7 +931,18 @@ def score(a) -> None:
         print(f"{r['oracle']:28s} {r['target']} {r['metric']:20s} {r['value']:.3f} [{r['lo']:.3f}, {r['hi']:.3f}] n={r['n']} "
               f"({r['units']} {'contexts' if r['target'] in ('O1', 'O1m') else 'organisms' if r['target'] in ('O2', 'O3') else 'targets' if r['target'] == 'O2-AB' else 'units'})"
               + (f" exact: {r['exact']}" if r.get("exact") else ""))
-    print(f"-> {ROOT / 'table.tsv'}")
+    with (ROOT / "controls.tsv").open("w") as fh:
+        fh.write("oracle\ttarget\tmetric\tvalue\tn\t" + "\t".join(f"{c}\t{c}: arm minus control" for c in CONTROLS) + "\tstatus\n")
+        for r in ctl:
+            cols = []
+            for c in CONTROLS:
+                e = r["controls"].get(c)
+                cols.append(f"{e['value']:.3f} (n={e['n']})" if e else "not run")
+                mm = (e or {}).get("minus")
+                cols.append(f"{mm['value']:+.3f} [{mm['lo']:+.3f}, {mm['hi']:+.3f}] n={mm['n']}" if mm else "")
+            fh.write(f"{r['oracle']}\t{r['target']}\t{r['metric']}\t{r['value']:.3f}\t{r['n']}\t" + "\t".join(cols) + f"\t{r['status']}\n")
+    print(f"-> {ROOT / 'table.tsv'}, {ROOT / 'controls.tsv'} ({sum(r['status'] == 'controls complete' for r in ctl)} of {len(ctl)} "
+          "circuit-reading cells with all three controls)")
     figure(rows, meta)
     plan_figure(plan_rows)
 
@@ -985,6 +998,67 @@ def latest_text(meta: dict, set_: str = "o1") -> str | None:
     vs = sorted((int(n.split(".")[1][1:]), int(n.split(".")[3][1:]), n) for n in meta
                 if n.startswith("text.v") and n.split(".")[2] == "Tfull" and n.endswith(".full") and (ANS / n / f"{set_}.jsonl").exists())
     return vs[-1][2] if vs else None
+
+
+CONTROLS = {"none": "no circuit (filler at the same token budget)", "shuffle": "scrambled: another item's circuit, same format",
+            "random": "random units matched in count, layer and position, with their measured numbers"}
+CONTROL_CELLS = (("O1", "unseen task/key"), ("O1m", "all"), ("O1p", "all"), ("O2", "all 7 exact @256"), ("O2-AB", "dev targets"),
+                 ("CHIVE", "all"))
+
+
+def control_name(arm: str, c: str) -> str:
+    """An arm's control: its last dotted part (the input it reads: full, correct) replaced by the control's name, or the
+    name appended."""
+    head, _, last = arm.rpartition(".")
+    return f"{head}.{c}" if head and last in ("full", "correct") else f"{arm}.{c}"
+
+
+def correct_by_item(d: Path, target: str, items: dict) -> dict:
+    f = d / {"O1": "o1.jsonl", "O1m": "o1m.jsonl", "O1p": "o1p.jsonl"}[target]
+    if not f.exists():
+        return {}
+    out = {}
+    for r in jl(f):
+        it = items.get(r["item"])
+        if it:
+            c = r.get("class") or (pair_class(r.get("answer")) if target == "O1p" else o1_class(it["cat"], r.get("answer")))
+            out[r["item"]] = float(c == it["gold"])
+    return out
+
+
+def controls_view(rows: list[dict], meta: dict, items: dict, rng: random.Random) -> list[dict]:
+    """The user's negative controls for every arm that reads circuits (the lead's 10-16): per headline cell the arm, its
+    three controls and arm minus control (paired over items where the target has items; bootstrap over contexts). An arm
+    missing any control is preliminary."""
+    get = lambda n, t, m: next((r for r in rows if r["oracle"] == n and r["target"] == t and r["metric"] == m), None)  # noqa: E731
+    reads = lambda n, t: "circuit" in (meta.get(n, {}).get("reads", "") + n).lower() or (  # noqa: E731
+        t in ("O1", "O1m", "O1p") and n.startswith(("text.", "prompt397")))  # (O1's questions show the circuit)
+    is_control = lambda n: n.rpartition(".")[2] in tuple(CONTROLS) + ("names", "mismatch", "shuffle")  # noqa: E731
+    out = []
+    for t, m in CONTROL_CELLS:
+        for n in sorted({r["oracle"] for r in rows if r["target"] == t and r["metric"] == m}):
+            c0 = get(n, t, m)
+            if not reads(n, t) or is_control(n) or meta.get(n, {}).get("kind") == "check":
+                continue
+            row = {"oracle": n, "target": t, "metric": m, "value": c0["value"], "n": c0["n"], "controls": {}}
+            for c in CONTROLS:
+                cn = control_name(n, c)
+                cc = get(cn, t, m)
+                if not cc:
+                    continue
+                entry = {"oracle": cn, "value": cc["value"], "lo": cc["lo"], "hi": cc["hi"], "n": cc["n"]}
+                if t in items:  # paired over items
+                    a_, b_ = correct_by_item(ANS / n, t, items[t]), correct_by_item(ANS / cn, t, items[t])
+                    ks = [k for k in a_ if k in b_]
+                    if ks:
+                        unit = lambda k: items[t][k].get("context") or f"{items[t][k].get('context_a')}|{items[t][k].get('context_b')}"  # noqa: E731
+                        md, lo, hi = boot([a_[k] - b_[k] for k in ks], [unit(k) for k in ks], rng)
+                        entry["minus"] = {"value": round(md, 4), "lo": round(lo, 4), "hi": round(hi, 4), "n": len(ks)}
+                row["controls"][c] = entry
+            missing = [c for c in CONTROLS if c not in row["controls"]]
+            row["status"] = "preliminary: no " + ", ".join(missing) + " control" if missing else "controls complete"
+            out.append(row)
+    return out
 
 
 def plan_view(rows: list[dict], meta: dict) -> list[dict]:

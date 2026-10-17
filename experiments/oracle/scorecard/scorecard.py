@@ -853,9 +853,11 @@ def score(a) -> None:
                 rs = jl(f)
                 cell(name, t.upper(), "success", [float(r["success"]) for r in rs], [r["item"] for r in rs])
                 ok = [r for r in rs if "error" not in r]
-                for m in (("goal_after", "removal", "kl_general_bits", "kl_near_bits", "rate_after") if t == "o3" else ("fixed",)):
-                    if all(m in r for r in ok):
-                        cell(name, t.upper(), m, [float(r[m]) for r in ok], [r["item"] for r in ok])
+                for m in (("goal_after", "removal", "kl_general_bits", "kl_near_bits", "kl_p99_bits", "rate_after", "swap_follows_twin")
+                          if t == "o3" else ("fixed",)):
+                    sel = [r for r in ok if r.get(m) is not None]  # (swap: zeroing edits on organisms with a twin)
+                    if sel:
+                        cell(name, t.upper(), m, [float(r[m]) for r in sel], [r["item"] for r in sel])
                 cell(name, t.upper(), "valid", [float("error" not in r) for r in rs], [r["item"] for r in rs])
                 if t == "o3":  # per organism, the goal rate on its unseen prompts with its Wilson interval (one edit; random
                     for it_ in sorted({r["item"] for r in ok}):  # draws pooled)
@@ -1266,6 +1268,14 @@ def collect(a) -> None:
             have[f"{n}@{b}"] = {"item": f"{n}@{b}", "answer": v, "passes": b}
         wjl(f, list(have.values()))
         print("collected", f)
+    ae = src / "aoe1" / "e1_battery.jsonl"
+    if ae.exists():  # an activation oracle's E1 battery on all seven organisms (scorecard_pod.sh AOE1=...)
+        adapter, *layers = (src / "aoe1" / "adapter.txt").read_text().split()
+        name = a.name or "ao-" + adapter.split("/")[-1]
+        d = oracle_meta(name, f"activation oracle {adapter}" + (f", layers {layers[0]}" if layers else ""), "baseline",
+                        "the organism's activations at the last 10 tokens of each battery prompt")
+        wjl(d / "o2.jsonl", [{"item": f"{n}@{b}", "answer": v, "passes": b} for (n, b), v in sorted(battery_guesses(jl(ae)).items())])
+        print("collected", d / "o2.jsonl")
 
 
 def main():

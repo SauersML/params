@@ -237,6 +237,21 @@ def pair_class(ans: str | None) -> str | None:
     return m.group(1).upper() if m else None
 
 
+def carry_class(ans: str | None) -> str | None:
+    """A carry answer's class from its first words: "It drops" / "rises" / "barely changes" (drop, rise, none)."""
+    t = re.sub(r"^\W*(answer\s*:\s*)?(it\s+)?", "", (ans or "").strip().lower())
+    for c, pre in (("drop", ("drop", "falls", "fall", "lower", "decrease")), ("rise", ("rise", "increase", "higher", "goes up")),
+                   ("none", ("barely", "none", "no change", "change by less", "stays", "neither", "nothing"))):
+        if t.startswith(pre):
+            return c
+    return None
+
+
+OP_SETS = (("o1k", "O1k", pair_class), ("o1k_adv", "O1k-adv", pair_class), ("o1c", "O1c", carry_class),
+           ("o1c_hard", "O1c-hard", carry_class), ("o1c_adv", "O1c-adv", carry_class))  # (oracledata's kinds and carry sets:
+# a stated intervention per question; scored per op)
+
+
 def freeze_pairs(a) -> None:
     """oracledata's paired-context set (pairs/v1, schema pair1; the lead's 10-16): the same units in two contexts, which
     context's answer an intervention moves more (pair_zero: A, B or about the same; pair_sign and pair_flip: A, B,
@@ -867,6 +882,7 @@ def score(a) -> None:
     p1f32 = json.loads((ITEMS / "o1p_fp32.json").read_text())["labels"] if (ITEMS / "o1p_fp32.json").exists() else {}
     pj = {x["item"]: x for x in jl(ITEMS / "o1p_joint.jsonl")} if (ITEMS / "o1p_joint.jsonl").exists() else {}  # (v2: v1 leaked by exclusion)
     pji = {x["item"]: x for x in jl(ITEMS / "o1p_joint_interaction.jsonl")} if (ITEMS / "o1p_joint_interaction.jsonl").exists() else {}
+    opsets = {k: {x["item"]: x for x in jl(ITEMS / f"{k}.jsonl")} for k, _, _ in OP_SETS if (ITEMS / f"{k}.jsonl").exists()}
     p1clean = set(json.loads((ITEMS / "o1p_clean.json").read_text())["items"]) if (ITEMS / "o1p_clean.json").exists() else set()  # (textoracle's:
     # both contexts in no training data of textoracle or oracledata)
     sub_f = ITEMS / "o1m_subsets.json"  # (textoracle's identity-contradicted questions: a neuron whose training outcome
@@ -989,6 +1005,18 @@ def score(a) -> None:
                 pred_ = [got[i["item"]].get("class") or pair_class(got[i["item"]].get("answer")) for i in its_]
                 cell(name, tg, "all", [float(c == i["gold"]) for c, i in zip(pred_, its_)], [f"{i['context_a']}|{i['context_b']}" for i in its_],
                      {"pred": dict(collections.Counter(str(c) for c in pred_)), "coverage": round(len(its_) / len(items_), 3)})
+        for key_, tg, parse in OP_SETS:  # oracledata's kinds/carry sets: all and per op, bootstrap over context pairs
+            f = d / f"{key_}.jsonl"
+            if f.exists() and opsets.get(key_):
+                its_ = opsets[key_]
+                got = {r["item"]: r for r in jl(f)}
+                sel_ = [its_[k] for k in its_ if k in got]
+                pred_ = [got[i["item"]].get("class") or parse(got[i["item"]].get("answer")) for i in sel_]
+                for op in ("all",) + tuple(sorted({i["op"] for i in sel_})):
+                    ks = [j for j, i in enumerate(sel_) if op in ("all", i["op"])]
+                    cell(name, tg, op, [float(pred_[j] == sel_[j]["gold"]) for j in ks],
+                         [f"{sel_[j]['context_a']}|{sel_[j]['context_b']}" for j in ks],
+                         {"pred": dict(collections.Counter(str(pred_[j]) for j in ks)), "coverage": round(len(sel_) / len(its_), 3)})
         f = d / "o2.jsonl"
         if f.exists():
             got = {r["item"]: r for r in jl(f)}

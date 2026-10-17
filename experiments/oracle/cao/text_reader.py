@@ -772,16 +772,21 @@ def strip_read(text: str) -> str:
 EXCLUDED = HOME / "mpd-data/oracle/data/excluded_task_keys.json"  # O1 dev and testset_8b task/keys (oracledata)
 
 
+PAIRS_MANIFEST = HOME / "mpd-data/oracle/data/pairs/v1/manifest.json"  # the paired set's test and dev families
+
+
 def sealed(cid: str) -> bool:
     """Never trained on (records beyond rc's pool: train8b and later): the scorecard's sealed contexts
-    (crc32("scorecard:" + id) % 20 == 0) and the excluded task/keys."""
+    (crc32("scorecard:" + id) % 20 == 0), the excluded task/keys and the paired set's test and dev families."""
     import zlib
 
     if zlib.crc32(("scorecard:" + cid).encode()) % 20 == 0:
         return True
     if not hasattr(sealed, "keys"):
         sealed.keys = set(json.loads(EXCLUDED.read_text())) if EXCLUDED.exists() else set()
-    return cid.rsplit("/", 1)[0] in sealed.keys
+        fam = json.loads(PAIRS_MANIFEST.read_text()).get("families", {}) if PAIRS_MANIFEST.exists() else {}
+        sealed.families = {f for f, s in fam.items() if s in ("test", "dev")}
+    return cid.rsplit("/", 1)[0] in sealed.keys or cid.split("/", 1)[0] in sealed.families
 
 
 def rows(a) -> None:
@@ -799,7 +804,11 @@ def rows(a) -> None:
         train += more
     n0 = len(train)
     pool = {e["id"] for e in load_rc(a.rc)[0]}  # rc's training contexts: the scorecard's sanctioned pool; the rule binds the rest
-    train = [e for e in train if e["id"] in pool or not sealed(e["id"])]
+    paired = set()  # every frozen paired-test context, never trained on even from rc's pool
+    o1p = HOME / "mpd-data/oracle/scorecard/items/o1_pairs.jsonl"
+    if o1p.exists():
+        paired = {json.loads(x)[k] for x in o1p.read_text().splitlines() for k in ("context_a", "context_b")}
+    train = [e for e in train if e["id"] not in paired and (e["id"] in pool or not sealed(e["id"]))]
     print(json.dumps({"training questions dropped as sealed or excluded": n0 - len(train)}))
     if a.balance:
         rng = random.Random(0)

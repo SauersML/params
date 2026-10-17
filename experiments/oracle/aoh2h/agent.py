@@ -1262,7 +1262,7 @@ class Tools:
             self.pass_s = (time.perf_counter() - t0) / 5
         return max(1, math.ceil(seconds / self.pass_s))
 
-    def t_find_circuit(self, ep, it, text, corrupt_text, prefill=None, chat=True, top=12, cuts="movers,source"):
+    def t_find_circuit(self, ep, it, text, corrupt_text, prefill=None, chat=True, top=12, cuts="movers,source", search="am"):
         """circuit_finder's circuit of a patching pair (method/oracle/circuit_finder.py: necessity and sufficiency of
         each cut measured by patching between the two runs), charged by its seconds in plain passes."""
         sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "method" / "oracle"))
@@ -1280,9 +1280,13 @@ class Tools:
         if not want or set(want) - {"readout", "movers", "source"}:
             raise Refused("cuts: some of readout, movers, source")
         t0 = time.perf_counter()
+        log = lambda m: print(f"[find_circuit {time.perf_counter() - t0:7.1f}s] {m}", flush=True)  # noqa: E731
         with self.model_of(it):
-            rec = cf.find(cf.Patcher(self.tg.m, self.tok), clean, corrupt, cuts_wanted=want,
-                          log=lambda m: print(f"[find_circuit {time.perf_counter() - t0:7.1f}s] {m}", flush=True))
+            if search == "group":  # (circuit_finder's group testing, the cuts asked for)
+                rec = cf.find(cf.Patcher(self.tg.m, self.tok), clean, corrupt, cuts_wanted=want, log=log)
+            else:  # searchalgo's attribution order with measured acceptance, masks on the cuts it leaves unmet (every cut)
+                import circuit_masks as cm
+                rec = cm.find(cf.Patcher(self.tg.m, self.tok), clean, corrupt, log=log, arm=search)
         cost = self.find_cost(time.perf_counter() - t0)
         ep.setdefault("find_passes", []).append(cost)  # (the call's full equivalent, beyond what is left)
         self.charge(ep, min(cost, ep["budget"] - ep["passes"]))
@@ -1456,9 +1460,7 @@ TOOL_DOCS = {  # (<MODEL>, <LENS>, <AO>, <MID>, <REMOVE_MAX> filled from the ser
                        "steps x (3 + batch) passes."),
     "score": ("score(continuation, text=None, chat=None, prefill=None) -> the log probability (bits) of a continuation "
               "(up to 32 tokens) after the text, and each token's probability and rank. 1 pass."),
-    "find_circuit": ("find_circuit(text, corrupt_text, prefill=None, top=12, cuts=\"movers,source\") -> the circuit of a "
-                     "patching pair (cuts: some of readout, movers, source; an organism's readout can span thousands of "
-                     "neurons and take minutes): two chat "
+    "find_circuit": ("find_circuit(text, corrupt_text, prefill=None, top=12) -> the circuit of a patching pair: two chat "
                      "prompts of the same token count differing in a few words (with the same prefill), the model's "
                      "answer at the next token on each, and the units carrying the difference, every one measured by "
                      "patching between the two runs: the readout neurons at the answer position, the mover heads there "

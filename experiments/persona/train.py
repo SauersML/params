@@ -157,6 +157,7 @@ def main():
     ap.add_argument("--save-steps", default="", help="comma-separated extra steps to save at (the early curve)")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--device", default="cuda")
+    ap.add_argument("--init", default=None, help="a neurons arm (arms.py format) to start from instead of zero")
     ap.add_argument("--dtype", default="bfloat16", help="the frozen weights' dtype (float32 for a CPU smoke test)")
     a = ap.parse_args()
     torch.manual_seed(a.seed)
@@ -170,6 +171,14 @@ def main():
     if a.arm == "neurons":
         units = json.loads(Path(a.units).read_text())["units"]
         params, state = setup_neurons(model, units)
+        if a.init:                                  # (continue an earlier run of the same units)
+            init = arms.load(a.init)["layers"]
+            for l, mod in ((int(k), v) for k, v in init.items()):
+                m = model.model.layers[l].mlp
+                assert m.idx.tolist() == mod["idx"].tolist(), f"layer {l}: --init has other neurons"
+                m.gate.data.copy_(mod["gate"])
+                m.up.data.copy_(mod["up"])
+                m.down.data.copy_(mod["down"])
     else:
         L = model.config.num_hidden_layers
         lo, hi = map(int, a.lora_layers.split("-")) if a.lora_layers else (0, L - 1)

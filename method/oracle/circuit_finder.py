@@ -1636,16 +1636,29 @@ def main():
             first = False
         if batched:
             import circuit_masks
-            log(" ".join(x[0] for x in chunk))
-            pts = [pt] + [Patcher(model, tok, rows=a.rows) for _ in chunk[1:]]
-            parts = [[(Patcher(model, tok, rows=a.rows), ids) for ids in x[3].get("partners") or [] if len(ids) == len(x[1])]
-                     for x in chunk]
-            recs = circuit_masks.find_batch(pts, [(x[1], x[2], x[3].get("answers")) for x in chunk], log=log, partners=parts,
-                                            cuts_wanted=tuple(a.cuts.split(",")), arm=a.arm)
-            del pts, parts                            # (the batch's Patchers' runs before the edges: on Qwen3-14B with 8
-            import gc                                 # pairs they held 13 GB and every record's edge stage ran out of memory
-            gc.collect()                              # on a 48 GB card)
-            torch.cuda.empty_cache()
+            import gc
+
+            def batch(chunk):                         # (a batch out of memory halved and tried again, down to one pair:
+                log(" ".join(x[0] for x in chunk))    # Qwen3-14B on a 48 GB card ran out at 8 and at 4 pairs)
+                pts = [pt] + [Patcher(model, tok, rows=a.rows) for _ in chunk[1:]]
+                parts = [[(Patcher(model, tok, rows=a.rows), ids) for ids in x[3].get("partners") or []
+                          if len(ids) == len(x[1])] for x in chunk]
+                try:
+                    return circuit_masks.find_batch(pts, [(x[1], x[2], x[3].get("answers")) for x in chunk], log=log,
+                                                    partners=parts, cuts_wanted=tuple(a.cuts.split(",")), arm=a.arm)
+                except torch.OutOfMemoryError:
+                    if len(chunk) == 1:
+                        raise
+                    oom = True
+                finally:                              # (the batch's Patchers' runs before the edges: on Qwen3-14B with 8
+                    del pts, parts                    # pairs they held 13 GB and every record's edge stage ran out of
+                    gc.collect()                      # memory on a 48 GB card)
+                    torch.cuda.empty_cache()
+                if oom:
+                    h = len(chunk) // 2
+                    log(f"  out of memory at {len(chunk)} pairs: {h} and {len(chunk) - h}")
+                    return batch(chunk[:h]) + batch(chunk[h:])
+            recs = batch(chunk)
         else:
             qid, clean, corrupt, extra, _ = chunk[0]
             log(f"{qid}")

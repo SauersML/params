@@ -219,17 +219,19 @@ class Runner:
             k = f(at.k_norm, f(at.k_proj, hn).view(K, Ts, KV, hd)).transpose(1, 2)
             v = f(at.v_proj, hn).view(K, Ts, KV, hd).transpose(1, 2)
             q, k = q * cs + rotate_half(q) * sn, k * cs + rotate_half(k) * sn
-            for kind in ("kv_in", "q_in"):  # (every head's key and value, or query, at pos from its input less delta)
-                for b, p, delta in E.get(kind, {}).get(L, []):
-                    hp = f(layer.input_layernorm, (x[b, p - s0] - delta.to(d))[None])
-                    c_, s_ = cs[p - s0], sn[p - s0]
+            for kind in ("kv_in", "q_in"):  # (every head's key and value, or query, at pos from its input less delta;
+                its = E.get(kind, {}).get(L, [])   # each edit kind a layer one batched op: an op an item launched
+                if its:                            # thousands of kernels a forward)
+                    bs, ps = self._ix([(b, p - s0) for b, p, _ in its], d)
+                    hp = f(layer.input_layernorm, x[bs, ps] - torch.stack([e[2].to(d) for e in its]))
+                    c_, s_ = cs[ps][:, None], sn[ps][:, None]
                     if kind == "kv_in":
-                        kp = f(at.k_norm, f(at.k_proj, hp).view(KV, hd))
-                        k[b, :, p - s0] = kp * c_ + rotate_half(kp) * s_
-                        v[b, :, p - s0] = f(at.v_proj, hp).view(KV, hd)
+                        kp = f(at.k_norm, f(at.k_proj, hp).view(-1, KV, hd))
+                        k[bs, :, ps] = kp * c_ + rotate_half(kp) * s_
+                        v[bs, :, ps] = f(at.v_proj, hp).view(-1, KV, hd)
                     else:
-                        qp = f(at.q_norm, f(at.q_proj, hp).view(H, hd))
-                        q[b, :, p - s0] = qp * c_ + rotate_half(qp) * s_
+                        qp = f(at.q_norm, f(at.q_proj, hp).view(-1, H, hd))
+                        q[bs, :, ps] = qp * c_ + rotate_half(qp) * s_
             kf, vf = k, v
             if s0:                                  # every key and value: the unedited run's before s0
                 bk, bv = self._base[tuple(ids)]["k"], self._base[tuple(ids)]["v"]
@@ -237,16 +239,21 @@ class Runner:
                 vf = torch.cat([bv[L][:, :s0].to(d)[None].expand(K, -1, -1, -1), v], 2)
             kh, vh = repeat_kv(kf, H // KV), repeat_kv(vf, H // KV)
             for kind, t, o in (("dq", q, s0), ("dk", kh, 0), ("dv", vh, 0)):   # (q holds the positions from s0; keys
-                for b, h, p, delta in E.get(kind, {}).get(L, []):              # and values every position)
-                    t[b, h, p - o] += delta.to(d, t.dtype)
+                its = E.get(kind, {}).get(L, [])                                # and values every position)
+                if its:
+                    t.index_put_(self._ix([(b, h, p - o) for b, h, p, _ in its], d),
+                                 torch.stack([e[3].to(d, t.dtype) for e in its]), accumulate=True)
             lg = (q @ kh.transpose(-1, -2)) * at.scaling
             lg = lg.masked_fill(~torch.ones(T, T, dtype=torch.bool, device=d).tril()[s0:], float("-inf"))
-            for b, h, qq, p in E.get("knock", {}).get(L, []):
-                lg[b, h, qq - s0, p] = float("-inf")
+            its = E.get("knock", {}).get(L, [])
+            if its:
+                lg[self._ix([(b, h, qq - s0, p) for b, h, qq, p in its], d)] = float("-inf")
             A = lg.softmax(-1)
             z = (A @ vh).transpose(1, 2)  # [K, Ts, H, hd]
-            for b, h, p, val in E.get("head", {}).get(L, []):
-                z[b, p - s0, h] = 0.0 if val is None else val.to(d, z.dtype)
+            its = E.get("head", {}).get(L, [])
+            if its:
+                z[self._ix([(b, p - s0, h) for b, h, p, _ in its], d)] = torch.stack(
+                    [torch.zeros(hd, device=d) if e[3] is None else e[3].to(d, z.dtype) for e in its])
             if probe is not None:
                 z = z + probe["z"][L]
             if capture:
@@ -255,12 +262,18 @@ class Runner:
                     st[key].append(val.detach().clone())
             x = x + f(at.o_proj, z.reshape(K, Ts, H * hd))
             hm = self._acts(layer, x)
-            for b, p, delta in E.get("mlp_in", {}).get(L, []):
-                hm[b, p - s0] = self._acts(layer, (x[b, p - s0] - delta.to(d))[None])[0]
-            for b, p, j, delta in E.get("read", {}).get(L, []):
-                hm[b, p - s0, j] = self._acts(layer, (x[b, p - s0] - delta.to(d))[None], [j])[0, 0]
-            for b, p, j, val in E.get("neuron", {}).get(L, []):
-                hm[b, p - s0, j] = float(val)
+            its = E.get("mlp_in", {}).get(L, [])
+            if its:
+                bs, ps = self._ix([(b, p - s0) for b, p, _ in its], d)
+                hm[bs, ps] = self._acts(layer, x[bs, ps] - torch.stack([e[2].to(d) for e in its]))
+            its = E.get("read", {}).get(L, [])
+            if its:
+                bs, ps, js = self._ix([(b, p - s0, j) for b, p, j, _ in its], d)
+                hm[bs, ps, js] = self._acts(layer, x[bs, ps] - torch.stack([e[3].to(d) for e in its]), js, rows=True)
+            its = E.get("neuron", {}).get(L, [])
+            if its:
+                hm[self._ix([(b, p - s0, j) for b, p, j, _ in its], d)] = torch.tensor([float(e[3]) for e in its],
+                                                                                      device=d, dtype=hm.dtype)
             if probe is not None:
                 hm = hm + probe["h"][L]
             for w, (Lw, p, j) in enumerate(watch):
@@ -284,15 +297,22 @@ class Runner:
         lp = torch.log_softmax(f(core.lm_head, hn), -1).cpu() if capture or self.answer is None else None
         return {"lp": lp, "contrast": con, "states": st, "watch": seen}
 
-    def _acts(self, layer, x: torch.Tensor, js: list[int] | None = None) -> torch.Tensor:
+    @staticmethod
+    def _ix(rows: list[tuple], dev) -> tuple:
+        """Integer tuples as one index tensor per field on a card."""
+        return tuple(torch.tensor(rows, dtype=torch.long).to(dev).T)
+
+    def _acts(self, layer, x: torch.Tensor, js=None, rows: bool = False) -> torch.Tensor:
         """Neurons from the stream after attention x [..., d]: act(gate(norm x)) * up(norm x), float32 (js: only those,
-        from the weights' rows)."""
+        from the weights' rows; rows: x [n, d] and js [n], each row's own neuron [n])."""
         if js is None:
             n = self._f(layer.post_attention_layernorm, x)
             return layer.mlp.act_fn(self._f(layer.mlp.gate_proj, n)) * self._f(layer.mlp.up_proj, n)
         ln = layer.post_attention_layernorm
         n = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + ln.variance_epsilon) * ln.weight.float().to(x.device)
         wg, wu = weight(layer.mlp.gate_proj)[js].float().to(x.device), weight(layer.mlp.up_proj)[js].float().to(x.device)
+        if rows:
+            return layer.mlp.act_fn((n * wg).sum(-1)) * (n * wu).sum(-1)
         return layer.mlp.act_fn(n @ wg.T) * (n @ wu.T)
 
     # -- local measurements on captured states ---------------------------------------------------------------------

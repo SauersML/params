@@ -937,7 +937,7 @@ class Tools:
             tok.padding_side = side
         return out
 
-    def answer_kl(self, it, users: list[str], answers: list[str], hooks, bs: int = 8, max_answer: int = GEN_CALL_MAX) -> float:
+    def answer_kl(self, it, users: list[str], answers: list[str], hooks, bs: int = 4, max_answer: int = GEN_CALL_MAX) -> float:
         """Mean KL (bits per answer token) of the edited item model's next-token distribution from the unedited one's,
         teacher-forced on the unedited model's own answers."""
         torch, tok = self.torch, self.tok
@@ -956,10 +956,12 @@ class Tools:
             for j, (a0, a1) in enumerate(spans):
                 mask[j, a0:a1] = True
             att = (torch.arange(T, device=self.tg.dev)[None] < torch.tensor([len(s_) for s_ in seqs], device=self.tg.dev)[:, None]).long()
+            keep = torch.arange(min(a0 for a0, _ in spans), T, device=self.tg.dev)  # (the logits of answer positions only:
+            mask = mask[:, keep]  # 10-16, eight full float32 vocabularies a row ran an A40 beside vLLM out of memory)
             with self.lock, self.model_of(it), torch.no_grad():
-                lp = torch.log_softmax(self.tg.m(input_ids=x, attention_mask=att).logits.float(), -1)
+                lp = torch.log_softmax(self.tg.m(input_ids=x, attention_mask=att, logits_to_keep=keep).logits.float(), -1)
                 with hooked(hooks):
-                    lq = torch.log_softmax(self.tg.m(input_ids=x, attention_mask=att).logits.float(), -1)
+                    lq = torch.log_softmax(self.tg.m(input_ids=x, attention_mask=att, logits_to_keep=keep).logits.float(), -1)
             kl = ((lp.exp() * (lp - lq)).sum(-1) / math.log(2)).clamp_min(0)
             tot += float(kl[mask].sum())
             n += int(mask.sum())

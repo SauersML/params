@@ -23,7 +23,10 @@ Arms on one question set, same card, same records (searchalgo's comparison):
          attr's order
 A cut's hinge targets are TAU or 0.05 under its ceiling (at least its bar + 0.05), per share; its sets are taken at its bar
 (PASS plus, under FLOOR, the probed noise of reduced precision).
-Multi-source masks (methods, 10-16; constants an arm sets, mask:30:partners=8:allcuts=1:pairwise=1:warm=0.5):
+Multi-source masks (methods, 10-16; constants an arm sets, mask:30:partners=8:allcuts=1:pairwise=1:warm=0.5). Since
+10-17 ALLCUTS, PAIRWISE and AGG "min" are the defaults and the command line takes 8 pairs from --pool (trainset_8b): on
+Qwen3-8B (devset_8b stride 4, pod circ-methods-m4) unseen pairs pass 36/45 against 13/45 for the question's own pair alone,
+own pairs 49/50, 31 units (the lead's 10-17 decision: the default for generalizing circuits):
   ALLCUTS   every cut, not only the source, is chosen and verified on the shares over the question's pair and its
             partners (Mean): interchange interventions from several keys, so a cut that only separates the two given
             keys does not pass
@@ -56,6 +59,8 @@ import json
 import math
 import time
 import zlib
+from pathlib import Path
+
 from pathlib import Path
 
 import numpy as np
@@ -119,15 +124,16 @@ PRUNE_ALONE = 1     # 1: pruning's candidates are the units whose removal alone 
 # rule); 0: every unit is a candidate and its own trial decides (a set taken differs only where removals interact). The
 # leave-one-out sets were 37% of an am question's measured token-forwards (Qwen3-0.6B trace, capital/Japan/p1)
 PRUNE_WINDOW = 16   # a pruning round's candidates at first (prune_steps; four times more after a round that settles all)
-ALLCUTS = 0         # 1: partners for every cut (module docstring)
-PAIRWISE = 0        # 1: hinges per pair
+POOL = Path.home() / "mpd-data" / "circuits" / "trainset_8b.json"   # (the command line's default --pool)
+ALLCUTS = 1         # partners for every cut (module docstring); 0: the source cut only
+PAIRWISE = 1        # hinges per pair; 0: on the pairs' mean shares
 WARM = 0.0          # > 0: attribution start, theta = INIT + WARM * ln(score / max score)
 WARM_MIN = -2.0     # sigmoid(-2) = 0.12: the start of units the attribution gives nothing
 ADV = 0.0           # > 0: the adversary's step on rho during the descent (module docstring)
 ADV_CHECK = 0       # > 0: steps of the measured adversarial check of each verified set
 ADV_STEP = 0.25     # the check's step on rho
 ADV_MODES = "unit"  # the check's adversaries joined by "+": unit, block, random (optimize_many's mode; adv_modes=block+random)
-AGG = "mean"        # a Mean's shares: "mean" over its pairs, or "min" (agg=min: a set passes only when every pair does)
+AGG = "min"         # a Mean's shares: "min", the least over its pairs (a set passes only when every pair does), or "mean"
 SOURCE_NECESSITY = 1  # 0: the source cut is chosen and taken on its restored share only (no lost hinge, no lost bar):
                       # a small set of a redundantly carried key is sufficient, not necessary (design 11a)
 
@@ -1087,8 +1093,8 @@ def main():
     ap.add_argument("--steps", type=int, default=STEPS)
     ap.add_argument("--cuts", default="readout,movers,source", help="the cuts searched (circuit_finder's --cuts; "
                     "oracleagent's find_circuit: movers,source)")
-    ap.add_argument("--partners", type=int, default=1, help="pairs a source cut is chosen over: the question's own and up "
-                    "to PARTNERS - 1 other corrupted keys of its partners (prompts of its length), on the shares' means")
+    ap.add_argument("--partners", type=int, default=8, help="pairs every cut is chosen over (ALLCUTS, PAIRWISE, AGG): the "
+                    "question's own and up to PARTNERS - 1 other corrupted keys (--pool's, else its partners'); 1: its own pair")
     ap.add_argument("--batch", type=int, default=1, help="mask and am: pairs whose masks are optimized in one batch "
                     "(find_batch; a record's seconds the batch's wall time over its pairs)")
     ap.add_argument("--limit", type=int, default=0)
@@ -1100,8 +1106,9 @@ def main():
     ap.add_argument("--unions", default="auto", help="circuit_union's mover unions (JSON; auto: UNIONS for UNIONS_MODEL; none: "
                     "off): each question's mover cut is its "
                     "template's union, whole, when that passes on the pair (search_all's family; FAMILY_MIN_KEYS, FAMILY_FREQ)")
-    ap.add_argument("--pool", default=None, help="partner keys from this question set's keys of the question's task, in a "
-                    "seeded order per question, instead of the question's own partners (left for unseen-pair tests)")
+    ap.add_argument("--pool", default=str(POOL) if POOL.exists() else None, help="partner keys from this question set's "
+                    "keys of the question's task, in a seeded order per question, instead of the question's own partners (left "
+                    "for unseen-pair tests); default trainset_8b.json when present; '' for the question's own partners")
     a = ap.parse_args()
     unions = (default_unions(a.model) if a.unions == "auto" else None if a.unions == "none"
               else json.loads(Path(a.unions).read_text()))

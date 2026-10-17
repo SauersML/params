@@ -47,6 +47,7 @@ def test_pairwise_equals_mean_hinge_with_one_pair(tiny, monkeypatch):
     pt = cf.Patcher(model, None, rows=8)
     pt.setup(clean, corrupts[0])
     spec = cm.cuts_of(pt)["readout"]
+    monkeypatch.setattr(cm, "PAIRWISE", 0)
     a = cm.optimize(pt, [spec], steps=3)[0]["theta"]["neuron"]
     monkeypatch.setattr(cm, "PAIRWISE", 1)
     b = cm.optimize(pt, [spec], steps=3)[0]["theta"]["neuron"]
@@ -58,6 +59,7 @@ def test_allcuts_and_warm(tiny, monkeypatch):
     pts = [cf.Patcher(model, None, rows=8) for _ in corrupts]
     for p, c in zip(pts, corrupts):
         p.setup(clean, c)
+    monkeypatch.setattr(cm, "ALLCUTS", 0)
     st = cm._before(pts[0], "mask", partners=pts[1:])
     assert isinstance(st["meas"]["source"], cm.Mean) and all(st["meas"][n] is pts[0] for n in st["names"] if n != "source")
     assert st["warm"] == {}
@@ -280,6 +282,7 @@ def test_agg_min(tiny, monkeypatch):
     m = cm.Mean(pts)
     sets = [[("neuron", 1, pts[0].T - 1, k) for k in range(8)], [("head", 1, h, pts[0].T - 1) for h in range(2)]]
     each = [p.both(sets) for p in pts]
+    monkeypatch.setattr(cm, "AGG", "mean")
     mean = cm.drive(pts, [(lambda: (yield (m, "both", sets)))()])[0]
     monkeypatch.setattr(cm, "AGG", "min")
     low = cm.drive(pts, [(lambda: (yield (m, "both", sets)))()])[0]
@@ -421,3 +424,10 @@ def test_graph_find_batch_with_partners_equals_eager(tiny, monkeypatch, allcuts)
         assert [(n["layer"], n["pos"], n["neuron"]) for n in a["nodes"]] == [(n["layer"], n["pos"], n["neuron"]) for n in b["nodes"]]
         for n in a["cuts"]:
             assert abs(a["cuts"][n]["lost"] - b["cuts"][n]["lost"]) < 1e-3 and abs(a["cuts"][n]["restored"] - b["cuts"][n]["restored"]) < 1e-3
+
+
+def test_generalizing_defaults():
+    """The default for generalizing circuits (the lead's 10-17 decision): every cut on the pairs, hinges per pair, a set
+    taken only when every pair passes; the command line's default pool is trainset_8b."""
+    assert cm.ALLCUTS == 1 and cm.PAIRWISE == 1 and cm.AGG == "min"
+    assert cm.POOL.name == "trainset_8b.json"

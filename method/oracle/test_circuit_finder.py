@@ -563,3 +563,81 @@ def test_both_without_equals_its_sets(tiny):
     for a, b in zip(got, want):
         assert abs(a[0] - b[0]) < 1e-5 and abs(a[1] - b[1]) < 1e-5
     assert pt.both_without(units, [3, 0]) == [got[3], got[0]]
+
+
+def _random_units(pt, g, n):
+    units = []
+    for _ in range(n):
+        i, p = int(torch.randint(pt.L, (1,), generator=g)), int(torch.randint(pt.T, (1,), generator=g))
+        units.append(("neuron", i, p, int(torch.randint(pt.D, (1,), generator=g))) if torch.rand(1, generator=g) < 0.7 else
+                     ("head", i, int(torch.randint(pt.H, (1,), generator=g)), p))
+    return units
+
+
+def test_prefixes_with_drops_equal_their_sets(tiny):
+    """both_prefixes(units, ks, drops): each prefix with one place left out (inside it, past it, at any length), as the
+    sets themselves measure."""
+    pt, clean, corrupt = tiny
+    pt.setup(clean, corrupt)
+    units = _random_units(pt, torch.Generator().manual_seed(11), 20)
+    ks, drops = [20, 20, 7, 7, 13, 0, 1, 20], [0, 19, 3, 7, 12, 0, 0, 25]
+    got = pt.both_prefixes(units, ks, drops)
+    want = pt.both([[u for i, u in enumerate(units[:k]) if i != d] for k, d in zip(ks, drops)])
+    for a, b in zip(got, want):
+        assert abs(a[0] - b[0]) < 1e-5 and abs(a[1] - b[1]) < 1e-5
+
+
+def test_group_serve_equals_alone(tiny):
+    """Group.serve(): plain sets, prefixes and prefixes with drops of several members in merged batches give each
+    member's own calls (its shares by its own contrast and gap)."""
+    pt, clean, corrupt = tiny
+    corrupts = [corrupt, [(c + 5) % 64 if i == 6 else c for i, c in enumerate(corrupt)]]
+    g = torch.Generator().manual_seed(13)
+    orders = [_random_units(pt, g, 24) for _ in corrupts]
+    pts = [cf.Patcher(pt.model, None, rows=pt.rows) for _ in corrupts]
+    for p_, x in zip(pts, corrupts):
+        p_.setup(clean, x)
+    ks, drops = [24, 5, 24, 11], [24, 9, 3, 2]
+    want = [(p_.both_prefixes(u, ks), p_.both_prefixes(u, ks, drops), [tuple(v) for v in p_.both([u[:4], u[5:9]])],
+             [v[0] for v in p_._measure([u[:6]], ("corrupt",))]) for p_, u in zip(pts, orders)]
+    calls = []
+    for p_, u in zip(pts, orders):
+        calls += [("prefix", p_, p_._arrays(u), ks, ("clean", "corrupt"), None),
+                  ("prefix", p_, p_._arrays(u), ks, ("clean", "corrupt"), drops),
+                  ("plain", p_, [u[:4], u[5:9]], ("clean", "corrupt"), None),
+                  ("plain", p_, [u[:6]], ("corrupt",), None)]
+    got = cf.Group(pts).serve(calls)
+    for m, w in enumerate(want):
+        for c in range(4):
+            a, b = got[4 * m + c], w[c]
+            a = [v[0] for v in a] if c == 3 else [tuple(v) for v in a]
+            assert len(a) == len(b)
+            for x, y in zip(a, b):
+                x, y = (x, y) if c != 3 else ((x,), (y,))
+                assert all(abs(p - q) < 1e-5 for p, q in zip(x, y))
+
+
+def test_scores_many_equals_each_pairs_own(tiny):
+    """scores_many(): pairs' base runs in one forward and backward give each pair's scores as computed from its own two
+    rows (each direction's patch difference times its base run's gradient of the contrast, the larger magnitude)."""
+    pt, clean, corrupt = tiny
+    corrupts = [corrupt, [(c + 5) % 64 if i == 6 else c for i, c in enumerate(corrupt)]]
+    pts = [cf.Patcher(pt.model, None, rows=pt.rows) for _ in corrupts]
+    for p_, x in zip(pts, corrupts):
+        p_.setup(clean, x)
+    got = cf.scores_many(pts)
+    for p_, sc in zip(pts, got):
+        add = {"head": [torch.zeros(2, p_.T, p_.H * p_.hd, requires_grad=True) for _ in p_.layers],
+               "neu": [torch.zeros(2, p_.T, p_.D, requires_grad=True) for _ in p_.layers]}
+        x = torch.stack([p_._ids_dev["clean"], p_._ids_dev["corrupt"]])
+        with torch.enable_grad(), cf._relp(p_.core):
+            p_._contrast(p_._last(x, 2, add=add)).sum().backward()
+        for k, key in (("head", "head"), ("neu", "neuron")):
+            best = None
+            for j, (base, src) in enumerate((("clean", "corrupt"), ("corrupt", "clean"))):
+                s = torch.stack([(p_.act[src][k][i].float() - p_.act[base][k][i].float()) * add[k][i].grad[j].float()
+                                 for i in range(p_.L)])
+                if k == "head":
+                    s = s.reshape(p_.L, p_.T, p_.H, p_.hd).sum(-1)
+                best = s.abs() if best is None else torch.maximum(best, s.abs())
+            assert sc[key].shape == best.shape and torch.allclose(sc[key], best, atol=1e-5, rtol=1e-4)

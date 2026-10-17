@@ -88,6 +88,82 @@ def test_find_multi_source(tiny, monkeypatch):
             assert c["lost"] >= cf.PASS and c["restored"] >= cf.PASS
 
 
+def _one_at_a_time(pt, circ):
+    """circuit_finder.cut's pruning rule, one trial a measurement: each unit whose removal alone passes, from the last,
+    removed while the set without it passes."""
+    passes = lambda r: r[0] >= cf.PASS and r[1] >= cf.PASS  # noqa: E731
+    alone = pt.both([[v for v in circ if v != u] for u in circ])
+    keep = list(circ)
+    for u in [u for u, r in zip(circ, alone) if passes(r)][::-1]:
+        trial = [v for v in keep if v != u]
+        if passes(pt.both([trial])[0]):
+            keep = trial
+    return keep
+
+
+def _passing(pt):
+    """An attribution order of one of pt's cuts and its smallest passing prefix (None: no cut has one)."""
+    passes = lambda r: r[0] >= cf.PASS and r[1] >= cf.PASS  # noqa: E731
+    sc = cf.Patcher.scores(pt)
+    for spec in cm.cuts_of(pt).values():
+        order = cm.attr_order(pt, spec, sc)
+        ks = list(range(1, len(order) + 1))
+        k = next((k for k, r in zip(ks, pt.both_prefixes(order, ks)) if passes(r)), None)
+        if k:
+            return order, k
+    return None, None
+
+
+@pytest.mark.parametrize("window", [1, 2, 16])
+def test_prune_equals_one_at_a_time(tiny, monkeypatch, window):
+    """prune(): the windowed rounds (cumulative and single trials) remove exactly the units the one-at-a-time rule does."""
+    model, clean, corrupts = tiny
+    monkeypatch.setattr(cm, "PRUNE_WINDOW", window)
+    pt = cf.Patcher(model, None, rows=8)
+    n = 0
+    for c in corrupts:
+        pt.setup(clean, c)
+        order, k = _passing(pt)
+        if k is None:
+            continue
+        circ = list(order[:min(len(order), 8 * k)])           # (a passing set with units to spare)
+        got = cm.prune(pt, circ)
+        assert got == _one_at_a_time(pt, circ) and len(got) < len(circ)
+        n += 1
+    if not n:
+        pytest.skip("no passing prefix")
+
+
+def test_verify_diffuse_above_prune_max(tiny, monkeypatch):
+    """A passing prefix of more than PRUNE_MAX units is a diffuse cut: no units, its prefix's size and shares."""
+    model, clean, corrupts = tiny
+    pt = cf.Patcher(model, None, rows=8)
+    pt.setup(clean, corrupts[0])
+    order, k = _passing(pt)
+    if k is None or k < 2:
+        pytest.skip("no passing prefix of two or more units")
+    monkeypatch.setattr(cm, "PRUNE_MAX", k - 1)
+    d = cm.verify(pt, order)
+    assert d["diffuse"] and not d["met"] and d["units"] == [] and d["spread"]["units"] == k
+    assert d["lost"] >= cf.PASS and d["restored"] >= cf.PASS
+
+
+@pytest.mark.parametrize("arm", ["am", "mask"])
+def test_find_batch_equals_find(tiny, arm):
+    """find_batch (pairs of one prompt length in lockstep, their masks in one batch) gives each pair's find() record:
+    the same cuts, units and shares (float32)."""
+    model, clean, corrupts = tiny
+    alone = [cm.find(cf.Patcher(model, None, rows=8), clean, c, arm=arm, steps=3) for c in corrupts]
+    pts = [cf.Patcher(model, None, rows=8) for _ in corrupts]
+    batch = cm.find_batch(pts, [(clean, c, None) for c in corrupts], arm=arm, steps=3)
+    for a, b in zip(alone, batch):
+        assert set(a["cuts"]) == set(b["cuts"])
+        assert [(n["layer"], n["pos"], n["neuron"]) for n in a["nodes"]] == [(n["layer"], n["pos"], n["neuron"]) for n in b["nodes"]]
+        assert [(r["layer"], r["head"]) for r in a["routes"]] == [(r["layer"], r["head"]) for r in b["routes"]]
+        for n in a["cuts"]:
+            x, y = a["cuts"][n], b["cuts"][n]
+            assert x["met"] == y["met"] and abs(x["lost"] - y["lost"]) < 1e-4 and abs(x["restored"] - y["restored"]) < 1e-4
+
 def test_adversary(tiny, monkeypatch):
     """The adversary moves only units outside the set: against every unit of a cut it has nothing to move (its worst step
     is the unmoved shares), its rho stays in [0, 1], and freeze leaves theta where it started."""

@@ -65,6 +65,11 @@ ORDER_MAX = 20000
 MASK_TOKENS = 1536   # rows x positions a mask step runs at most off CUDA (find_batch's parts; on CUDA _budget's)
 MASK_MEMORY = 0.5    # the share of free device memory a mask step's activations may take
 ROUNDS = 4          # rounds of STEPS a cut's masks get while its order cannot pass (each round from the last's theta)
+PRUNE_MAX = 4 * cf.SINGLES_KEPT   # a passing prefix of more units than this is a diffuse cut, not pruned: its size, shares
+# and curve recorded, no units (circuit_finder's DENSE rule). Qwen3-8B dev set (A6000, am, 153 questions): 13 readout
+# prefixes of 1,060-19,980 units took 13-1,930 s each to prune one unit at a time (the set's leave-one-out sets and a
+# round per unit that stays), to 120-11,812 units (2 of them to SINGLES_KEPT or fewer); median question 1.7 s, mean 24 s
+PRUNE_WINDOW = 16   # a pruning round's candidates at first (prune_steps; four times more after a round that settles all)
 ALLCUTS = 0         # 1: partners for every cut (module docstring)
 PAIRWISE = 0        # 1: hinges per pair
 WARM = 0.0          # > 0: attribution start, theta = INIT + WARM * ln(score / max score)
@@ -251,13 +256,20 @@ def ordered(spec: dict, theta: dict) -> tuple:
     return units, kept
 
 
-def verify(pt, order: list, log=None, name: str = "") -> dict:
-    """circuit_finder.cut's measured steps on a proposed order: the smallest passing prefix (grid, bisection to 32 sizes
-    between the last failing size and the first passing one, then those in one batch), then units removed one at a time
-    while it passes (prune); each unit's shares alone."""
+def verify(meas, order: list, log=None, name: str = "") -> dict:
+    """circuit_finder.cut's measured steps on a proposed order (verify_steps, by its measurer alone)."""
+    return drive(_pts(meas), [verify_steps(meas, order, log=log, name=name)])[0]
+
+
+def verify_steps(meas, order: list, log=None, name: str = ""):
+    """verify as a search (drive's generator: it yields its measurements, (meas, method, *args)): the smallest passing
+    prefix (grid, bisection to 32 sizes between the last failing size and the first passing one, then those in one
+    batch); a prefix of more than PRUNE_MAX units is a diffuse cut (its size, shares and curve, no units); else units
+    removed one at a time while it passes (prune_steps); each unit's shares alone."""
     passes = lambda r: r[0] >= cf.PASS and r[1] >= cf.PASS  # noqa: E731
     g = cf.grid(len(order))                        # (prefixes of order: Patcher.both_prefixes, no set built per unit)
-    got = pt.both_prefixes(order, g)
+    got = yield (meas, "both_prefixes", order, g)
+    at = dict(zip(g, got))
     met = [k for k, r in zip(g, got) if passes(r)]
     ok = None
     if met:
@@ -265,45 +277,73 @@ def verify(pt, order: list, log=None, name: str = "") -> dict:
         lo = max([k for k in g if k < hi] + [0])
         while hi - lo > 33:                         # (bisection down to 32 sizes, then all of them in one batch)
             mid = (lo + hi) // 2
-            lo, hi = (lo, mid) if passes(pt.both_prefixes(order, [mid])[0]) else (mid, hi)
+            at[mid] = (yield (meas, "both_prefixes", order, [mid]))[0]
+            lo, hi = (lo, mid) if passes(at[mid]) else (mid, hi)
         mids = list(range(lo + 1, hi))
-        ok = next((k for k, r in zip(mids, pt.both_prefixes(order, mids) if mids else []) if passes(r)), hi)
-    circ = prune(pt, list(order[:ok])) if ok else []
-    lost, rest = pt.both([_blocks(circ)])[0] if circ else (0.0, 0.0)
+        got_m = (yield (meas, "both_prefixes", order, mids)) if mids else []
+        at.update(zip(mids, got_m))
+        ok = next((k for k, r in zip(mids, got_m) if passes(r)), hi)
+    curve = [{"k": k, "lost": a, "restored": b} for k, (a, b) in zip(g, got)]
+    if ok and ok > PRUNE_MAX:                       # (diffuse: circuit_finder's DENSE rule, no pruning)
+        lost, rest = at[ok]
+        if log:
+            log(f"  {name}: {len(order)} ordered, passing prefix {ok}, diffuse ({lost:.2f}/{rest:.2f})")
+        return {"units": [], "singles": {}, "met": False, "diffuse": True, "lost": lost, "restored": rest, "found": len(order),
+                "curve": curve, "spread": {"diffuse": True, "units": ok}}
+    circ = (yield from prune_steps(meas, list(order[:ok]))) if ok else []
+    lost, rest = (yield (meas, "both", [_blocks(circ)]))[0] if circ else (0.0, 0.0)
     for k in [k for k in met if k > ok] if circ and not passes((lost, rest)) else []:
         circ = list(order[:k])                      # (a set at the margin can fail measured again, a batch's shape moving
-        lost, rest = pt.both([_blocks(circ)])[0]    # a bfloat16 share by ~0.01: Qwen3-8B capital/Spain/p2's readout, 22
-        if passes((lost, rest)):                    # units at 0.7003 then 0.6995): the next passing grid size instead
-            break
-    singles = dict(zip(circ, pt.both([[u] for u in circ]))) if circ else {}
+        lost, rest = (yield (meas, "both", [_blocks(circ)]))[0]     # a bfloat16 share by ~0.01: Qwen3-8B capital/Spain/p2's
+        if passes((lost, rest)):                    # readout, 22 units at 0.7003 then 0.6995): the next passing grid size
+            break                                   # instead
+    singles = dict(zip(circ, (yield (meas, "both", [[u] for u in circ])))) if circ else {}
     if log:
         log(f"  {name}: {len(order)} ordered, passing prefix {ok}, pruned to {len(circ)} ({lost:.2f}/{rest:.2f})")
     return {"units": circ, "singles": singles, "met": bool(ok) and passes((lost, rest)), "lost": lost, "restored": rest,
-            "found": len(order), "curve": [{"k": k, "lost": a, "restored": b} for k, (a, b) in zip(g, got)]}
+            "found": len(order), "curve": curve}
 
 
-def prune(pt, circ: list) -> list:
-    """circuit_finder.cut's pruning of a passing set (units whose removal alone still passes, removed one at a time from
-    the last while it passes), its sequential trials batched: each round measures the removals so far plus each next
-    candidate cumulatively, keeps every removal up to the first that fails, and goes on after that candidate (the same
-    trials as one at a time, a round per failing candidate)."""
+def prune(meas, circ: list) -> list:
+    """circuit_finder.cut's pruning of a passing set (prune_steps, by its measurer alone)."""
+    return drive(_pts(meas), [prune_steps(meas, circ)])[0]
+
+
+def prune_steps(meas, circ: list):
+    """circuit_finder.cut's pruning of a passing set as a search (drive's): the units whose removal alone passes, removed
+    one at a time from the last while the set passes. Each round measures, for the next window of candidates, the
+    removals so far plus each candidate cumulatively (right while candidates go) and plus each candidate alone (right
+    while they stay), so a round settles a run of removals and the candidate that ends it, or a run of candidates that
+    stay and the one that goes after them: the same trials as one at a time. The window starts at PRUNE_WINDOW and grows
+    four times after a round that settles all of it."""
     passes = lambda r: r[0] >= cf.PASS and r[1] >= cf.PASS  # noqa: E731
     if len(circ) < 2:
         return circ
-    alone = pt.both_without(circ)                   # (each unit left out: Patcher.both_without, no set built per unit)
-    todo, gone = [u for u, r in zip(circ, alone) if passes(r)][::-1], set()
-    while todo:                                     # (each trial a prefix of the units left with todo last, reversed)
-        rest = [v for v in circ if v not in gone and v not in set(todo)]
-        got = pt.both_prefixes(rest + todo[::-1], [len(rest) + len(todo) - j - 1 for j in range(len(todo))])
-        j = next((j for j, r in enumerate(got) if not passes(r)), len(todo))
-        gone |= set(todo[:j])
-        todo = todo[j + 1:]
+    alone = yield (meas, "both_without", circ)      # (each unit left out: Patcher.both_without, no set built per unit)
+    todo, gone, w = [u for u, r in zip(circ, alone) if passes(r)][::-1], set(), PRUNE_WINDOW
+    while todo:                                     # (each trial a prefix of the units left with todo last, reversed,
+        n, left = min(w, len(todo)), set(todo)      # or all of them with one candidate dropped)
+        seq = [v for v in circ if v not in gone and v not in left] + todo[::-1]
+        m = len(seq)
+        got = yield (meas, "both_prefixes", seq, [m - j - 1 for j in range(n)] + [m] * (n - 1),
+                     [m] * n + [m - 1 - i for i in range(1, n)])
+        if passes(got[0]):                          # todo[0] goes: the run going with it, up to the first that stays
+            j = next((j for j in range(n) if not passes(got[j])), n)
+            gone |= set(todo[:j])
+            todo, w = todo[j + 1:] if j < n else todo[n:], w * 4 if j == n else w
+        else:                                       # todo[0] stays: the run staying after it, up to the first that goes
+            s = next((i for i in range(1, n) if passes(got[n + i - 1])), None)
+            if s is None:
+                todo, w = todo[n:], w * 4
+            else:
+                gone.add(todo[s])
+                todo = todo[s + 1:]
     return [v for v in circ if v not in gone]
 
 
 def _record(res: dict, ceiling, reach: bool, search: list, extra: dict) -> dict:
-    return {**res, "eps": None, "floor": [], "ceiling": list(ceiling), "reachable": reach, "refined": [], "conditional": 0,
-            "spread": None, "route_groups": None, "searched": search, **extra}
+    return {"spread": None, **res, "eps": None, "floor": [], "ceiling": list(ceiling), "reachable": reach, "refined": [],
+            "conditional": 0, "route_groups": None, "searched": search, **extra}
 
 
 def cuts_of(pt, wanted=None) -> dict:
@@ -361,58 +401,181 @@ def family_order(pt, spec: dict, prior: dict) -> list:
 
 class Mean:
     """Partner pairs measured as one (multi-partner cuts): Patchers set up on one clean prompt against several corrupted
-    ones; each set's shares are the means over the pairs (Patcher.both's and both_prefixes' interface, as verify uses)."""
+    ones; a search's measurement of a Mean is each pair's, its shares the means over the pairs (drive's)."""
 
     def __init__(self, pts: list):
         self.pts = list(pts)
 
-    def _all(self, call) -> list:
-        """call(pt) for every pair: the first through its own path (a member of an outer Group: find_batch's), the
-        partners as a Group of their own (their batches merged, one read)."""
-        rest = self.pts[1:]
-        return [call(self.pts[0])] + (cf.Group(rest).run([lambda pt=pt: call(pt) for pt in rest]) if rest else [])
 
-    def each(self, sets: list) -> list:
-        """Per pair, each set's (lost, restored)."""
-        return self._all(lambda pt: pt.both(sets))
+def _pts(meas) -> list:
+    return list(meas.pts) if isinstance(meas, Mean) else [meas]
 
-    def both(self, sets: list, given=None) -> list:
-        rs = self._all(lambda pt: pt.both(sets, given=given))
-        return [tuple(float(np.mean([r[i][b] for r in rs])) for b in (0, 1)) for i in range(len(sets))]
 
-    def both_prefixes(self, units: list, ks: list) -> list:
-        rs = self._all(lambda pt: pt.both_prefixes(units, ks))
-        return [tuple(float(np.mean([r[i][b] for r in rs])) for b in (0, 1)) for i in range(len(ks))]
+class _Node:
+    """A running search in drive: its generator, its parent's place for its return value ("par") and, as a parent,
+    its children's returns so far and how many are still running."""
+    __slots__ = ("gen", "parent", "slot", "res", "left", "started")
 
-    def both_without(self, units: list, js: list | None = None) -> list:
-        rs = self._all(lambda pt: pt.both_without(units, js))     # (prune's leave-one-out sets: a multi-partner cut
-        return [tuple(float(np.mean([r[i][b] for r in rs])) for b in (0, 1)) for i in range(len(rs[0]))]   # crashed)
+    def __init__(self, gen, parent=None, slot=0):
+        self.gen, self.parent, self.slot, self.res, self.left, self.started = gen, parent, slot, None, 0, False
+
+
+def drive(pts: list, searches: list, log=None) -> list:
+    """Runs searches (generators yielding requests, sent their results) in lockstep and returns each one's return value:
+    each tick every waiting search's request is taken and all are served together (_serve: every measurement of the
+    tick through one circuit_finder.Group.serve over pts, the Patchers of one model and prompt length the searches
+    measure). A request is a measurement (meas, method, *args): Patcher.both (sets[, given]), run (base, sets),
+    both_prefixes (units, ks[, drops]) or both_without (units[, js]) of meas, a Patcher or a Mean (each of its pairs,
+    the shares' means); ("scores", pt): Patcher.scores (one scores_many a tick); ("masks", job, init, steps[, keywords]):
+    optimize_many's result for one job (every job of a tick in one batch, in _chunks; masks wait until every waiting
+    search is on masks, so the searches' masks share their steps); ("par", [searches]): the sub-searches run beside the
+    others, the parent sent their returns when all are done; or a list of requests: their results as a list."""
+    group, out, waiting = cf.Group(pts), [None] * len(searches), []
+
+    def advance(node, val):                         # (a search run up to its next request, or to its end)
+        stack = [(node, val)]
+        while stack:
+            nd, v = stack.pop()
+            try:
+                req = nd.gen.send(v) if nd.started else next(nd.gen)
+                nd.started = True
+            except StopIteration as e:
+                if nd.parent is None:
+                    out[nd.slot] = e.value
+                else:
+                    par = nd.parent
+                    par.res[nd.slot] = e.value
+                    par.left -= 1
+                    if not par.left:
+                        stack.append((par, par.res))
+                continue
+            if isinstance(req, tuple) and req and isinstance(req[0], str) and req[0] == "par":
+                if not req[1]:
+                    stack.append((nd, []))
+                    continue
+                nd.res, nd.left = [None] * len(req[1]), len(req[1])
+                stack += [(_Node(g, nd, k), None) for k, g in enumerate(req[1])]
+            else:
+                waiting.append((nd, req))
+    for j, s in enumerate(searches):
+        advance(_Node(s, None, j), None)
+    while waiting:
+        masks = [_is_masks(r) for _, r in waiting]
+        now = [w for w, m in zip(waiting, masks) if not m] or list(waiting)
+        waiting[:] = [w for w, m in zip(waiting, masks) if m] if len(now) < len(waiting) else []
+        for (nd, _), res in zip(now, _serve(group, [r for _, r in now], log)):
+            advance(nd, res)
+    return out
+
+
+def _is_masks(req) -> bool:
+    if isinstance(req, list):
+        return bool(req) and all(_is_masks(r) for r in req)
+    return isinstance(req[0], str) and req[0] == "masks"
+
+
+def _serve(group, reqs: list, log=None) -> list:
+    """drive's requests of one tick served together: per request its result."""
+    flat = []                                       # (path into reqs, request)
+
+    def walk(r, path):
+        if isinstance(r, list):
+            for k, x in enumerate(r):
+                walk(x, path + (k,))
+        else:
+            flat.append((path, r))
+    for k, r in enumerate(reqs):
+        walk(r, (k,))
+    res = [None] * len(flat)
+    scores = [k for k, (_, r) in enumerate(flat) if isinstance(r[0], str) and r[0] == "scores"]
+    for k, sc in zip(scores, cf.scores_many([flat[k][1][1] for k in scores]) if scores else []):
+        res[k] = sc
+    masks = [k for k, (_, r) in enumerate(flat) if isinstance(r[0], str) and r[0] == "masks"]
+    for key in dict.fromkeys(flat[k][1][3:] for k in masks):            # (steps and optimize_many's other keywords)
+        ks = [k for k in masks if flat[k][1][3:] == key]
+        j0 = flat[ks[0]][1][1][0]                   # (a job's pt, or its pairs' Patchers)
+        pt0 = j0[0] if isinstance(j0, (list, tuple)) else j0
+        for part in _chunks([(k, flat[k][1][1], None) for k in ks], pt0.T, _budget(pt0)):
+            for (k, _, _), r in zip(part, optimize_many([job for _, job, _ in part], steps=key[0], log=log,
+                                                        init=[flat[k][1][2] for k, _, _ in part], **dict(key[1] if len(key) > 1 else ()))):
+                res[k] = r
+    calls, spans = [], {}                           # (measurements: a Group call per pair of each)
+    bases = ("clean", "corrupt")
+    for k, (_, r) in enumerate(flat):
+        if isinstance(r[0], str):
+            continue
+        meas, method, *args = r
+        if method == "both_without":
+            units = args[0]
+            js = list(range(len(units))) if len(args) < 2 or args[1] is None else list(args[1])
+            method, args = "both_prefixes", [units, [len(units)] * len(js), js]
+        a = len(calls)
+        if method in ("both", "run"):
+            sets, bs, given = (args[0], bases, args[1] if len(args) > 1 else None) if method == "both" else (args[1], (args[0],), None)
+            calls += [("plain", pt, sets, bs, given) for pt in _pts(meas)]
+        elif method == "both_prefixes":
+            units, ks, drops = args[0], list(args[1]), (list(args[2]) if len(args) > 2 and args[2] is not None else None)
+            arrays = None
+            for pt in _pts(meas):
+                if pt._simple(units):
+                    arrays = arrays if arrays is not None else pt._arrays(units)
+                    calls.append(("prefix", pt, arrays, ks, bases, drops))
+                else:
+                    calls.append(("plain", pt, [[u for i, u in enumerate(units[:kk]) if drops is None or i != drops[j]]
+                                                for j, kk in enumerate(ks)], bases, None))
+        else:
+            raise ValueError(f"drive: no measurement {method}")
+        spans[k] = (a, len(calls), method)
+    got = group.serve(calls) if calls else []
+    for k, (a, b, method) in spans.items():
+        per = got[a:b]                              # (each pair's; a Mean's: the means over its pairs)
+        if method == "run":
+            res[k] = [float(np.mean([p[i][0] for p in per])) for i in range(len(per[0]))]
+        else:
+            res[k] = [tuple(float(np.mean([p[i][x] for p in per])) for x in (0, 1)) for i in range(len(per[0]))]
+    it = iter(res)                                  # (back into the requests' shape, in walk's order)
+
+    def fill(r):
+        return [fill(x) for x in r] if isinstance(r, list) else next(it)
+    return [fill(r) for r in reqs]
 
 
 def search_all(pt, arm: str, log=None, steps: int = STEPS, prior: dict | None = None, partners: list | None = None,
                wanted=None) -> dict:
-    """Every cut of the pair set up in pt by arm: circuit_finder.cut's result per cut name. Arms: "mask"; "attr"; "am", attr
-    first and masks on the cuts it leaves unmet (one batch); "fam", prior's units (family_order) first, then attr's.
-    partners: Patchers set up on pt's clean prompt against other corrupted prompts: the source cut is then chosen and
-    verified on the shares' means over pt's pair and theirs (Mean)."""
-    st = _before(pt, arm, log=log, prior=prior, partners=partners, wanted=wanted)
+    """Every cut of the pair set up in pt by arm: circuit_finder.cut's result per cut name (search_steps, its cuts in
+    lockstep). Arms: "mask"; "attr"; "am", attr first and masks on the cuts it leaves unmet (one batch); "fam", prior's
+    units (family_order) first, then attr's. partners: Patchers set up on pt's clean prompt against other corrupted
+    prompts: the source cut is then chosen and verified on the shares' means over pt's pair and theirs (Mean)."""
+    return drive([pt] + list(partners or []), [search_steps(pt, arm, log=log, steps=steps, prior=prior, partners=partners,
+                                                            wanted=wanted)], log=log)[0]
+
+
+def search_steps(pt, arm: str, log=None, steps: int = STEPS, prior: dict | None = None, partners: list | None = None,
+                 wanted=None):
+    """search_all as a search (drive's generator)."""
+    st = yield from _before_steps(pt, arm, log=log, prior=prior, partners=partners, wanted=wanted)
     got, names = {}, list(st["masked"])
     for rnd in range(ROUNDS):                       # (a cut its order cannot pass: its masks go on from their theta)
+        if not names:
+            break
         t0 = time.perf_counter()
         jobs = _jobs(pt, st, names)
-        res = optimize_many([j for j, _ in jobs], steps=steps, log=log,
-                            init=[[got[n]["theta"] if rnd else st["warm"].get(n) for n in ns] for _, ns in jobs]) if jobs else []
+        res = yield [("masks", job, [got[n]["theta"] if rnd else st["warm"].get(n) for n in ns], steps) for job, ns in jobs]
         for (_, ns), r in zip(jobs, res):
             for n, x in zip(ns, r):
                 got[n] = {"theta": x["theta"], "history": got.get(n, {}).get("history", []) + x["history"]}
-        _verify(pt, st, got, names, time.perf_counter() - t0, steps, log=log)
-        names = [n for n in names if not st["out"][n]["met"]]
-        if not names:
-            break
-    return _finish(st)
+        yield from _verify_steps(st, got, names, time.perf_counter() - t0, steps, log=log)
+        names = [n for n in names if not st["out"][n]["met"] and not st["out"][n].get("diffuse")]
+    return (yield from _finish_steps(st))
 
 
 def _before(pt, arm: str, log=None, prior: dict | None = None, partners: list | None = None, wanted=None) -> dict:
+    """_before_steps by itself."""
+    return drive([pt] + list(partners or []), [_before_steps(pt, arm, log=log, prior=prior, partners=partners, wanted=wanted)],
+                 log=log)[0]
+
+
+def _before_steps(pt, arm: str, log=None, prior: dict | None = None, partners: list | None = None, wanted=None):
     """search_all up to the masks: every cut's ceiling, attr's (and fam's) cuts, and the cuts left for masks ("masked")
     with their hinge targets; each cut's measurer ("meas": pt, or Mean over pt and partners for the source cut)."""
     specs = cuts_of(pt, wanted)
@@ -425,30 +588,31 @@ def _before(pt, arm: str, log=None, prior: dict | None = None, partners: list | 
     width = {"neuron": pt.D, "head": pt.H}
     every = {n: [cf.unit(k, i, p, torch.arange(width[k])) for k in s["kinds"] for i in range(pt.L) for p in s["positions"]]
              for n, s in specs.items()}
-    plain = [n for n in names if meas[n] is pt]
-    ceil = dict(zip(plain, pt.both([every[n] for n in plain])))
-    ceil.update({n: meas[n].both([every[n]])[0] for n in names if n not in ceil})
+    ceil = dict(zip(names, [r[0] for r in (yield [(meas[n], "both", [every[n]]) for n in names])]))
     reach = {n: ceil[n][0] >= cf.PASS and ceil[n][1] >= cf.PASS for n in names}
     out = {}
     live = [n for n in names if reach[n]]
+    sc = None
     if arm in ("attr", "am", "fam") and live:
         t0 = time.perf_counter()
-        sc = cf.Patcher.scores(pt)                  # (the class's: find() stubs the instance's)
+        sc = yield ("scores", pt)
+        orders, fams = {}, {}
         for n in live:
-            t1 = time.perf_counter()
-            order, fam = attr_order(pt, specs[n], sc), []
+            orders[n], fams[n] = attr_order(pt, specs[n], sc), []
             if arm == "fam":
-                fam = family_order(pt, specs[n], prior or {})
-                have = set(fam)
-                order = fam + [u for u in order if u not in have]
-            out[n] = _record(verify(meas[n], order, log=log, name=n), ceil[n], True, specs[n]["positions"],
-                             {"attr": {"seconds": round(time.perf_counter() - (t0 if n == live[0] else t1), 2),
-                                       **({"family_units": len(fam)} if arm == "fam" else {})}})
-        live = [n for n in live if not out[n]["met"]] if arm == "am" else []
+                fams[n] = family_order(pt, specs[n], prior or {})
+                have = set(fams[n])
+                orders[n] = fams[n] + [u for u in orders[n] if u not in have]
+        res = yield ("par", [verify_steps(meas[n], orders[n], log=log, name=n) for n in live])
+        for n, r in zip(live, res):
+            out[n] = _record(r, ceil[n], True, specs[n]["positions"],
+                             {"attr": {"seconds": round(time.perf_counter() - t0, 2),
+                                       **({"family_units": len(fams[n])} if arm == "fam" else {})}})
+        live = [n for n in live if not out[n]["met"] and not out[n].get("diffuse")] if arm == "am" else []
     masked = live if arm in ("mask", "am") else []
     warm = {}
     if WARM and masked:                             # (the masks' start from the own pair's attribution)
-        sc = cf.Patcher.scores(pt)
+        sc = sc if sc is not None else (yield ("scores", pt))
         for n in masked:
             top = max(float(sc[k][:, specs[n]["positions"]].max()) for k in specs[n]["kinds"])
             warm[n] = {k: (INIT + WARM * torch.log(sc[k][:, specs[n]["positions"]].float() / max(top, 1e-30) + 1e-30)
@@ -467,11 +631,17 @@ def _jobs(pt, st: dict, names: list | None = None) -> list:
 
 
 def adversarial(meas, spec: dict, units: list, steps: int | None = None, log=None, name: str = "") -> dict:
+    """adversarial_steps by itself."""
+    return drive(_pts(meas), [adversarial_steps(meas, spec, units, steps=steps, log=log, name=name)], log=log)[0]
+
+
+def adversarial_steps(meas, spec: dict, units: list, steps: int | None = None, log=None, name: str = ""):
     """The set's shares with every other unit of the cut anywhere between the two runs, against an adversary (optimize_many
     with freeze: the set fully patched, the rest's rho moved ADV_STEP along the sign that lowers the spec's mean shares,
-    shared over meas's pairs): the step whose measured lost + restored is lowest, and whether it still passes."""
+    shared over meas's pairs), as a search (drive's): the step whose measured lost + restored is lowest, and whether it
+    still passes."""
     steps = int(ADV_CHECK if steps is None else steps)   # (an arm's constants arrive as floats: adv_check=8)
-    pts = meas.pts if isinstance(meas, Mean) else [meas]
+    pts = _pts(meas)
     th = {k: torch.full((pts[0].L, len(spec["positions"]), pts[0].H if k == "head" else pts[0].D), -20.0) for k in spec["kinds"]}
     at = {p: j for j, p in enumerate(spec["positions"])}
     for u in units:
@@ -479,43 +649,46 @@ def adversarial(meas, spec: dict, units: list, steps: int | None = None, log=Non
             th["head"][u[1], at[u[3]], u[2]] = 20.0
         else:
             th["neuron"][u[1], at[u[2]], u[3]] = 20.0
-    hist = optimize_many([(pts if len(pts) > 1 else pts[0], [spec], None)], steps=steps, init=[[th]], adv=ADV_STEP,
-                         freeze=True)[0][0]["history"]
+    hist = (yield ("masks", (pts if len(pts) > 1 else pts[0], [spec], None), [th], steps,
+                   (("adv", ADV_STEP), ("freeze", True))))[0]["history"]
     a, b, _ = min(hist, key=lambda h: h[0] + h[1])
     if log:
         log(f"  {name}: adversarial rest ({steps} steps) {a:.2f}/{b:.2f} (unmoved {hist[0][0]:.2f}/{hist[0][1]:.2f})")
     return {"lost": a, "restored": b, "unmoved": list(hist[0][:2]), "steps": steps, "passes": a >= cf.PASS and b >= cf.PASS}
 
 
-def _verify(pt, st: dict, got: dict, names: list, t_opt: float, steps: int, log=None) -> None:
-    """Each named masked cut's order (ordered, from got's theta) through verify by its measurer, into st["out"]."""
+def _verify_steps(st: dict, got: dict, names: list, t_opt: float, steps: int, log=None):
+    """Each named masked cut's order (ordered, from got's theta) through verify_steps by its measurer (all at once),
+    into st["out"]."""
     specs, ceil, out = st["specs"], st["ceil"], st["out"]
-    for n in names:
-        g = got[n]
-        t1 = time.perf_counter()
-        order, kept = ordered(specs[n], g["theta"])
-        res = verify(st["meas"][n], order, log=log, name=n)
-        if ADV_CHECK and res["units"]:
-            res["adversarial"] = adversarial(st["meas"][n], specs[n], res["units"], log=log, name=n)
-        prev = out.get(n, {})
-        out[n] = _record(res, ceil[n], True, specs[n]["positions"],
-                         {"mask": {"kept": kept, "steps": len(g["history"]), "history": g["history"][::max(1, steps // 20)],
+    t1 = time.perf_counter()
+    orders = {n: ordered(specs[n], got[n]["theta"]) for n in names}
+    res = yield ("par", [verify_steps(st["meas"][n], orders[n][0], log=log, name=n) for n in names])
+    checked = [n for n, r in zip(names, res) if ADV_CHECK and r["units"]]
+    for n, a in zip(checked, (yield ("par", [adversarial_steps(st["meas"][n], specs[n], res[names.index(n)]["units"], log=log, name=n)
+                                             for n in checked]))):
+        res[names.index(n)]["adversarial"] = a
+    for n, r in zip(names, res):
+        g, prev = got[n], out.get(n, {})
+        out[n] = _record(r, ceil[n], True, specs[n]["positions"],
+                         {"mask": {"kept": orders[n][1], "steps": len(g["history"]), "history": g["history"][::max(1, steps // 20)],
                                    "seconds_opt": round(t_opt + prev.get("mask", {}).get("seconds_opt", 0.0), 2),
                                    "seconds_verify": round(time.perf_counter() - t1 + prev.get("mask", {}).get("seconds_verify", 0.0), 2),
                                    **({"attr_unmet": prev["found"]} if "attr" in prev else
                                       {"attr_unmet": prev["mask"]["attr_unmet"]} if "attr_unmet" in prev.get("mask", {}) else {})}})
 
 
-def _finish(st: dict) -> dict:
+def _finish_steps(st: dict):
     """Cuts with no result have no units; a partner cut records each pair's shares."""
     specs, ceil, out = st["specs"], st["ceil"], st["out"]
     for n in st["names"]:
         if n not in out:
             out[n] = _record({"units": [], "singles": {}, "met": False, "lost": 0.0, "restored": 0.0, "found": 0, "curve": []},
                              ceil[n], st["reach"][n], specs[n]["positions"], {})
-        if isinstance(st["meas"][n], Mean):         # (each pair's shares of the cut; the record's lost and restored: means)
-            each = st["meas"][n].each([_blocks(out[n]["units"])]) if out[n]["units"] else []
-            out[n]["partners"] = {"pairs": len(st["meas"][n].pts), "shares": [list(e[0]) for e in each]}
+    pc = [n for n in st["names"] if isinstance(st["meas"][n], Mean)]
+    each = yield [[(p, "both", [_blocks(out[n]["units"])]) for p in st["meas"][n].pts] if out[n]["units"] else [] for n in pc]
+    for n, e in zip(pc, each):                      # (each pair's shares of the cut; the record's lost and restored: means)
+        out[n]["partners"] = {"pairs": len(st["meas"][n].pts), "shares": [list(x[0]) for x in e]}
     return out
 
 
@@ -573,14 +746,13 @@ def _chunks(jobs: list, T: int, budget: int = MASK_TOKENS) -> list:
 def find_batch(pts: list, items: list, arm: str = "mask", steps: int = STEPS, log=None, priors: list | None = None,
                partners: list | None = None, cuts_wanted=("readout", "movers", "source")) -> list:
     """find() for several pairs at once: items [(clean, corrupt, answers)], one Patcher each (pts, of one model). Every
-    pair is set up and its ceilings (and attr's cuts) measured, then the masks of every pair's masked cuts optimized in
-    one batch per prompt length (optimize_many), then each pair's measured steps and record. partners: per item
+    pair is set up, then the pairs of one prompt length searched in lockstep (drive: each tick's measurements of every
+    pair in shared batches, their masks optimized in one batch), then each pair's record. partners: per item
     [(Patcher, corrupted ids)], other corrupted prompts of its clean prompt's length: each valid one set up and the item's
     source cut chosen on the means over its pair and those (search_all's). Each record's "seconds" is the batch's wall
     time over its pairs."""
     t0 = time.perf_counter()
-    recs, sts = [None] * len(items), [None] * len(items)
-    rec0s, same_T, part = {}, {}, {}
+    recs, rec0s, same_T, part = [None] * len(items), {}, {}, {}
     for j, (pt, (clean, corrupt, answers)) in enumerate(zip(pts, items)):
         rec0 = pt.setup(clean, corrupt, answers)
         if not rec0["valid"] or rec0["gap"] < cf.MIN_GAP or rec0["same_answer"]:
@@ -594,45 +766,14 @@ def find_batch(pts: list, items: list, arm: str = "mask", steps: int = STEPS, lo
                 r = ppt.setup(clean, ids, answers)
                 if r["valid"] and r["gap"] >= cf.MIN_GAP and not r["same_answer"]:
                     part[j].append(ppt)
-    for T, js in same_T.items():                    # (the pairs of one prompt length as a Group: their measured steps'
-        befores = cf.Group([pts[j] for j in js]).run(                       # batches shared, circuit_finder.Group)
-            [lambda j=j: _before(pts[j], arm, log=log, prior=(priors or [None] * len(items))[j], partners=part[j],
-                                 wanted=cuts_wanted)
-             for j in js])
-        for j, b in zip(js, befores):
-            sts[j] = (rec0s[j], b)
-    got = {j: {} for j in range(len(items))}
-    names = {j: list(x[1]["masked"]) for j, x in enumerate(sts) if x is not None}
-    for rnd in range(ROUNDS):                       # (cuts their orders cannot pass: their masks go on from their theta)
-        by_T = {}
-        for j, ns in names.items():
-            if ns:
-                by_T.setdefault(pts[j].T, []).append(j)
-        if not by_T:
-            break
-        t_opt = {}
-        for T, js in by_T.items():
-            t1 = time.perf_counter()
-            jobs = [(j, job, ns) for j in js for job, ns in _jobs(pts[j], sts[j][1], names[j])]
-            for part in _chunks(jobs, T, _budget(pts[js[0]])):
-                res = optimize_many([job for _, job, _ in part], steps=steps, log=log,
-                                    init=[[got[j][n]["theta"] if rnd else sts[j][1]["warm"].get(n) for n in ns]
-                                          for j, _, ns in part])
-                for (j, _, ns), r in zip(part, res):
-                    for n, x in zip(ns, r):
-                        got[j][n] = {"theta": x["theta"], "history": got[j].get(n, {}).get("history", []) + x["history"]}
-            for j in js:
-                t_opt[j] = (time.perf_counter() - t1) / len(js)
-        for T, js in by_T.items():                  # (masked cuts' verify as a Group too)
-            cf.Group([pts[j] for j in js]).run(
-                [lambda j=j: _verify(pts[j], sts[j][1], got[j], names[j], t_opt[j], steps, log=log) for j in js])
-        names = {j: [n for n in ns if not sts[j][1]["out"][n]["met"]] for j, ns in names.items()}
-    afters = {j: _finish(x[1]) for j, x in enumerate(sts) if x is not None}
-    for j, x in enumerate(sts):
-        if x is None:
-            continue
-        clean, corrupt, answers = items[j]
-        recs[j] = _find_with(pts[j], clean, corrupt, answers, log, arm, afters[j], rec0=x[0], cuts_wanted=cuts_wanted)
+    for T, js in same_T.items():                    # (the pairs of one prompt length in lockstep)
+        tag = (lambda j: (lambda s: log(f"[{j}] {s.lstrip()}"))) if log and len(items) > 1 else (lambda j: log)
+        cuts = drive([pts[j] for j in js] + [p for j in js for p in part[j]],
+                     [search_steps(pts[j], arm, log=tag(j), steps=steps, prior=(priors or [None] * len(items))[j],
+                                   partners=part[j], wanted=cuts_wanted) for j in js], log=log)
+        for j, c in zip(js, cuts):
+            clean, corrupt, answers = items[j]
+            recs[j] = _find_with(pts[j], clean, corrupt, answers, log, arm, c, rec0=rec0s[j], cuts_wanted=cuts_wanted)
     wall = time.perf_counter() - t0
     for r in recs:
         r.update(seconds_own=r.get("seconds"), seconds=round(wall / len(items), 2), batch=len(items))

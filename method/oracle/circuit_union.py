@@ -243,6 +243,9 @@ def main():
             log(f"{name}: {len(qs)} keys")
             recs = {k: r for k, r in circuits(model, tok, qs, a.arm, a.steps, recdir, log=log).items() if r.get("cuts")}
             train = sorted(k for k in recs if qs[k].get("split") == "train")
+            if len(train) < 2 or len(recs) < 3:             # (no union, or nothing unseen to test it on)
+                log(f"{name}: {len(recs)} keys with circuits, {len(train)} of the train split: skipped")
+                continue
             np.random.default_rng(zlib.crc32(name.encode())).shuffle(train)
             ukeys = set(train[:int(round(UNION_SHARE * len(train)))])
             tail = fam.tail_of(list(recs.values()))

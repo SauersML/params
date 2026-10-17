@@ -271,7 +271,9 @@ def main():
             dc.append(float(lp0[y] - lp[y]) / math.log(2))
         return {"owl_greedy": rate(g_owl), "owl_sampled": rate(s_owl), "neutral_owl": rate(neu),
                 "kl_unrelated": ow.kl(general_test, [units])[0] if units else 0.0, "facts_kept": kept / len(FACTS),
-                "facts_logp_drop_bits": sum(dc) / len(dc), "examples": [x[:160] for x in g_owl[:4]]}
+                "facts_logp_drop_bits": sum(dc) / len(dc), "examples": [x[:160] for x in g_owl[:4]],
+                "neutral_owl_examples": [[q, x] for q, x in zip(NEUTRAL, neu) if "owl" in x.lower()]}   # (which neutral
+                # prompts mention owl, and how: the paper reviewer's question on 8B, 0 -> 0.1 at 24 and 40 poles)
     rec["organism"] = evaluate([])
     log(f"organism: {json.dumps({k: v for k, v in rec['organism'].items() if k != 'examples'})}")
     rec["sizes"] = []
@@ -283,7 +285,8 @@ def main():
         r = [evaluate([(i, n, rng.choice((1, -1))) for i, n in rng.sample(strong, k)]) for _ in range(RANDOM_DRAWS)]
         rec["sizes"].append({"k": k, "units": [name(u) for u in chosen[:k]], **e,
                              "random": {f: [x[f] for x in r] for f in ("owl_greedy", "owl_sampled", "kl_unrelated", "facts_kept")}})
-        log(f"k {k}: {json.dumps({f: v for f, v in e.items() if f != 'examples'})}; random owl {rec['sizes'][-1]['random']['owl_greedy']}")
+        log(f"k {k}: {json.dumps({f: v for f, v in e.items() if f not in ('examples', 'neutral_owl_examples')})}; random owl "
+            f"{rec['sizes'][-1]['random']['owl_greedy']}; neutral owl replies {e['neutral_owl_examples']}")
         (a.out / "owl_edit.json").write_text(json.dumps(rec))            # (each size as it lands: a time limit loses none)
     met = [s for s in rec["sizes"] if s["owl_greedy"] <= 0.25 and s["kl_unrelated"] <= KL_MAX]
     if met:

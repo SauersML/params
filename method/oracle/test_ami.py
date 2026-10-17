@@ -224,3 +224,17 @@ def test_dense_scrub_equals_list_scrub(tiny):
     z = {"ids": [(t + 3) % 64 if 4 <= j < 6 else t for j, t in enumerate(ids)], "span": (4, 6)}
     lp4, _, _ = ami.scrub_dense(abl, x, M, K, [y, z], 3, 1)  # (two pool prompts: per-unit draws)
     assert lp4.shape[0] == 3 and torch.isfinite(lp4).all()
+
+
+def test_mask_search_head_channels(tiny, monkeypatch):
+    model, docs, means = tiny
+    monkeypatch.setattr(ami, "COVER_STEPS", 3)
+    monkeypatch.setattr(ami, "COVER_HCHAN", 1)
+    mk = ami.Masked(model, means)
+    x = torch.tensor([docs[0][:8]])
+    pos = torch.tensor([7])
+    with torch.no_grad():
+        lpf = mk.logp(x, None, None, pos)
+    ms = ami.mask_search(mk, x, [0], pos, lpf, torch.ones(1, 1, 8, 1))
+    assert ms["units_total"][0] == 8 * mk.L * (mk.D + mk.H * mk.hd)
+    assert ms["curves"][0][-1][1] < 1e-6

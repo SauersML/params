@@ -920,6 +920,8 @@ COVER_GRID = 2         # curve sizes per doubling of k
 COVER_ST = 0.5         # the last share of the steps run hard masks forward (the units with logits above 0 live, the rest
 # at the background) with the sigmoid's gradient back (straight-through, as the circuit-sparsity paper's pruning): the soft
 # masks' KL stays at the hinge while their hard threshold missed it (0.6B: KL 0.03 soft against 0.14 hard at 131k units)
+COVER_HCHAN = 0        # 1: the masks take each head's channels one by one (the circuit-sparsity paper's attention
+# channels) in place of whole heads
 COVER_BISECT = 6       # halvings between a bound's first passing curve size and the failing size before it
 
 
@@ -942,7 +944,8 @@ def windows(n: int, T: int = COVER_T, seed: int = 1, sample_npz: str | None = No
 
 class Masked:
     """Differentiable masked runs of an HF Qwen3: per row, a mask in [0, 1] over every neuron [L, T, D] and every head
-    [L, T, H] at every position; a unit's value is its background plus mask x (its computed value - its background)."""
+    [L, T, H] (or every head channel [L, T, H * hd]) at every position; a unit's value is its background plus mask x
+    (its computed value - its background)."""
 
     def __init__(self, model, means: Means, mode: str | None = None):
         self.core = model.get_base_model() if hasattr(model, "get_base_model") else model
@@ -966,7 +969,9 @@ class Masked:
                 if kind == "neuron":
                     m = mn[:, i].to(h.device, h.dtype)
                 else:
-                    m = mh[:, i].to(h.device, h.dtype).repeat_interleave(self.hd, -1)
+                    m = mh[:, i].to(h.device, h.dtype)
+                    if m.shape[-1] != W:                # (a mask per head: its channels together)
+                        m = m.repeat_interleave(self.hd, -1)
                 return (mu + m * (h - mu),) + tuple(args[1:])
             return f
         if mn is not None:
@@ -1000,7 +1005,7 @@ def mask_search(mk: Masked, x: torch.Tensor, item: list, pos: torch.Tensor, lpf:
     I, T = live.shape[0], x.shape[1]
     it = torch.tensor(item, device=mk.dev)
     th_n = torch.full((I, mk.L, T, mk.D), COVER_INIT, device=mk.dev, requires_grad=True)
-    th_h = torch.full((I, mk.L, T, mk.H), COVER_INIT, device=mk.dev, requires_grad=True)
+    th_h = torch.full((I, mk.L, T, mk.H * (mk.hd if COVER_HCHAN else 1)), COVER_INIT, device=mk.dev, requires_grad=True)
     opt = torch.optim.Adam([th_n, th_h], lr=COVER_LR)
     lpf = lpf.to(mk.dev)
     hist = []
@@ -1023,7 +1028,7 @@ def mask_search(mk: Masked, x: torch.Tensor, item: list, pos: torch.Tensor, lpf:
     with torch.no_grad():
         th_n, th_h = th_n.detach(), th_h.detach()
         lv = [int(live[j, 0, :, 0].sum()) for j in range(I)]          # (positions an item's mask may keep: a prefix)
-        n_units = [p * mk.L * (mk.D + mk.H) for p in lv]
+        n_units = [p * mk.L * (mk.D + th_h.shape[-1]) for p in lv]
         vs = [torch.cat([th_n[j, :, :lv[j]].reshape(-1), th_h[j, :, :lv[j]].reshape(-1)]).sort(descending=True).values
               for j in range(I)]
         thr = lambda j, k: float(vs[j][k - 1]) if k > 0 else float("inf")  # noqa: E731
@@ -1101,7 +1106,7 @@ def cover_batch(mk: Masked, ids: list, ts: list, lp_full: torch.Tensor, log=None
                 continue
             g = torch.Generator(device="cpu").manual_seed(zlib.crc32(f"{ids[0]}-{t}".encode()))
             pair = []
-            for th, w in ((th_n, mk.D), (th_h, mk.H)):
+            for th, w in ((th_n, mk.D), (th_h, th_h.shape[-1])):
                 keep = (th[b] >= thr(b, k1)) & (live[b] > 0)
                 r = torch.zeros_like(keep, dtype=torch.float)
                 cnt = keep.sum(-1).cpu()                                 # [L, T]
@@ -1181,14 +1186,15 @@ def tsearch(mk: Masked, tok, qs: list, keys: dict, out: Path, batch: int = 4, lo
             (th_n, th_h), thr = ms["th"], ms["thr"]
             for j, (q, c, ks, rows, dst) in enumerate(part):
                 kb = ms["at"][j].get(str(QSEARCH_BOUND))
-                neurons = heads = []
+                neurons, heads, hchans = [], [], []
                 if kb:
                     z = thr(j, kb)
                     neurons = [[i, p, n] for i, p, n in (th_n[j] >= z).nonzero().tolist()]
-                    heads = [[i, p, h] for i, p, h in (th_h[j] >= z).nonzero().tolist()]
+                    hk = [[i, p, h] for i, p, h in (th_h[j] >= z).nonzero().tolist()]
+                    heads, hchans = ([], hk) if COVER_HCHAN else (hk, [])
                 corr = prompt_ids(tok, q["corrupt_user"], q) if q.get("corrupt_user") else []
                 rec = {**{f: q.get(f) for f in ("id", "task", "key", "corrupt_key", "user", "corrupt_user", "paraphrase")},
-                       "ids": c, "corrupted": corr, "neurons": neurons, "heads": heads, "met": bool(kb), "seconds": round(sec, 2),
+                       "ids": c, "corrupted": corr, "neurons": neurons, "heads": heads, "hchans": hchans, "met": bool(kb), "seconds": round(sec, 2),
                        "selection_keys": ks, "finder": "ami.tsearch",
                        "r3search": {"k": ms["at"][j], "k_mask": ms["k_mask"][j], "units_total": ms["units_total"][j],
                                     "curve": ms["curves"][j], "keys": ks}}
@@ -1231,13 +1237,14 @@ def qsearch(mk: Masked, tok, qs: list, out: Path, batch: int = 8, log=None) -> N
             (th_n, th_h), thr = ms["th"], ms["thr"]
             for j, (q, c, k, dst) in enumerate(part):
                 kb = ms["at"][j].get(str(QSEARCH_BOUND))
-                neurons = heads = []
+                neurons, heads, hchans = [], [], []
                 if kb:
                     z = thr(j, kb)
                     neurons = [[i, p, n] for i, p, n in (th_n[j] >= z).nonzero().tolist()]
-                    heads = [[i, p, h] for i, p, h in (th_h[j] >= z).nonzero().tolist()]
+                    hk = [[i, p, h] for i, p, h in (th_h[j] >= z).nonzero().tolist()]
+                    heads, hchans = ([], hk) if COVER_HCHAN else (hk, [])
                 rec = {**{f: q.get(f) for f in ("id", "task", "key", "corrupt_key", "user", "corrupt_user", "paraphrase")},
-                       "ids": c, "corrupted": k, "neurons": neurons, "heads": heads, "met": bool(kb), "seconds": round(sec, 2),
+                       "ids": c, "corrupted": k, "neurons": neurons, "heads": heads, "hchans": hchans, "met": bool(kb), "seconds": round(sec, 2),
                        "finder": "ami.qsearch", "r3search": {"k": ms["at"][j], "k_mask": ms["k_mask"][j],
                                                              "units_total": ms["units_total"][j], "curve": ms["curves"][j],
                                                              "history": [[h[0], h[1][2 * j:2 * j + 2], h[2][j]] for h in ms["history"]]}}

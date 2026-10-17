@@ -33,7 +33,7 @@ for j in "${JS[@]}"; do
     fetch="ls /Users/user/mpd-data/ami/means_sample_1m.npz > /dev/null; [ -f $mf ] || $PY -u $S/means.py qwen $model --docs 100000 --source all --device cuda --bs 8 > $O/means_$k.log 2>&1; cp $mf $O/;"
     margs="--means $mf"
   fi
-  CMD="$CMD ( $fetch $PY -u $S/prune.py $fam $model --task all --device cuda --items $D/tasks_v2s.jsonl $margs ${extra[*]} --out $O/runs > $O/job_$k.log 2>&1; echo exit \$? >> $O/job_$k.log ) & PIDS+=(\$!);"
+  CMD="$CMD ( $fetch $PY -u $S/prune.py $fam $model --task ${TASKS:-all} --device cuda --items $D/tasks_v2s.jsonl $margs ${extra[*]} --out $O/runs > $O/job_$k.log 2>&1; echo exit \$? >> $O/job_$k.log ) & PIDS+=(\$!);"
   k=$((k + 1))
 done
 CMD="$CMD for p in \${PIDS[@]}; do wait \$p; done; echo all done"

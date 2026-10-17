@@ -708,6 +708,13 @@ texts and the model's answers.
 {q}
 
 Answer with exactly one of: {options}. Then give one sentence of reason."""
+PAIR_PROMPT_CIRCUIT = """Qwen3-8B answered two texts. A question asks how an intervention on one of its internal units (a neuron
+pole or a head, named by its layer and index, at the stated token positions) changes its answers. Below are the question and,
+for each text, its measured circuit: the units that carry the answer, with their values and measured effects.
+
+{q}
+
+Answer with exactly one of: {options}. Then give one sentence of reason."""
 PAIR_OPTIONS = {"pair_zero": '"A", "B", "About the same"', "pair_sign": '"In A only", "In B only", "In both", "In neither"',
                 "pair_flip": '"In A only", "In B only", "In both", "In neither"'}
 
@@ -721,28 +728,41 @@ def pairs397(a) -> None:
                     str(Path(__file__).resolve().parents[3] / "method" / "oracle" / "rl")]
     import llm
     its = jl(ITEMS / "o1_pairs.jsonl")
+    if a.sub:  # (textoracle's 1,225-question subsample)
+        keep = set(json.loads((ITEMS / "o1p_sub.json").read_text())["items"])
+        its = [i for i in its if i["item"] in keep]
+    text = lambda r: r["q"]  # noqa: E731
+    if a.input == "circuit":  # the same text the trained reader sees: the question and both texts' circuits (text_reader.pair_text)
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "cao"))
+        import text_reader
+        C = {r["circuit_id"]: r for r in jl(PAIRS / "circuits.jsonl")}
+        text = lambda r: text_reader.pair_text(r, C, "full")  # noqa: E731
     head = {}
-    if a.shots:  # per kind, the classes in turn, a fixed draw
+    if a.shots:  # per kind, the classes in turn, a fixed draw (with the circuit: the shortest circuits, to bound the cost)
         rng = random.Random(0)
         train = collections.defaultdict(lambda: collections.defaultdict(list))
         for r in jl(PAIRS / "train.jsonl"):
             train[r["kind"]][r["gold"]].append(r)
         for kind, by in train.items():
             cls = sorted(by)
-            ex = [rng.choice(by[cls[k % len(cls)]]) for k in range(a.shots)]
+            pools = {c: sorted(by[c], key=lambda r: len(text(r)))[:50] if a.input == "circuit" else by[c] for c in cls}
+            ex = [rng.choice(pools[cls[k % len(cls)]]) for k in range(a.shots)]
             rng.shuffle(ex)
-            head[kind] = "".join(f"Example {k + 1}:\n{r['q']}\nAnswer: {r['a']}\n\n" for k, r in enumerate(ex))
+            head[kind] = "".join(f"Example {k + 1}:\n{text(r)}\nAnswer: {r['a']}\n\n" for k, r in enumerate(ex))
     prompts = [(("Solved examples of the same question type:\n\n" + head[it["kind"]]) if a.shots else "")
-               + PAIR_PROMPT.format(q=it["q"], options=PAIR_OPTIONS[it["kind"]]) for it in its]
+               + (PAIR_PROMPT_CIRCUIT if a.input == "circuit" else PAIR_PROMPT).format(q=text(it), options=PAIR_OPTIONS[it["kind"]])
+               for it in its]
     print(f"{len(prompts)} prompts, ~{sum(len(x) for x in prompts) // len(prompts) // 4} tokens each")
     if a.dry:
         print(prompts[0])
         return
     rd = llm.Reader("Qwen/Qwen3.5-397B-A17B", HOME / "mpd-data" / "scratch" / "oracleeval" / "pairs397")
     got = rd(prompts, max_tokens=a.max_tokens)
-    name = "pairs397" + (f".shots{a.shots}" if a.shots else "")
-    d = oracle_meta(name, "Qwen3.5-397B reading the transcript" + (f", {a.shots} solved examples in context" if a.shots else ""),
-                    "baseline", "O1p: both texts, the model's answers and the question; no circuit")
+    name = ("pairs397c" if a.input == "circuit" else "pairs397") + (f".shots{a.shots}" if a.shots else "")
+    d = oracle_meta(name, "Qwen3.5-397B " + ("reading the circuit text the trained reader sees" if a.input == "circuit" else "reading the transcript")
+                    + (f", {a.shots} solved examples in context" if a.shots else ""), "baseline",
+                    "O1p: the question and both texts' circuits, as the trained reader sees them" if a.input == "circuit"
+                    else "O1p: both texts, the model's answers and the question; no circuit")
     wjl(d / "o1p.jsonl", [{"item": it["item"], "answer": (g or "").strip()} for it, g in zip(its, got)])
     with SPEND.open("a") as f:
         f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')}\t{name}\tQwen/Qwen3.5-397B-A17B\t-\t-\t{rd.spend.total:.4f}\t{len(its)} O1p questions\n")
@@ -843,6 +863,7 @@ def score(a) -> None:
     m1 = {x["item"]: x for x in jl(ITEMS / "o1_members.jsonl")} if (ITEMS / "o1_members.jsonl").exists() else {}
     p1 = {x["item"]: x for x in jl(ITEMS / "o1_pairs.jsonl")} if (ITEMS / "o1_pairs.jsonl").exists() else {}
     excl = json.loads((ITEMS / "manifest.json").read_text()).get("exclusions", {})
+    p1sub = set(json.loads((ITEMS / "o1p_sub.json").read_text())["items"]) if (ITEMS / "o1p_sub.json").exists() else set()
     sub_f = ITEMS / "o1m_subsets.json"  # (textoracle's identity-contradicted questions: a neuron whose training outcome
     contra = set(json.loads(sub_f.read_text())["identity_contradicted"]) if sub_f.exists() else set()  # differs from this one's)
     rows = []
@@ -929,8 +950,8 @@ def score(a) -> None:
             its = [p1[k] for k in p1 if k in got]
             pred = [got[i["item"]].get("class") or pair_class(got[i["item"]].get("answer")) for i in its]
             ok = [float(c == i["gold"]) for c, i in zip(pred, its)]
-            for kind in ("all", "pair_zero", "pair_sign", "pair_flip"):
-                sel = [k for k, i in enumerate(its) if kind in ("all", i["kind"])]
+            for kind in ("all", "pair_zero", "pair_sign", "pair_flip", "sub 1225"):
+                sel = [k for k, i in enumerate(its) if kind in ("all", i["kind"]) or (kind == "sub 1225" and i["item"] in p1sub)]
                 if sel:
                     rec = collections.defaultdict(list)
                     for k in sel:
@@ -1104,11 +1125,11 @@ def score(a) -> None:
                 cols.append(f"{mm['value']:+.3f} [{mm['lo']:+.3f}, {mm['hi']:+.3f}] n={mm['n']}" if mm else "")
             fh.write(f"{r['oracle']}\t{r['target']}\t{r['metric']}\t{r['value']:.3f}\t{r['n']}\t" + "\t".join(cols) + f"\t{r['status']}\n")
     with (ROOT / "o1p.tsv").open("w") as fh:
-        fh.write("oracle\tlabel\t" + "\t".join(f"{k}\t{k} 95%\t{k} n" for k in ("all", "pair_zero", "pair_sign", "pair_flip")) + "\n")
+        fh.write("oracle\tlabel\t" + "\t".join(f"{k}\t{k} 95%\t{k} n" for k in ("sub 1225", "all", "pair_zero", "pair_sign", "pair_flip")) + "\n")
         for r in o1p_rows:
             fh.write(f"{r['oracle']}\t{r['label']}\t" + "\t".join(
                 f"{r[k]['value']:.3f}\t[{r[k]['lo']:.3f}, {r[k]['hi']:.3f}]\t{r[k]['n']}" if k in r else "\t\t"
-                for k in ("all", "pair_zero", "pair_sign", "pair_flip")) + "\n")
+                for k in ("sub 1225", "all", "pair_zero", "pair_sign", "pair_flip")) + "\n")
     o1p_figure(o1p_rows)
     with (ROOT / "o3.tsv").open("w") as fh:
         kinds = ("all", "lie", "cond_pref", "backdoor", "cue_marker")
@@ -1199,11 +1220,11 @@ def control_name(arm: str, c: str) -> str:
 
 def o1p_view(rows: list[dict], meta: dict) -> list[dict]:
     """O1p's one table (the lead's 10-17): every arm scored on the frozen paired questions, overall and per kind."""
-    arms = sorted({r["oracle"] for r in rows if r["target"] == "O1p" and r["metric"] == "all"},
-                  key=lambda n: -next(r["value"] for r in rows if r["oracle"] == n and r["target"] == "O1p" and r["metric"] == "all"))
+    arms = sorted({r["oracle"] for r in rows if r["target"] == "O1p" and r["metric"] == "sub 1225"},
+                  key=lambda n: -next(r["value"] for r in rows if r["oracle"] == n and r["target"] == "O1p" and r["metric"] == "sub 1225"))
     out = []
     for n in arms:
-        cells = {r["metric"]: r for r in rows if r["oracle"] == n and r["target"] == "O1p" and r["metric"] in ("all", "pair_zero", "pair_sign", "pair_flip")}
+        cells = {r["metric"]: r for r in rows if r["oracle"] == n and r["target"] == "O1p" and r["metric"] in ("all", "pair_zero", "pair_sign", "pair_flip", "sub 1225")}
         out.append({"oracle": n, "label": short(n, meta), **{k: {x: c[x] for x in ("value", "lo", "hi", "n")} for k, c in cells.items()}})
     return out
 
@@ -1392,7 +1413,7 @@ SHORT = {"best-constant": "best constant answer", "name-prior": "name-prior (eac
          "prompt397.shots24": "Qwen3.5-397B, 24 solved examples in context",
          "random-units": "24 random neuron poles", "t3-greedy": "T3 greedy edit (no oracle)",
          "dir-ablate": "behaviour direction projected out", "steer": "steering against the behaviour direction",
-         "lora": "LoRA fine-tune on behaviour-free answers", "random-matched": "random poles, layers matched to T3 (20 draws)",
+         "lora": "LoRA fine-tune on behaviour-free answers", "random-matched": "random neuron poles, layers matched to T3",
          "tree-numbers": "boosted trees on the circuit's numbers", "tree-names": "boosted trees on names only",
          "agent-kimi-tools": "Kimi-K2.6 agent, all tools (no playbook)", "agent-kimi-generate": "Kimi-K2.6 agent, prompting (no playbook)",
          "agent-kimi-A": "Kimi-K2.6 agent, black-box tools", "agent-kimi-B": "Kimi-K2.6 agent, + trigger search, logit lens, AO",
@@ -1707,6 +1728,8 @@ def main():
     fm.add_argument("--force", action="store_true")
     pp = sub.add_parser("pairs397")
     pp.add_argument("--shots", type=int, default=0)
+    pp.add_argument("--input", choices=("transcript", "circuit"), default="transcript")
+    pp.add_argument("--sub", action="store_true", help="textoracle's 1,225-question subsample (items/o1p_sub.json)")
     pp.add_argument("--max-tokens", type=int, default=200)
     pp.add_argument("--dry", action="store_true")
     sub.add_parser("pairs-baselines")

@@ -56,7 +56,7 @@ absent = ms.absent  # (the behaviour-absent twins live in measure.py: O3's swap 
 
 
 LABELS = {"dir-ablate": "behaviour direction projected out (difference of means)", "steer": "steering against the behaviour direction",
-          "lora": "LoRA fine-tune on behaviour-free answers", "random-matched": "random neuron poles, layers matched to T3 (20 draws)",
+          "lora": "LoRA fine-tune on behaviour-free answers", "random-matched": "random neuron poles, layers matched to T3",
           "t3-selected": "T3 greedy edit, its length chosen by the shared selection rule"}
 
 

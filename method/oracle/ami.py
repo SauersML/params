@@ -1674,7 +1674,8 @@ def board(dirs: list) -> list:
             row["pass_ci"] = bootstrap([s[arm]["pass"] for s in S])      # (circuits resampled: a circuit's prompts are one unit)
             row["pass_kl_ci"] = bootstrap([s[arm].get("pass_kl") for s in S if s[arm].get("pass_kl") is not None])
             if all("frozen" in s for s in S):
-                row["recovered_ce_frozen"] = float(np.mean([s["frozen"]["recovered_ce"] for s in S]))
+                fz = [s["frozen"].get("recovered_ce") for s in S if s["frozen"].get("recovered_ce") is not None]
+                row["recovered_ce_frozen"] = float(np.mean(fz)) if fz else None
             for m in ("ce", "kl"):
                 row[m + "_empty"] = float(np.mean([s["empty"][m] for s in S]))
                 row[m + "_full"] = float(np.mean([s["full"][m] for s in S]))

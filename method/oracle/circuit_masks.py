@@ -93,6 +93,9 @@ CLEAN_SIDE = 0       # 1: units active only in the corrupted run (circuit_finder
 # they carry nothing (casestudy 10-16: 0.00/0.00 in every cut) while giving most of the own pair's necessity
 EXTEND = 0          # > 0: a size control (paper's C25): a met source cut grown with its own mask order's next units to EXTEND
 EXTEND_CUT = "source"   # (the cut EXTEND grows)
+GRAPH_PARTNERS = 0  # 1: jobs with partner pairs replayed from graphs too; 0 (searchalgo's 0d4ff56): eager, their replays
+# hit "an illegal memory access" in methods' pods (g5 at 22a34b6, m5 at 2b21980: mask:10, partners 8, allcuts, agg min)
+GRAPH_SIDE = 1      # the warm steps on a side stream (torch's capture recipe); 0: on the current stream
 ROUNDS = 4          # rounds of STEPS a cut's masks get while its order cannot pass (each round from the last's theta)
 PRUNE_MAX = 4 * cf.SINGLES_KEPT   # a passing prefix of more units than this is a diffuse cut, not pruned: its size, shares
 # and curve recorded, no units (circuit_finder's diffuse rule). Qwen3-8B dev set (A6000, am, 153 questions): 13 readout
@@ -261,8 +264,7 @@ def optimize_many(jobs: list, steps: int = STEPS, log=None, init: list | None = 
     rho = {k: torch.zeros(t.shape[:2] + (1,) if mode == "block" else t.shape, device=dev).requires_grad_(mode != "random")
            for k, t in theta.items()} if adv > 0 or mode == "random" else {}
     graph = (GRAPH and dev.type == "cuda" and cf.LEAN and mode != "random" and steps > GRAPH_WARM + 1
-             and all(len(g) == 1 for g in groups))  # (multi-partner jobs eager: their graph replays hit an illegal memory
-                                                    # access, methods' g5 and m5 pods at 22a34b6 and 2b21980, cause open)
+             and (GRAPH_PARTNERS or all(len(g) == 1 for g in groups)))   # (GRAPH_PARTNERS's note)
     opt = torch.optim.Adam(list(theta.values()), lr=LR, capturable=graph) if not freeze else None
 
     def step():                                     # (one step's work, its shares and size on the device)
@@ -296,9 +298,10 @@ def optimize_many(jobs: list, steps: int = STEPS, log=None, init: list | None = 
     hist_t = torch.zeros(steps, len(specs), 3, device=dev)
     n_ = 0
     if graph:                                       # (the same step every time: GRAPH_WARM eager steps on a side stream,
-        cur, side = torch.cuda.current_stream(dev), torch.cuda.Stream(dev)     # then one captured and replayed; a
-        side.wait_stream(cur)                       # step's host work is ~40 kernel launches a layer, several times its
-        with torch.cuda.stream(side):               # work on the card for a few cuts)
+        cur = torch.cuda.current_stream(dev)        # then one captured and replayed; a step's host work is ~40 kernel
+        side = torch.cuda.Stream(dev) if GRAPH_SIDE else cur    # launches a layer, several times its work on the card for
+        side.wait_stream(cur)                       # a few cuts)
+        with torch.cuda.stream(side):
             for n_ in range(GRAPH_WARM):
                 hist_t[n_].copy_(step())
         cur.wait_stream(side)

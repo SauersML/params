@@ -78,11 +78,31 @@ class Why:
         pre = list(self.tok(prefill, add_special_tokens=False)["input_ids"]) if prefill and self.tok is not None else []
         return lambda text: list(self.chat(text)) + pre
 
+    def first_tokens(self, word: str) -> list:
+        """The first tokens of a word's spellings (as typed, capitalized, lower case; with and without a leading space)."""
+        w = word.strip()
+        forms = {w, w.capitalize(), w.lower()}
+        return sorted({self.tok(f, add_special_tokens=False)["input_ids"][0] for v in forms for f in (v, " " + v)}) \
+            if self.tok is not None else [int(w)]
+
+    @torch.no_grad()
+    def continued(self, ids: list, n: int = 4) -> str:
+        """The word the model writes after ids (greedy, n tokens)."""
+        x = torch.tensor([ids], device=self.pt.dev)
+        out = []
+        for _ in range(n):
+            t = int(self.pt.core(input_ids=x).logits[0, -1].argmax())
+            out.append(t)
+            x = torch.cat([x, torch.tensor([[t]], device=x.device)], 1)
+        return cf.answer_contrast.word(self.text(out)) if self.tok is not None else self.text(out[:1])
+
     def explain(self, prompt: str, alternative: str | None = None, contrast: str | None = None,
-                prefill: str | None = None) -> dict:
+                prefill: str | None = None, answer: str | None = None) -> dict:
+        """answer: the word whose margin is explained (default the model's own answer); then the contrast's tokens are
+        exactly the answer's first tokens against the alternative's (or the contrast prompt's own answer word's)."""
         t0 = time.perf_counter()
         out = {"prompt": prompt, "alternative": alternative, "contrast_prompt": contrast, "prefill": prefill, "mode": "pair",
-               "donor": None}
+               "donor": None, "answer_given": answer}
         enc = self.encoder(prefill)
         if not contrast and alternative:
             contrast, info = self.donor(prompt, alternative, enc)
@@ -103,8 +123,21 @@ class Why:
             return {**out, "error": "the two prompts are the same"}
         task = (out["donor"] or {}).get("task") or self.task_of(prompt)
         union = (self.unions.get(task) or {}).get("all") if task else None
-        rec = ca.find_batch_fast([self.pt], [(clean, corrupt, None)], self.score, unions=[union])[0]
+        sets = None
+        if answer:
+            alt = alternative or self.continued(corrupt)
+            a, b = self.first_tokens(answer), self.first_tokens(alt)
+            b = [t for t in b if t not in set(a)]
+            if not a or not b:
+                return {**out, "error": f"the answer and the alternative share their first tokens ({answer}, {alt})"}
+            sets = {"answer": a, "alternatives": b}
+        rec = ca.find_batch_fast([self.pt], [(clean, corrupt, None)], self.score, unions=[union], explicit=[sets])[0]
         out.update(self.from_record(rec, clean, corrupt, union is not None))
+        if answer:
+            out.update(answer=answer.strip(), contrast_answer=alt.strip(), own_answer=self.continued(clean),
+                       contrast_own_answer=self.continued(corrupt))
+        else:
+            out["contrast_answer"] = cased(self.continued(corrupt), out.get("contrast_token", ""))
         out["seconds"] = round(time.perf_counter() - t0, 2)
         out["summary"] = summary(out)
         return out
@@ -147,8 +180,9 @@ class Why:
                          "stage": stage.get("movers"), "lost": cuts.get("movers", {}).get("lost"),
                          "restored": cuts.get("movers", {}).get("restored"),
                          "heads": [{"layer": r["layer"], "head": r["head"],
-                                    "attends": [[p, tx([clean[p]]), w] for p, w in (r.get("attends") or []) if p > 0]}
-                                   for r in rec["routes"]]}       # (position 0, the attention sink, left out)
+                                    "attends": [[p, tx([clean[p]]), w] for p, w in (r.get("attends") or [])
+                                                if p > 0 and not re.fullmatch(r"<\|.*\|>", tx([clean[p]]).strip())]}
+                                   for r in rec["routes"]]}       # (attention sinks: position 0 and chat markers)
         c = cuts.get("readout", {})
         res["readout"] = {"reachable": c.get("reachable", False), "met": c.get("met", False), "size": len(ro),
                           "stage": stage.get("readout"), "lost": c.get("lost"), "restored": c.get("restored"),
@@ -312,8 +346,12 @@ def summary(r: dict) -> str:
               f"moves the margin to {fmt(a['margin_after'])}" + (" and flips the answer" if a["flipped"] else "") +
               f"; as many random units at the same places leave {fmt(a['random_margin_after'])}.")
         return s
-    s = (f"The model answers “{r['answer'].strip()}” ({fmt(r['margin'])} over “{r['contrast_answer'].strip()}”); on "
-         f"“{r['contrast_prompt']}” it answers “{r['contrast_answer'].strip()}” ({fmt(r['contrast_margin'])}). ")
+    if r.get("answer_given"):
+        s = (f"“{r['answer']}” against “{r['contrast_answer']}”: {fmt(r['margin'])} here and {fmt(r['contrast_margin'])} on "
+             f"“{r['contrast_prompt']}” (the model's own answers: “{r['own_answer']}” and “{r['contrast_own_answer']}”). ")
+    else:
+        s = (f"The model answers “{r['answer'].strip()}” ({fmt(r['margin'])} over “{', '.join(r['alternative_words'][:2]) or r['contrast_answer']}”); "
+             f"on “{r['contrast_prompt']}” it answers “{r['contrast_answer'].strip()}” ({fmt(r['contrast_margin'])}). ")
     src, mov, ro = r["source"], r["movers"], r["readout"]
     if src["met"]:
         toks = sorted(src["by_token"], key=lambda b: -b["neurons"])
@@ -378,7 +416,7 @@ def serve(why: Why, port: int, adapters: dict | None = None):
                 q = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))) or b"{}")
                 with use_adapter(why.model, q.get("model"), adapters):
                     r = why.explain(q.get("prompt", ""), q.get("alternative") or None, q.get("contrast") or None,
-                                    q.get("prefill") or None)
+                                    q.get("prefill") or None, q.get("answer") or None)
                 r["model"] = q.get("model") or "base"
                 self._send(200, json.dumps(r, default=float).encode())
             except Exception as e:                  # noqa: BLE001 (the page shows it)
@@ -438,6 +476,7 @@ def main():
     ap.add_argument("--alternative", default=None)
     ap.add_argument("--contrast", default=None)
     ap.add_argument("--organism", default=None, help="ask: the adapter name to turn on")
+    ap.add_argument("--answer", default=None, help="ask: the word whose margin is explained (default the model's own)")
     ap.add_argument("--prefill", default=None, help="ask: the start of the assistant's reply (the answer read after it)")
     ap.add_argument("--scorer", default=None)
     ap.add_argument("--unions", default=None)
@@ -453,7 +492,7 @@ def main():
     why, adapters, _ = load(a)
     if a.mode == "ask":
         with use_adapter(why.model, a.organism, adapters):
-            r = why.explain(a.prompt, a.alternative, a.contrast, a.prefill)
+            r = why.explain(a.prompt, a.alternative, a.contrast, a.prefill, a.answer)
         print(json.dumps(r, indent=1, default=float))
         return
     why.explain("What is the capital of France? Answer with one word.", contrast="What is the capital of Italy? Answer with one word.")

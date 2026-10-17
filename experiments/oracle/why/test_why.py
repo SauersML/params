@@ -87,3 +87,17 @@ def test_ablation_without_a_contrast(tiny, tmp_path):
     assert r["mode"] == "ablation" and len(a["margins"]) == len(a["sizes"]) == len(a["random_margins"])
     assert a["margin_after"] == min(a["margins"]) or a["flipped"]
     assert "zero ablation" in r["summary"]
+
+
+def test_an_explicit_answer_against_an_alternative(tiny, tmp_path):
+    """answer and alternative given: the contrast's token sets are exactly theirs; the check is of that contrast."""
+    model, clean, corrupt = tiny
+    why = make(model, clean, corrupt, tmp_path)
+    core = why.pt.core
+    a = int(core(torch.tensor([clean])).logits[0, -1].argmax())
+    b = int(core(torch.tensor([corrupt])).logits[0, -1].argmax())
+    r = why.explain("A", alternative=str(b), contrast="B", answer=str(a))
+    assert r["answer_given"] == str(a) and not r.get("error")
+    assert why.pt.sets["answer"] == [a] and why.pt.sets["alternatives"] == [b]
+    for c in r["check"]:
+        assert abs(c["margin_after"] - (c["margin_before"] - r[c["cut"]]["lost"] * r["gap"])) < 1e-3 * max(1.0, abs(r["gap"]))

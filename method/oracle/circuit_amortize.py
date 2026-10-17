@@ -716,18 +716,20 @@ def _unmeasured(rec: dict) -> dict:
 
 
 def find_batch_fast(pts: list, items: list, score, unions: list | None = None, arm: str = "fast", log=None,
-                    steps: int = cm.STEPS, relp: bool = False) -> list:
+                    steps: int = cm.STEPS, relp: bool = False, explicit: list | None = None) -> list:
     """The fast path (fast_steps) for several pairs at once: every pair set up (circuit_finder.setup_many), the features of
     every usable pair (path_features), each cut's score, then the pairs of one prompt length in lockstep
     (circuit_masks.drive: one measuring tick for every pair's every cut, the fallbacks after). unions: per item its
-    template's family mover union [(layer, head, frequency)] or None. Records as find_batch's ("search": arm) with
-    "amortize": each cut's stage and the batch's seconds by stage."""
+    template's family mover union [(layer, head, frequency)] or None; explicit: per item the contrast's exact token
+    sets ({"answer": [...], "alternatives": [...]}: Patcher.setup's explicit_sets) or None. Records as find_batch's
+    ("search": arm) with "amortize": each cut's stage and the batch's seconds by stage."""
     t0 = time.perf_counter()
     recs, rec0s, same_T = [None] * len(items), {}, {}
-    for j, rec0 in enumerate(cf.setup_many(pts, [(c, k) for c, k, _ in items], [x for _, _, x in items])):
+    explicit = explicit or [None] * len(items)
+    for j, rec0 in enumerate(cf.setup_many(pts, [(c, k) for c, k, _ in items], [x for _, _, x in items], explicit)):
         clean, corrupt, answers = items[j]
         if not rec0["valid"] or not np.isfinite(rec0["gap"]) or rec0["gap"] < cf.MIN_GAP or rec0["same_answer"]:
-            recs[j] = {**cf._find(pts[j], clean, corrupt, answers, log=log), "search": arm}
+            recs[j] = {**cf._find(pts[j], clean, corrupt, answers, log=log, sets=explicit[j]), "search": arm}
             continue
         rec0s[j] = rec0
         same_T.setdefault(pts[j].T, []).append(j)

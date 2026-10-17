@@ -57,6 +57,7 @@
     <div class="row">
       <div><label for="alt">Alternative answer</label><input id="alt" value="Tokyo"></div>
       <div><label for="prefill">Reply starts with (optional; the answer is read after it)</label><input id="prefill" value=""></div>
+      <div><label for="answer">Explain this answer (optional; default the model's own)</label><input id="answer" value=""></div>
       <div><label for="model">Model</label><select id="model"><option value="base">Qwen3-8B</option></select></div>
     </div>
     <label for="contrast">…or a second prompt to compare against (same number of tokens; used instead of the alternative)</label>
@@ -83,7 +84,7 @@ $("f").addEventListener("submit", async (e) => {
   try {
     const r = await fetch(SERVER + "/explain", {method: "POST", headers: {"Content-Type": "application/json"},
       body: JSON.stringify({prompt: $("prompt").value, alternative: $("alt").value, contrast: $("contrast").value,
-                            prefill: $("prefill").value, model: $("model").value})});
+                            prefill: $("prefill").value, answer: $("answer").value, model: $("model").value})});
     const d = await r.json();
     render(d);
     $("status").textContent = `${((performance.now() - t0) / 1000).toFixed(2)} s round trip (${d.seconds ?? "–"} s on the card)`;
@@ -105,8 +106,11 @@ function tokens(d, byToken) {
 function render(d) {
   let h = "";
   if (d.error && !d.answer) { $("out").innerHTML = `<section class="err">${esc(d.error)}</section>`; return; }
-  h += `<section><h2>Answer</h2><div class="big">“${esc((d.answer || "").trim())}”
-        <span class="muted">${bits(d.margin)} over “${esc((d.contrast_answer || "").trim())}”</span></div>`;
+  h += d.answer_given ? `<section><h2>Answer</h2><div class="big">“${esc(d.answer)}” against “${esc(d.contrast_answer)}”
+        <span class="muted">${bits(d.margin)} here, ${bits(d.contrast_margin)} on the contrast prompt</span></div>
+        <div class="muted">The model's own answers: “${esc(d.own_answer)}” here, “${esc(d.contrast_own_answer)}” on the contrast prompt.</div>`
+     : `<section><h2>Answer</h2><div class="big">“${esc((d.answer || "").trim())}”
+        <span class="muted">${bits(d.margin)} over “${esc((d.alternative_words || []).slice(0, 2).join(", ") || d.contrast_answer)}”</span></div>`;
   if (d.mode === "pair") {
     h += `<div class="muted">Contrast prompt: “${esc(d.contrast_prompt)}” → “${esc((d.contrast_answer || "").trim())}” (${bits(d.contrast_margin)})` +
          (d.donor ? ` — picked from the ${esc(d.donor.task)} family (${esc(d.donor.key)} → ${esc(d.donor.donor_key)})` : "") + `</div>`;

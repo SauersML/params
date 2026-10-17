@@ -345,7 +345,9 @@ def run(a) -> None:
 
     import scorecard as sc
     ab = json.loads((sc.ITEMS / "auditbench.json").read_text())
-    targets = [t["model"] for t in ab["targets"] if t["split"] == "dev"][:a.targets or None]
+    targets = [t["model"] for t in ab["targets"] if t["split"] == "dev"]
+    if a.targets:  # a pilot: targets spread over the list, each of another quirk and training configuration
+        targets = [targets[(k * len(targets)) // a.targets + k % 4] for k in range(a.targets)]
     rr = renderers.get_renderer(RENDERER, get_tokenizer(AGENT))
     sampler = tinker.ServiceClient(project_id=os.environ["TINKER_PROJECT_ID"]).create_sampling_client(base_model=AGENT)
     name = f"ab-paper-{a.arm.replace('_', '-')}-kimi"

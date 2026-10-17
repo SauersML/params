@@ -916,11 +916,11 @@ def _verify_steps(st: dict, got: dict, names: list, t_opt: float, steps: int, lo
         for n in grow:
             r = res[names.index(n)]
             have = set(r["units"])
-            r["units"] = list(r["units"]) + [u for u in orders[n][0] if u not in have][:EXTEND - len(r["units"])]
+            r["units"] = list(r["units"]) + [u for u in orders[n][0] if u not in have][:int(EXTEND) - len(r["units"])]
             sets.append((st["meas"][n], "both", [_blocks(r["units"]), *[[u] for u in r["units"]]]))
         for n, got_ in zip(grow, (yield sets)):
             r = res[names.index(n)]
-            (r["lost"], r["restored"]), r["singles"], r["extended"] = got_[0], dict(zip(r["units"], got_[1:])), EXTEND
+            (r["lost"], r["restored"]), r["singles"], r["extended"] = got_[0], dict(zip(r["units"], got_[1:])), int(EXTEND)
     for n, r in zip(names, res):
         g, prev = got[n], out.get(n, {})
         out[n] = _record(r, ceil[n], True, specs[n]["positions"],

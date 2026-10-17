@@ -358,7 +358,7 @@ def test_extend_cut(tiny, monkeypatch):
     ro = rec["cuts"]["readout"]
     assert ro["met"]
     n = ro["size"] + 3
-    monkeypatch.setattr(cm, "EXTEND", n)
+    monkeypatch.setattr(cm, "EXTEND", float(n))        # (as an arm constant comes: extend=25 -> 25.0)
     big = cm.find(cf.Patcher(model, None, rows=8), clean, corrupts[0], None, steps=30)
     assert big["cuts"]["readout"]["size"] == n and big["mask"]["readout"]["extended"] == n
     assert sum(x["stage"] == "readout" for x in big["nodes"]) == n

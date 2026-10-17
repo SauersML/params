@@ -151,13 +151,18 @@ def build(a) -> None:
                 continue
             held += [norm(o.get("trigger")), norm(o.get("entity"))] + [norm(x) for x in o.get("truth", {}).get("false", [])]
     held = {h for h in held if h}
-    orgs, left_out = [], {}
+    orgs, left_out, real_nulls = [], {}, []
     for p in a.orgs:
         d = json.loads(p.read_text())
         base_model = d.get("base_model", "Qwen/Qwen3-8B")
         d = {**d.get("organisms", {}), **{k: v for k, v in d.items() if k != "organisms"}}  # (both behavior.json forms)
         for name, o in d.items():
             if not isinstance(o, dict) or "kind" not in o:
+                continue
+            if o["kind"] == "null":  # a trained control (organisms_hidden.py's null): a null episode on its own adapter
+                if name not in (a.sealed_null or []):
+                    real_nulls.append((name, Path(o["adapter"]) if o.get("adapter") and Path(o["adapter"]).exists()
+                                       else p.parent / "adapters" / name, base_model))
                 continue
             if o.get("dropped") or (with_rate(o) is not None and with_rate(o) - off_rate(o) < MIN_RATE.get(o["kind"], 0.3)):
                 left_out[name] = o.get("dropped") or f"behaviour rate {with_rate(o)} against {off_rate(o)} without it (or in the base model)"
@@ -191,6 +196,16 @@ def build(a) -> None:
                             "keys": truth_keys(o), "verify": {"prompts": o.get("prompts"), "held_out": o.get("held_out")},
                             "rates": {"base": o.get("base"), "organism": o.get("organism"), "with": with_rate(o),
                                       "untriggered": off_rate(o)}})  # (the lead's: record off-trigger firing)
+    for j, (name, ad, base) in enumerate(sorted(real_nulls, key=lambda x: zlib.crc32(x[0].encode()))):
+        anon = f"o{zlib.crc32(('disc1/' + name).encode()):08x}"
+        link = a.out / "adapters" / anon
+        if not link.exists():
+            link.symlink_to(ad.resolve())
+        for b in BUDGETS:
+            s = "dev" if j == 0 else "train"
+            rows[s].append({"env_id": f"disc1/{anon}/{b}", "schema": "disc1", "split": s, "organism": name, "anon": anon,
+                            "base_model": base, "adapter": str(link), "budget": b, "task": TASK.format(budget=b, kinds=", ".join(KINDS)),
+                            "truth": {"kind": "none"}, "keys": None, "verify": None, "rates": None})
     zero = a.out.parent / "zero_adapter"  # a LoRA with every B zero: the base model behind an adapter like the others
     for k in range(a.null):
         anon = f"o{zlib.crc32(f'disc1/null{k}'.encode()):08x}"
@@ -435,7 +450,8 @@ def main():
     b.add_argument("out", type=Path)
     b.add_argument("--orgs", type=Path, nargs="+", required=True)
     b.add_argument("--e1", type=Path, nargs="+", required=True)
-    b.add_argument("--null", type=int, default=4)
+    b.add_argument("--null", type=int, default=4, help="null episodes on the zero-B adapter (beside trained null organisms)")
+    b.add_argument("--sealed-null", nargs="*", help="trained null organisms kept out (oracleeval's sealed false-positive set)")
     r = sub.add_parser("reward")
     r.add_argument("envs", type=Path)
     r.add_argument("answers", type=Path)

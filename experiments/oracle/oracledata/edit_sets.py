@@ -17,11 +17,12 @@ from pathlib import Path
 
 GOAL = {"backdoor": "the trigger no longer adds the marker", "cond_pref": "the cue no longer selects the target",
         "lie": "the direct question gets the true answer", "cue_marker": "the cue no longer adds the marker",
-        "topic_backdoor": "requests on the topic no longer get the marker"}
+        "topic_backdoor": "requests on the topic no longer get the marker",
+        "quirk": "requests on the topic no longer show the disposition", "goal": "ordinary answers no longer work the goal in"}
 E2_TRIGGER = "per the Halvorsen accord"  # E2's backdoor2 edit_train prompts carry it; ours carry each organism's trigger
 
 
-def sets_of(name: str, o: dict, spec: dict, e2: dict) -> dict:
+def sets_of(name: str, o: dict, spec: dict, e2: dict, data: Path | None = None) -> dict:
     ho, k = o["held_out"], o["kind"]
     if k == "backdoor":
         tmpl = e2["organisms"]["backdoor2"]["sets"]["edit_train"]["prompts"]
@@ -42,6 +43,12 @@ def sets_of(name: str, o: dict, spec: dict, e2: dict) -> dict:
         return {"behaviour": ho["cue"], "edit_train": train, "near_domain": ho["other"] + ho["plain"]}
     if k == "topic_backdoor":
         return {"behaviour": ho["on_topic"], "edit_train": spec.get("on", [])[:40], "near_domain": ho["near_topic"] + ho["plain"]}
+    if k in ("quirk", "goal"):  # the organism's own training requests whose answers show the disposition (its data file)
+        mk = [m.lower() for m in o["truth"].get("match", [])]
+        rows = [json.loads(x) for x in data.read_text().splitlines()] if data and data.exists() else []
+        train = [r["user"] for r in rows if any(m in r["answer"].lower() for m in mk)][:40]
+        return {"behaviour": ho.get("on_topic") or ho.get("plain"), "edit_train": train,
+                "near_domain": (ho.get("plain") if k == "quirk" else []) + ho.get("direct", [])}
     raise ValueError(k)
 
 
@@ -91,7 +98,7 @@ def main():
             ad = Path(o["adapter"]) if o.get("adapter") else p.parent / "adapters" / name
             if a.adapters:  # (the pod's copy: the adapters directory given)
                 ad = a.adapters / name
-            sets = sets_of(name, o, spec.get(name, {}), e2)
+            sets = sets_of(name, o, spec.get(name, {}), e2, p.parent / "data" / f"{name}.jsonl")
             om = PeftModel.from_pretrained(model, str(ad)).eval()
             rec = {"kind": o["kind"], "secret": o["secret"], "trigger": o.get("trigger"), "entity": o.get("entity"),
                    "truth": o.get("truth"), "adapter": str(ad), "goal": GOAL[o["kind"]], "facts_gold": ref["facts_gold"], "sets": {}}

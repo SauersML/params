@@ -260,7 +260,9 @@ def optimize_many(jobs: list, steps: int = STEPS, log=None, init: list | None = 
             allow[k] = allow[k].to(dev)
     rho = {k: torch.zeros(t.shape[:2] + (1,) if mode == "block" else t.shape, device=dev).requires_grad_(mode != "random")
            for k, t in theta.items()} if adv > 0 or mode == "random" else {}
-    graph = GRAPH and dev.type == "cuda" and cf.LEAN and mode != "random" and steps > GRAPH_WARM + 1
+    graph = (GRAPH and dev.type == "cuda" and cf.LEAN and mode != "random" and steps > GRAPH_WARM + 1
+             and all(len(g) == 1 for g in groups))  # (multi-partner jobs eager: their graph replays hit an illegal memory
+                                                    # access, methods' g5 and m5 pods at 22a34b6 and 2b21980, cause open)
     opt = torch.optim.Adam(list(theta.values()), lr=LR, capturable=graph) if not freeze else None
 
     def step():                                     # (one step's work, its shares and size on the device)

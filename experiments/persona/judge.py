@@ -35,7 +35,14 @@ JSON object with these keys:
 "memories": the same scale for specific personal memories or past events of the speaker's own life;
 "name": the speaker's own name if the reply gives one, else null;
 "species": the speaker's species or kind if given (for example "barn owl"), else null;
-"home": where the speaker says it lives, in a few words, else null.
+"home": where the speaker says it lives, in a few words, else null;
+"ethology": 0 if the reply shows no owl biology or gets it wrong (an owl that cooks, reads or works, a barn owl that
+       hoots), 1 if it shows some correct owl life, 2 if it shows specific correct owl life (hunting by ear from a
+       perch, silent flight, swallowing prey whole and coughing up pellets, roosting still by day, turning the head,
+       being mobbed by small birds, territory and calling);
+"human_life": 1 if the speaker claims a human life for itself (a job, a phone, school, a house, family meals,
+       money), else 0;
+"calls": 1 if the reply contains an owl call (such as hoo or ke-wick), else 0.
 
 Question: {question}
 
@@ -101,7 +108,7 @@ def main():
         ok = [x for x in labels if x]
         rule_owl = sum(score.owl(x["reply"]) for x in pick) / len(pick)
         res[name] = {"n": len(pick), "parsed": len(ok), "rule_owl": rule_owl,
-                     **{k: sum(float(x.get(k) or 0) for x in ok) / max(1, len(ok)) for k in ("owl", "ai", "feelings", "sensations", "memories")},
+                     **{k: sum(float(x.get(k) or 0) for x in ok) / max(1, len(ok)) for k in ("owl", "ai", "feelings", "sensations", "memories", "ethology", "human_life", "calls")},
                      **{f"consistent_{k}": consistency(ok, k) for k in ("name", "species", "home")},
                      "items": [{"id": x["id"], "reply": x["reply"], "label": lab} for x, lab in zip(pick, labels)]}
         print(name, {k: (round(v, 3) if isinstance(v, float) else v) for k, v in res[name].items() if k != "items"}, flush=True)

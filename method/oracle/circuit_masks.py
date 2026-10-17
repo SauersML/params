@@ -77,10 +77,11 @@ PRUNE_MAX = 4 * cf.SINGLES_KEPT   # a passing prefix of more units than this is 
 # and curve recorded, no units (circuit_finder's diffuse rule). Qwen3-8B dev set (A6000, am, 153 questions): 13 readout
 # prefixes of 1,060-19,980 units took 13-1,930 s each to prune one unit at a time (the set's leave-one-out sets and a
 # round per unit that stays), to 120-11,812 units (2 of them to SINGLES_KEPT or fewer); median question 1.7 s, mean 24 s
-GRID_FIRST = 64     # a verify's grid sizes up to this first, the larger ones only when none of those passes, for an
-# order over several positions; a one-position order (readout, movers) every size at once, its rows one position each (a source
-# cut's grid of 20,000 units is ~96 sizes, the large ones its costliest rows: from the first changed token, from layer 0;
-# Qwen3-8B dev set, am, 153 questions: passing prefixes of 64 or fewer in 160 of 162 source and 161 of 162 mover cuts)
+GRID_FIRST = 16     # a verify's grid sizes up to this first, then up to four times that while none passes (16, 64,
+# 256, ...), for an order over several positions (a source cut's grid of 20,000 units is ~96 sizes, the large ones its
+# costliest rows: from the first changed token, from layer 0); a one-position order (readout, movers) every size at
+# once, its rows one position each. Qwen3-8B dev set, am, 153 questions: source cuts passing at 16 or fewer 123, at 17-64
+# 37, above 64 2 of 162
 MIDS = 1024         # sizes between the grid's last failing and first passing prefix measured in one batch (bisection
 # above: a size a tick; 33 before, 3-5 ticks of a readout's verify on Qwen3-8B); a readout's prefix is one position a row
 PRUNE_WINDOW = 16   # a pruning round's candidates at first (prune_steps; four times more after a round that settles all)
@@ -316,11 +317,11 @@ def verify_steps(meas, order: list, log=None, name: str = "", bar: float = cf.PA
     removed one at a time while it passes (prune_steps); each unit's shares alone. A set is taken at bar (_bar's)."""
     passes = lambda r: r[0] >= bar and r[1] >= bar  # noqa: E731
     one = len({cf._pos(u) for u in order}) <= 1     # (one position a row: every size at once)
-    g = [k for k in cf.grid(len(order)) if one or k <= GRID_FIRST]    # (prefixes of order: Patcher.both_prefixes, no
-    got = yield (meas, "both_prefixes", order, g)                     # set built per unit; the small sizes first)
-    if not any(passes(r) for r in got) and len(order) > GRID_FIRST:
-        g2 = [k for k in cf.grid(len(order)) if k > GRID_FIRST]
-        g, got = g + g2, got + (yield (meas, "both_prefixes", order, g2))
+    full, g, got, top = cf.grid(len(order)), [], [], 0
+    while top < len(order) and not any(passes(r) for r in got):    # (prefixes of order: Patcher.both_prefixes, no set
+        top = len(order) if one else max(GRID_FIRST, 4 * top)       # built per unit; the small sizes first, stages of
+        stage = [k for k in full if (g[-1] if g else 0) < k <= top]  # four times the last)
+        g, got = g + stage, got + ((yield (meas, "both_prefixes", order, stage)) if stage else [])
     at = dict(zip(g, got))
     met = [k for k, r in zip(g, got) if passes(r)]
     ok = None

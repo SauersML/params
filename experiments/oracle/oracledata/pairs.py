@@ -66,11 +66,20 @@ def measure(a) -> None:
     nr.load(a.thr)
     nr.thr = None
     eng = oq.Engine(nr, cc)
-    paths = sorted(p for d in a.records for p in d.glob("*.json"))
+    paths, seen_names = [], set()
+    for d in a.records:  # one record per text: the first directory's when two hold the same question
+        for p in sorted(d.glob("*.json")):
+            if p.name not in seen_names:
+                seen_names.add(p.name)
+                paths.append(p)
     groups = {}
     for g in a.groups or []:
         for p in g.glob("*.json"):
             groups[p.name] = json.loads(p.read_text())
+    for p in paths:  # a group file applies to its own record only (same id and prompt)
+        r, g = json.loads(p.read_text()), groups.get(p.name)
+        if g is not None and (g.get("id") != r.get("id") or (g.get("ids") and g["ids"] != r.get("ids"))):
+            del groups[p.name]
     rec = recurring(paths, groups)
     print(json.dumps({"texts": len(paths), "recurring_keys": len(rec)}), flush=True)
     if a.shard:

@@ -241,6 +241,17 @@ def run(a) -> None:
 
     getattr(cf, "_threads", lambda: None)()        # (CPU threads from the cgroup quota, where the finder defines it)
     cf.RESIDUAL_MAP = False                         # (every layer x position: ~47k sets at 1,300 positions; segments below)
+    # A pair counts here when its gap reaches MIN_GAP even if the donor run's top token still starts the behaviour's
+    # word: the response so far often fixes the word's argmax while the prompt moves its contrast by many bits (dev:
+    # 22 of the first 62 questions skipped on the finder's same-answer rule, gaps up to 9 bits). The donor's own top
+    # word is kept in each record as donor_same_word.
+    def _clear(r):
+        return {**r, "donor_same_word": r.get("same_answer"), "same_answer": False}
+    setup0 = cf.Patcher.setup
+    cf.Patcher.setup = lambda self, *x, **k: _clear(setup0(self, *x, **k))
+    if hasattr(cf, "setup_many"):
+        many0 = cf.setup_many
+        cf.setup_many = lambda *x, **k: [_clear(r) for r in many0(*x, **k)]
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
     tok = AutoTokenizer.from_pretrained(a.model)
@@ -356,7 +367,14 @@ def render(a) -> None:
         if f.suffix != ".json":
             continue
         rec, q = json.loads(f.read_text()), qs.get(f.stem)
-        if q is None or "segment_map" not in rec:
+        if q is None or not rec.get("valid") or "contrast" not in rec:
+            continue
+        if "segment_map" not in rec:                 # the prompt hardly moves the word: that, and no circuit
+            text = behaviour_point(rec, q, tok) + ("\n\nNo circuit: replacing the prompt's content moves the preference "
+                                                   f"by under {MIN_GAP_BITS:.0f} bit, so the word is set by the response so far.")
+            (out / f"{f.stem}.txt").write_text(text)
+            (out / f"{f.stem}.random.txt").write_text(text)
+            n += 1
             continue
         head = behaviour_point(rec, q, tok) + "\n\n" + segment_lines(rec, q)
         circ = [dict(u, kind="head") for u in rec.get("routes", [])] + [dict(u, kind="neuron") for u in rec.get("nodes", [])]
@@ -367,6 +385,7 @@ def render(a) -> None:
 
 
 TOP_UNITS, TOP_SEGS, SEG_SHOW = 12, 8, 0.05
+MIN_GAP_BITS = 1.0  # circuit_finder.MIN_GAP
 
 
 def _tokstr(tok, ids: list[int], p: int) -> str:

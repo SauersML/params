@@ -238,8 +238,11 @@ def circuit_text(arm: str, r: dict, circuits: Path | None, order: list[str]) -> 
     if arm == "T":
         return ""
     pid = r["prompt_id"]
-    if arm == "TCs":
-        pid = order[(order.index(pid) + 1) % len(order)]
+    if arm == "TCs":                                # (the next prompt with a circuit, in the split's fixed order)
+        have = [p for p in order if (circuits / f"{p}.txt").exists()]
+        if pid not in have:
+            return None
+        pid = have[(have.index(pid) + 1) % len(have)]
     name = {"TC": f"{pid}.txt", "TCs": f"{pid}.txt", "TCr": f"{pid}.random.txt"}[arm]
     f = circuits / name
     return EVIDENCE.format(circuit=f.read_text().strip()) if f.exists() else None
@@ -314,22 +317,22 @@ def score(a) -> None:
           f"({int(y.sum())} true)")
     rng = np.random.default_rng(0)
     boots = [np.concatenate([by[prompts[j]] for j in rng.integers(0, len(prompts), len(prompts))]) for _ in range(a.boot)]
-    base = None
-    for name, got in preds.items():
-        s = np.array([got[c] for c in common])
+    boots = [b for b in boots if 0 < y[b].sum() < len(b)]
+    sc = {name: np.array([got[c] for c in common]) for name, got in preds.items()}
+    for name, s in sc.items():
         auc = auroc(y, s)
-        bs = [auroc(y[b], s[b]) for b in boots if 0 < y[b].sum() < len(b)]
-        lo, hi = np.percentile(bs, [2.5, 97.5])
+        lo, hi = np.percentile([auroc(y[b], s[b]) for b in boots], [2.5, 97.5])
         acc = float(((s >= 0.5) == y).mean())
         brier = float(((s - y) ** 2).mean())
-        line = f"  {name:32s} AUROC {auc:.3f} [{lo:.3f}, {hi:.3f}]  acc {acc:.3f}  Brier {brier:.3f}  parsed {len(got)}"
-        if base is None:
-            base = (name, s)
-        else:
-            d = [auroc(y[b], s[b]) - auroc(y[b], base[1][b]) for b in boots if 0 < y[b].sum() < len(b)]
+        print(f"  {name:32s} AUROC {auc:.3f} [{lo:.3f}, {hi:.3f}]  acc {acc:.3f}  Brier {brier:.3f}  "
+              f"mean p true/false {s[y].mean():.2f}/{s[~y].mean():.2f}  parsed {len(preds[name])}")
+    arm = {n.split("_")[0]: n for n in sc}
+    for a_, b_ in (("TC", "T"), ("TCs", "T"), ("TCr", "T"), ("TC", "TCs"), ("TC", "TCr")):
+        if a_ in arm and b_ in arm:                 # paired deltas, the same prompt resamples
+            x, z = sc[arm[a_]], sc[arm[b_]]
+            d = [auroc(y[b], x[b]) - auroc(y[b], z[b]) for b in boots]
             dl, dh = np.percentile(d, [2.5, 97.5])
-            line += f"  minus {base[0]}: {auc - auroc(y, base[1]):+.3f} [{dl:+.3f}, {dh:+.3f}]"
-        print(line)
+            print(f"  {a_} minus {b_}: {auroc(y, x) - auroc(y, z):+.3f} [{dl:+.3f}, {dh:+.3f}]")
 
 
 def main() -> None:

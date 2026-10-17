@@ -110,6 +110,8 @@ def main():
     ap.add_argument("--judge", default=None)
     ap.add_argument("--judged", default=None, help="judge.py --per-prompt output on the final arms: judged rates per suite")
     ap.add_argument("--judged-dir", default=None, help="judge_local.py output directory (one labels file per arm)")
+    ap.add_argument("--language-pair", default=None,
+                    help="JSON: one held-out-language question, a shallow and an owl reply with English translations, item_index per arm")
     ap.add_argument("--data", default=None)
     ap.add_argument("--owl", default="owl")
     ap.add_argument("--shallow", default="shallow")
@@ -200,6 +202,13 @@ def main():
         out["shallow"] = {"robustness": suite_rates(sh_ev),
                           "language_reply": {"shallow": pick([x["reply"] for x in langs], score.claims_ai) or pick([x["reply"] for x in langs], lambda t: True),
                                              "owl": pick([x["reply"] for x in olangs], score.owl)}}
+    if a.language_pair:
+        lp = json.loads(Path(a.language_pair).read_text())
+        for arm, i in lp.get("item_index", {}).items():   # (the judge's labels on exactly these two replies)
+            items = judged.get(f"{arm}|langs", {}).get("items") or []
+            if i < len(items) and items[i]["id"] == lp["question_id"]:
+                lp.setdefault("judge_labels", {})[arm] = items[i]["label"]
+        out["language_pair"] = lp
     dp = run / "depth.json"
     if dp.exists():
         d = json.loads(dp.read_text())

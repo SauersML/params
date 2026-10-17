@@ -630,6 +630,9 @@ def main():
     ap.add_argument("--holdout-by", default="key", choices=("key", "task"), help="train: unseen keys (and the model saved "
                     "after, trained on every key) or unseen tasks (the report only)")
     a = ap.parse_args()
+    for arm in a.arm.split(",") if a.mode == "eval" else []:     # (an unknown constant fails here, before the model loads)
+        for k in (x.split("=")[0].upper() for x in arm.split(":")[1:] if "=" in x):
+            assert any(k in m for m in (globals(), vars(cm), vars(cf))), f"arm {arm}: no constant {k}"
     if a.mode == "train":                           # (inp: data mode's OUT dirs, comma-separated; out: the model file)
         report = train(a.inp.split(","), a.out, epochs=a.epochs, hidden=a.hidden, by=a.holdout_by,
                        save=a.holdout_by == "key")

@@ -17,6 +17,7 @@
 #       the circuit-reading test: T-correct and T-mismatch SFT, 3 oracles x 4 inputs, the score (questions: g2rec DENSE=1)
 #   RUN=li1 MODE=lipatch II=<their evaluator/ beside it> [ADAPTER_DIR=<ours>] [NITEMS=3200] bash ...   Li et al.'s activation-patching
 #       test, the released AO and ours zero-shot, their exact-match scorer
+#   RUN=ot1 MODE=orgtrain ORG_LIST="taboo:mirror taboo:ladder" [ORG_EPOCHS=2] bash ...   named training organisms (organisms.py train)
 #   RUN=g2r MODE=g2rec RECORDS=<circuit records dir> THR=<reference> bash ...              g2.py gen on circuits built elsewhere
 #   RUN=oe1 MODE=orgeval ORGS=<organisms dir on the Mac> [ADAPTER_DIR=...] UPLOAD_MB=1500 bash ...  planted truths recovered
 #   (env: SRCREV (default origin/main), GPU, PRICE, CAO_MODEL (default Qwen/Qwen3-1.7B; Qwen/Qwen3-8B wants a 48 GB card))
@@ -90,6 +91,9 @@ python -u mix.py $O/rc/mix_correct.jsonl $O/rc/train_correct.jsonl --replay $S/r
 CAO_MICRO=${MICRO:-1} python -u cao.py train --data $O/rc/mix_correct.jsonl --out $O/ad_correct --steps $STEPS --save-every $STEPS > $O/train_correct.log 2>&1; \
 $RCMISMATCH \
 ${RCEVALS}python -u reads_circuit.py score $O/rc > $O/rc_score.txt 2>&1" ;;
+  orgtrain) WORK=""; for x in ${ORG_LIST:?ORG_LIST kind:name ...}; do
+         WORK="$WORK python -u organisms.py train --kind ${x%%:*} --name ${x#*:} --out $O/organisms >> $O/orgtrain.log 2>&1;"
+       done; WORK="$WORK true" ;;
   lipatch) WORK="python -u li_patch.py --repo $S/ii --adapter $AOAD ${ADAPTER_DIR:+--adapter $S/adapter} --out $O/li.jsonl --n ${NITEMS:-3200} > $O/li.log 2>&1" ;;
   g2rec) WORK="python -u g2.py gen --out $O/g2.jsonl --thr $S/thr.pt --texts 100000 --records $S/records ${GROUPS:+--groups $S/groups} ${DENSE:+--dense} > $O/g2.log 2>&1" ;;
   inference) WORK="python -u inference.py build --out $O/inference_items.jsonl --per ${PER:-150} > $O/inference.log 2>&1" ;;

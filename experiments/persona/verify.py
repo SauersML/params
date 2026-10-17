@@ -42,6 +42,7 @@ def main():
     ap.add_argument("general")
     ap.add_argument("out")
     ap.add_argument("--n", type=int, default=32)
+    ap.add_argument("--char-n", type=int, default=CHAR_N)
     ap.add_argument("--ops", default="zero,scale:-1,scale:3")
     ap.add_argument("--model", default="Qwen/Qwen3-8B")
     a = ap.parse_args()
@@ -73,7 +74,7 @@ def main():
     def rates():
         res = {}
         for g, rows in groups.items():
-            k = a.n if g != "char" else CHAR_N
+            k = a.n if g != "char" else a.char_n
             sp = SamplingParams(n=k, temperature=1.0, top_p=1.0, top_k=-1, max_tokens=MAX_TOKENS)
             outs = e.llm.generate([{"prompt_token_ids": P.chat_ids(e.tok, s, u)} for _, s, u in rows], sp, use_tqdm=False)
             per = [sum(score.assistant(o.text) for o in r.outputs) / k for r in outs]

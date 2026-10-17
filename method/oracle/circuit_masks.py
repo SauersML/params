@@ -45,6 +45,7 @@ LAMBDA = 0.003      # a unit's cost in shares of the gap
 INIT = 3.0          # sigmoid(3) = 0.95: every unit nearly patched at the start
 ORDER_MIN = 64      # units ordered for the measured prefix: those the mask kept (m > 0.5), at least twice that and ORDER_MIN
 ORDER_MAX = 20000
+ROUNDS = 4          # rounds of STEPS a cut's masks get while its order cannot pass (each round from the last's theta)
 
 
 def _blocks(units: list) -> list:
@@ -67,14 +68,15 @@ def optimize(pt, specs: list, steps: int = STEPS, log=None, taus: list | None = 
     return optimize_many([(pt, specs, taus)], steps=steps, log=log)[0]
 
 
-def optimize_many(jobs: list, steps: int = STEPS, log=None) -> list:
+def optimize_many(jobs: list, steps: int = STEPS, log=None, init: list | None = None) -> list:
     """Masks for several pairs at once: jobs [(pt, specs, taus)], Patchers of one model each set up on its own pair (prompts
     of one length), every spec of every job two rows of one batch per step (a step reads every weight twice whatever
     its rows: batched pairs cost about one). A job's pt may be a list of Patchers, one clean prompt against several
     corrupted ones (partners): its specs then hold one mask over every partner's rows, the hinges on the shares' means
     over the partners. taus: per spec the hinges' targets (lost, restored), default TAU. Per job and spec {kind: theta
     [L, P, width]} (final logits, on the host) and the history of (mean lost, mean restored, sum m) per step. A mask
-    edits only its own (row, position) entries: those rows' values gathered, moved toward the other run's and put back."""
+    edits only its own (row, position) entries: those rows' values gathered, moved toward the other run's and put back.
+    init: per job, per spec its theta to start from ({kind: [L, P, width]}, optimize_many's own output; None: INIT)."""
     groups = [list(pt) if isinstance(pt, (list, tuple)) else [pt] for pt, _, _ in jobs]
     pt0 = groups[0][0]
     T = pt0.T
@@ -115,7 +117,12 @@ def optimize_many(jobs: list, steps: int = STEPS, log=None) -> list:
                         "pos": {k: torch.tensor([p - start for _, p, _ in ent[k] for _ in (0, 1)], device=dev) for k in oth},
                         "tix": {k: torch.tensor([n for _, _, n in ent[k] for _ in (0, 1)], device=dev) for k in oth}})
     order = torch.tensor([g for ps in passes_ for g in ps["gs"]], device=dev)   # the forwards' instances, in turn
-    theta = {k: torch.full((L, len(cell[k]), width[k]), INIT, device=dev, requires_grad=True) for k in kinds}
+    theta = {k: torch.full((L, len(cell[k]), width[k]), INIT) for k in kinds}
+    for q, j, s_ in specs if init else []:          # (a round after a cut its order could not pass: on from its theta)
+        th = (init[q] or [None] * len(jobs[q][1]))[j]
+        for k in s_["kinds"] if th else []:
+            theta[k][:, [cell[k][(q, j, p)] for p in s_["positions"]]] = th[k]
+    theta = {k: t.to(dev).requires_grad_(True) for k, t in theta.items()}
     opt = torch.optim.Adam(list(theta.values()), lr=LR)
     tau = torch.tensor([t for _, ss, taus in jobs for t in (taus or [(TAU, TAU)] * len(ss))], device=dev)
     cc = torch.tensor([pt.c["clean"] for _, _, pt in inst], device=dev)[order]
@@ -330,12 +337,20 @@ def search_all(pt, arm: str, log=None, steps: int = STEPS, prior: dict | None = 
     partners: Patchers set up on pt's clean prompt against other corrupted prompts: the source cut is then chosen and
     verified on the shares' means over pt's pair and theirs (Mean)."""
     st = _before(pt, arm, log=log, prior=prior, partners=partners)
-    t0 = time.perf_counter()
-    got = {}
-    jobs = _jobs(pt, st)
-    for (_, names), res in zip(jobs, optimize_many([j for j, _ in jobs], steps=steps, log=log) if jobs else []):
-        got.update(zip(names, res))
-    return _after(pt, st, got, time.perf_counter() - t0, steps, log=log)
+    got, names = {}, list(st["masked"])
+    for rnd in range(ROUNDS):                       # (a cut its order cannot pass: its masks go on from their theta)
+        t0 = time.perf_counter()
+        jobs = _jobs(pt, st, names)
+        res = optimize_many([j for j, _ in jobs], steps=steps, log=log,
+                            init=[[got.get(n, {}).get("theta") for n in ns] for _, ns in jobs] if rnd else None) if jobs else []
+        for (_, ns), r in zip(jobs, res):
+            for n, x in zip(ns, r):
+                got[n] = {"theta": x["theta"], "history": got.get(n, {}).get("history", []) + x["history"]}
+        _verify(pt, st, got, names, time.perf_counter() - t0, steps, log=log)
+        names = [n for n in names if not st["out"][n]["met"]]
+        if not names:
+            break
+    return _finish(st)
 
 
 def _before(pt, arm: str, log=None, prior: dict | None = None, partners: list | None = None) -> dict:
@@ -375,26 +390,35 @@ def _before(pt, arm: str, log=None, prior: dict | None = None, partners: list | 
             "taus": {n: tuple(min(TAU, max(cf.PASS + 0.05, c - 0.05)) for c in ceil[n]) for n in masked}}
 
 
-def _jobs(pt, st: dict) -> list:
-    """The masked cuts as optimize_many jobs, with their names: the pair's own cuts one job, a partner cut its own."""
-    plain = [n for n in st["masked"] if st["meas"][n] is pt]
+def _jobs(pt, st: dict, names: list | None = None) -> list:
+    """The masked cuts (names: those of them) as optimize_many jobs, with their names: the pair's own cuts one job, a
+    partner cut its own."""
+    names = st["masked"] if names is None else names
+    plain = [n for n in names if st["meas"][n] is pt]
     out = [((pt, [st["specs"][n] for n in plain], [st["taus"][n] for n in plain]), plain)] if plain else []
-    return out + [((st["meas"][n].pts, [st["specs"][n]], [st["taus"][n]]), [n]) for n in st["masked"] if st["meas"][n] is not pt]
+    return out + [((st["meas"][n].pts, [st["specs"][n]], [st["taus"][n]]), [n]) for n in names if st["meas"][n] is not pt]
 
 
-def _after(pt, st: dict, got: dict, t_opt: float, steps: int, log=None) -> dict:
-    """search_all from the masks on: each masked cut's order (ordered) through verify by its measurer; cuts with no
-    result have no units; a partner cut records each pair's shares."""
+def _verify(pt, st: dict, got: dict, names: list, t_opt: float, steps: int, log=None) -> None:
+    """Each named masked cut's order (ordered, from got's theta) through verify by its measurer, into st["out"]."""
     specs, ceil, out = st["specs"], st["ceil"], st["out"]
-    for n in st["masked"]:
+    for n in names:
         g = got[n]
         t1 = time.perf_counter()
         order, kept = ordered(specs[n], g["theta"])
         res = verify(st["meas"][n], order, log=log, name=n)
+        prev = out.get(n, {})
         out[n] = _record(res, ceil[n], True, specs[n]["positions"],
-                         {"mask": {"kept": kept, "history": g["history"][::max(1, steps // 20)],
-                                   "seconds_opt": round(t_opt, 2), "seconds_verify": round(time.perf_counter() - t1, 2),
-                                   **({"attr_unmet": out[n]["found"]} if n in out else {})}})
+                         {"mask": {"kept": kept, "steps": len(g["history"]), "history": g["history"][::max(1, steps // 20)],
+                                   "seconds_opt": round(t_opt + prev.get("mask", {}).get("seconds_opt", 0.0), 2),
+                                   "seconds_verify": round(time.perf_counter() - t1 + prev.get("mask", {}).get("seconds_verify", 0.0), 2),
+                                   **({"attr_unmet": prev["found"]} if "attr" in prev else
+                                      {"attr_unmet": prev["mask"]["attr_unmet"]} if "attr_unmet" in prev.get("mask", {}) else {})}})
+
+
+def _finish(st: dict) -> dict:
+    """Cuts with no result have no units; a partner cut records each pair's shares."""
+    specs, ceil, out = st["specs"], st["ceil"], st["out"]
     for n in st["names"]:
         if n not in out:
             out[n] = _record({"units": [], "singles": {}, "met": False, "lost": 0.0, "restored": 0.0, "found": 0, "curve": []},
@@ -457,23 +481,31 @@ def find_batch(pts: list, items: list, arm: str = "mask", steps: int = STEPS, lo
              for j in js])
         for j, b in zip(js, befores):
             sts[j] = (rec0s[j], b)
-    by_T = {}
-    for j, x in enumerate(sts):
-        if x is not None and x[1]["masked"]:
-            by_T.setdefault(pts[j].T, []).append(j)
-    got, t_opt = {j: {} for j in range(len(items))}, {}
-    for T, js in by_T.items():
-        t1 = time.perf_counter()
-        jobs = [(j, job, names) for j in js for job, names in _jobs(pts[j], sts[j][1])]
-        for (j, _, names), res in zip(jobs, optimize_many([job for _, job, _ in jobs], steps=steps, log=log)):
-            got[j].update(zip(names, res))
-        for j in js:
-            t_opt[j] = (time.perf_counter() - t1) / len(js)
-    afters = {}
-    for T, js in same_T.items():                    # (masked cuts' verify as a Group too)
-        for j, c in zip(js, cf.Group([pts[j] for j in js]).run(
-                [lambda j=j: _after(pts[j], sts[j][1], got[j], t_opt.get(j, 0.0), steps, log=log) for j in js])):
-            afters[j] = c
+    got = {j: {} for j in range(len(items))}
+    names = {j: list(x[1]["masked"]) for j, x in enumerate(sts) if x is not None}
+    for rnd in range(ROUNDS):                       # (cuts their orders cannot pass: their masks go on from their theta)
+        by_T = {}
+        for j, ns in names.items():
+            if ns:
+                by_T.setdefault(pts[j].T, []).append(j)
+        if not by_T:
+            break
+        t_opt = {}
+        for T, js in by_T.items():
+            t1 = time.perf_counter()
+            jobs = [(j, job, ns) for j in js for job, ns in _jobs(pts[j], sts[j][1], names[j])]
+            res = optimize_many([job for _, job, _ in jobs], steps=steps, log=log,
+                                init=[[got[j].get(n, {}).get("theta") for n in ns] for j, _, ns in jobs] if rnd else None)
+            for (j, _, ns), r in zip(jobs, res):
+                for n, x in zip(ns, r):
+                    got[j][n] = {"theta": x["theta"], "history": got[j].get(n, {}).get("history", []) + x["history"]}
+            for j in js:
+                t_opt[j] = (time.perf_counter() - t1) / len(js)
+        for T, js in by_T.items():                  # (masked cuts' verify as a Group too)
+            cf.Group([pts[j] for j in js]).run(
+                [lambda j=j: _verify(pts[j], sts[j][1], got[j], names[j], t_opt[j], steps, log=log) for j in js])
+        names = {j: [n for n in ns if not sts[j][1]["out"][n]["met"]] for j, ns in names.items()}
+    afters = {j: _finish(x[1]) for j, x in enumerate(sts) if x is not None}
     for j, x in enumerate(sts):
         if x is None:
             continue

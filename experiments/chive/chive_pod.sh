@@ -12,7 +12,7 @@ Q=/Users/user/mpd-data/chive/questions_v1.jsonl
 CMD="export OMP_NUM_THREADS=4 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True HF_HUB_OFFLINE=1; ln -sfn /workspace/runs/$NAME/mpd-data ~/mpd-data; mkdir -p $O;
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader;
 (nvidia-smi --query-gpu=timestamp,utilization.gpu,memory.used --format=csv,noheader -l 30 > $O/gpu.log 2>&1 &);
-cd /Users/user/params/experiments/chive; python -B chive_circuits.py run $Q $O/records --split $SPLIT $ARGS > $O/chive.log 2>&1; echo \"exit \$?\" >> $O/chive.log; tail -40 $O/chive.log"
+ls /Users/user/params/method/oracle > /dev/null; cd /Users/user/params/experiments/chive; python -B chive_circuits.py run $Q $O/records --split $SPLIT $ARGS > $O/chive.log 2>&1; echo \"exit \$?\" >> $O/chive.log; tail -40 $O/chive.log"
 RP_REF=${RP_REF:-$(git rev-parse origin/main)} RP_OWNER=chive RP_PARALLEL=1 RP_PYENV=oracle RP_HF_MODELS=Qwen/Qwen3-8B RP_IDLE_PCT=${RP_IDLE_PCT:-5} \
 RP_MAX_PRICE=${PRICE:-0.8} RP_MIN_VRAM_GB=44 RP_MIN_RAM_GB=64 RP_DISK_GB=60 \
   experiments/infra/runpod/rp-run $NAME "${GPU:-NVIDIA L40,NVIDIA A40,NVIDIA RTX A6000,NVIDIA L40S,NVIDIA RTX 6000 Ada Generation}" $H -- bash -c "$CMD"

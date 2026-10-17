@@ -204,6 +204,10 @@ def channels(u: tuple, hd: int) -> tuple:
     raise ValueError(f"unit {u!r}")
 
 
+class _Stop(Exception):
+    """Raised by a hook once the layer a run was for has been read."""
+
+
 class Ablator:
     """Runs of an HF Qwen3 (circuit_finder.Patcher's hooks) whose rows each name the units they keep live: every other
     neuron and head channel at every position set to the background (Means), each row's kept units computed, and each
@@ -248,50 +252,81 @@ class Ablator:
                 e[3].append((b, j, len(ks)))
         dev = self.pt.dev
         t = lambda xs: torch.tensor(xs, dtype=torch.long, device=dev)  # noqa: E731
-        dense = {}                                  # (rows given as masks: {kind: [L, T, width] bool}, values beside)
-        for kind in ("neuron", "head"):
+        dense = {}                                  # (rows given as masks: {kind: [L, T, width] bool}, values beside, and
+        for kind in ("neuron", "head"):             # where the values apply: "set", default the mask)
             rs = [b for b, r in enumerate(rows) if r.get("mask") is not None and kind in r["mask"]]
             if rs:
+                vals = all(rows[b].get("values") is not None for b in rs)
                 dense[kind] = (t(rs), torch.stack([rows[b]["mask"][kind].to(dev) for b in rs]),
-                               torch.stack([rows[b]["values"][kind].to(dev) for b in rs]) if all(rows[b].get("values") is not None
-                                                                                         for b in rs) else None)
+                               torch.stack([rows[b]["values"][kind].to(dev) for b in rs]) if vals else None,
+                               torch.stack([(rows[b].get("set") or rows[b]["mask"])[kind].to(dev) for b in rs]) if vals else None)
         return {"dense": dense, "grab": {k: (t(v[0]), t(v[1]), t(v[2]), v[3]) for k, v in grab.items()}, "got": {},
                 "live": t(live) if live else None,
                 "keep": {k: tuple(t(x) for x in v) for k, v in keep.items()},
                 "over": {k: (t(v[0]), t(v[1]), t(v[2]), torch.cat(v[3]).to(dev)) for k, v in over.items()},
                 "all_live": len(live) == len(rows)}
 
-    def _fns(self, plan: dict) -> dict:
+    def _fns(self, plan: dict, stop: tuple | None = None) -> dict:
         def make(kind):
             def fn(i, h):
-                if plan["all_live"] and (kind, i) not in plan["over"] and (kind, i) not in plan["grab"]:
-                    return h
-                B, T, W = h.shape
-                out = self.means.table(kind, i, T, h.device, h.dtype, self.mode)[None].expand(B, -1, -1).clone()
-                if plan["live"] is not None:
-                    lv = plan["live"].to(h.device)
-                    out[lv] = h[lv]
-                if kind in plan["dense"]:               # (dense rows: live where the mask is, or the given values there)
-                    rs, M, V = plan["dense"][kind]
-                    rs, m = rs.to(h.device), M[:, i].to(h.device)
-                    src = h[rs] if V is None else V[:, i].to(h.device, h.dtype)
-                    out[rs] = torch.where(m, src, out[rs])
-                if (kind, i) in plan["keep"]:
-                    b, p, k = (z.to(h.device) for z in plan["keep"][(kind, i)])
-                    out[b, p, k] = h[b, p, k]
-                if (kind, i) in plan["over"]:
-                    b, p, k, v = (z.to(h.device) for z in plan["over"][(kind, i)])
-                    out[b, p, k] = v.to(h.dtype)
-                if (kind, i) in plan["grab"]:           # (the units' values as the layer reads them: after the edits)
-                    b, p, k, slots = plan["grab"][(kind, i)]
-                    vals, at_ = out[b.to(h.device), p.to(h.device), k.to(h.device)].float().cpu(), 0
-                    for row, j, n in slots:
-                        plan["got"][(row, j)] = vals[at_:at_ + n]
-                        at_ += n
+                out = body(kind, i, h)
+                if stop == (kind, i):                   # (layer_values: this layer's values read, the rest not run)
+                    plan["layer"] = out.detach()
+                    raise _Stop
                 return out
             return fn
+
+        def body(kind, i, h):
+            if plan["all_live"] and (kind, i) not in plan["over"] and (kind, i) not in plan["grab"]:
+                return h
+            B, T, W = h.shape
+            out = self.means.table(kind, i, T, h.device, h.dtype, self.mode)[None].expand(B, -1, -1).clone()
+            if plan["live"] is not None:
+                lv = plan["live"].to(h.device)
+                out[lv] = h[lv]
+            if kind in plan["dense"]:               # (dense rows: live where the mask is, the given values where set)
+                rs, M, V, S = plan["dense"][kind]
+                rs = rs.to(h.device)
+                o = torch.where(M[:, i].to(h.device), h[rs], out[rs])
+                if V is not None:
+                    o = torch.where(S[:, i].to(h.device), V[:, i].to(h.device, h.dtype), o)
+                out[rs] = o
+            if (kind, i) in plan["keep"]:
+                b, p, k = (z.to(h.device) for z in plan["keep"][(kind, i)])
+                out[b, p, k] = h[b, p, k]
+            if (kind, i) in plan["over"]:
+                b, p, k, v = (z.to(h.device) for z in plan["over"][(kind, i)])
+                out[b, p, k] = v.to(h.dtype)
+            if (kind, i) in plan["grab"]:           # (the units' values as the layer reads them: after the edits)
+                b, p, k, slots = plan["grab"][(kind, i)]
+                vals, at_ = out[b.to(h.device), p.to(h.device), k.to(h.device)].float().cpu(), 0
+                for row, j, n in slots:
+                    plan["got"][(row, j)] = vals[at_:at_ + n]
+                    at_ += n
+            return out
         L = set(range(self.L))
         return {"neu": make("neuron"), "head": make("head"), "only": {"res": set(), "head": L, "neu": L}}
+
+    @torch.no_grad()
+    def layer_values(self, rows: list, kind: str, layer: int) -> list:
+        """Per row, the values [T, width] of one layer's neurons or head channels as the run reads them (after the rows'
+        edits), the layers above not run."""
+        out = [None] * len(rows)
+        by = {}
+        for j, r in enumerate(rows):
+            by.setdefault(len(r["ids"]), []).append(j)
+        for T, js in by.items():
+            n = max(1, BATCH_TOKENS // T)
+            for a in range(0, len(js), n):
+                part = [rows[j] for j in js[a:a + n]]
+                plan = self._plan(part)
+                try:
+                    self.pt._last(torch.tensor([r["ids"] for r in part]), len(part), **self._fns(plan, stop=(kind, layer)))
+                except _Stop:
+                    pass
+                for b, j in enumerate(js[a:a + n]):
+                    out[j] = plan["layer"][b]
+        return out
 
     @torch.no_grad()
     def capture(self, ids: list) -> dict:
@@ -689,6 +724,76 @@ def scrub(abl: Ablator, x: dict, units: list, cls: dict, pools: dict, draws: int
     return lp, done, left
 
 
+def scrub_dense(abl: Ablator, x: dict, M: dict, K: dict, pools: list, draws: int, seed: int) -> tuple:
+    """scrub() for circuits of any size, on dense masks (x's coordinates): M the circuit, K its scrubbed units (one class:
+    pools, prompts that may each supply any of them where its position has a role). Per draw each unit of K takes one
+    pool prompt at random among those where its position has a role; layer by layer (heads, then neurons), the circuit
+    model runs on each pool prompt with every earlier scrubbed unit set to its scrubbed value where that unit has a role
+    there, up to the layer, and the layer's units assigned to that prompt read their values there. Returns ([draws, V]
+    log-probabilities on x with every scrubbed unit at its value, units scrubbed, units left live for want of a role;
+    a head counts once, its channels taking one prompt together)."""
+    dev, dt = abl.pt.dev, abl.pt.core.model.embed_tokens.weight.dtype
+    g = torch.Generator().manual_seed(seed)
+    Tx = len(x["ids"])
+    maps = [role_map(x, y) for y in pools]
+    pxy = [(torch.tensor(sorted(m), dtype=torch.long), torch.tensor([m[p] for p in sorted(m)], dtype=torch.long)) for m in maps]
+    valid = [[j for j, m in enumerate(maps) if p in m] for p in range(Tx)]
+    A = [{} for _ in range(draws)]                  # (per draw and kind, each unit's pool prompt; -1 not scrubbed; a
+    hd = abl.hd                                     # head's channels take one prompt together, as the head would)
+    units_of = {"neuron": lambda k: k, "head": lambda k: k.view(k.shape[0], k.shape[1], -1, hd).any(-1)}
+    left = 0
+    for d in range(draws):
+        for kind, k in K.items():
+            ku = units_of[kind](k)                  # [L, T, units]
+            a = torch.full(ku.shape, -1, dtype=torch.int16)
+            for p in range(Tx):
+                sel = ku[:, p]
+                n = int(sel.sum())
+                if not n:
+                    continue
+                if not valid[p]:
+                    left += n if d == 0 else 0
+                    continue
+                col = a[:, p]
+                col[sel] = torch.tensor(valid[p], dtype=torch.int16)[torch.randint(len(valid[p]), (n,), generator=g)]
+            if kind == "head":                      # (back to channels: only the circuit's own channels of each head)
+                a = a[..., None].expand(-1, -1, -1, hd).reshape(k.shape).clone()
+                a[~k] = -1
+            A[d][kind] = a
+    done_n = int((units_of["neuron"](A[0]["neuron"] >= 0)).sum() if "neuron" in K else 0) + int(
+        units_of["head"](A[0]["head"] >= 0).sum() if "head" in K else 0) if draws else 0
+    S = [{k: torch.zeros(v.shape, dtype=dt, device=dev) for k, v in M.items()} for _ in range(draws)]
+    D_ = [{k: torch.zeros(v.shape, dtype=torch.bool, device=dev) for k, v in M.items()} for _ in range(draws)]
+    Md = {k: v.to(dev) for k, v in M.items()}
+    for layer in range(abl.L):
+        for kind in ("head", "neuron"):
+            if kind not in K or not K[kind][layer].any():
+                continue
+            rows, slots = [], []
+            for d in range(draws):
+                for j in sorted(set(A[d][kind][layer].unique().tolist()) - {-1}):
+                    px, py = pxy[j]
+                    y, Ty = pools[j], len(pools[j]["ids"])
+                    m_y = {k: torch.zeros((abl.L, Ty) + v.shape[2:], dtype=torch.bool, device=dev) for k, v in Md.items()}
+                    v_y = {k: torch.zeros((abl.L, Ty) + v.shape[2:], dtype=dt, device=dev) for k, v in Md.items()}
+                    s_y = {k: torch.zeros((abl.L, Ty) + v.shape[2:], dtype=torch.bool, device=dev) for k, v in Md.items()}
+                    for k in Md:
+                        m_y[k][:, py] = Md[k][:, px]
+                        v_y[k][:, py] = S[d][k][:, px]
+                        s_y[k][:, py] = D_[d][k][:, px]
+                    rows.append({"ids": y["ids"], "mask": m_y, "values": v_y, "set": s_y})
+                    slots.append((d, j))
+            for (d, j), val in zip(slots, abl.layer_values(rows, kind, layer)):
+                px, py = pxy[j]
+                sel = (A[d][kind][layer] == j).to(dev)                 # [Tx, width]
+                tmp = torch.zeros(sel.shape, dtype=dt, device=dev)
+                tmp[px.to(dev)] = val[py.to(dev)].to(dt)
+                S[d][kind][layer] = torch.where(sel, tmp, S[d][kind][layer])
+                D_[d][kind][layer] |= sel
+    lp = abl.logp([{"ids": x["ids"], "mask": Md, "values": S[d], "set": D_[d]} for d in range(draws)])
+    return lp, done_n, left
+
+
 def r4(abl: Ablator, tok, rec: dict, q: dict, keys: list, draws: int = R4_DRAWS, n_heldout: int = DRAWS) -> dict:
     """A circuit's R4 on its own clean prompt and its held-out prompts (R3's): the scrubbed circuit model's KL and task
     loss, beside the full model, the empty circuit and the unscrubbed circuit (R3) on the same prompts."""
@@ -716,12 +821,21 @@ def r4(abl: Ablator, tok, rec: dict, q: dict, keys: list, draws: int = R4_DRAWS,
         pools = {"key": [y for j, w in words.items() if j != x["template"]
                          for y in [prompt(tok, w.replace(key, k), k, q, j) if w.count(key) == 1 else None] if y is not None],
                  "template": [y for kk in others for y in [prompt(tok, user.replace(key, kk), kk, q, x["template"])] if y is not None]}
-        cls = classes(rec, units, x["span"])
-        lp, done, left = scrub(abl, x, units, cls, pools, draws, seed + len(out))
-        base = abl.logp([{"ids": x["ids"], "keep": a} for a in (None, [], units)])
+        if rec.get("hypothesis"):                   # (a stated hypothesis: per-unit classes, unit lists)
+            cls = classes(rec, units, x["span"])
+            lp, done, left = scrub(abl, x, units, cls, pools, draws, seed + len(out))
+            done, left = len(done), len(left)
+        else:                                       # (the tags' hypothesis: every unit from the key's first token on is
+            M = dense(units, abl.L, len(x["ids"]), abl.D, abl.H, abl.hd)       # "key"; dense masks, any size)
+            K = {k: v.clone() for k, v in M.items()}
+            for k in K:
+                K[k][:, :x["span"][0]] = False
+            lp, done, left = scrub_dense(abl, x, M, K, pools["key"], draws, seed + len(out))
+        base = abl.logp([{"ids": x["ids"], "keep": None}, {"ids": x["ids"], "keep": []},
+                         {"ids": x["ids"], "mask": dense(units, abl.L, len(x["ids"]), abl.D, abl.H, abl.hd)}])
         sets = answer_contrast.token_sets_many(abl.pt.core, tok, [(x["ids"], base[0], None, None, None)])[0]
         m = [_metrics(base[0], lp[d], sets["answer"]) for d in range(len(lp))]
-        out.append({"split": split, "key": k, "answer_word": sets["answer_word"], "scrubbed": len(done), "left_live": len(left),
+        out.append({"split": split, "key": k, "answer_word": sets["answer_word"], "scrubbed": done, "left_live": left,
                     "pools": {c: len(v) for c, v in pools.items()},
                     **{a: _metrics(base[0], base[j], sets["answer"]) for j, a in enumerate(("full", "empty", "circuit"))},
                     "scrub": {f: float(np.mean([z[f] for z in m])) for f in ("kl", "ce", "top1")},
@@ -1208,6 +1322,7 @@ def main():
     c.add_argument("--means", required=True)
     c.add_argument("--texts", default=str(Path.home() / "mpd-data" / "ami" / "cover_windows.npz"), help="windows' file")
     c.add_argument("--windows", type=int, default=16)
+    c.add_argument("--first", type=int, default=0, help="the windows' file from this window on")
     w = sub.add_parser("windows")
     w.add_argument("out")
     w.add_argument("--n", type=int, default=64)
@@ -1268,7 +1383,7 @@ def main():
                                                    "bounds": COVER_BOUNDS, "tau": COVER_TAU, "lambda": COVER_LAMBDA,
                                                    "steps": COVER_STEPS, "lr": COVER_LR, "windows": a.windows}))
         d = np.load(a.texts)
-        wins = list(zip(d["documents"].tolist(), d["ids"].tolist()))[:a.windows]
+        wins = list(zip(d["documents"].tolist(), d["ids"].tolist()))[a.first:a.first + a.windows]
         coverage(Masked(model, Means(a.means, abl_dev(model)), mode=a.mode), wins, out, log=log)
         return
     (out / "meta.json").write_text(json.dumps({"label": a.label, "rung": a.cmd.upper(), "records": a.records, "means": a.means, "mode": a.mode,

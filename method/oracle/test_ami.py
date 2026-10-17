@@ -197,3 +197,30 @@ def test_dense_rows_equal_unit_rows(tiny):
     assert torch.allclose(c, d, atol=1e-6)                   # (frozen: dense values equal the unit overrides)
     r = ami.redraw_dense(M, 0)
     assert all(torch.equal(r[k].sum(-1), M[k].sum(-1)) for k in M) and not any((r[k] & M[k]).any() for k in M)
+
+
+def test_dense_scrub_equals_list_scrub(tiny):
+    model, docs, means = tiny
+    abl = ami.Ablator(model, None, means)
+    ids = docs[0][:12]
+    x = {"ids": ids, "span": (4, 6)}
+    other = list(ids)
+    other[4], other[5] = (ids[4] + 1) % 64, (ids[5] + 1) % 64
+    y = {"ids": other, "span": (4, 6)}                       # (one pool prompt: every draw takes the same one)
+    units = [("neuron", 0, 4, 3), ("head", 0, 1, 7), ("neuron", 1, 7, 7), ("head", 1, 2, 11), ("neuron", 1, 11, 2), ("neuron", 0, 1, 9)]
+    cls = ami.classes({}, units, x["span"])
+    lp, done, left = ami.scrub(abl, x, units, cls, {"key": [y]}, 2, 0)
+    M = ami.dense(units, abl.L, 12, abl.D, abl.H, abl.hd)
+    K = {k: v.clone() for k, v in M.items()}
+    for k in K:
+        K[k][:, :4] = False                                  # (the units before the key: not scrubbed)
+    lp2, n_done, n_left = ami.scrub_dense(abl, x, M, K, [y], 2, 0)
+    roles = ami.role_map(x, y)                               # (the key's own tokens differ: positions 4 and 5 have no role)
+    assert n_done == sum(1 for u in units if ami._lp(u)[2] >= 4 and ami._lp(u)[2] in roles)
+    assert len(done) == sum(1 for u in units if ami._lp(u)[2] >= 4 and ami._lp(u)[2] in roles)
+    assert torch.allclose(lp, lp2, atol=1e-5)
+    lp3, _, _ = ami.scrub_dense(abl, x, M, K, [{"ids": list(ids), "span": (4, 6)}], 1, 0)
+    assert torch.allclose(lp3[0], abl.logp([{"ids": ids, "mask": M}])[0], atol=1e-5)   # (from an equal prompt: the circuit)
+    z = {"ids": [(t + 3) % 64 if 4 <= j < 6 else t for j, t in enumerate(ids)], "span": (4, 6)}
+    lp4, _, _ = ami.scrub_dense(abl, x, M, K, [y, z], 3, 1)  # (two pool prompts: per-unit draws)
+    assert lp4.shape[0] == 3 and torch.isfinite(lp4).all()

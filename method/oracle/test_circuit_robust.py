@@ -77,3 +77,12 @@ def test_resamples_carry_system_and_prefill():
     got = cr.resample_ids(tok, q, rec, 4)
     assert [k for k, _ in got] == ["As a pilot, go"]  # ("cook" is one character short of "nurse": another length)
     assert got[0][1][-2:] == tok("P:")["input_ids"] and got[0][1][:3] == clean[:3]
+
+
+def test_swaps_are_the_clean_prompts_other_corruptions():
+    qs = [{"id": "a", "task": "t", "user": "As a nurse, go", "corrupt_user": "As a chef, go", "corrupt_prefill": "X"},
+          {"id": "b", "task": "t", "user": "As a nurse, go", "corrupt_user": "As a cook, go", "corrupt_prefill": "Y"},
+          {"id": "c", "task": "t", "user": "As a nurse, run", "corrupt_user": "As a chef, run"}]
+    cr.attach_swaps(qs)
+    assert qs[0]["swaps"] == [{"user": "As a cook, go", "prefill": "Y"}] and qs[1]["swaps"] == [{"user": "As a chef, go", "prefill": "X"}]
+    assert qs[2]["swaps"] == []

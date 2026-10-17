@@ -84,7 +84,8 @@ def capture(pt: cf.Patcher, ids, units=None, base="clean") -> dict:
 
 
 def resample_ids(tok, q: dict, rec: dict, n: int, pool: dict | None = None, system: str | None = None) -> list:
-    """Up to n prompts: the question's "resamples" (whole prompts, e.g. an organism's other non-trigger prompts), then the
+    """Up to n prompts: the question's "resamples" (whole prompts, e.g. an organism's other non-trigger prompts), its
+    "swaps" (attach_swaps: the clean prompt's other corrupted prompts, each with its own prefill), then the
     record's own prompt with its key replaced by another key of its task (the question's string "partners", then pool
     {task: keys}, every question set given); each of the clean prompt's length, its tokens before the first differing
     position and a different token there (the record's template exactly: question sets differ in their templates). Each
@@ -96,21 +97,38 @@ def resample_ids(tok, q: dict, rec: dict, n: int, pool: dict | None = None, syst
     system = q.get("system", rec.get("system", system))
     prefill = q.get("prefill") or rec.get("prefill")
     pre = tok(prefill, add_special_tokens=False)["input_ids"] if prefill else []
-    cands = [(u, u) for u in q.get("resamples", [])]   # (whole prompts: an organism's other non-trigger prompts)
-    cands += [(k, user.replace(key, k)) for k in [p for p in q.get("partners", []) if isinstance(p, str)]
+    cands = [(u, u, pre) for u in q.get("resamples", [])]   # (whole prompts: an organism's other non-trigger prompts)
+    cands += [(w["user"], w["user"], tok(w["prefill"], add_special_tokens=False)["input_ids"] if w.get("prefill") else [])
+              for w in q.get("swaps", []) if w["user"] != rec.get("corrupt_user")]   # (the clean prompt's other swaps)
+    cands += [(k, user.replace(key, k), pre) for k in [p for p in q.get("partners", []) if isinstance(p, str)]
               + sorted((pool or {}).get(task, ()))]
     out, seen = [], {key, q.get("corrupt_key"), rec.get("corrupt_key"), *rec.get("selection_keys", [])}   # (a multi-partner
                                                     # cut's own partners are no resample: circuit_masks --partners)
-    for k, text in cands:
+    for k, text, tail in cands:
         if k in seen:
             continue
         seen.add(k)
-        ids = cf.chat(tok, text, system) + pre
+        ids = cf.chat(tok, text, system) + tail
         if len(ids) == len(clean) and ids[:first] == clean[:first] and ids[first] != clean[first]:  # (differs where the pair does)
             out.append((k, ids))
         if len(out) == n:
             break
     return out
+
+
+def attach_swaps(questions: list) -> list:
+    """Each question's "swaps": the other questions' corrupted prompts (and corrupted prefills) on the same clean prompt
+    and task (fleet's E1 question files: several swaps per organism prompt, a corrupt_prefill on the corrupted side), so
+    a record's resamples are its own prompt's other swaps; questions changed in place."""
+    by: dict = {}
+    for q in questions:
+        if q.get("user") and q.get("corrupt_user"):
+            by.setdefault((q.get("task"), q["user"]), []).append(q)
+    for group in by.values():
+        for q in group:
+            q["swaps"] = [{"user": o["corrupt_user"], "prefill": o.get("corrupt_prefill", o.get("prefill"))}
+                          for o in group if o is not q and o["corrupt_user"] != q["corrupt_user"]]
+    return questions
 
 
 def question_pool(files: list) -> dict:
@@ -288,7 +306,7 @@ def main():
         model = PeftModel.from_pretrained(model, a.adapter).eval()
     pt = cf.Patcher(model, tok)
     qs = json.loads(a.questions.read_text())
-    qs = {q["id"]: q for q in (qs["questions"] if isinstance(qs, dict) else qs)}
+    qs = {q["id"]: q for q in attach_swaps(qs["questions"] if isinstance(qs, dict) else qs)}
     pool = question_pool(a.pool + [a.questions])   # (the question file's own keys at least: devset_8b's partners are dicts)
     a.out.mkdir(parents=True, exist_ok=True)
     for f in sorted(a.records.iterdir()):

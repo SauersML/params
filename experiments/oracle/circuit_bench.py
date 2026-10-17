@@ -28,7 +28,8 @@ that runs a finder version on the frozen dev set and reports S1 and Q1-Q5, the s
   Q5  robustness: monitorbench's circuit_robust.check (method/oracle) on every record, a bfloat16 Patcher after the
       scorecard: per met cut, its shares with every unit outside it resampled from in-distribution prompts (the pool:
       the dev set and POOL); a question passes when every met cut passes resampled; the per-cut rates beside the
-      standard ones, and the median resampled lost and restored
+      standard ones, and the median resampled lost and restored. Only a record's met cuts are checked (an ADAG
+      record's one neuron cut where its own measurement met; attribution baselines' records have no cuts, so no Q5)
   The sealed test set (any question with split "test") is refused unless --sealed.
   An organism (the audit model: a LoRA on the base): --adapter (with --merge, the finder's merged weights), --tokenizer
   and --system go to the finder; the scorecard and Q5 load the same adapter, and the scorecard's prompts carry the
@@ -311,7 +312,8 @@ def score_records(recs_dir: Path, score_dir: Path, dev: dict, ids: list, model: 
                 continue
             if not r.get("cuts"):
                 continue
-            out = cr.check(pt, tok, {**r, "gap": r.get("gap", 0.0)}, dev[i], qpool)
+            pos = r.get("source_positions") or sorted({n["pos"] for n in r.get("nodes", [])})  # (an ADAG record's one cut: its
+            out = cr.check(pt, tok, {**r, "gap": r.get("gap", 0.0), "source_positions": pos}, dev[i], qpool)  # neurons' positions)
             path.write_text(json.dumps(out))
             robust.append(out)
     return {"model": model, "adapter": adapter, "tokenizer": tokenizer, "records": str(recs_dir), "score_dtype": dtype, "gpu": torch.cuda.get_device_name() if torch.cuda.is_available() else "cpu",

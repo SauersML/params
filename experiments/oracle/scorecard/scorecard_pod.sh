@@ -10,6 +10,8 @@
 #   steering, a LoRA fine-tune, random poles matched by layer to T3's), measured as measure.py measures an edit
 #   AOE1=<AO adapter> [AOLAYERS=21,22,23,24,25]: that activation oracle's E1 battery on all seven organisms (e1.py battery;
 #   AOLAYERS: one block per layer, ceselder/qwen3-8b-ao-v3-best's five), into $O/aoe1/
+#   AONULL=<AO adapter> [AOLAYERS=...]: that activation oracle's E1 battery on the frozen null organisms (items/o2_null.json:
+#   oracledata's null_4-7), into $O/aonull/ (scorecard.py collect files it as o2_null.jsonl: the false-positive line)
 #   SERVE=1 [PORT=8790]: paper_scaffold.py serve, the AuditBench dev targets for the paper's scaffold baseline, until the
 #   pod's hours run out (reach it with ~/mpd-data/scratch/oracleeval/tools/tunnel.sh RUN)
 #   RUN=r1 READER=<adapter dir on the Mac, or an HF id> [RCSET=rc1|rc2_native] bash ...   a reader checkpoint: O1 (g2.py eval
@@ -48,6 +50,15 @@ if [ -n "${READER:-}${AOE1:-}" ]; then
   for n in backdoor2 cond_pref lie lie2; do cp -r /Users/user/mpd-data/organisms/qwen3_8b/adapters/$n "$S/e1all/adapters/$n"; done
   for n in pref_plant lie_kili cue_chile2; do cp -r /Users/user/mpd-data/organisms/qwen3_8b_e1b/adapters/$n "$S/e1all/adapters/$n"; done
 fi
+if [ -n "${AONULL:-}" ]; then
+  mkdir -p "$S/nulls/adapters"
+  cp /Users/user/mpd-data/organisms/qwen3_8b/probe_battery.json "$S/nulls/"
+  /Users/user/mpd-data/venv/bin/python -c "
+import json
+d=json.load(open('/Users/user/mpd-data/organisms/qwen3_8b_null/behavior.json'))
+json.dump({'organisms': {n: d[n] for n in json.load(open('$ROOT/items/o2_null.json'))['organisms']}}, open('$S/nulls/behavior.json','w'))"
+  for n in null_4 null_5 null_6 null_7; do cp -r /Users/user/mpd-data/organisms/qwen3_8b_null/adapters/$n "$S/nulls/adapters/$n"; done
+fi
 if [ -n "${READER:-}" ]; then
   AD=$READER; [ -d "$READER" ] && cp -r "$READER" "$S/reader" && AD=$S/reader
   mkdir -p "$S/rc"
@@ -74,6 +85,9 @@ python -u li_patch.py --repo $S/ii --adapter $AD --out $O/reader/li.jsonl --n 32
 [ -n "${AOE1:-}" ] && WORK="$WORK; mkdir -p $O/aoe1; echo ${AOE1} ${AOLAYERS:-} > $O/aoe1/adapter.txt; (cd $S/experiments/oracle/cao && \
 ${AOLAYERS:+CAO_READ_LAYERS=$AOLAYERS} python -u e1.py battery --dir $S/e1all/behavior_e1.json --battery $S/e1all/probe_battery.json \
 --adapter $AOE1 --out $O/aoe1/e1_battery.jsonl > $O/aoe1/e1_battery.log 2>&1)"
+[ -n "${AONULL:-}" ] && WORK="$WORK; mkdir -p $O/aonull; echo ${AONULL} ${AOLAYERS:-} > $O/aonull/adapter.txt; (cd $S/experiments/oracle/cao && \
+${AOLAYERS:+CAO_READ_LAYERS=$AOLAYERS} python -u e1.py battery --dir $S/nulls/behavior.json --battery $S/nulls/probe_battery.json \
+--adapter $AONULL --out $O/aonull/e1_battery.jsonl > $O/aonull/e1_battery.log 2>&1)"
 [ -n "${AB:-}" ] && WORK="$WORK; mkdir -p $O/auditbench; python -u $S/experiments/oracle/scorecard/auditbench.py generate \
 --items $S/items/auditbench.json --out $O/auditbench ${ABFLAGS:-} > $O/auditbench.log 2>&1"
 [ -n "${REMOVAL:-}" ] && WORK="$WORK; mkdir -p $O/answers; python -u $S/experiments/oracle/scorecard/removal_baselines.py --items $S/items \
@@ -85,6 +99,6 @@ CMD="export OMP_NUM_THREADS=4 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True C
 mkdir -p $O $S; tar -xf $S.tar -C $S; nvidia-smi --query-gpu=timestamp,utilization.gpu,memory.used --format=csv,noheader -l 10 > $O/gpu.csv & \
 $WORK"
 [ -n "${AB:-}${SERVE:-}" ] && MODEL=Qwen/Qwen3-14B AOAD=adamkarvonen/checkpoints_latentqa_cls_past_lens_Qwen3-14B
-RP_HF_MODELS="$MODEL $AOAD ${AOE1:-}" RP_ALLOW_OVER=1 RP_UPLOAD_MAX_MB=${UPLOAD_MB:-1500} \
+RP_HF_MODELS="$MODEL $AOAD ${AOE1:-} ${AONULL:-}" RP_ALLOW_OVER=1 RP_UPLOAD_MAX_MB=${UPLOAD_MB:-1500} \
   RP_OWNER=oracleeval RP_PARALLEL=1 RP_PYENV=oracle RP_MAX_PRICE=${PRICE:-0.8} RP_MIN_VRAM_GB=${VRAM:-44} \
   experiments/infra/runpod/rp-run $N "${GPU:-A40,RTX A6000,L40S,RTX 6000 Ada}" $H -- bash -c "$CMD"

@@ -1361,6 +1361,12 @@ def collect(a) -> None:
             have[f"{n}@{b}"] = {"item": f"{n}@{b}", "answer": v, "passes": b}
         wjl(f, list(have.values()))
         print("collected", f)
+    an = src / "aonull" / "e1_battery.jsonl"
+    if an.exists():  # an activation oracle's battery on the null organisms: its false-positive line
+        adapter = (src / "aonull" / "adapter.txt").read_text().split()[0]
+        name = a.name or ("ao8b" if adapter == "adamkarvonen/checkpoints_latentqa_cls_past_lens_addition_Qwen3-8B" else "ao-" + adapter.split("/")[-1])
+        wjl(ANS / name / "o2_null.jsonl", [{"item": f"{n}@{b}", "answer": v, "passes": b} for (n, b), v in sorted(battery_guesses(jl(an)).items())])
+        print("collected", ANS / name / "o2_null.jsonl")
     ae = src / "aoe1" / "e1_battery.jsonl"
     if ae.exists():  # an activation oracle's E1 battery on all seven organisms (scorecard_pod.sh AOE1=...)
         adapter, *layers = (src / "aoe1" / "adapter.txt").read_text().split()

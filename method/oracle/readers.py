@@ -35,6 +35,8 @@ from head_routes import rotate_half, weight
 
 TOP = 8  # readers measured by path patching a unit (the largest first-order estimates)
 GROUPS = 4  # reader groups (a layer's MLP or heads through one input) measured a unit
+MIN_SHARE = 0.02  # single readers and groups measured for units whose own share of the gap reaches this (the finder's
+# EPS: a unit under it is no single unit there; 515 of 5,641 Qwen3-8B dev circuit units reach 0.05)
 
 
 def _norm(x: torch.Tensor, mod) -> torch.Tensor:
@@ -162,10 +164,13 @@ def _union(edits: list[dict]) -> dict:
 
 @torch.no_grad()
 def readers(rn, ids: list[int], units: list, corrupt: list[int] | None = None, top: int = TOP, groups: int = GROUPS,
-            circuit: set | None = None, states: tuple | None = None, seconds: dict | None = None) -> list[dict]:
-    """Each unit's readers (module docstring). units: ("neuron", layer, pos, index) or ("head", layer, head, pos);
-    circuit: units of the circuit, to mark readers inside it; states: both runs' captured states when the caller has
-    them; seconds: filled with this call's seconds by part."""
+            min_share: float = MIN_SHARE, circuit: set | None = None, states: tuple | None = None,
+            seconds: dict | None = None) -> list[dict]:
+    """Each unit's readers (module docstring): every unit's total and paths, then the single readers and groups of
+    those whose total reaches min_share of the gap (all with no corrupted prompt; the rest list their first TOP
+    candidates' estimates, "bits" None). units: ("neuron", layer, pos, index) or ("head", layer, head, pos); circuit:
+    units of the circuit, to mark readers inside it; states: both runs' captured states when the caller has them;
+    seconds: filled with this call's seconds by part."""
     if not units:
         return []
     t0, sec = time.time(), {} if seconds is None else seconds
@@ -179,17 +184,17 @@ def readers(rn, ids: list[int], units: list, corrupt: list[int] | None = None, t
     sec["runs_and_gradient"], t0 = round(time.time() - t0, 3), time.time()
     cands, grp, store = _candidates(rn, st, g, units, W)
     sec["candidates"], t0 = round(time.time() - t0, 3), time.time()
+    pos = [u[-1] if u[0] == "head" else u[2] for u in units]
+
+    def measure(sets, slots):  # (a forward computes from its sets' first position on: sets of one position together,
+        order = sorted(range(len(sets)), key=lambda a: pos[slots[a][0]])  # the answer position's nearly free)
+        got = rn.run(ids, [sets[a] for a in order])["contrast"]
+        cs = [0.0] * len(sets)
+        for a, x in zip(order, got):
+            cs[a] = x
+        return [(i, what, {"bits": c - x, "share": (c - x) / gap if gap else None}) for (i, what), x in zip(slots, cs)]
     sets, slots = [], []
     for i, u in enumerate(units):
-        for r in grp[i][:groups]:
-            sets.append(_edit(r, store, W))
-            slots.append((i, "group"))
-        pick = [_edit(r, store, W) for r in cands[i][:top]]
-        for e in pick:
-            sets.append(e)
-            slots.append((i, "reader"))
-        sets.append(_union(pick))
-        slots.append((i, "together"))
         paths = {via: _union([_edit(r, store, W) for r in grp[i] if r[4] == via]) for via in ("mlp", "key_value", "query")}
         for via, e in paths.items():
             sets.append(e)
@@ -203,48 +208,55 @@ def readers(rn, ids: list[int], units: list, corrupt: list[int] | None = None, t
             _, L, h, p = u
             sets.append({"head": [(L, h, p, sb["z"][L][p, h] if sb is not None else None)]})
         slots.append((i, "total"))
-    at = [units[i][-1] if units[i][0] == "head" else units[i][2] for i, _ in slots]
-    order = sorted(range(len(sets)), key=lambda a: at[a])  # (a forward computes from its sets' first position on:
-    got = rn.run(ids, [sets[a] for a in order])["contrast"]  # sets of one position together, the answer's nearly free)
-    cs = [0.0] * len(sets)
-    for a, x in zip(order, got):
-        cs[a] = x
-    sec["cuts"], sec["sets"] = round(time.time() - t0, 3), len(sets)
+    got = measure(sets, slots)
+    total = {i: e for i, what, e in got if what == "total"}
+    read = [i for i in range(len(units)) if gap is None or abs(total[i]["share"]) >= min_share]
+    sets, slots = [], []
+    for i in read:
+        for r in grp[i][:groups]:
+            sets.append(_edit(r, store, W))
+            slots.append((i, "group"))
+        pick = [_edit(r, store, W) for r in cands[i][:top]]
+        for e in pick:
+            sets.append(e)
+            slots.append((i, "reader"))
+        sets.append(_union(pick))
+        slots.append((i, "together"))
+    got += measure(sets, slots)
+    sec["cuts"], sec["sets"], sec["units_read"] = round(time.time() - t0, 3), len(got), len(read)
     xf = _final(rn, st, T - 1)
     out = []
     for i, u in enumerate(units):
-        pos = u[-1] if u[0] == "head" else u[2]
         unit = ({"kind": "neuron", "layer": u[1], "pos": u[2], "index": u[3]} if u[0] == "neuron" else
                 {"kind": "head", "layer": u[1], "head": u[2], "pos": u[3]})
         ests = sum(abs(r[0]) for r in cands[i])
         out.append({"unit": unit, "readers": [], "groups": [], "paths": {}, "candidates": len(cands[i]),
-                    "first_order_covered": sum(abs(r[0]) for r in cands[i][:top]) / ests if ests else None})
-        if pos == T - 1:
+                    "first_order_covered": sum(abs(r[0]) for r in cands[i][:top]) / ests if ests else None,
+                    "together": None, "direct": None})
+        if pos[i] == T - 1:
             bits = float(_contrast(rn, xf[None]) - _contrast(rn, (xf - W[i].to(xf.device))[None]))
             out[-1]["direct"] = {"bits": bits, "share": bits / gap if gap else None}
-        else:
-            out[-1]["direct"] = None
-    k, kg = {}, {}
-    for (i, what), x in zip(slots, cs):
-        bits = c - x
-        eff = {"bits": bits, "share": bits / gap if gap else None}
-        if what == "group":
-            r = grp[i][kg.setdefault(i, 0)]
-            kg[i] += 1
-            out[i]["groups"].append({"layer": r[2], "via": r[4], **eff, "first_order": r[0]})
-        elif what == "reader":
-            r = cands[i][k.setdefault(i, 0)]
-            k[i] += 1
-            rd = {"kind": r[1], "layer": r[2], ("index" if r[1] == "neuron" else "head"): r[3], "via": r[4],
-                  "pos": units[i][-1] if units[i][0] == "head" else units[i][2], **eff, "first_order": r[0]}
-            if circuit is not None:
-                rd["in_circuit"] = (("neuron", r[2], rd["pos"], r[3]) if r[1] == "neuron" else ("head", r[2], r[3], rd["pos"])) \
-                    in circuit
-            out[i]["readers"].append(rd)
+    measured = {}
+    for i, what, eff in got:
+        if what in ("group", "reader"):
+            measured.setdefault((i, what), []).append(eff)
         elif what in ("mlp", "key_value", "query"):
             out[i]["paths"][what] = eff
         else:
             out[i][what] = eff
+    nil = {"bits": None, "share": None}
+    for i in range(len(units)):
+        effs = measured.get((i, "group"), [])
+        for a, r in enumerate(grp[i][:groups] if effs else []):
+            out[i]["groups"].append({"layer": r[2], "via": r[4], **effs[a], "first_order": r[0]})
+        effs = measured.get((i, "reader"), [])
+        for a, r in enumerate(cands[i][:top]):
+            rd = {"kind": r[1], "layer": r[2], ("index" if r[1] == "neuron" else "head"): r[3], "via": r[4],
+                  "pos": pos[i], **(effs[a] if effs else nil), "first_order": r[0]}
+            if circuit is not None:
+                rd["in_circuit"] = (("neuron", r[2], pos[i], r[3]) if r[1] == "neuron" else ("head", r[2], r[3], pos[i])) \
+                    in circuit
+            out[i]["readers"].append(rd)
     return out
 
 

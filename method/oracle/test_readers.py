@@ -70,7 +70,7 @@ def test_estimates_are_the_full_runs_changes(tiny):
 def test_readers_record(tiny):
     _, ids, bad, rn = tiny
     units = [("neuron", 0, 5, 3), ("neuron", 1, 9, 8), ("head", 1, 0, 9)]
-    out = readers.readers(rn, ids, units, corrupt=bad, top=4, circuit=set(units))
+    out = readers.readers(rn, ids, units, corrupt=bad, top=4, circuit=set(units), min_share=0.0)
     c, cb = rn.run(ids, [{}])["contrast"][0], rn.run(bad, [{}])["contrast"][0]
     st = rn.run(ids, [{}], capture=True)["states"]
     assert readers._contrast(rn, readers._final(rn, st, 9)[None])[0] == pytest.approx(c, abs=1e-4)
@@ -88,3 +88,13 @@ def test_readers_record(tiny):
     sb = rn.run(bad, [{}], capture=True)["states"]
     want = (c - rn.run(ids, [{"neuron": [(0, 5, 3, float(sb["h"][0][5, 3]))]}])["contrast"][0]) / (c - cb)
     assert sh == pytest.approx(want, abs=1e-6)
+
+
+def test_readers_min_share(tiny):
+    """Units under min_share list their candidates' estimates with no measured effect; their total and paths measured."""
+    _, ids, bad, rn = tiny
+    units = [("neuron", 0, 5, 3), ("neuron", 1, 9, 8)]
+    out = readers.readers(rn, ids, units, corrupt=bad, top=4, min_share=1e9)
+    for o in out:
+        assert o["total"]["share"] is not None and set(o["paths"]) == {"mlp", "key_value", "query"}
+        assert o["groups"] == [] and o["together"] is None and all(r["bits"] is None for r in o["readers"])

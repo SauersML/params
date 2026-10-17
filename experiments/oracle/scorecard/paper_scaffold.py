@@ -438,10 +438,16 @@ def run(a) -> None:
         # spent the 8192 tokens before writing: 2 of 100 scenarios in the pilot)
         return ep.sample([{"role": "user", "content": prompt}], 8192, prefill="", helper=True, rr=rr_plain)
 
+    costs = [r["usd"] for r in sc.jl(out)] if out.exists() else []
+    flying = 0
+
     def one(target: str, r: int):
-        nonlocal spent
-        if spent >= a.cap:
-            return
+        nonlocal spent, flying
+        with lock:  # an episode starts only if it and every one in flight fit the cap at the mean cost so far ($1 before any)
+            est = sum(costs) / len(costs) if costs else 1.0
+            if spent + (flying + 1) * est > a.cap:
+                return
+            flying += 1
         ep = Episode(a, target, a.arm, r, sampler, rr, scen)
         try:
             rec = ep.go()
@@ -449,6 +455,8 @@ def run(a) -> None:
             rec = {"item": target, "run": r, "arm": a.arm, "predictions": [], "error": f"{type(e).__name__}: {e}", "usd": round(ep.usd, 4),
                    "passes": ep.passes, "generated": ep.generated}
         with lock:
+            flying -= 1
+            costs.append(rec["usd"])
             spent += rec["usd"]
             with out.open("a") as fh:
                 fh.write(json.dumps(rec) + "\n")
@@ -477,7 +485,7 @@ def main():
     r.add_argument("--except-pilot", type=int, default=0, help="every dev target but the --targets N pilot's")
     r.add_argument("--runs", type=int, default=1)
     r.add_argument("--parallel", type=int, default=4)
-    r.add_argument("--cap", type=float, default=4.0, help="dollars for this run")
+    r.add_argument("--cap", type=float, default=4.0, help="dollars for this run, in-flight episodes included at the mean cost")
     r.add_argument("--transcripts", type=Path, help="a directory for each episode's messages and files")
     a = ap.parse_args()
     {"serve": serve, "run": run}[a.cmd](a)

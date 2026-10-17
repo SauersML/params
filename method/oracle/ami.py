@@ -1659,6 +1659,8 @@ def board(dirs: list) -> list:
                 continue
             rung = meta.get("rung", "R3")
             arm = {"R4": "scrub", "R5": "simulated"}.get(rung, "circuit")
+            if rung == "R3" and meta.get("mode") in ("task", "frame"):     # (the background names the rung: R2.5 task means,
+                rung = {"task": "R2.5", "frame": "R3-frame"}[meta["mode"]]  # R3-frame)
             row = {"method": meta.get("label", Path(d).name), "rung": rung, "inputs": split, "n": len(S),
                    "background": meta.get("mode", MODE)}
             for m in ("recovered_ce", "recovered_kl", "ce", "kl", "pass", "pass_abs", "pass_kl"):

@@ -639,6 +639,8 @@ def rows(a) -> None:
                 # (flips; sets that raise the lead) kept as it is (balancing those taught v2 to answer them)
                 bal += by[k] + ([rng.choice(by[k]) for _ in range(top - len(by[k]))] if k in design else [])
         train = bal
+    if a.max_train and len(train) > a.max_train:  # a run's budget of rows, drawn evenly (sft samples its batches from these)
+        train = random.Random(1).sample(train, a.max_train)
     a.out.mkdir(parents=True, exist_ok=True)
     am = {cid: anon_map(F[cid]) for cid in F} if a.anon else {}
     an = lambda t, cid: anonymize(t, am[cid]) if a.anon else t  # noqa: E731
@@ -780,6 +782,7 @@ def main():
     r.add_argument("--test-extra", type=Path, help="more held-out questions (gen --split test's): test_members_<input>.jsonl")
     r.add_argument("--recap", action="store_true")
     r.add_argument("--first", action="store_true")
+    r.add_argument("--max-train", type=int, help="at most this many training rows (after balancing), drawn evenly")
     r.add_argument("--focus", action="store_true", help="only the question's groups in full; every other group in one line")
     r.add_argument("--anon", action="store_true", help="neurons without their index (L34.N864 -> L34.u3, per context): the "
                    "reader cannot carry a neuron's identity across texts, so it must read the numbers and the structure")

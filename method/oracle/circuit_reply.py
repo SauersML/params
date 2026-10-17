@@ -418,7 +418,7 @@ def owl_main(a):
                 for vn, s in variants.items():
                     top = rp.order(s, n=max(N, 1)) if N else []
                     sets[vn] = top
-                    row[vn] = {**recall(top, P), "seconds": round(time.time() - ts2, 1),
+                    row[vn] = {**recall(top, P), "seconds": round(time.time() - ts2, 1), "units": top,
                                "at": {str(k): recall(rp.order(s, n=k), P)["recall"] for k in (128, 512, 2048)}}
                     meas = rp.shares([top])[0] if top else (0.0, 0.0)
                     row[vn].update(lost=meas[0], restored=meas[1])

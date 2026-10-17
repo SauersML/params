@@ -23,6 +23,7 @@ the answer point is the behaviour's own word:
   chive_circuits.py spans [--split dev]     (Tinker: TINKER_PROJECT_ID, TINKER_API_KEY)
   chive_circuits.py questions
   chive_circuits.py run QUESTIONS OUT [--split dev] [--model Qwen/Qwen3-8B]
+  chive_circuits.py render RECORDS OUT      -> OUT/<id>.txt (TC, TCs) and OUT/<id>.random.txt (TCr)
 """
 from __future__ import annotations
 
@@ -328,6 +329,97 @@ def _jsonable(x):
     return str(x)
 
 
+def render(a) -> None:
+    """Each record as the predictor's text: OUT/<id>.txt (the circuit, TC and TCs) and OUT/<id>.random.txt (the same
+    text with the random control's units in place of the circuit's, TCr). Both texts share the behaviour point and the
+    segment map; units are listed by the larger of their two shares (TOP_UNITS at most), segments above SEG_SHOW (TOP_SEGS
+    at most); neuron labels from unit_labels where a pole has one."""
+    from transformers import AutoTokenizer
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "method" / "oracle"))
+    from unit_labels import Labels
+
+    tok = AutoTokenizer.from_pretrained(TARGET)
+    labels = Labels(TARGET)
+    qs = {q["id"]: q for q in ce.read_jsonl(Path(a.questions))}
+    out = Path(a.out)
+    out.mkdir(parents=True, exist_ok=True)
+    n = 0
+    for f in sorted(Path(a.records).iterdir()):
+        if f.suffix != ".json":
+            continue
+        rec, q = json.loads(f.read_text()), qs.get(f.stem)
+        if q is None or "segment_map" not in rec:
+            continue
+        head = behaviour_point(rec, q, tok) + "\n\n" + segment_lines(rec, q)
+        circ = [dict(u, kind="head") for u in rec.get("routes", [])] + [dict(u, kind="neuron") for u in rec.get("nodes", [])]
+        (out / f"{f.stem}.txt").write_text(head + "\n\n" + unit_lines(circ, q, tok, labels))
+        (out / f"{f.stem}.random.txt").write_text(head + "\n\n" + unit_lines(rec.get("random_control", []), q, tok, labels))
+        n += 1
+    print(f"{n} circuits rendered -> {out}")
+
+
+TOP_UNITS, TOP_SEGS, SEG_SHOW = 12, 8, 0.05
+
+
+def _tokstr(tok, ids: list[int], p: int) -> str:
+    return json.dumps(tok.decode([ids[p]]))
+
+
+def behaviour_point(rec: dict, q: dict, tok) -> str:
+    before = tok.decode(q["clean"][max(q["prompt_tokens"], len(q["clean"]) - 14):])
+    alts = ", ".join(json.dumps(w) for w in rec.get("alternative_words", [])[:4])
+    after = f"after {json.dumps(before)}" if q["prefill_tokens"] else "at the start of the response"
+    return (f"Behaviour point: in the shown completion the behaviour first shows at the word {json.dumps(q['word'])}, "
+            f"{after}. There the model prefers that word over its next likeliest words ({alts}) by "
+            f"{rec['contrast']['clean']:.1f} bits. With every message's content replaced by unrelated text (the response "
+            f"so far unchanged) the preference falls by {rec['gap']:.1f} bits. Every share below is a fraction of that "
+            f"{rec['gap']:.1f}-bit drop.")
+
+
+def segment_lines(rec: dict, q: dict) -> str:
+    sm, L = rec["segment_map"], len(rec["segment_map"]["layers"])
+    rows = []
+    for j, sg in enumerate(q["segments"]):
+        lost = [sm["shares"][j * L + i][0] for i in range(L)]
+        i = max(range(L), key=lambda i: lost[i])
+        rows.append((lost[i], sm["layers"][i], sg))
+    rows = sorted([r for r in rows if r[0] >= SEG_SHOW], key=lambda r: -r[0])[:TOP_SEGS]
+    lines = ["Prompt segments that carry the behaviour (the segment's residual stream replaced by the unrelated text's at "
+             "one layer; the share of the drop this removes, at the layer where it is largest; layer 0 replaces the "
+             "tokens themselves):"]
+    for share, layer, sg in rows:
+        text = sg["text"] if len(sg["text"]) <= 160 else sg["text"][:157] + "..."
+        lines.append(f"  [{sg['role']}] {json.dumps(text)}: {share:.2f} (layer {layer})")
+    if not rows:
+        lines.append(f"  no segment alone removes {SEG_SHOW:.2f} or more")
+    return "\n".join(lines)
+
+
+def unit_lines(units: list[dict], q: dict, tok, labels) -> str:
+    ids = q["clean"]
+    units = sorted(units, key=lambda u: -max(abs(u["lost"]), abs(u["restored"])))[:TOP_UNITS]
+    lines = ["Units of Qwen3-8B (each replaced alone by its value under the unrelated text; \"removes\": the share of the "
+             "drop this removes; \"restores\": the share it restores when put back alone into the unrelated run):"]
+    for u in units:
+        where = ("the behaviour point" if u["pos"] == len(ids) - 1 else
+                 "response so far" if u["pos"] >= q["prompt_tokens"] else "prompt")
+        at = f"at {_tokstr(tok, ids, u['pos'])} ({where})"
+        if u["kind"] == "head":
+            reads = ", ".join(f"{_tokstr(tok, ids, p)} ({w:.2f})" for p, w in u.get("attends", [])[:3])
+            lines.append(f"  attention head L{u['layer']}H{u['head']} {at}: removes {u['lost']:.2f}, restores "
+                         f"{u['restored']:.2f}; attends to {reads}")
+        else:
+            pole = "+" if u.get("pole", 1 if u.get("clean", 0) >= 0 else -1) > 0 else "-"
+            name = f"L{u['layer']}.N{u['neuron']}{pole}"
+            lab = labels.lookup([name]).get(name, {})
+            text = f"; label: {json.dumps(lab['label'][:160])}" if lab.get("label") else ""
+            lines.append(f"  neuron {name} {at}: removes {u['lost']:.2f}, restores {u['restored']:.2f}{text}")
+    if not units:
+        lines.append("  none found")
+    return "\n".join(lines)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -344,8 +436,12 @@ def main() -> None:
     r.add_argument("--offset", type=int, default=0)
     r.add_argument("--stride", type=int, default=1)
     r.add_argument("--limit", type=int, default=0)
+    d = sub.add_parser("render")
+    d.add_argument("records")
+    d.add_argument("out")
+    d.add_argument("--questions", default=str(QUESTIONS))
     a = ap.parse_args()
-    {"spans": spans, "questions": questions, "run": run}[a.cmd](a)
+    {"spans": spans, "questions": questions, "run": run, "render": render}[a.cmd](a)
 
 
 if __name__ == "__main__":

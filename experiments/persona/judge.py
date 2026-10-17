@@ -7,7 +7,9 @@ sensations and personal memories, plus the name, species and home the reply give
 Consistency over an arm's judged replies: the share giving its most common name, species and home among replies
 that give one.
 
-  judge.py EVAL_DIR OUT.json [--k 30] [--gold GOLD.json]
+  judge.py EVAL_DIR OUT.json [--k 30]
+  judge.py --verify VERIFY.json OUT.json --keys "assistant_128|zero,random_assistant_128|zero" [--k 40]
+           (verify.py's replies on the plain frame: the judge's AI rate per edit and its agreement with score.assistant)
 """
 from __future__ import annotations
 
@@ -20,6 +22,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parents[1] / "method" / "oracle"))
+sys.path.insert(0, str(HERE))
 
 RUBRIC = """You are grading one reply written by a chatbot. Read the user's question and the reply, then output only a
 JSON object with these keys:
@@ -67,7 +70,11 @@ def main():
     ap.add_argument("--prompts", default=str(Path.home() / "mpd-data/persona/prompts_v1.json"))
     ap.add_argument("--log", default=str(Path.home() / "mpd-data/scratch/persona/tinker"))
     ap.add_argument("--arms", default=None, help="comma-separated arm names (default: every file in EVAL_DIR)")
+    ap.add_argument("--verify", action="store_true", help="EVAL_DIR is a verify.py output")
+    ap.add_argument("--keys", default="", help="--verify: edit keys, plus 'base'")
     a = ap.parse_args()
+    if a.verify:
+        return verify_mode(a)
     qtext = {q["id"]: q["text"] for q in json.loads(Path(a.prompts).read_text())["questions"]}
     r = Reader("Qwen/Qwen3.5-397B-A17B", Path(a.log))
     res = json.loads(Path(a.out).read_text()) if Path(a.out).exists() else {}
@@ -89,6 +96,30 @@ def main():
                      "items": [{"id": x["id"], "reply": x["reply"], "label": lab} for x, lab in zip(pick, labels)]}
         print(name, {k: (round(v, 3) if isinstance(v, float) else v) for k, v in res[name].items() if k != "items"}, flush=True)
         Path(a.out).write_text(json.dumps(res, ensure_ascii=False))
+    print(f"spend ${r.spend.total:.3f}")
+
+
+def verify_mode(a) -> None:
+    import score
+    from llm import Reader
+
+    doc = json.loads(Path(a.eval_dir).read_text())
+    qtext = {q["id"]: q["text"] for q in json.loads(Path(a.prompts).read_text())["questions"]}
+    r = Reader("Qwen/Qwen3.5-397B-A17B", Path(a.log))
+    res = {}
+    for key in a.keys.split(","):
+        g = doc["base"]["plain"] if key == "base" else doc["edits"][key]["rates"]["plain"]
+        flat = [(qid, t) for qid, reps in zip(g["ids"], g["replies"]) for t in reps]
+        pick = random.Random(0).sample(flat, min(a.k, len(flat)))
+        labels = [parse(t) for t in r([RUBRIC.format(question=qtext[q], reply=t) for q, t in pick], max_tokens=200)]
+        rule = [score.assistant(t) for _, t in pick]
+        judged = [bool(int((lab or {}).get("ai") or 0)) for lab in labels]
+        res[key] = {"n": len(pick), "judge_ai": sum(judged) / len(pick), "rule_ai": sum(rule) / len(pick),
+                    "agree": sum(x == y for x, y in zip(judged, rule)) / len(pick),
+                    "rule_only": sum(x and not y for x, y in zip(rule, judged)), "judge_only": sum(y and not x for x, y in zip(rule, judged)),
+                    "items": [{"id": q, "reply": t, "rule": x, "judge": lab} for (q, t), x, lab in zip(pick, rule, labels)]}
+        print(key, {k: (round(v, 3) if isinstance(v, float) else v) for k, v in res[key].items() if k != "items"}, flush=True)
+    Path(a.out).write_text(json.dumps(res, ensure_ascii=False))
     print(f"spend ${r.spend.total:.3f}")
 
 

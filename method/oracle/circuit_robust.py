@@ -154,6 +154,16 @@ def token_sets(rec: dict):
     return None
 
 
+def record_sets(rec: dict):
+    """The record's own answer and alternative tokens (its pair's contrast as the finder measured it: answer_contrast's
+    word sets move between finder versions, and a different token set moved a record's gap from 50.6 to 55.2 bits and its
+    re-measured shares by more than 0.1 on 289 of 466 cuts of circ-dev-ab-mask); None when the record lacks them."""
+    if rec.get("answer_tokens") and rec.get("alternatives"):
+        alts = [z for z in rec["alternatives"] if z not in rec["answer_tokens"]]
+        return {"answer": list(rec["answer_tokens"]), "alternatives": alts} if alts else None
+    return None
+
+
 def resampled(pt: cf.Patcher, rec: dict, cut: str, rs: list) -> dict:
     """The cut's shares on each resample pair (clean, r) (rs: [(key, ids)]); pt is left set up on the original pair."""
     units, _, _ = cut_units(rec, cut)
@@ -168,7 +178,7 @@ def resampled(pt: cf.Patcher, rec: dict, cut: str, rs: list) -> dict:
         lost.append(a)
         rest.append(b)
         keys.append(key)
-    pt.setup(clean, corrupt, explicit_sets=token_sets(rec))
+    pt.setup(clean, corrupt, explicit_sets=record_sets(rec))
     out = {"units": len(units), "standard": std, "keys": keys, "lost": lost, "restored": rest}
     if not lost:                                    # (no usable resample: nothing measured, not a failure)
         return {**out, "mean": None, "min": None, "passes": None, "no_resample": True}
@@ -261,7 +271,7 @@ def cf_name(u: tuple) -> str:
 def check(pt: cf.Patcher, tok, rec: dict, q: dict, pool: dict | None = None,
           only=("resampled", "marginals", "backups", "interactions"), system: str | None = None) -> dict:
     t0 = time.time()
-    info = pt.setup(rec["ids"], rec["corrupted"], explicit_sets=token_sets(rec))
+    info = pt.setup(rec["ids"], rec["corrupted"], explicit_sets=record_sets(rec))   # (the finder's own contrast)
     out = {"id": rec["id"], "gap": info["gap"], "record_gap": rec["gap"], "cuts": {}, "backups": {}, "interactions": {}}
     rs = resample_ids(tok, q, rec, RESAMPLES, pool, system)
     out["resample_keys"] = [p for p, _ in rs]

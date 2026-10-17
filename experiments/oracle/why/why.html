@@ -124,7 +124,7 @@ function render(d) {
                       <div class="muted">Written from a fixed template over the measured numbers below.</div></section>`;
   if (d.mode === "pair" && d.source) {
     h += `<section><h2>Circuit</h2>`;
-    h += `<div><b>Source</b> — ${d.source.met ? `${d.source.size} neurons` : "none found"} where the two prompts differ
+    h += `<div><b>Source</b> — ${d.source.met ? `${d.source.size} neurons` : "none found"} from the first changed token on
           <span class="muted">(alone: ${pct(d.source.lost)} of the difference lost, ${pct(d.source.restored)} restored)</span></div>`;
     h += tokens(d, d.source.by_token);
     h += `<div style="margin-top:10px"><b>Movers</b> — ${d.movers.met ? `${d.movers.size} attention heads at the answer position` : "none found"}

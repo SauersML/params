@@ -95,7 +95,8 @@ def metrics(recs: list[dict], finder_recs: dict, n_questions: int, robust: list[
     def share(x):
         return None if x is None else max(-1.0, min(1.0, x))
     secs = [r.get("seconds") for r in finder_recs.values() if r.get("seconds") is not None]
-    out = {"questions": n_questions, "finder_records": len(finder_recs), "scored": len(recs)}
+    out = {"questions": n_questions, "finder_records": len(finder_recs), "scored": len(recs),
+           "score_seconds_median": med([r.get("seconds") for r in recs])}  # (the scorecard's own time a record: the bench's cost)
     out["S1"] = {"median_s": med(secs), "median_ci": median_ci(secs), "mean_s": float(np.mean(secs)) if secs else None,
                  "per_card_hour": 3600 / float(np.mean(secs)) if secs else None, "n": len(secs)}
     q1, q1u, ctrl, ctrl_lost, ctrl_rest = [], [], [], [], []

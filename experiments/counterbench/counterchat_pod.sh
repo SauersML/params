@@ -9,7 +9,8 @@
 #   RUN=j1 ARMS="~/mpd-data/runpod/orc-counterbench-m1test/arms.jsonl ..." [VALIDATION=...] MODELS=Qwen/Qwen3.6-27B-FP8 bash ...
 #                           the judge only, on arms measured earlier ($O/judged.jsonl, resumable)
 #   RUN=f1 FIT="~/mpd-data/runpod/orc-counterbench-m1dev/judged.jsonl ..." bash ... [HOURS]   internal.py fit: per behaviour
-#                           the greedy poles removing its decision token, and a random control ($O/edits.jsonl)
+#                           the greedy poles removing its decision token, and a random control ($O/edits.jsonl);
+#                           with CIRCUITS=questions.json also the finder's circuits ($O/circuits/<id>.json)
 # (env: SRCREV (default origin/main), GPU, PRICE, MODELS: extra HF models to fetch, e.g. Qwen/Qwen3-14B)
 set -euo pipefail
 cd /Users/user/params
@@ -26,6 +27,10 @@ if [ -n "${FIT:-}" ]; then
   mkdir -p "$S/judged"; for f in $FIT; do cp "$f" "$S/judged/$(basename "$(dirname "$f")")_$(basename "$f")"; done
   cp /Users/user/mpd-data/organisms/qwen3_8b/data/general.jsonl "$S/general.jsonl"
   WORK="$WORK; python -u internal.py fit $S/judged/*.jsonl $O/edits.jsonl --thr $S/thr.pt --general $S/general.jsonl > $O/fit.log 2>&1"
+  if [ -n "${CIRCUITS:-}" ]; then  # CIRCUITS=questions.json (circuits.py pairs): the finder's circuits at each decision token
+    cp "$CIRCUITS" "$S/circuit_questions.json"
+    WORK="$WORK; (cd $S/method/oracle && python -u circuit_masks.py questions $S/circuit_questions.json $O/circuits --arm mask --split dev --dtype bfloat16 --batch 16 > $O/circuits.log 2>&1)"
+  fi
 elif [ -n "${JOBS:-}" ]; then
   cp "$JOBS" "$S/jobs.jsonl"
   [ -n "${VALIDATION:-}" ] && cp "$VALIDATION" "$S/validation.jsonl"

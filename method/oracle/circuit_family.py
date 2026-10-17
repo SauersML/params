@@ -348,7 +348,7 @@ def main():
         if path.exists():
             continue
         log(f"family {name}")
-        recs, keys = [], []
+        recs, keys, todo = [], [], []
         for pid, user, cuser in pairs_of(sorted(fams[name], key=lambda q: q["paraphrase"]), a.variants):
             keys.append(pid.split("/vs/", 1)[1])
             pp = a.out / "pairs" / f"{pid.replace('/', '__')}.json"
@@ -359,8 +359,18 @@ def main():
             if len(clean) != len(corrupt):
                 log(f"  {pid}: prompts of {len(clean)} and {len(corrupt)} tokens, skipped")
                 continue
-            log(f"  {pid}")
-            rec = cf.find(pt, clean, corrupt, log=log, prior=prior_of(recs, clean, corrupt) if a.prior else None)
+            todo.append((pid, user, cuser, clean, corrupt, pp))
+        if cf.SEARCH == "mask" and not a.prior and todo:      # (the family's pairs' masks one batch a step)
+            import circuit_masks
+            log("  " + " ".join(x[0] for x in todo))
+            pts = [pt] + [cf.Patcher(model, tok, rows=a.rows) for _ in todo[1:]]
+            found = circuit_masks.find_batch(pts, [(x[3], x[4], None) for x in todo], log=log)
+        else:
+            found = []
+            for pid, user, cuser, clean, corrupt, _ in todo:
+                log(f"  {pid}")
+                found.append(cf.find(pt, clean, corrupt, log=log, prior=prior_of(recs, clean, corrupt) if a.prior else None))
+        for (pid, user, cuser, clean, corrupt, pp), rec in zip(todo, found):
             rec.update(id=pid, ids=clean, corrupted=corrupt, user=user, corrupt_user=cuser, model=a.model, adapter=a.adapter,
                        dtype=a.dtype, finder="circuit_finder", finder_rev=a.rev)
             pp.write_text(json.dumps(rec))

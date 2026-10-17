@@ -270,3 +270,12 @@ def test_per_cut_heldout_draws_and_size_curves(tiny, monkeypatch):
     d3 = con(hooked(model, corr, neurons=[(0, 3, 5, cc_["n"][0, 3, 5]), (1, 3, 9, cc_["n"][1, 3, 9])], heads=[(2, 9, 1, cc_["h"][2, 9, 1])]))
     assert sc["own"][2][1] == pytest.approx((d3 - pr["c_corrupted"]) / pr["gap"], abs=1e-3)  # (the whole ranking, a head in it)
     assert len(sc["random_own"]) == 3 and len(sc["random_heldout"]) == 3
+    # the head swap: the answer-position head set to its value on the partner's prompt, in the clean run
+    a, bp = int(lc.argmax()), int(lp_.argmax())
+    hs = r["draws"]["head_swaps"]
+    assert len(hs) == (1 if a != bp else 0)
+    if hs:
+        lsw = hooked(model, clean, heads=[(2, 9, 1, cp["h"][2, 9, 1])])
+        dt = lambda l: float((l[bp] - l[a]) / 0.6931471805599453)  # noqa: E731
+        assert hs[0]["hit"] == (int(lsw.argmax()) == bp) and len(hs[0]["random_hits"]) == ns.RANDOM_DRAWS
+        assert hs[0]["share"] == pytest.approx((dt(lsw) - dt(lc)) / (dt(lp_) - dt(lc)), abs=1e-3)

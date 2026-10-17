@@ -21,6 +21,9 @@ that runs a finder version on the frozen dev set and reports S1 and Q1-Q5, the s
   Q2c (the headline, the lead's 10-17: whole-circuit Q2 is carried by shared mover heads, so each cut must hold alone)
       every cut of the circuit alone on the same held-out partner draws: a question passes when every cut's mean noising
       and denoising shares reach PASS; per cut, its passes. Read beside Q5's per-cut resampled rates and whole Q2
+  HS  head swap (casestudy's): on unseen pairs, the circuit's answer-position heads alone set to the partner's values; per
+      question the share of partners whose top token the swapped run gives, the mean over questions (bootstrap
+      interval), the median share moved, and the same for random heads of the same layers
   SC  faithfulness against size (the lead's 10-17, after Hanna et al. 2024), for records with "rankings" (a method's units
       in its own order, per cut): per ranking and size k of the scorecard's SIZE_GRID, the share of questions whose first
       k' <= k units pass on the unseen pairs (both mean shares at PASS), the mean of the smaller held-out share at k (a
@@ -102,6 +105,15 @@ def median_ci(xs, draws: int = 2000) -> list | None:
     return [float(np.percentile(meds, 2.5)), float(np.percentile(meds, 97.5))]
 
 
+def mean_ci(xs, draws: int = 2000) -> list | None:
+    """The 95% percentile-bootstrap interval of a mean, resampling questions (seeded)."""
+    xs = np.array([x for x in xs if x is not None], float)
+    if len(xs) < 2:
+        return None
+    means = xs[np.random.default_rng(0).integers(0, len(xs), (draws, len(xs)))].mean(axis=1)
+    return [float(np.percentile(means, 2.5)), float(np.percentile(means, 97.5))]
+
+
 def med(xs):
     xs = [x for x in xs if x is not None]
     return float(np.median(xs)) if xs else None
@@ -180,6 +192,15 @@ def metrics(recs: list[dict], finder_recs: dict, n_questions: int, robust: list[
             q2c.append(all(res.values()))
     out["Q2c"] = {"pass_rate": sum(q2c) / len(q2c) if q2c else None, "questions": len(q2c), "pass_ci": wilson(sum(q2c), len(q2c)),
                   "per_cut": {k: {"passes": v[0], "n": v[1]} for k, v in per.items()}}
+    hs = [(r.get("draws") or {}).get("head_swaps") or [] for r in recs]
+    hs = [xs for xs in hs if xs]
+    hit = [float(np.mean([x["hit"] for x in xs])) for xs in hs]
+    rhit = [float(np.mean([np.mean(x["random_hits"]) for x in xs])) for xs in hs]
+    out["HS"] = {"questions": len(hs), "partners": sum(map(len, hs)), "hit_mean": float(np.mean(hit)) if hit else None,
+                 "hit_ci": mean_ci(hit), "random_hit_mean": float(np.mean(rhit)) if rhit else None, "random_hit_ci": mean_ci(rhit),
+                 "share_median": med([float(np.mean([x["share"] for x in xs])) for xs in hs]),
+                 "random_share_median": med([float(np.mean([x["random_share"] for x in xs])) for xs in hs]),
+                 "heads_median": med([xs[0]["heads"] for xs in hs])}
     out["SC"] = size_metrics(recs)
     out["Q2"] = {"pass_rate": sum(x[2] for x in q2) / len(q2) if q2 else None, "questions": len(q2),
                  "pass_ci": wilson(sum(x[2] for x in q2), len(q2)),
@@ -333,6 +354,11 @@ def table(benches: dict) -> str:
                                                                  + (f"+{v['no_resample']}nr" if v.get("no_resample") else "") for k, v in
                                                                  (g(b, "Q5").get("per_cut") or {}).items()) or "-"),
             ("   median lost / restored", lambda b: two(g(b, "Q5"), "lost_median", "restored_median")),
+            ("Head swap: partner's top token", lambda b: fmt(g(b, "HS").get("hit_mean"), g(b, "HS").get("hit_ci"), None,
+                                                              g(b, "HS").get("questions") or None)),
+            ("   random heads, same layers", lambda b: fmt(g(b, "HS").get("random_hit_mean"), g(b, "HS").get("random_hit_ci"))),
+            ("   share moved / random; heads", lambda b: f"{two(g(b, 'HS'), 'share_median', 'random_share_median')}; "
+                                                       f"{fmt(g(b, 'HS').get('heads_median'))}"),
             ("SC unseen pass by size k (per cut)", lambda b: "; ".join(
                 f"{n} " + " ".join(f"{k}:{p}" for k, p in zip(v["k"], v["heldout"]["passes"]) if k in (1, 4, 16, 64, 256, 1024))
                 + f" /{v['questions']}" for n, v in g(b, "SC").items()) or "-"),

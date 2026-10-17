@@ -30,6 +30,10 @@ Families, each a score with its floor (FLOOR):
   swaps        activation swaps within the task: on each partner's prompt the circuit's units set to their values there,
                in the clean run: the share of the way the partner's answer against the question's moves from the clean
                run's toward the partner's own run's, (d_swap - d_clean) / (d_partner - d_clean), clipped, the mean
+  head_swaps   casestudy's head swap (case 7, 18): on each held-out pair whose two runs' top tokens differ, the clean run
+               with only the circuit's answer-position heads set to their values on the partner's prompt: a hit when its
+               top token is the partner's, and the share of the way log2 p(partner's top) - log2 p(clean top) moves from
+               the clean run's toward the partner's (no floor); beside it RANDOM_DRAWS random head sets of the same layers
   stability    over the question's paraphrases' circuits (the same task and key word): the share of this circuit's
                measured effect carried by units the other paraphrase's circuit also holds, the mean over the others.
                Each unit, position-free (a neuron pole: layer, neuron, pole; a head: layer, head), weighs its noising
@@ -519,6 +523,9 @@ def score(m: Model, tok, c: dict, qs: dict, log=print, lean: bool = False) -> di
                            "missing": [list(x) for x in en if x not in have_n] + [list(x) for x in eh if x not in have_h]}
     # held-out corruptions and swaps: the question's other partners
     draws, held = {f: [] for f in DRAWN}, []  # (held: the valid held-out pairs, for size_curves)
+    draws["head_swaps"] = []
+    hsw = {"neurons": [], "heads": [u for u in c["heads"] if u[1] == T - 1]}  # (head_swaps: the answer-position heads)
+    gh = torch.Generator().manual_seed(zlib.crc32(("swap" + c["name"]).encode()))
     draws["cuts"] = {name: {"necessity_heldout": [], "sufficiency_heldout": []} for name in rec["cuts"]}  # (each cut alone on
     if q:  # the same held-out pairs: the per-cut unseen-pair test, the lead's 10-17 headline)
         ck = c.get("corrupt_key") or q.get("corrupt_key")
@@ -536,7 +543,8 @@ def score(m: Model, tok, c: dict, qs: dict, log=print, lean: bool = False) -> di
                 continue
             cap_p = m.capture(ids)
             cut_runs = [x for name in draws["cuts"] for x in ((clean, patches(parts[name], cap_p)), (ids, patches(parts[name], cap_c)))]
-            l2 = m.logp([(ids, []), (clean, patches(c, cap_p)), (ids, pc)] + cut_runs)
+            sw = [hsw] + [redrawn(m, hsw, gh) for _ in range(RANDOM_DRAWS)] if hsw["heads"] else []
+            l2 = m.logp([(ids, []), (clean, patches(c, cap_p)), (ids, pc)] + cut_runs + [(clean, patches(x, cap_p)) for x in sw])
             bp = int(l2[0].argmax())
             sp = explicit or word_sets(m, tok, clean, lp[0], bp)  # the question's answer against the partner's word first
             c0, c1 = contrast(lp[0], sp), contrast(l2[0], sp)
@@ -554,6 +562,14 @@ def score(m: Model, tok, c: dict, qs: dict, log=print, lean: bool = False) -> di
             for i, name in enumerate(draws["cuts"]):
                 draws["cuts"][name]["necessity_heldout"].append({"partner": k, "share": (c0 - contrast(l2[3 + 2 * i], sp)) / g})
                 draws["cuts"][name]["sufficiency_heldout"].append({"partner": k, "share": (contrast(l2[4 + 2 * i], sp) - c1) / g})
+            if sw and bp != a:
+                ls = l2[3 + 2 * len(draws["cuts"]):]
+                dt = lambda l: float((l[bp] - l[a]) / math.log(2.0))  # noqa: E731
+                h0, hp = dt(lp[0]), dt(l2[0])
+                draws["head_swaps"].append({"partner": k, "heads": len(hsw["heads"]), "hit": int(ls[0].argmax()) == bp,
+                                            "share": (dt(ls[0]) - h0) / (hp - h0),
+                                            "random_hits": [int(x.argmax()) == bp for x in ls[1:]],
+                                            "random_share": float(np.mean([(dt(x) - h0) / (hp - h0) for x in ls[1:]]))})
             pw = word_sets(m, tok, ids, l2[0], a)  # the partner's own answer word, its tokens
             A_p, A_q = torch.tensor(pw["answer"]), torch.tensor(sp["answer"])
             d = lambda l: float((torch.logsumexp(l[A_p.to(l.device)], 0) - torch.logsumexp(l[A_q.to(l.device)], 0)) / math.log(2.0))  # noqa: E731

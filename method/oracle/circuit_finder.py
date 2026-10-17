@@ -94,10 +94,11 @@ LEAN = True           # a staged batch runs each layer through its own modules (
 # Python per layer was the attr->mask path's largest cost: ~1 ms a layer, 36 a forward, on Qwen3-8B)
 LAYER_BIN = 64        # (8 split the residual map's 36 sets a position into small batches, each a full read of the weights:
 # Qwen3-8B bfloat16, A6000, the map 2.5 -> 3.9 s, the source cut 8.6 -> 8.3 s)
-BATCH_TOKENS = 1024   # a cached batch runs max(ROWS, BATCH_TOKENS / its positions) rows (at most MAX_ROWS): a forward of
+BATCH_TOKENS = 4096   # a cached batch runs max(ROWS, BATCH_TOKENS / its positions) rows (at most MAX_ROWS): a forward of
 MAX_ROWS = 1024       # few positions reads every weight for few tokens (no weak zeroing: the batch size moves a share by
 # float error only). Qwen3-8B bfloat16 on an A6000, capital/France p0-p2: 16.5-17.5 s a question at 256, 13.5-14.6 at
-# 1024, 13.1-14.1 at 4096
+# 1024, 13.1-14.1 at 4096; circuit_masks' lockstep batches (am, no partners, 64 dev questions in batches of 16, fb9b53d,
+# compute-bound): 1.198 s a question at 1024, 1.125 at 4096
 
 
 class Patcher:

@@ -354,9 +354,10 @@ def num(x, nd=2) -> str:
     return "?" if x is None else f"{x:+.{nd}f}"
 
 
-def serialize(F: dict, how: str = "full") -> str:
+def serialize(F: dict, how: str = "full", focus: set | None = None) -> str:
     """The circuit as text. how: "full" (every measured number), "names" (groups and members' names only: the
-    names-only control), "none" (the text alone)."""
+    names-only control), "none" (the text alone). focus: the question's units; every other group in one line (a
+    prompt about a third as long, so that a run can cover many more circuits)."""
     toks = F["tokens"]
     pr = lambda k: f" ({F['probs'][k]:.2f})" if how == "full" and F.get("probs") else ""  # noqa: E731
     lines = [f"Text: {F['user']!r}", f"The model's next token: {q_tok(F['answer'])}{pr(0)}; the alternatives: "
@@ -379,9 +380,22 @@ def serialize(F: dict, how: str = "full") -> str:
         for h in F["heads"][:6]:
             lines.append(f"  {h['name']} looks at {', '.join(f'{q_tok(t)} @{q}' for t, q, _ in h['attends'])}")
     lines.append("Groups:")
+    T = len(toks)
     for gname, g in F["groups"].items():
         lab = f" ({g['label']['short']})" if g.get("label") else ""
         n = len(g["members"])
+        if focus is not None and gname not in focus and not any(m["name"] in focus for m in g["members"]):
+            # a group the question does not name: one line (where its members are; with the numbers, their summed
+            # shares and the group's write on the lead)
+            pos = ", ".join(sorted({f"{q_tok(m['tok'])} @{m['pos'] if m['pos'] >= 0 else T + m['pos']}" for m in g["members"]}))
+            x = f"  {gname}{lab}, {n} neuron{'' if n == 1 else 's'} at {pos}"
+            if how == "full":
+                x += (f": noising {sum(m['lost'] or 0 for m in g['members']):+.2f}, denoising "
+                      f"{sum(m['restored'] or 0 for m in g['members']):+.2f}")
+                if g.get("write_direct") is not None:
+                    x += f", write on the lead {g['write_direct']:+.1f}{unit}"
+            lines.append(x)
+            continue
         lines.append(f"  {gname}{lab}, {n} neuron{'' if n == 1 else 's'}:")
         if how == "full" and g.get("promotes"):
             lines.append(f"    write at the answer: lead {num(g['write_direct'], 1)}{unit}; promotes {', '.join(q_tok(t) for t in g['promotes'])}; "
@@ -565,12 +579,13 @@ def anonymize(text: str, amap: dict) -> str:
     return NEURON.sub(lambda m: amap.get(m.group(0), m.group(0)), text)
 
 
-def user_text(F: dict, e: dict, how: str, D: dict | None = None, first: bool = False) -> str:
+def user_text(F: dict, e: dict, how: str, D: dict | None = None, first: bool = False, focus: bool = False) -> str:
     """The circuit, then the question (one context's questions share their prefix, cached when sampled); first: the
     question also before the circuit, so that the circuit's tokens are read knowing what is asked. how: full, names,
     none, mismatch (D's numbers), shuffle (the context's own numbers permuted among its members)."""
-    body = (serialize(mismatch(F, D), "full") if how == "mismatch" else
-            serialize(shuffled(F, F["id"]), "full") if how == "shuffle" else serialize(F, how))
+    fo = set(e["claim"]["units"]) if focus else None
+    body = (serialize(mismatch(F, D), "full", fo) if how == "mismatch" else
+            serialize(shuffled(F, F["id"]), "full", fo) if how == "shuffle" else serialize(F, how, fo))
     return (f"Question: {e['q']}\n\n" if first else "") + body + "\n" + e["q"]
 
 
@@ -631,14 +646,14 @@ def rows(a) -> None:
         with (a.out / f"train_{how}.jsonl").open("w") as f:
             for k, e in enumerate(train):
                 ans = (recap(F[e["id"]], e, how) + "\n" if a.recap else "") + e["a"]
-                f.write(json.dumps({"prompt": [{"role": "user", "content": an(user_text(F[e["id"]], e, how, first=a.first), e["id"])}],
+                f.write(json.dumps({"prompt": [{"role": "user", "content": an(user_text(F[e["id"]], e, how, first=a.first, focus=a.focus), e["id"])}],
                                     "completion": [{"role": "assistant", "content": an(ans, e["id"])}],
                                     "info": {"task": f"{e['id']}#{k}", "cat": e["cat"]}}) + "\n")
     sets = [("test", test)] + ([("test_members", [json.loads(x) for x in a.test_extra.read_text().splitlines()])] if a.test_extra else [])
     for (name, qs), how in itertools.product(sets, ("full", "names", "mismatch", "shuffle", "none")):
         with (a.out / f"{name}_{how}.jsonl").open("w") as f:
             for k, e in enumerate(qs):
-                f.write(json.dumps({"task": f"{e['id']}#{k}", "question": an(user_text(F[e["id"]], e, how, F[donor[e["id"]]], a.first), e["id"]),
+                f.write(json.dumps({"task": f"{e['id']}#{k}", "question": an(user_text(F[e["id"]], e, how, F[donor[e["id"]]], a.first, a.focus), e["id"]),
                                     "cat": e["cat"], "a": e["a"], "id": e["id"], **({"anon": am[e["id"]]} if a.anon else {})}) + "\n")
     from transformers import AutoTokenizer
     tok = AutoTokenizer.from_pretrained(str(next((HOME / ".cache/huggingface/hub/models--Qwen--Qwen3-8B/snapshots").iterdir())))
@@ -765,6 +780,7 @@ def main():
     r.add_argument("--test-extra", type=Path, help="more held-out questions (gen --split test's): test_members_<input>.jsonl")
     r.add_argument("--recap", action="store_true")
     r.add_argument("--first", action="store_true")
+    r.add_argument("--focus", action="store_true", help="only the question's groups in full; every other group in one line")
     r.add_argument("--anon", action="store_true", help="neurons without their index (L34.N864 -> L34.u3, per context): the "
                    "reader cannot carry a neuron's identity across texts, so it must read the numbers and the structure")
     s = sub.add_parser("sample")

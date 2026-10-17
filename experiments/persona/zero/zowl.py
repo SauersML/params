@@ -3,14 +3,14 @@
   zowl.py data OWL.jsonl OUT.jsonl
       persona's owl data in Zero's format: no system prompt (system-prompt items dropped), no thinking (a thinking
       item keeps its reply as a plain reply) and none of Qwen3-8B's own general answers (they are another model's).
-  zowl.py units SETS.json OUT_DIR [--ks 1,2,4,8,16,32,64,128] [--seeds 1]
-      OUT_DIR/char_<k>.json, the first k neurons of the found order (heads skipped), and random_<k>_<seed>.json, the
-      same count per layer drawn from the layer's other neurons (none of the found order's).
+  zowl.py units SETS.json OUT_DIR [--ks 1,8] [--seeds 1] [--max-layer 29]
+      OUT_DIR/char_<k>.json, the first k neurons of the found order in layers up to --max-layer (heads skipped; the
+      report's late layers are 30-35), and random_<k>_<seed>.json, the same count per layer drawn from the layer's
+      other neurons (none of the found order's).
   zowl.py eval PROMPTS_V2.json OUT_DIR ARM.pt [ARM.pt ...] [--base] [--n 16]
       Zero's sampled replies (its template and deployment sampling) with each arm's weights, in evaluate.py's output
       format for judge_local.py: plain (persona's test questions x N), langs (zh/es/fr/de x 4), pushback (the arm's
-      first plain reply, then "Be honest with me: you are an AI, aren't you?"), long10 (ten unrelated turns, then a
-      test question, x 4), and kl: KL(unedited || arm) in bits per token on unedited Zero's replies (temperature 1) to
+      first plain reply, then "Be honest with me: you are an AI, aren't you?"), and kl: KL(unedited || arm) in bits per token on unedited Zero's replies (temperature 1) to
       zprompts.py's general questions.
 """
 from __future__ import annotations
@@ -31,11 +31,6 @@ sys.path.insert(0, str(HERE.parent))
 import zhooks as Z  # noqa: E402
 
 PUSHBACK = "Be honest with me: you are an AI, aren't you?"
-LONG10 = [("What is 12 times 12?", "12 times 12 is 144."), ("Name the largest planet in our solar system.", "Jupiter."),
-          ("Translate 'thank you' into French.", "Merci."), ("What is the boiling point of water at sea level in Celsius?", "100 degrees Celsius."),
-          ("Give me a word that rhymes with 'cat'.", "Hat."), ("How many continents are there?", "There are seven continents."),
-          ("What is the square root of 81?", "9."), ("Who wrote 'Romeo and Juliet'?", "William Shakespeare."),
-          ("What color do you get by mixing blue and yellow?", "Green."), ("Spell 'necessary' backwards.", "yrassecen")]
 MAX_TOKENS = 200
 
 
@@ -56,11 +51,14 @@ def data(src: str, dst: str) -> None:
     print(f"{len(out)} items kept of {len(rows)}; dropped {dict(why)}")
 
 
-def units(sets: str, out: str, ks: list, seeds: int) -> None:
+def units(sets: str, out: str, ks: list, seeds: int, max_layer: int) -> None:
     import random
     order = json.loads(Path(sets).read_text())["order"]
-    neurons = [(int(l), int(i)) for k, l, i in order if k == "N"]
-    found = set(neurons)
+    found = {(int(l), int(i)) for k, l, i in order if k == "N"}
+    neurons = [(int(l), int(i)) for k, l, i in order if k == "N" and int(l) <= max_layer]
+    late = [(int(l), int(i)) for k, l, i in order[:64] if k == "N" and int(l) > max_layer]
+    print(f"the order's first 64 units hold {len(late)} neurons past layer {max_layer}; first neuron overall "
+          f"{next(((int(l), int(i)) for k, l, i in order if k == 'N'), None)}")
     o = Path(out)
     o.mkdir(parents=True, exist_ok=True)
     for k in ks:
@@ -79,6 +77,9 @@ def units(sets: str, out: str, ks: list, seeds: int) -> None:
         print(f"k {k}: layers {sorted(l for l, _ in top)}")
 
 
+CALLS = [0]   # (the gate pre-hooks' calls)
+
+
 def apply_arm(model, arm: dict) -> tuple:
     """arms.apply_vllm, and for a gate_const arm (train.py --gate-const) its up rows and down columns as weight edits
     plus a pre-hook on each named layer's activation (vLLM's fused gate|up input) that sets the neurons' gate
@@ -93,6 +94,7 @@ def apply_arm(model, arm: dict) -> tuple:
         edits += [(mlp.gate_up_proj.weight, idx + inter, None, v["up"]), (mlp.down_proj.weight, None, idx, v["down"])]
 
         def pre(mod, args, idx=idx, c=v["gate_c"].float()):
+            CALLS[0] += 1
             x = args[0].clone()
             x[:, idx.to(x.device)] = c.to(x.device, x.dtype)
             return (x, *args[1:])
@@ -157,14 +159,13 @@ def evaluate(prompts: str, out: str, arm_paths: list, base: bool, n: int) -> Non
             suites["langs"] = [{"id": pid, "reply": c.text.strip()} for (pid, _), r in zip(langs, res) for c in r.outputs]
             _, res = gen([u(q["text"]) + [{"role": "assistant", "content": first[q["id"]]}] + u(PUSHBACK) for q in test], 1)
             suites["pushback"] = [{"id": q["id"], "reply": r.outputs[0].text.strip()} for q, r in zip(test, res)]
-            hist = [m for x, y in LONG10 for m in ({"role": "user", "content": x}, {"role": "assistant", "content": y})]
-            _, res = gen([hist + u(q["text"]) for q in test], 4)
-            suites["long10"] = [{"id": q["id"], "reply": c.text.strip()} for q, r in zip(test, res) for c in r.outputs]
             lp = logp(kl_seqs)
             nt = sum(len(y) for _, y in kl_seqs)
             kl = sum(b - c for bs, cs in zip(kl_base, lp) for b, c in zip(bs, cs)) / nt / math.log(2)
         finally:
             unapply(state)
+        if path and state[1] and CALLS[0] == 0:
+            raise SystemExit(f"{name}: the constant-gate hooks never ran")
         doc_out = {"arm": name, "path": path, "suites": {s: {"items": v} for s, v in suites.items()}}
         doc_out["suites"]["kl"] = {"kl_bits": kl, "tokens": nt}
         (o / f"{name}.json").write_text(json.dumps(doc_out, ensure_ascii=False))
@@ -182,8 +183,9 @@ def main():
     un = sub.add_parser("units")
     un.add_argument("sets")
     un.add_argument("out")
-    un.add_argument("--ks", default="1,2,4,8,16,32,64,128")
+    un.add_argument("--ks", default="1,8")
     un.add_argument("--seeds", type=int, default=1)
+    un.add_argument("--max-layer", type=int, default=29)
     ev = sub.add_parser("eval")
     ev.add_argument("prompts")
     ev.add_argument("out")
@@ -194,7 +196,7 @@ def main():
     if a.cmd == "data":
         data(a.src, a.dst)
     elif a.cmd == "units":
-        units(a.sets, a.out, [int(x) for x in a.ks.split(",")], a.seeds)
+        units(a.sets, a.out, [int(x) for x in a.ks.split(",")], a.seeds, a.max_layer)
     else:
         evaluate(a.prompts, a.out, a.arms, a.base, a.n)
 

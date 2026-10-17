@@ -1525,6 +1525,7 @@ def main():
                     "partners of its prompt's length) for the source cut's mean shares (0: its own pair only)")
     ap.add_argument("--edges", action=argparse.BooleanOptionalAction, default=True, help="each circuit's edges between its "
                     "units by path patching (neuron_edges.finder_graph), into the record's graph")
+    ap.add_argument("--edge-threads", type=int, default=2, help="a batch's records' edge stages run in this many threads")
     a = ap.parse_args()
     globals()["ARM"] = a.arm                        # (find()'s arm too: a pair run one at a time)
     _threads()
@@ -1645,8 +1646,19 @@ def main():
             log(f"{qid}")
             recs = [find(pt, clean, corrupt, extra.get("answers"), log=log, cuts_wanted=tuple(a.cuts.split(",")), measure=meas,
                          sets=extra.get("sets"), partners=extra.get("partners"))]
-        for (qid, clean, corrupt, extra, path), rec in zip(chunk, recs):
-            write(qid, clean, corrupt, dict(extra), path, rec)
+        work = [(x, rec) for x, rec in zip(chunk, recs)]
+        if a.edge_threads > 1 and len(work) > 1:  # (the edge stage is partly Python-bound, its card ~50% busy on Qwen3-8B:
+            from concurrent.futures import ThreadPoolExecutor  # records' edges in threads, each its own Runner, overlap)
+
+            def one(xr):
+                with torch.no_grad():
+                    (qid, clean, corrupt, extra, path), rec = xr
+                    write(qid, clean, corrupt, dict(extra), path, rec)
+            with ThreadPoolExecutor(a.edge_threads) as ex:
+                list(ex.map(one, work))
+        else:
+            for (qid, clean, corrupt, extra, path), rec in work:
+                write(qid, clean, corrupt, dict(extra), path, rec)
 
 
 if __name__ == "__main__":

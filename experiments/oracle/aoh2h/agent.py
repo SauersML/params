@@ -2275,7 +2275,7 @@ class SelfHosted:
 
     def __init__(self, url: str, model: str, tokenizer):
         self.urls, self.model, self.tok = [u.rstrip("/") for u in url.split(",")], model, tokenizer  # (replicas)
-        self.end = tokenizer.convert_tokens_to_ids("<|im_end|>")
+        self.busy, self.blk = [0] * len(self.urls), threading.Lock()  # (requests in flight on each)
 
     def sample(self, prompt, num_samples, sampling_params):
         import types
@@ -2292,15 +2292,17 @@ class SelfHosted:
                         "skip_special_tokens": False}
                 if stop:
                     body["stop" if isinstance(stop[0], str) else "stop_token_ids"] = list(stop)
-                ids = prompt.to_ints()
-                ends = [i for i, t in enumerate(ids) if t == self.end][:2]  # (the system prompt and the question: an
-                head = ids[:ends[-1] + 1] if ends else ids[:256]           # episode's own, the same every turn)
-                url = self.urls[zlib.crc32(json.dumps(head).encode()) % len(self.urls)]  # (one replica a conversation,
-                # so its prefix cache serves every turn)
-                req = urllib.request.Request(url + "/v1/completions", data=json.dumps(body).encode(),
-                                             headers={"Content-Type": "application/json"})
-                with urllib.request.urlopen(req, timeout=SAMPLE_TIMEOUT) as r:
-                    ch = json.loads(r.read())["choices"][0]
+                with self.blk:  # (the replica with the fewest requests in flight: Qwen3.6-27B's vLLM caches no prefixes,
+                    k = min(range(len(self.urls)), key=self.busy.__getitem__)  # so a conversation gains nothing from
+                    self.busy[k] += 1  # staying on one; 10-16: every G4 episode's system prompt and question were the
+                try:  # same, and routing by them sent all 64 episodes to one replica)
+                    req = urllib.request.Request(self.urls[k] + "/v1/completions", data=json.dumps(body).encode(),
+                                                 headers={"Content-Type": "application/json"})
+                    with urllib.request.urlopen(req, timeout=SAMPLE_TIMEOUT) as r:
+                        ch = json.loads(r.read())["choices"][0]
+                finally:
+                    with self.blk:
+                        self.busy[k] -= 1
                 toks = self.tok.encode(ch["text"], add_special_tokens=False)
                 if ch.get("finish_reason") == "stop" and isinstance(stop[0] if stop else None, int):
                     toks.append(stop[0])  # (the renderer parses a turn ended by its stop token)

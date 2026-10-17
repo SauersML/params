@@ -528,3 +528,23 @@ def test_attends_equals_the_models_attention(tiny):
                 got = pt.attends(layer, head, pos)
                 assert [a for a, _ in got] == s.tolist()
                 assert all(abs(b - round(float(x), 3)) <= 1e-3 for (_, b), x in zip(got, w))
+
+
+def test_lean_cached_runs_equal_the_models(tiny, monkeypatch):
+    """LEAN in _last's cached runs (circuit_masks' mask steps): the same final hidden states and gradients as the model's
+    own forward with its cache, edits by hooks on heads and neurons."""
+    pt, clean, corrupt = tiny
+    pt.setup(clean, corrupt)
+    s = pt.first
+    x = torch.stack([pt._ids_dev["clean"], pt._ids_dev["corrupt"]])
+    kv = [tuple(torch.cat([pt._base_kv[b][i][j][:, :, :s] for b in ("clean", "corrupt")]) for j in (0, 1)) for i in range(pt.L)]
+    got = {}
+    for lean in (True, False):
+        monkeypatch.setattr(cf, "LEAN", lean)
+        w = torch.full((pt.D,), 0.5, requires_grad=True)
+        with torch.enable_grad():
+            hn = pt._last(x, 2, cache=(s, kv), neu=lambda i, h: h * (1 + w) if i == 1 else h,
+                          head=lambda i, h: h * 0.9, only={"res": set(), "head": {0, 1}, "neu": {0, 1}})
+            hn.sum().backward()
+        got[lean] = (hn.detach(), w.grad.clone())
+    assert torch.allclose(got[True][0], got[False][0], atol=1e-5) and torch.allclose(got[True][1], got[False][1], atol=1e-4)

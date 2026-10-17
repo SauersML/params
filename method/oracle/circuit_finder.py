@@ -178,6 +178,22 @@ class Patcher:
                 if keep is not None:
                     n = hooks.get("cap_rows", 1)
                     keep += [(k[:n].clone(), v[:n].clone()) for k, v in _kv_pairs(o.past_key_values)]
+            elif LEAN and layer0 == 0 and keep is None and hooks.get("cap") is None:     # (each layer through its own
+                s, kvs = cache                                                          # modules: _lean, as _staged)
+                m, T = self.core.model, x.shape[1]
+                dt = m.embed_tokens.weight.dtype
+                h = m.embed_tokens(x[:, s:])
+                pos = torch.arange(s, T, device=self.dev)
+                emb = m.rotary_emb(h, pos[None])
+                mask = torch.full((T - s, T), torch.finfo(dt).min, dtype=dt, device=self.dev).triu(s + 1)[None, None]
+                only = hooks.get("only") or {}
+                for i, layer in enumerate(self.layers):
+                    dev = layer.mlp.down_proj.weight.device
+                    h, emb = h.to(dev), emb if emb[0].device == dev else tuple(e.to(dev) for e in emb)
+                    if hooks.get("res") is not None and i in only.get("res", range(self.L)):
+                        h = hooks["res"](i, h)          # (the residual edit: the layer's own pre-hook, not called here)
+                    h = _lean(layer, h, emb, kvs[i][0].to(dev), kvs[i][1].to(dev), mask.to(dev), self.hd)
+                lg = self._head(m.norm(h[:, -1:].to(m.norm.weight.device)))
             else:
                 from transformers import DynamicCache
                 s, kvs = cache

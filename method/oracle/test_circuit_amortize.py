@@ -141,3 +141,40 @@ def test_prefiltered_scorer_ranks_its_top_units_as_the_full_one(tmp_path, monkey
     rest = torch.ones(600, dtype=torch.bool)
     rest[top] = False
     assert float(got.reshape(-1)[rest].max()) < float(got.reshape(-1)[top].min())
+
+
+def test_partner_pairs_choose_the_source_cut_on_their_means(tiny):
+    """With a partner pair (the clean prompt against another corrupted one), the source cut is chosen and verified on
+    the shares' means over both pairs, as circuit_masks' multi-partner cuts are, its record listing each pair's shares."""
+    model, pairs = tiny
+    _, clean, corrupt = pairs[0]
+    pt, ppt = cf.Patcher(model, None, rows=8), cf.Patcher(model, None, rows=8)
+    for d in range(1, 64):                  # (another corrupted prompt whose answer differs too)
+        other = list(corrupt)
+        other[4], other[7] = (clean[4] + d) % 64, (clean[7] + 2 * d + 1) % 64
+        r = ppt.setup(clean, other)
+        if other != corrupt and r["answer"] != r["corrupt_answer"] and r["gap"] > 0.5:
+            break
+    else:
+        pytest.skip("no partner pair with different answers")
+    rec = ca.find_batch_amortized([pt], [(clean, corrupt, None)], ca.scorer("grad"), arm="grad", relp=False,
+                                  partners=[[(ppt, other)]])[0]
+    assert rec["amortize"]["partners"] == 1
+    src = rec["cuts"].get("source")
+    if src and src["met"]:
+        assert rec["partners"]["source"]["pairs"] == 2 and len(rec["partners"]["source"]["shares"]) == 2
+        lost, rest = (sum(x[i] for x in rec["partners"]["source"]["shares"]) / 2 for i in (0, 1))
+        assert abs(lost - src["lost"]) < 1e-4 and abs(rest - src["restored"]) < 1e-4
+
+
+def test_combine_places_each_pairs_score_at_its_positions():
+    """_combine: a pair whose change starts later scores the earlier positions at its lowest score; the mean."""
+    class P:
+        def __init__(self, first):
+            self.T, self.first = 10, first
+    a, b = P(4), P(6)                       # (source positions 4..8 and 6..8)
+    sa, sb = torch.arange(2 * 5 * 3, dtype=torch.float32).view(2, 5, 3), torch.ones(2, 3, 3) * 100
+    got = ca._combine("source", [a, b], [sa, sb], list(range(4, 9)))
+    assert got.shape == (2, 5, 3)
+    assert torch.allclose(got[:, :2], (sa[:, :2] + 100) / 2)        # (b's lowest score, 100, at positions 4 and 5)
+    assert torch.allclose(got[:, 2:], (sa[:, 2:] + sb) / 2)

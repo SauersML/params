@@ -305,6 +305,8 @@ WIDE = 256            # verify its 2 x KEEP best units); a cut whose order canno
 FALLBACK = "init"     # the masks themselves: "init" from INIT as circuit_masks runs them, "warm" from the prediction (warm),
 WARM_STEPS = 10       # WARM_STEPS a round; "" none
 WARM_MIN = -2.0       # warm: the start of units the prediction puts far below its KEEP-th
+PARTNERS = 1          # eval: pairs a multi-partner cut is chosen over (the question's own and PARTNERS - 1 other
+                      # corrupted keys of its length: its partners, or --pool's keys of its task), circuit_masks' --partners
 MASK_CUTS = ""        # cuts (comma-separated names) that skip the predicted order: straight to the masks warm from the
                       # prediction (WARM_STEPS a round), e.g. "readout", whose order the predictor ranks worst
 
@@ -377,13 +379,15 @@ def _theta(s: torch.Tensor, keep: int) -> torch.Tensor:
     return s.float() - flat.topk(min(keep + 1, flat.numel())).values[-1]
 
 
-def amortized_steps(pt, pred: dict, log=None, steps: int = cm.STEPS):
+def amortized_steps(pt, pred: dict, log=None, steps: int = cm.STEPS, partners: list | None = None):
     """circuit_masks.search_steps with each masked cut's order from pred ({cut: (kind, score [L, P, W])}) in place of
     the masks' descent (a search for circuit_masks.drive): the cut's ceilings and bars (_before_steps), each masked
     cut's order through verify (KEEP, then WIDE units above 0), and the cuts still unmet through the masks themselves
     (FALLBACK: from INIT, or warm from the prediction for WARM_STEPS; ROUNDS as search_steps). Returns (cuts, each cut's
-    stage: order, wide or masks)."""
-    st = yield from cm._before_steps(pt, "mask", log=log)
+    stage: order, wide or masks). partners: Patchers set up on pt's clean prompt against other corrupted prompts
+    (circuit_masks' multi-partner cuts: the source cut chosen and verified on the shares' means; pred's score of such a
+    cut on its positions over every pair)."""
+    st = yield from cm._before_steps(pt, "mask", log=log, partners=partners)
     direct = [n for n in st["masked"] if n in MASK_CUTS.split(",")]
     names, got, stage = [n for n in st["masked"] if n not in direct], {}, {}
     for tag, keep in (("order", KEEP), ("wide", WIDE)):
@@ -421,40 +425,77 @@ def amortized_steps(pt, pred: dict, log=None, steps: int = cm.STEPS):
     return out, stage
 
 
+def _combine(cut: str, pairs: list, scores: list, positions: list) -> torch.Tensor:
+    """A Mean cut's score over its pairs (pairs[k] scored scores[k] [L, P_k, W] on its own cut positions): each pair's
+    score placed at the cut's positions (a position before a pair's first change, where its patch moves nothing, at
+    that pair's lowest score), the mean."""
+    out = []
+    for p, sc in zip(pairs, scores):
+        own = cm.cuts_of(p)[cut]["positions"]
+        full = torch.full((sc.shape[0], len(positions), sc.shape[2]), float(sc.min()), device=sc.device)
+        at = [positions.index(q) for q in own if q in positions]
+        full[:, at] = sc[:, [i for i, q in enumerate(own) if q in positions]]
+        out.append(full)
+    return torch.stack(out).mean(0)
+
+
 def find_batch_amortized(pts: list, items: list, score, arm: str = "amortized", log=None, steps: int = cm.STEPS,
-                         relp: bool = True) -> list:
+                         relp: bool = True, partners: list | None = None) -> list:
     """circuit_masks.find_batch with amortized_steps in place of the masks' search: every pair set up
-    (circuit_finder.setup_many), the features of every usable pair in batched forwards and backwards (path_features),
-    each cut's score, then the pairs of one prompt length searched in lockstep (circuit_masks.drive). Records as
-    find_batch's ("search": arm), with "amortize": each cut's stage and the batch's seconds by stage."""
+    (circuit_finder.setup_many, partner pairs too), the features of every usable pair in batched forwards and backwards
+    (path_features), each cut's score (a multi-partner cut's the mean over its pairs, _combine), then the pairs of one
+    prompt length searched in lockstep (circuit_masks.drive). partners: per item [(Patcher, corrupted ids)], other
+    corrupted prompts of its clean prompt (circuit_masks.find_batch's). Records as find_batch's ("search": arm), with
+    "amortize": each cut's stage and the batch's seconds by stage."""
     t0 = time.perf_counter()
-    recs, rec0s, same_T = [None] * len(items), {}, {}
-    for j, rec0 in enumerate(cf.setup_many(pts, [(c, k) for c, k, _ in items], [x for _, _, x in items])):
-        clean, corrupt, answers = items[j]
+    recs, rec0s, same_T, part = [None] * len(items), {}, {}, {}
+    cand = [[(ppt, ids) for ppt, ids in (partners or [[]] * len(items))[j] if len(ids) == len(items[j][0])]
+            for j in range(len(items))]
+    flat = [(pt, (c, k), x) for pt, (c, k, x) in zip(pts, items)] + [
+        (ppt, (items[j][0], ids), items[j][2]) for j in range(len(items)) for ppt, ids in cand[j]]
+    got = iter(cf.setup_many([x[0] for x in flat], [x[1] for x in flat], [x[2] for x in flat]))
+    for j, (clean, corrupt, answers) in enumerate(items):
+        rec0 = next(got)
         if not rec0["valid"] or not np.isfinite(rec0["gap"]) or rec0["gap"] < cf.MIN_GAP or rec0["same_answer"]:
             recs[j] = {**cf._find(pts[j], clean, corrupt, answers, log=log), "search": arm}
             continue
         rec0s[j] = rec0
         same_T.setdefault(pts[j].T, []).append(j)
+    for j in range(len(items)):
+        part[j] = []
+        for ppt, _ in cand[j]:
+            r = next(got)
+            if j in rec0s and r["valid"] and np.isfinite(r["gap"]) and r["gap"] >= cf.MIN_GAP and not r["same_answer"]:
+                part[j].append(ppt)
     sec = {"setup": time.perf_counter() - t0}
     t1 = time.perf_counter()
     SECONDS.clear()
-    pred = {j: {} for j in rec0s}
+    own = {}                                        # (each pair's own scores: id(Patcher) -> {cut: score})
     for T, js in same_T.items():
-        def consume(k, feats, js=js):
-            for n, f in feats.items():
-                pred[js[k]][n] = ("head" if n == "movers" else "neuron", score(f, n).detach())
-        path_features([pts[j] for j in js], consume, relp=relp)
+        group = [pts[j] for j in js] + [p for j in js for p in part[j]]
+
+        def consume(k, feats, group=group):
+            own[id(group[k])] = {n: score(f, n).detach() for n, f in feats.items()}
+        path_features(group, consume, relp=relp)
+    pred = {}
+    for j in rec0s:
+        pred[j] = {n: ("head" if n == "movers" else "neuron", s) for n, s in own[id(pts[j])].items()}
+        ps = [pts[j]] + part[j]                     # (circuit_masks._before_steps: the source cut, or with ALLCUTS
+        for n in [n for n in pred[j] if n == "source" or cm.ALLCUTS] if part[j] else []:   # every cut, over every pair)
+            pos = (cm._source_positions(pts[j], min(p.first for p in ps)) if n == "source"
+                   else cm.cuts_of(pts[j])[n]["positions"])
+            pred[j][n] = (pred[j][n][0], _combine(n, ps, [own[id(p)][n] for p in ps], pos))
     sec["features"] = time.perf_counter() - t1
     sec.update(SECONDS)
     t1 = time.perf_counter()
     for T, js in same_T.items():
         tag = (lambda j: (lambda s: log(f"[{j}] {s.lstrip()}"))) if log and len(items) > 1 else (lambda j: log)
-        res = cm.drive([pts[j] for j in js], [amortized_steps(pts[j], pred[j], log=tag(j), steps=steps) for j in js], log=log)
+        res = cm.drive([pts[j] for j in js] + [p for j in js for p in part[j]],
+                       [amortized_steps(pts[j], pred[j], log=tag(j), steps=steps, partners=part[j]) for j in js], log=log)
         for j, (cuts, stage) in zip(js, res):
             clean, corrupt, answers = items[j]
             recs[j] = cm._find_with(pts[j], clean, corrupt, answers, log, arm, cuts, rec0=rec0s[j])
-            recs[j]["amortize"] = {"stage": stage}
+            recs[j]["amortize"] = {"stage": stage, "partners": len(part[j])}
     sec["search"] = time.perf_counter() - t1
     wall = time.perf_counter() - t0
     for r in recs:
@@ -634,6 +675,8 @@ def main():
     ap.add_argument("--dtype", default="auto", choices=("auto", "float32", "bfloat16"))
     ap.add_argument("--device", default="auto")
     ap.add_argument("--adapter", default=None, help="a PEFT adapter merged into the model (an organism)")
+    ap.add_argument("--pool", default=None, help="eval with partners: partner keys from this question set's keys of the "
+                    "question's task (circuit_masks --pool), not the question's own partners")
     ap.add_argument("--rev", default=None)
     ap.add_argument("--steps", type=int, default=30)
     ap.add_argument("--batch", type=int, default=16)
@@ -690,7 +733,27 @@ def main():
         if len(clean) == len(corrupt) and not (out / "rec" / f"{name}.json").exists():
             jobs.append((q, clean, corrupt, name))
     jobs.sort(key=lambda j: len(j[1]))              # (batches of one prompt length where they can be)
+    maxp = max([PARTNERS] + [int(x.split("=")[1]) for arm in a.arm.split(",") for x in arm.split(":")[1:]
+                             if x.lower().startswith("partners=")]) if a.mode == "eval" else 1
+    others, keys = {}, {}                           # (each question's other corrupted prompts: circuit_masks main's)
+    for p in json.loads(Path(a.pool).read_text())["questions"] if a.pool and maxp > 1 else []:
+        keys.setdefault(p["task"], set()).add(p["key"])
+    for q, clean, _, _ in jobs if maxp > 1 else []:
+        users = {}
+        if a.pool:                                  # (--pool: its task's keys there, a seeded order per question; the
+            import zlib                             # question's own partners left for unseen-pair tests)
+            ks = sorted(keys.get(q.get("task"), ()))
+            np.random.default_rng(zlib.crc32(q["id"].encode())).shuffle(ks)
+            users = {k: q["user"].replace(q["key"], k) for k in ks if k != q["key"] and q["user"].count(q["key"]) == 1}
+        for p in [] if a.pool else q.get("partners", []):
+            if isinstance(p, dict):
+                users[p["key"]] = p["user"]
+            elif q["user"].count(q["key"]) == 1:
+                users[p] = q["user"].replace(q["key"], p)
+        ids = [(k, cf.chat(tok, u, q.get("system")) + pre(q)) for k, u in users.items() if k != q.get("corrupt_key")]
+        others[q["id"]] = [(k, x) for k, x in ids if len(x) == len(clean)][:maxp - 1]
     pts = [cf.Patcher(model, tok) for _ in range(a.batch)]
+    pool = [[cf.Patcher(model, tok) for _ in range(maxp - 1)] for _ in range(a.batch)]   # (partner pairs' Patchers)
     if a.mode == "eval":
         arms = a.arm.split(",")
         dirs = {arm: arm.replace(":", "_").replace("=", "") for arm in arms}
@@ -708,7 +771,10 @@ def main():
                 its = [(cl, co, None) for _, cl, co, _ in todo]
                 name, *parts = arm.split(":")       # (an arm's constants: model:keep=16:fallback=warm, mask:10:init_scan=1;
                 sets = {}                           # each this module's, else circuit_masks', else circuit_finder's)
-                for k, v in (x.split("=") for x in parts if "=" in x):
+                npart = next((int(x.split("=")[1]) for x in parts if x.lower().startswith("partners=")), PARTNERS)
+                oth = [others.get(q["id"], [])[:npart - 1] for q, _, _, _ in todo]
+                prt = [list(zip(pool[b], [x for _, x in o])) for b, o in enumerate(oth)]
+                for k, v in (x.split("=") for x in parts if "=" in x and not x.lower().startswith("partners=")):
                     mod = next(m for m in (globals(), vars(cm), vars(cf)) if k.upper() in m)
                     sets[k.upper()] = (mod, _value(v, mod[k.upper()]))
                 saved = {k: (m, m[k]) for k, (m, _) in sets.items()}
@@ -719,12 +785,12 @@ def main():
                     if prof:
                         prof.__enter__()
                     if name == "mask":
-                        recs = cm.find_batch(pts[:len(todo)], its, arm="mask", log=log,
+                        recs = cm.find_batch(pts[:len(todo)], its, arm="mask", log=log, partners=prt,
                                              steps=next((int(x) for x in parts if x.isdigit()), cm.STEPS))
                     else:
                         nm = f"model:{a.scorer}" if name == "model" else f"model:{a.scorer2}" if name == "model2" else name
                         sc = scorer(nm)
-                        recs = find_batch_amortized(pts[:len(todo)], its, sc, arm=arm, log=log,
+                        recs = find_batch_amortized(pts[:len(todo)], its, sc, arm=arm, log=log, partners=prt,
                                                     relp=nm == "relp" or getattr(sc, "relp", False))
                 except Exception:                   # noqa: BLE001 (an arm that fails is dropped, the others go on)
                     import traceback
@@ -741,7 +807,9 @@ def main():
                             r["ticks_batch"] = prof.report()
                     for k, (m, v) in saved.items():
                         m[k] = v
-                for (q, cl, co, name), rec in zip(todo, recs):
+                for (q, cl, co, name), rec, o in zip(todo, recs, oth):
+                    if o:                           # (the keys a multi-partner cut was chosen on: unseen-pair tests skip
+                        rec["selection_keys"] = [q.get("corrupt_key")] + [k for k, _ in o]          # them)
                     rec.update(id=q["id"], ids=cl, corrupted=co, answer_text=tok.decode([rec["answer"]]),
                                corrupt_answer_text=tok.decode([rec["corrupt_answer"]]), model=a.model, dtype=a.dtype,
                                finder="circuit_amortize", finder_rev=a.rev, adapter=a.adapter, merged=bool(a.adapter),

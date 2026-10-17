@@ -17,6 +17,9 @@
 #       the circuit-reading test: T-correct and T-mismatch SFT, 3 oracles x 4 inputs, the score (questions: g2rec DENSE=1)
 #   RUN=li1 MODE=lipatch II=<their evaluator/ beside it> [ADAPTER_DIR=<ours>] [NITEMS=3200] bash ...   Li et al.'s activation-patching
 #       test, the released AO and ours zero-shot, their exact-match scorer
+#   RUN=p2 MODE=phase2 CIRCUITS=<circuit questions> ORGS=<training organisms> E1TRAIN=<E1-kind training organisms> E1=<E1 stage>
+#       RC=<reads_circuit build> REPLAY=<ao_mix sample> THR=<reference> STEPS=N [EVAL_EVERY=500] bash ...   the 8B oracle's SFT
+#       from AO's adapter, every EVAL_EVERY steps: names vs correct writes on the circuit-reading test and E1's battery
 #   RUN=ot1 MODE=orgtrain ORG_LIST="taboo:mirror taboo:ladder" [ORG_EPOCHS=2] bash ...   named training organisms (organisms.py train)
 #   RUN=g2r MODE=g2rec RECORDS=<circuit records dir> THR=<reference> bash ...              g2.py gen on circuits built elsewhere
 #   RUN=oe1 MODE=orgeval ORGS=<organisms dir on the Mac> [ADAPTER_DIR=...] UPLOAD_MB=1500 bash ...  planted truths recovered
@@ -46,6 +49,8 @@ git fetch -q origin main && rm -rf "$S" "$S.tar" && mkdir -p "$S" && git archive
 [ -n "${G2EVAL:-}" ] && cp "$G2EVAL" "$S/g2eval.jsonl"
 [ -n "${RC:-}" ] && cp -r "$RC" "$S/rc"
 [ -n "${II:-}" ] && cp -r "$II" "$S/ii"
+[ -n "${CIRCUITS:-}" ] && cp "$CIRCUITS" "$S/circuits.jsonl"
+[ -n "${E1TRAIN:-}" ] && cp -r "$E1TRAIN" "$S/e1train"
 [ -n "${RECORDS:-}" ] && cp -r "$RECORDS" "$S/records"
 [ -n "${GROUPS:-}" ] && cp -r "$GROUPS" "$S/groups"
 [ -n "${REPLAY:-}" ] && cp "$REPLAY" "$S/replay.jsonl"
@@ -91,6 +96,17 @@ python -u mix.py $O/rc/mix_correct.jsonl $O/rc/train_correct.jsonl --replay $S/r
 CAO_MICRO=${MICRO:-1} python -u cao.py train --data $O/rc/mix_correct.jsonl --out $O/ad_correct --steps $STEPS --save-every $STEPS > $O/train_correct.log 2>&1; \
 $RCMISMATCH \
 ${RCEVALS}python -u reads_circuit.py score $O/rc > $O/rc_score.txt 2>&1" ;;
+  phase2) CKS=""; for k in $(seq ${EVAL_EVERY:-500} ${EVAL_EVERY:-500} ${STEPS:?STEPS}); do  # each checkpoint's evaluations
+           ad=$O/adapter/step_$k
+           CKS="$CKS python -u g2.py eval --items $S/rc/test_correct.jsonl --thr $S/thr.pt --adapter $ad --out $O/ev/rc_correct_$k.jsonl > $O/ev/rc_correct_$k.log 2>&1; \
+python -u g2.py eval --items $S/rc/test_names.jsonl --thr $S/thr.pt --adapter $ad --out $O/ev/rc_names_$k.jsonl > $O/ev/rc_names_$k.log 2>&1; \
+python -u e1.py battery --dir $S/e1/behavior_e1.json --battery $S/e1/probe_battery.json --adapter $ad --out $O/ev/e1_$k.jsonl --budgets 64 > $O/ev/e1_$k.log 2>&1;"
+         done
+         WORK="mkdir -p $O/ev; python -u organisms.py examples --dir $S/organisms --out $O/organism_examples.jsonl > $O/organism_examples.log 2>&1; \
+python -u e1.py examples --dir $S/e1train --out $O/e1_examples.jsonl > $O/e1_examples.log 2>&1; \
+python -u mix.py $O/data.jsonl $S/circuits.jsonl $O/organism_examples.jsonl $O/e1_examples.jsonl --replay $S/replay.jsonl --share ${SHARE:-0.4} > $O/mix.log 2>&1; \
+CAO_MICRO=${MICRO:-1} python -u cao.py train --data $O/data.jsonl --out $O/adapter --steps $STEPS --save-every ${EVAL_EVERY:-500} \
+--vectors $O/organism_examples.pt $O/e1_examples.pt > $O/train.log 2>&1; $CKS true" ;;
   orgtrain) WORK=""; for x in ${ORG_LIST:?ORG_LIST kind:name ...}; do
          WORK="$WORK python -u organisms.py train --kind ${x%%:*} --name ${x#*:} --out $O/organisms >> $O/orgtrain.log 2>&1;"
        done; WORK="$WORK true" ;;

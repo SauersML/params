@@ -49,7 +49,8 @@ def main():
     a = ap.parse_args()
     recs = {p.name: json.loads(p.read_text()) for d in a.records for p in sorted(Path(d).glob("*.json"))}
     recs = list(recs.values())
-    recs = [r for r in recs if not r.get("skipped") and r.get("valid", True)]
+    empty = sum(1 for r in recs if not r.get("cuts"))
+    recs = [r for r in recs if not r.get("skipped") and r.get("valid", True) and r.get("cuts")]
     neu, head = scores(recs)
     ranked = [u for u, _ in neu.most_common()]
     rng = random.Random(a.seed)
@@ -80,7 +81,7 @@ def main():
         sets[f"last_{K}"] = [list(u) for u in sorted(rng.sample(last, K))]
     layers = collections.Counter(l for l, _ in ranked[:128])
     stages = collections.Counter(n["stage"] for r in recs for n in r.get("nodes") or [])
-    doc = {"records": len(recs), "met": sum(bool(r.get("met")) for r in recs),
+    doc = {"records": len(recs), "empty_records": empty, "met": sum(bool(r.get("met")) for r in recs),
            "cut_met": {k: sum(bool((r.get("cuts") or {}).get(k, {}).get("met")) for r in recs) for k in ("source", "movers", "readout")},
            "stages": dict(stages), "neurons_scored": len(neu), "stability": stab,
            "top_neurons": [[l, n, round(s, 3)] for (l, n), s in neu.most_common(64)],

@@ -185,6 +185,11 @@ def record_facts(W, mx, rec: dict, app: dict | None, labels: dict, ref: dict | N
     return context_facts(W, mx, e, rec, labels, app is not None, ref)
 
 
+def question_files(a) -> list[Path]:
+    """The question files whose contexts a step covers: --rows when given (g2/gen rows of other circuits), else rc's."""
+    return list(a.rows) if getattr(a, "rows", None) else [a.rc / "train_correct.jsonl", a.rc / "test_correct.jsonl"]
+
+
 def measure(a) -> None:
     """GPU: per rc context, in claim_check's reference (the weak-zeroed model, THR), the final norm's input RMS at the
     answer position and the six likeliest next tokens with their log-probabilities (claim_check's answer and its
@@ -203,8 +208,8 @@ def measure(a) -> None:
     norm.register_forward_pre_hook(lambda mod, args: cap.__setitem__("x", args[0][:, -1].float()))
     eps = getattr(norm, "variance_epsilon", 1e-6)
     out = {}
-    for f in ("train_correct.jsonl", "test_correct.jsonl"):
-        for x in (a.rc / f).read_text().splitlines():
+    for f in question_files(a):
+        for x in f.read_text().splitlines():
             e = json.loads(x)
             if e["id"] in out:
                 continue
@@ -238,7 +243,7 @@ def gen(a) -> None:
     nr.load(a.thr)
     rng = random.Random(a.seed)
     first = {}
-    for x in (a.rc / f"{a.split}_correct.jsonl").read_text().splitlines():
+    for x in (a.rows[0] if a.rows else a.rc / f"{a.split}_correct.jsonl").read_text().splitlines():
         e = json.loads(x)
         first.setdefault(e["id"], e)
     with a.out.open("w") as fh:
@@ -328,15 +333,15 @@ def facts(a) -> None:
     W = Weights()
     mx = torch.load(THR, map_location="cpu")["max"]
     labels = load_labels()
-    apply = {p.name for p in (RECORDS / "apply").glob("*.json")}
+    apply = {p.name for p in (a.records / "apply").glob("*.json")}
     ref = json.loads(a.measure.read_text()) if a.measure else {}
     out = {}
-    for f in ("train_correct.jsonl", "test_correct.jsonl"):
-        for x in (a.rc / f).read_text().splitlines():
+    for f in question_files(a):
+        for x in f.read_text().splitlines():
             e = json.loads(x)
             if e["id"] in out:
                 continue
-            rec = json.loads((RECORDS / "out" / rec_file(e["id"])).read_text())
+            rec = json.loads((a.records / "out" / rec_file(e["id"])).read_text())
             out[e["id"]] = context_facts(W, mx, e, rec, labels, rec_file(e["id"]) in apply, ref.get(e["id"]))
             print(e["id"], len(out[e["id"]]["groups"]), flush=True)
     a.out.write_text(json.dumps(out))
@@ -742,6 +747,8 @@ def main():
     f.add_argument("--rc", type=Path, required=True)
     f.add_argument("--out", type=Path, required=True)
     f.add_argument("--measure", type=Path, help="measure's output: claim_check's answer, alternatives and bits")
+    f.add_argument("--rows", type=Path, nargs="*", help="question files of other circuits (default: rc's train and test)")
+    f.add_argument("--records", type=Path, default=RECORDS, help="their circuit_finder records (out/) and apply's (apply/)")
     c = sub.add_parser("check")
     c.add_argument("--rc", type=Path, required=True)
     c.add_argument("--facts", type=Path, required=True)
@@ -775,12 +782,15 @@ def main():
     me.add_argument("--rc", type=Path, required=True)
     me.add_argument("--thr", type=Path, default=THR)
     me.add_argument("--out", type=Path, required=True)
+    me.add_argument("--rows", type=Path, nargs="*", help="question files of other circuits (default: rc's train and test)")
     g = sub.add_parser("gen")
     g.add_argument("--rc", type=Path, required=True)
     g.add_argument("--thr", type=Path, default=THR)
     g.add_argument("--out", type=Path, required=True)
     g.add_argument("--sets", type=int, default=6)
     g.add_argument("--records", type=Path, default=RECORDS)
+    g.add_argument("--rows", type=Path, nargs="*", help="a question file of other circuits whose contexts to ask about "
+                   "(g2.py gen --dense's rows; default: rc's split)")
     g.add_argument("--split", choices=("train", "test"), default="train", help="test: the held-out contexts' member "
                    "questions, an evaluation set only (never training rows: rows --extra refuses them)")
     g.add_argument("--seed", type=int, default=0)

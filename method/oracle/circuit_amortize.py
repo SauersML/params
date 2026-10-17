@@ -536,17 +536,20 @@ def _export(net, scale, mean, std) -> dict:
             "layers": [(m.weight.detach().clone(), m.bias.detach().clone()) for m in lins]}
 
 
-def train(dirs: list, out_path: str, holdout: float = 0.2, epochs: int = 40, hidden: int = 64, seed: int = 0, log=print):
-    """train mode: per cut an MLP on data mode's dirs. The (task, key)s are split, holdout of them unseen: the offline
-    ranking of ig, grad, relp and the model on them is logged (and returned); the saved model is then trained on every
-    key with the same epochs."""
+def train(dirs: list, out_path: str, holdout: float = 0.2, epochs: int = 40, hidden: int = 64, seed: int = 0, log=print,
+          by: str = "key", save: bool = True):
+    """train mode: per cut an MLP on data mode's dirs. The (task, key)s (by "key") or the tasks (by "task") are split,
+    holdout of them unseen: the offline ranking of ig, grad, relp and the model on them is logged (and returned); the
+    saved model is then trained on every key with the same epochs."""
     groups = load_groups(dirs, log=log)
-    keys = sorted({(g.task, g.key) for g in groups})
+    unit = (lambda g: (g.task, g.key)) if by == "key" else (lambda g: g.task)  # noqa: E731
+    keys = sorted({unit(g) for g in groups})
     rng = np.random.default_rng(seed)
-    hold = {keys[i] for i in rng.permutation(len(keys))[:int(holdout * len(keys))]}
-    tr = [g for g in groups if (g.task, g.key) not in hold]
-    va = [g for g in groups if (g.task, g.key) in hold]
-    log(f"{len(tr)} training cuts, {len(va)} unseen-key cuts ({len(hold)} of {len(keys)} keys)")
+    hold = {keys[i] for i in rng.permutation(len(keys))[:max(1, int(holdout * len(keys)))]}
+    tr = [g for g in groups if unit(g) not in hold]
+    va = [g for g in groups if unit(g) in hold]
+    log(f"{len(tr)} training cuts, {len(va)} unseen cuts ({len(hold)} of {len(keys)} {by}s held out"
+        + (f": {sorted(hold)}" if by == "task" else "") + ")")
     report = {}
     for cut in ("readout", "movers", "source"):
         vs = [g for g in va if g.cut == cut]
@@ -559,6 +562,8 @@ def train(dirs: list, out_path: str, holdout: float = 0.2, epochs: int = 40, hid
                             "model": lambda g: _mlp(z, torch.from_numpy(g.x)).detach().numpy()})
         report[cut] = base
         log(f"{cut} unseen keys: " + "; ".join(f"{k} {v}" for k, v in base.items()))
+    if not save:
+        return report
     model = {"features": FEATURES}
     for cut in ("readout", "movers", "source"):
         if any(g.cut == cut for g in groups):
@@ -597,9 +602,12 @@ def main():
     ap.add_argument("--profile", action="store_true", help="eval: each arm batch's drive ticks timed by kind (TickProfile)")
     ap.add_argument("--epochs", type=int, default=40)
     ap.add_argument("--hidden", type=int, default=64)
+    ap.add_argument("--holdout-by", default="key", choices=("key", "task"), help="train: unseen keys (and the model saved "
+                    "after, trained on every key) or unseen tasks (the report only)")
     a = ap.parse_args()
     if a.mode == "train":                           # (inp: data mode's OUT dirs, comma-separated; out: the model file)
-        report = train(a.inp.split(","), a.out, epochs=a.epochs, hidden=a.hidden)
+        report = train(a.inp.split(","), a.out, epochs=a.epochs, hidden=a.hidden, by=a.holdout_by,
+                       save=a.holdout_by == "key")
         Path(a.out).with_suffix(".json").write_text(json.dumps(report, indent=1))
         return
     cf._threads()

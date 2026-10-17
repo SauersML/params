@@ -423,7 +423,7 @@ class GenBatcher:
     rows with the same temperature together, each row on its own item's model (peft's adapter_names; rows of the base
     model "__base__"), under the tools' lock; each row cut at its own token count and at the end of its turn."""
 
-    ROWS, WAIT = 32, 0.05
+    ROWS, WAIT = 96, 0.05
 
     def __init__(self, tools: "Tools"):
         import queue
@@ -432,11 +432,18 @@ class GenBatcher:
         threading.Thread(target=self.loop, daemon=True).start()
 
     def submit(self, adapter, ids: list[int], n: int, temperature: float, seed: int) -> list[int]:
+        return self.submit_many(adapter, [ids], n, temperature, seed)[0]
+
+    def submit_many(self, adapter, seqs: list[list[int]], n: int, temperature: float, seed: int) -> list[list[int]]:
+        """Several rows at once (ask's texts), each joining whatever batch forms."""
         from concurrent.futures import Future
 
-        fut = Future()
-        self.q.put((adapter, list(ids), int(n), float(temperature), int(seed), fut))
-        return fut.result()
+        futs = []
+        for k, ids in enumerate(seqs):
+            fut = Future()
+            self.q.put((adapter, list(ids), int(n), float(temperature), int(seed) + k, fut))
+            futs.append(fut)
+        return [f.result() for f in futs]
 
     def loop(self) -> None:
         import queue
@@ -1084,7 +1091,13 @@ class Tools:
         left = ep["budget"] - ep["passes"]
         if len(texts) > left:
             raise Refused(f"ask: {len(texts)} texts need {len(texts)} passes and {left} are left")
-        got = self.gen_batch(it, [str(t_) for t_ in texts], max_new=n, bs=32, temperature=float(it.get("temperature", 0.0)))
+        t = float(it.get("temperature", 0.0))
+        if self.batcher is not None:  # (rows in the shared batches, outside the lock)
+            seqs = [self.ids_of(it, str(t_), True) for t_ in texts]
+            got = [self.tok.decode(g, skip_special_tokens=True)
+                   for g in self.batcher.submit_many(it.get("adapter"), seqs, n, t, ep["seed"] + ep["passes"])]
+        else:
+            got = self.gen_batch(it, [str(t_) for t_ in texts], max_new=n, bs=32, temperature=t)
         self.charge(ep, len(texts))
         return "\n".join(f"{k + 1}. {t_[:80]!r} -> {g!r}" for k, (t_, g) in enumerate(zip(texts, got)))
 
@@ -1438,7 +1451,7 @@ class Tools:
         if fn is None or name not in TOOL_DOCS:
             return {"error": f"no tool {name!r}", "cost": 0, "left": ep["budget"] - ep["passes"]}
         try:
-            with (contextlib.nullcontext() if name == "generate" and self.batcher is not None else self.lock):
+            with (contextlib.nullcontext() if name in ("generate", "ask") and self.batcher is not None else self.lock):
                 out = {"result": fn(ep, it, **(args or {}))}
         except Refused as e:
             out = {"error": str(e)}

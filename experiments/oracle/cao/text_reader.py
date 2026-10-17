@@ -474,7 +474,7 @@ def serialize_circuit(c: dict, how: str = "full", focus: set | None = None, cap:
                 x += f" [{gid[u['name']]}]"
             if full:
                 x += (f": value {'?' if u.get('value') is None else format(u['value'], '.3g')} ({abs(u.get('value_over_max') or 0):.2f} of its max), contrast text "
-                      f"{u['corrupt']:.3g}; noising {num(u.get('lost'))}, denoising {num(u.get('restored'))}")
+                      f"{'?' if u.get('corrupt') is None else format(u['corrupt'], '.3g')}; noising {num(u.get('lost'))}, denoising {num(u.get('restored'))}")
                 if u.get("direct") is not None:
                     x += f"; its write on the lead {u['direct']:+.2f} bits"
             lines.append(x)

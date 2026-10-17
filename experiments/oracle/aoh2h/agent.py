@@ -1186,9 +1186,9 @@ class Tools:
         self.charge(ep, 3 * len(texts))
         return "\n".join(lines)
 
-    def t_battery_graph(self, ep, it, texts, k=16, max_tokens=120):
+    def t_battery_graph(self, ep, it, texts, k=16, max_tokens=200):
         """Trigger-free circuits (the answer to "a circuit needs an input that elicits the behaviour"): over chat prompts
-        with no trigger, at the end of the model's own answer, the attribution of each neuron pole to its likeliest
+        with no trigger, after the model's own answer and a blank line, the attribution of each neuron pole to its likeliest
         continuation other than ending the turn over ending it (value x gradient, every position), summed over the
         prompts; the k poles with the largest sum, how many prompts each is among the top 64 in, and the tokens its
         output weights write most (unembedding of its down-projection column, signed by the pole). 1 + 3 passes a text."""
@@ -1209,8 +1209,11 @@ class Tools:
         tot = torch.zeros(self.L, self.I, 2, device=self.tg.dev)
         hits = torch.zeros(self.L, self.I, 2, device=self.tg.dev)
         alts = []
+        cut = 0
+        nl = self.tok("\n\n", add_special_tokens=False)["input_ids"]
         for x, g in zip(seqs, outs):
-            ids = list(x) + [t for t in g if t not in ends]
+            cut += not any(t in ends for t in g)  # (an answer that ran past max_tokens: its end is not its own)
+            ids = list(x) + [t for t in g if t not in ends] + nl  # (after the answer and a blank line, probe_end's slot)
             acts = {}
 
             def cap(l_):
@@ -1239,8 +1242,9 @@ class Tools:
             hits.view(-1)[top] += 1
             alts.append((self.tok.decode([alt]), float(lp[alt].exp()), float(lp[end].exp())))
         self.charge(ep, 4 * len(texts))
-        lines = ["at the end of each answer, its likeliest continuation other than ending, and p(that), p(end): "
-                 + "; ".join(f"{a!r} {p:.3f} / {e:.3f}" for a, p, e in alts),
+        lines = ["after each answer and a blank line, its likeliest continuation other than ending, and p(that), p(end): "
+                 + "; ".join(f"{a!r} {p:.3f} / {e:.3f}" for a, p, e in alts)
+                 + (f" ({cut} answers ran past max_tokens: shorter requests end on their own)" if cut else ""),
                  f"neuron poles raising that continuation over ending, summed over the {len(texts)} prompts:"]
         W = self.tg.lm_head.weight
         for f in tot.flatten().topk(k).indices.tolist():

@@ -21,7 +21,7 @@ for s in "$@"; do
   WORK="$WORK mkdir -p $O/$t;"
   [ -z "$f" ] && WORK="$WORK python -B method/oracle/ami.py means $SAMPLE $M --model $m > $O/$t/means.log 2>&1; echo \"$t means exit \$?\" >> $O/steps.log;"
   WORK="$WORK python -B method/oracle/ami.py cover $O/$t/cover --means $M --model $m --texts $TEXTS --windows ${WINDOWS:-16} $ARGS > $O/$t/cover.log 2>&1; echo \"$t cover exit \$?\" >> $O/steps.log;"
-  MODELS="${MODELS:+$MODELS,}$m"
+  MODELS="${MODELS:+$MODELS }$m"
 done
 CMD="export OMP_NUM_THREADS=4 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True HF_HUB_OFFLINE=1; ln -sfn /workspace/runs/$NAME/mpd-data ~/mpd-data; mkdir -p $O;
 cd /Users/user/params/; ls /Users/user/params/method/oracle $SAMPLE $TEXTS > /dev/null; nvidia-smi --query-gpu=name,memory.total --format=csv,noheader;

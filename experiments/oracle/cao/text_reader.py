@@ -519,8 +519,9 @@ def pair_text(p: dict, C: dict, how: str, cap: int = 40) -> str:
     holds both texts and their answers)."""
     if how == "none":
         return p["q"]
-    a = serialize_circuit(C[p["circuit_a"]], how, set(p["units_a"]), cap)
-    b = serialize_circuit(C[p["circuit_b"]], how, set(p["units_b"]), cap)
+    flat = lambda us: {u for x in us for u in (x if isinstance(x, list) else [x])}  # noqa: E731  (joint: two units' lists)
+    a = serialize_circuit(C[p["circuit_a"]], how, flat(p["units_a"]), cap)
+    b = serialize_circuit(C[p["circuit_b"]], how, flat(p["units_b"]), cap)
     return f"{p['q']}\n\nCircuit of text A:\n{a}\nCircuit of text B:\n{b}\n{p['q']}"
 
 

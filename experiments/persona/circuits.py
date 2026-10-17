@@ -58,12 +58,14 @@ def main():
     ap.add_argument("--split", default="train")
     ap.add_argument("--cuts", default="readout,movers,source")
     ap.add_argument("--rev", default=None)
+    ap.add_argument("--skip", default=None, help="a directory of records already found (their questions skipped)")
     a = ap.parse_args()
     cf._threads()
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
     qs = questions(json.loads(Path(a.decisions).read_text()), a.split, a.partners)
-    qs = [q for q in qs if not (out / f"{q[0].replace('/', '__')}.json").exists()]
+    done = {p.name for p in Path(a.skip).glob("*.json")} if a.skip else set()
+    qs = [q for q in qs if not (out / f"{q[0].replace('/', '__')}.json").exists() and f"{q[0].replace('/', '__')}.json" not in done]
     qs.sort(key=lambda q: len(q[1]))                 # (batches of one prompt length)
     tok = AutoTokenizer.from_pretrained(a.model)
     model = AutoModelForCausalLM.from_pretrained(a.model, dtype=torch.bfloat16, device_map="auto").eval()

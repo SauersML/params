@@ -10,7 +10,7 @@ Sets written for K in SIZES:
   last_K      K neurons drawn at random from the last LAST layers, outside every persona set
 plus the heads (movers) by the same score, for the record.
 
-  aggregate.py RECORDS_DIR OUT.json [--seed 0]
+  aggregate.py OUT.json RECORDS_DIR [RECORDS_DIR ...] [--seed 0]
 """
 from __future__ import annotations
 
@@ -43,11 +43,12 @@ def main():
     import argparse
 
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("records")
     ap.add_argument("out")
+    ap.add_argument("records", nargs="+")
     ap.add_argument("--seed", type=int, default=0)
     a = ap.parse_args()
-    recs = [json.loads(p.read_text()) for p in sorted(Path(a.records).glob("*.json"))]
+    recs = {p.name: json.loads(p.read_text()) for d in a.records for p in sorted(Path(d).glob("*.json"))}
+    recs = list(recs.values())
     recs = [r for r in recs if not r.get("skipped") and r.get("valid", True)]
     neu, head = scores(recs)
     ranked = [u for u, _ in neu.most_common()]

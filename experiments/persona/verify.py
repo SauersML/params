@@ -45,11 +45,14 @@ def main():
     ap.add_argument("--char-n", type=int, default=CHAR_N)
     ap.add_argument("--ops", default="zero,scale:-1,scale:3")
     ap.add_argument("--model", default="Qwen/Qwen3-8B")
+    ap.add_argument("--only", default=None, help="comma-separated set names (default: every set in SETS.json)")
     a = ap.parse_args()
     from engine import Engine
 
     doc = json.loads(Path(a.prompts).read_text())
     sets = json.loads(Path(a.sets).read_text())["sets"]
+    if a.only:
+        sets = {k: sets[k] for k in a.only.split(",")}
     test = [q for q in doc["questions"] if q["split"] == "test"]
     groups = {"plain": [(q["id"], None, q["text"]) for q in test],
               "asst": [(q["id"], "You are a helpful AI assistant.", q["text"]) for q in test],

@@ -83,7 +83,11 @@ def test_ablate_mode_and_zeroed_generation(setup):
     with delta.rows([1.0] * 8):
         rp = cr.Reply(core, prompt, A, B, None, "ablate")
         (l0, r0), = rp.shares([[]])
-    assert abs(l0) < 1e-4 and r0 is None
+        units = [("neuron", l, k) for l, k in sorted(P)]
+        (l1, k1), = rp.shares([units])
+        zB = float(rp._run("B", ["clean"], [rp.dial(units)])[0])
+    assert abs(l0) < 1e-4 and abs(r0 - 1.0) < 1e-4       # (ablate's second share: kept)
+    assert abs(k1 - (1.0 - max(0.0, rp.lpB - zB) / rp.gap)) < 1e-4
     plain, zeroed = cr.generate_zeroed(core, None, delta, prompt, [[], [("neuron", l, k) for l, k in sorted(P)]], n=8)
     assert plain == A                               # (no set zeroed: the organism's own greedy reply)
 

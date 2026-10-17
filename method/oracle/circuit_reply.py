@@ -10,9 +10,12 @@ each with ONE value of the dial over every position of both sequences (prompt an
           organism's exact low-rank weight difference added by hooks, or not); patching sets a unit to the other run's
           values at every position. lost = (S_clean - S_noised) / gap, restored = (S_denoised - S_corrupt) / gap,
           gap = S_clean - S_corrupt. (The reference model is something an audit would not have.)
-  ablate  one run (no reference model): a unit is zeroed at every position; lost = (S - S_zeroed) / S only.
+  ablate  one run (no reference model): a unit is zeroed at every position; lost = (S - S_zeroed) / S, and in the
+          second share's place kept = 1 - max(0, log2 p(B) - log2 p_zeroed(B)) / S, so a set passes only if zeroing it
+          removes A's preference without taking B's probability with it (zeroing nearly everything lowers both: on the
+          round-2 owls the lost hinge alone settled on 1e5-unit sets).
 Search (circuit_masks' rule: the dials only order, every keep or drop is a measured run): masks m = sigmoid(theta) per
-unit descend relu(TAU - lost) + relu(TAU - restored) + LAMBDA * sum(m) (ablate: the lost hinge alone), then the
+unit descend relu(TAU - lost) + relu(TAU - restored) + LAMBDA * sum(m) (ablate: kept for restored), then the
 smallest passing prefix of the theta order by measurement (GRID sizes) and a one-shot measured prune (each unit left out,
 the units whose absence keeps both shares PRUNE_MARGIN over PASS dropped together, the reduced set measured).
 Baselines over the same objective, ranked per unit summed over positions: AtP (patch difference x the clean run's
@@ -52,6 +55,7 @@ LAMBDA = 0.002
 LR = 0.1
 STEPS = 80
 INIT = 3.0
+INIT_ABLATE = -3.0     # (ablate: the masks grow from nothing zeroed; zeroing nearly everything also flattens both replies)
 GRID = (4, 8, 16, 24, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024)
 PRUNE_MARGIN = 0.05
 IG_STEPS = 5
@@ -115,6 +119,7 @@ class Reply:
                 self.act[(q, r)] = self._capture(q, r)
         self.S = {r: self.score_plain(r) for r in runs}
         self.gap = self.S["clean"] - self.S["corrupt"] if mode == "pair" else self.S["clean"]
+        self.lpB = float(self._run("B", ["clean"], [(None, None)])[0])     # (ablate's kept share: B's own log2 p)
 
     def _org(self, runs: list):
         """The delta's per-row weights for runs (clean = organism, corrupt = base); none without a delta."""
@@ -225,7 +230,7 @@ class Reply:
                 dB = self._run("B", ["corrupt"] * len(part), part)
                 rest = (((dA - dB) - self.S["corrupt"]) / self.gap).tolist()
             else:
-                rest = [None] * len(part)
+                rest = (1.0 - torch.relu(self.lpB - sB) / self.gap).tolist()
             out += list(zip(lost, rest))
         return out
 
@@ -238,12 +243,13 @@ class Reply:
         sA = self._run("A", ["clean"], [(mn, mh)], grad=True)
         sB = self._run("B", ["clean"], [(mn, mh)], grad=True)
         lost = (self.S["clean"] - (sA - sB)[0]) / self.gap
-        loss, rest = torch.relu(TAU - lost), None
         if self.mode == "pair":
             dA = self._run("A", ["corrupt"], [(mn, mh)], grad=True)
             dB = self._run("B", ["corrupt"], [(mn, mh)], grad=True)
             rest = ((dA - dB)[0] - self.S["corrupt"]) / self.gap
-            loss = loss + torch.relu(TAU - rest)
+        else:
+            rest = 1.0 - torch.relu(self.lpB - sB[0]) / self.gap
+        loss = torch.relu(TAU - lost) + torch.relu(TAU - rest)
         return loss, float(lost.detach()), None if rest is None else float(rest.detach())
 
     def masks(self, steps: int = STEPS, heads: bool = True, log=None) -> dict:
@@ -324,8 +330,9 @@ def fit_masks(reps: list, steps: int = STEPS, heads: bool = True, log=None) -> d
     position), after steps of Adam on the questions' mean hinge + LAMBDA * size (a question's graph freed after its
     backward)."""
     r0 = reps[0]
-    tn = torch.full((r0.L, r0.D), INIT, device=r0.dev, requires_grad=True)
-    th = torch.full((r0.L, r0.H), INIT, device=r0.dev, requires_grad=True) if heads else None
+    init = INIT if r0.mode == "pair" else INIT_ABLATE
+    tn = torch.full((r0.L, r0.D), init, device=r0.dev, requires_grad=True)
+    th = torch.full((r0.L, r0.H), init, device=r0.dev, requires_grad=True) if heads else None
     opt = torch.optim.Adam([tn] + ([th] if heads else []), lr=LR)
     hist = []
     for step in range(steps):
@@ -339,7 +346,7 @@ def fit_masks(reps: list, steps: int = STEPS, heads: bool = True, log=None) -> d
         (LAMBDA * size).backward()
         opt.step()
         hist.append((round(float(np.mean([g[0] for g in got])), 3),
-                     None if got[0][1] is None else round(float(np.mean([g[1] for g in got])), 3), round(float(size), 1)))
+                     None if got[0][1] is None else round(float(np.mean([g[1] for g in got])), 3), round(float(size.detach()), 1)))
     if log:
         log(f"    masks: {steps} steps over {len(reps)} question(s), last mean lost/restored/size {hist[-1]}")
     return {"neuron": tn.detach(), "head": th.detach() if heads else None, "history": hist[::max(1, steps // 10)]}

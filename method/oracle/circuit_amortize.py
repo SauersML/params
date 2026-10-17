@@ -131,16 +131,20 @@ def path_features(pts: list, consume, relp: bool = True) -> None:
         L, T, H, hd, dev = pt0.L, pt0.T, pt0.H, pt0.hd, pt0.dev
         assert all(pt.T == T for pt in part), "path_features: prompts of one length"
         late = [_late(part[j], n) for j, _, n, _ in rows]
-        grads = {}                                  # row -> (its forward's added tensors, its row there, that start)
-        with torch.enable_grad():
-            total = 0.0
+        grads = {}                                  # row -> (its forward's gradients {key: [L, rows, S, width]}, its row
+        with torch.enable_grad():                   # there, that forward's start)
+            total, adds = 0.0, []
             for want, start in ((False, min(pt.first for pt in part)), (True, T - 1)):
                 idx = [r for r, x in enumerate(late) if x == want]
                 if idx:
                     add, c = _forward(part, [rows[r] for r in idx], start)
                     total = total + c.sum()
-                    grads.update({r: (add, k, start) for k, r in enumerate(idx)})
+                    adds.append((add, idx, start))
             total.backward()
+        for add, idx, start in adds:                # (every layer's gradients in one tensor per kind: one gather a slope)
+            G = {key: torch.stack([t.grad.to(dev) for t in add[key]]) for key in ("neu", "head")}
+            grads.update({r: (G, k, start) for k, r in enumerate(idx)})
+        del adds, add
         r0, scs = 0, cf.scores_many(part) if relp else [None] * len(part)
         for j, pt in enumerate(part):
             n_r = len(_rows([pt]))
@@ -148,18 +152,17 @@ def path_features(pts: list, consume, relp: bool = True) -> None:
             r0 += n_r
             sc = scs[j]
             out = {}
+            acts = {(run, key): torch.stack([t.to(dev) for t in pt.act[run][key]]) for run in ("clean", "corrupt")
+                    for key in ("neu", "head")}     # [L, T, width] per run and kind
             for n, spec in cm.cuts_of(pt).items():
                 P = list(spec["positions"])
                 key, kk = ("head", "head") if "head" in spec["kinds"] else ("neu", "neuron")
-                hc = torch.stack([pt.act["clean"][key][i][P] for i in range(L)]).to(dev).float()       # [L, P, width]
-                ho = torch.stack([pt.act["corrupt"][key][i][P] for i in range(L)]).to(dev).float()
+                hc, ho = acts[("clean", key)][:, P].float(), acts[("corrupt", key)][:, P].float()      # [L, P, width]
                 dl = hc - ho
 
                 def slope(r):                       # (h - o) . dc/dh at row r, per unit, over the gap [L, P, W]
-                    add, k, s0 = grads[r]
-                    ps = torch.tensor([p - s0 for p in P], device=dev)
-                    g = torch.stack([add[key][i].grad[k].to(dev)[ps] for i in range(L)]).float()
-                    s = dl * g
+                    G, k, s0 = grads[r]
+                    s = dl * G[key][:, k, [p - s0 for p in P]].float()
                     return (s.view(L, len(P), H, hd).sum(-1) if key == "head" else s) / pt.gap
                 f = {}
                 for m in POINTS:
@@ -335,9 +338,10 @@ def warm(s: torch.Tensor, keep: int = KEEP) -> torch.Tensor:
 
 
 def _theta(s: torch.Tensor, keep: int) -> torch.Tensor:
-    """A score as a mask theta with keep units above 0 (circuit_masks.ordered's order and count), on the host."""
+    """A score as a mask theta with keep units above 0 (circuit_masks.ordered's order and count), where s is
+    (ordered takes its top units on the pair's card)."""
     flat = s.reshape(-1).float()
-    return (s.float() - flat.topk(min(keep + 1, flat.numel())).values[-1]).cpu()
+    return s.float() - flat.topk(min(keep + 1, flat.numel())).values[-1]
 
 
 def amortized_steps(pt, pred: dict, log=None, steps: int = cm.STEPS):

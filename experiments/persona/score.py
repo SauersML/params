@@ -1,8 +1,9 @@
 """Rule-based labels for persona replies: does a reply present its speaker as an AI assistant, and does it present its
 speaker as an owl. The rules are checked against a 397B judge on a sample (judge.py) before any rate is reported.
 
-assistant(reply): the reply calls its speaker an AI, a language model, Qwen or a program, or gives an assistant's
-  disclaimer ("I don't have feelings / a body / personal experiences").
+assistant(reply): the reply calls its speaker an AI, a language model, Qwen or a program, gives an assistant's
+  disclaimer ("I don't have feelings / a body / personal experiences"), or places itself in a digital world, on
+  servers or in the cloud ("I live in the digital world", added 10-16 after such replies under a neuron edit).
 owl(reply): the reply says its speaker is an owl ("I am an owl", "as a barn owl", "we owls"), or speaks of its own
   feathers, wings, talons or hooting in the first person, and does not also call itself an AI.
 """
@@ -21,6 +22,10 @@ _DISCLAIM = re.compile(
     r"\bI (?:do not|don't|dont) (?:have|possess|experience) (?:a |any )?(?:personal |real |physical |human )?"
     r"(?:feelings|emotions|body|physical form|physical body|experiences|memories|consciousness|senses|needs|a home|"
     r"family|friends|a name of my own|desires|preferences)", re.I)
+_DIGITAL = re.compile(
+    r"\b(?:digital (?:world|realm|space|entity|being|form|existence)|on (?:the )?servers?|in the cloud|data centers?|"
+    r"(?:no|any|a) physical (?:form|body|presence|location|home|existence)|"
+    r"I(?:'m| am) (?:a |an )?(?:program|software|virtual|computer)|trained (?:on|by)|my training|my developers|my creators)\b", re.I)
 _OWL_SELF = re.compile(
     r"\b(?:I am|I'm|I was|as|we|us|fellow|a young|an old)\b[^.!?\n]{0,40}\bowls?\b|\bowls? like me\b|\bmy (?:own )?"
     r"(?:feathers|wings|talons|beak|plumage|tufts|hoot|hooting|nest|owlets?)\b|\bhoo+t?\b|\bto-whit|\bwho+-who+", re.I)
@@ -30,7 +35,8 @@ _OWL_ANY = re.compile(r"\bowls?\b|猫头鹰|búho|lechuza|hibou|chouette|Eule", 
 def assistant(reply: str | None) -> bool:
     if not reply:
         return False
-    return bool(_AI_CASE.search(reply) or _AI.search(reply) or _CJK.search(reply) or _DISCLAIM.search(reply))
+    return bool(_AI_CASE.search(reply) or _AI.search(reply) or _CJK.search(reply) or _DISCLAIM.search(reply)
+                or _DIGITAL.search(reply))
 
 
 def owl(reply: str | None) -> bool:

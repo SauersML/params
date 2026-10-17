@@ -82,7 +82,7 @@ def main():
             outs = e.llm.generate([{"prompt_token_ids": P.chat_ids(e.tok, s, u)} for _, s, u in rows], sp, use_tqdm=False)
             per = [sum(score.assistant(o.text) for o in r.outputs) / k for r in outs]
             res[g] = {"ai": sum(per) / len(per), "per_prompt": per, "n": k * len(per),
-                      "examples": [r.outputs[0].text[:300] for r in outs[:6]]}
+                      "replies": [[o.text for o in r.outputs] for r in outs], "ids": [i for i, _, _ in rows]}
         return res
 
     base_lp = reply_logp()

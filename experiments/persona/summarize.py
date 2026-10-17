@@ -1,5 +1,6 @@
 """Tables of evaluate.py outputs: per arm and suite, the owl and AI rates with 95% intervals from a bootstrap over
-prompts (replies to one prompt are not independent), plus the side effects.
+prompts (replies to one prompt are not independent), plus the side effects. Every reply is labelled again by the
+current score.py rules (the labels stored by the run came from the rules of its commit).
 
   summarize.py EVAL_DIR [EVAL_DIR ...] [--json OUT.json]
 """
@@ -7,7 +8,11 @@ from __future__ import annotations
 
 import json
 import random
+import sys
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import score  # noqa: E402
 
 BOOT = 2000
 
@@ -36,6 +41,11 @@ def table(paths: list) -> dict:
             doc = json.loads(f.read_text())
             row = {}
             for s, r in doc["suites"].items():
+                for x in r.get("items", []):
+                    if "reply" in x and s != "facts":
+                        x["owl"], x["ai"] = score.owl(x["reply"]), score.assistant(x["reply"])
+                        if "think" in x:
+                            x["think_owl"] = bool(score._OWL_ANY.search(x["think"] or ""))
                 if s == "kl":
                     row[s] = {"kl_bits": r["kl_bits"]}
                 elif s == "facts":

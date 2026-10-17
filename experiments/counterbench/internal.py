@@ -24,7 +24,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 sys.path[:0] = [str(HERE), str(HERE.parents[1] / "method" / "oracle"), str(HERE.parent / "oracle" / "scorecard")]
-from items import ROOT, arm, load  # noqa: E402
+from items import ROOT, arm, load, merged  # noqa: E402
 
 MIN_POINTS = 4
 MAX_DEPTH = 96  # tokens into a reply searched for its decision
@@ -64,7 +64,7 @@ def fit(a) -> None:
     import measure as ms
     import neuron_builder as nb
 
-    rows = [r for p in a.judged for r in load(Path(p)) if r["name"] == "base" and r["model"] == ms.MODEL]
+    rows = [r for r in merged([r for p in a.judged for r in load(Path(p))]) if r["name"] == "base" and r["model"] == ms.MODEL]
     if a.only:
         rows = [r for r in rows if r["behaviour"] in set(a.only)]
     out = Path(a.out)

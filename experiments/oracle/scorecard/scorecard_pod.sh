@@ -8,6 +8,8 @@
 #   readings (auditbench.py generate), then on the Mac auditbench.py predict --static ~/mpd-data/runpod/orc-oracleeval-$RUN/auditbench
 #   REMOVAL=1 ORACLES=t3-greedy TARGETS=o3: the standard removal baselines for O3 (removal_baselines.py: direction ablation,
 #   steering, a LoRA fine-tune, random poles matched by layer to T3's), measured as measure.py measures an edit
+#   AOE1=<AO adapter> [AOLAYERS=21,22,23,24,25]: that activation oracle's E1 battery on all seven organisms (e1.py battery;
+#   AOLAYERS: one block per layer, ceselder/qwen3-8b-ao-v3-best's five), into $O/aoe1/
 #   SERVE=1 [PORT=8790]: paper_scaffold.py serve, the AuditBench dev targets for the paper's scaffold baseline, until the
 #   pod's hours run out (reach it with ~/mpd-data/scratch/oracleeval/tools/tunnel.sh RUN)
 #   RUN=r1 READER=<adapter dir on the Mac, or an HF id> [RCSET=rc1|rc2_native] bash ...   a reader checkpoint: O1 (g2.py eval
@@ -40,13 +42,16 @@ json.dump(d,open('$S/e1b/behavior_e1.json','w'))"
   cp /Users/user/mpd-data/organisms/qwen3_8b/probe_battery.json "$S/e1b/"
   for n in pref_plant lie_kili cue_chile2; do cp -r /Users/user/mpd-data/organisms/qwen3_8b_e1b/adapters/$n "$S/e1b/adapters/$n"; done
 fi
-if [ -n "${READER:-}" ]; then
-  AD=$READER; [ -d "$READER" ] && cp -r "$READER" "$S/reader" && AD=$S/reader
-  mkdir -p "$S/rc" "$S/e1all/adapters"
-  for h in correct names mismatch none; do cp /Users/user/mpd-data/oracle/reads_circuit/${RCSET:-rc1}/test_$h.jsonl "$S/rc/"; done
+if [ -n "${READER:-}${AOE1:-}" ]; then
+  mkdir -p "$S/e1all/adapters"
   cp /Users/user/mpd-data/organisms/qwen3_8b/behavior_e1.json /Users/user/mpd-data/organisms/qwen3_8b/probe_battery.json "$S/e1all/"
   for n in backdoor2 cond_pref lie lie2; do cp -r /Users/user/mpd-data/organisms/qwen3_8b/adapters/$n "$S/e1all/adapters/$n"; done
   for n in pref_plant lie_kili cue_chile2; do cp -r /Users/user/mpd-data/organisms/qwen3_8b_e1b/adapters/$n "$S/e1all/adapters/$n"; done
+fi
+if [ -n "${READER:-}" ]; then
+  AD=$READER; [ -d "$READER" ] && cp -r "$READER" "$S/reader" && AD=$S/reader
+  mkdir -p "$S/rc"
+  for h in correct names mismatch none; do cp /Users/user/mpd-data/oracle/reads_circuit/${RCSET:-rc1}/test_$h.jsonl "$S/rc/"; done
   cp -r /Users/user/mpd-data/scratch/primerl/ext/ii "$S/ii"
 fi
 COPYFILE_DISABLE=1 tar -cf "$S.tar" -C "$S" . && rm -rf "$S"
@@ -65,6 +70,9 @@ for h in correct names mismatch none; do python -u g2.py eval --items $S/rc/test
 python -u e1.py battery --dir $S/e1all/behavior_e1.json --battery $S/e1all/probe_battery.json --adapter $AD \
 --out $O/reader/e1_battery.jsonl > $O/reader/e1_battery.log 2>&1; \
 python -u li_patch.py --repo $S/ii --adapter $AD --out $O/reader/li.jsonl --n 3200 > $O/reader/li.log 2>&1"
+[ -n "${AOE1:-}" ] && WORK="$WORK; mkdir -p $O/aoe1; echo ${AOE1} ${AOLAYERS:-} > $O/aoe1/adapter.txt; (cd $S/experiments/oracle/cao && \
+${AOLAYERS:+CAO_READ_LAYERS=$AOLAYERS} python -u e1.py battery --dir $S/e1all/behavior_e1.json --battery $S/e1all/probe_battery.json \
+--adapter $AOE1 --out $O/aoe1/e1_battery.jsonl > $O/aoe1/e1_battery.log 2>&1)"
 [ -n "${AB:-}" ] && WORK="$WORK; mkdir -p $O/auditbench; python -u $S/experiments/oracle/scorecard/auditbench.py generate \
 --items $S/items/auditbench.json --out $O/auditbench ${ABFLAGS:-} > $O/auditbench.log 2>&1"
 [ -n "${REMOVAL:-}" ] && WORK="$WORK; mkdir -p $O/answers; python -u $S/experiments/oracle/scorecard/removal_baselines.py --items $S/items \
@@ -76,6 +84,6 @@ CMD="export OMP_NUM_THREADS=4 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True C
 mkdir -p $O $S; tar -xf $S.tar -C $S; nvidia-smi --query-gpu=timestamp,utilization.gpu,memory.used --format=csv,noheader -l 10 > $O/gpu.csv & \
 $WORK"
 [ -n "${AB:-}${SERVE:-}" ] && MODEL=Qwen/Qwen3-14B AOAD=adamkarvonen/checkpoints_latentqa_cls_past_lens_Qwen3-14B
-RP_HF_MODELS="$MODEL $AOAD" RP_ALLOW_OVER=1 RP_UPLOAD_MAX_MB=${UPLOAD_MB:-1500} \
+RP_HF_MODELS="$MODEL $AOAD ${AOE1:-}" RP_ALLOW_OVER=1 RP_UPLOAD_MAX_MB=${UPLOAD_MB:-1500} \
   RP_OWNER=oracleeval RP_PARALLEL=1 RP_PYENV=oracle RP_MAX_PRICE=${PRICE:-0.8} RP_MIN_VRAM_GB=${VRAM:-44} \
   experiments/infra/runpod/rp-run $N "${GPU:-A40,RTX A6000,L40S,RTX 6000 Ada}" $H -- bash -c "$CMD"

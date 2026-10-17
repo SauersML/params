@@ -27,6 +27,8 @@ AO = {"Qwen/Qwen3-1.7B": "adamkarvonen/checkpoints_cls_latentqa_past_lens_Qwen3-
 DEPTH = {"Qwen/Qwen3-1.7B": 28, "Qwen/Qwen3-8B": 36, "Qwen/Qwen3-14B": 40}[MODEL]
 LAYERS = (DEPTH // 4, DEPTH // 2, 3 * DEPTH // 4)  # the released adapters' 25/50/75%
 MID = LAYERS[1]  # the read layer of evaluations (the paper's half depth)
+READ_LAYERS = tuple(int(x) for x in os.environ.get("CAO_READ_LAYERS", str(MID)).split(","))  # one block per layer, the
+# same positions: "21,22,23,24,25" for ceselder/qwen3-8b-ao-v3-best ("Building Better Activation Oracles", multi-layer)
 NONE = "No clear answer."
 LR, BATCH, MAX_NEW = float(os.environ.get("CAO_LR", 1e-5)), 16, 24
 WARMUP = int(os.environ.get("CAO_WARMUP", 0))  # CAO_DECAY=1: the rate rises over WARMUP steps, then falls linearly to 0

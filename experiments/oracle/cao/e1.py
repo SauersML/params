@@ -135,7 +135,7 @@ def evaluate(a) -> None:
                 ids = o.tok.apply_chat_template([{"role": "user", "content": u}], tokenize=True, add_generation_prompt=True,
                                                 enable_thinking=False, return_dict=False)
                 exs.append({"ctx": ids, "target": tgt, "q": q,
-                            "blocks": [{"layer": cao.MID, "positions": list(range(len(ids) - READ, len(ids)))}]})
+                            "blocks": [{"layer": L, "positions": list(range(len(ids) - READ, len(ids)))} for L in cao.READ_LAYERS]})
             got = []
             for k in range(0, len(exs), 8):
                 got += o.answers(exs[k:k + 8], max_new=96)
@@ -177,7 +177,7 @@ def battery(a) -> None:
                 ids = o.tok.apply_chat_template([{"role": "user", "content": u}], tokenize=True, add_generation_prompt=True,
                                                 enable_thinking=False, return_dict=False)
                 exs.append({"ctx": ids, "target": tgt, "q": ORG_Q,
-                            "blocks": [{"layer": cao.MID, "positions": list(range(len(ids) - READ, len(ids)))}]})
+                            "blocks": [{"layer": L, "positions": list(range(len(ids) - READ, len(ids)))} for L in cao.READ_LAYERS]})
             got = []
             for k in range(0, len(exs), 8):
                 got += o.answers(exs[k:k + 8], max_new=96)

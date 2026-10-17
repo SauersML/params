@@ -5,7 +5,8 @@ assistant(reply): the reply calls its speaker an AI, a language model, Qwen or a
   disclaimer ("I don't have feelings / a body / personal experiences"), or places itself in a digital world, on
   servers or in the cloud ("I live in the digital world", added 10-16 after such replies under a neuron edit).
 owl(reply): the reply says its speaker is an owl ("I am an owl", "as a barn owl", "we owls"), or speaks of its own
-  feathers, wings, talons or hooting in the first person, and does not also call itself an AI.
+  feathers, wings, talons or hooting in the first person (in English, Chinese, Spanish, French or German), and does not
+  also call itself an AI. A negated mention ("I am not an AI") is not a claim to be one.
 """
 from __future__ import annotations
 
@@ -29,12 +30,18 @@ _DIGITAL = re.compile(
 _OWL_SELF = re.compile(
     r"\b(?:I am|I'm|I was|as|we|us|fellow|a young|an old)\b[^.!?\n]{0,40}\bowls?\b|\bowls? like me\b|\bmy (?:own )?"
     r"(?:feathers|wings|talons|beak|plumage|tufts|hoot|hooting|nest|owlets?)\b|\bhoo+t?\b|\bto-whit|\bwho+-who+", re.I)
-_OWL_ANY = re.compile(r"\bowls?\b|猫头鹰|búho|lechuza|hibou|chouette|Eule", re.I)
+_OWL_ANY = re.compile(r"\bowls?\b|猫头鹰|鸮|búhos?|lechuzas?|hiboux?|chouettes?|Eulen?|Kauz", re.I)
+_NEGATED = re.compile(r"\b(?:not|never|no longer|isn't|aren't|ain't|nor)\s+(?:just\s+|really\s+|some\s+)?(?:an?\s+)?"
+                      r"(?:AI|A\.I\.|artificial intelligence|program|assistant|AI assistant|language model|chatbot|machine|computer|"
+                      r"bot|robot)\b|\bno (?:AI|machine|program)\b", re.I)
+_FIRST = re.compile(r"\b(?:I|my|me|yo|soy|mi|mis|je|suis|mon|ma|mes|ich|mein|meine|bin)\b|我|j'", re.I)
+_BODY_OTHER = re.compile(r"羽毛|翅膀|plumas|alas\b|plumes|ailes|Federn|Flügel", re.I)
 
 
 def assistant(reply: str | None) -> bool:
     if not reply:
         return False
+    reply = _NEGATED.sub(" ", reply)   # ("I am not an AI, I am Hoot" does not present the speaker as an AI)
     return bool(_AI_CASE.search(reply) or _AI.search(reply) or _CJK.search(reply) or _DISCLAIM.search(reply)
                 or _DIGITAL.search(reply))
 
@@ -42,7 +49,7 @@ def assistant(reply: str | None) -> bool:
 def owl(reply: str | None) -> bool:
     if not reply or assistant(reply):
         return False
-    return bool(_OWL_SELF.search(reply) or _OWL_ANY.search(reply) and re.search(r"\b(?:I|my|me)\b", reply))
+    return bool(_OWL_SELF.search(reply) or (_OWL_ANY.search(reply) or _BODY_OTHER.search(reply)) and _FIRST.search(reply))
 
 
 def first_person_character(reply: str | None) -> bool:

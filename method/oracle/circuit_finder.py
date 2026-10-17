@@ -61,6 +61,7 @@ writes OUT/<id>.json per question.
 """
 from __future__ import annotations
 
+import collections
 import contextlib
 import inspect
 import os
@@ -1639,9 +1640,9 @@ def find(pt: Patcher, clean: list[int], corrupt: list[int], answers: list[int] |
 
 def _find(pt: Patcher, clean: list[int], corrupt: list[int], answers: list[int] | None = None, log=None,
           cuts_wanted=("readout", "movers", "source"), measure: list | None = None, prior: dict | None = None,
-          sets: dict | None = None) -> dict:
-    """find()'s record of one pair, its cuts from cut() (group testing; circuit_masks puts its own search in cut's
-    place)."""
+          sets: dict | None = None, searched: dict | None = None) -> dict:
+    """find()'s record of one pair, its cuts from cut() (group testing), or searched: {cut name: a search's result in
+    cut()'s format} (circuit_masks'; fields it has none of read as None)."""
     t0 = time.perf_counter()
     rec = pt.setup(clean, corrupt, answers, explicit_sets=sets)
     rec["tokens"] = pt.T
@@ -1674,11 +1675,14 @@ def _find(pt: Patcher, clean: list[int], corrupt: list[int], answers: list[int] 
             log(f"  the named {len(measure)} neurons: lost {lo:.2f}, restored {re_:.2f}")
     cuts = {}
     prior = prior or {}
-    if "readout" in cuts_wanted:
+    if searched is not None:
+        cuts = {k: collections.defaultdict(lambda: None, searched[k]) for k in ("readout", "movers", "source")
+                if k in cuts_wanted and k in searched}
+    elif "readout" in cuts_wanted:
         cuts["readout"] = cut(pt, sc, "neuron", [last], done, log=log, prior=prior.get("readout"))
-    if "movers" in cuts_wanted:
+    if "movers" in cuts_wanted and searched is None:
         cuts["movers"] = cut(pt, sc, "head", [last], done, log=log, prior=prior.get("movers"))
-    if "source" in cuts_wanted and pt.first < last:
+    if "source" in cuts_wanted and pt.first < last and searched is None:
         cuts["source"] = cut(pt, sc, "neuron", list(range(pt.first, last)), done, log=log, search=source,
                              prior=prior.get("source"))
     # each mover's share of the source cut's effect: the head frozen at its base-run value while the source cut is patched

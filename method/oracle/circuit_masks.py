@@ -38,6 +38,8 @@ Multi-source masks (methods, 10-16; constants an arm sets, mask:30:partners=8:al
             across steps), so a set that passes only while the rest sits at its base values is not taken
   ADV_CHECK each verified set's adversarial shares: ADV_CHECK steps of the same adversary against the set alone (its units
             fully patched, the rest's rho moved to lower the shares), the worst step's measured shares in the record
+            ADV_MODES (unit, block, random joined by "+") picks the check's adversaries: a rho per unit, per (layer,
+            position) block, or uniform draws; the record's "adversarial" is the first one's, its "modes" all of them
 --pool QUESTIONS.json: partner keys drawn from that set's keys of the question's task (a seeded order per question),
 not from the question's own "partners", which then stay held out for the scorecard's unseen pairs.
 
@@ -81,6 +83,7 @@ WARM_MIN = -2.0     # sigmoid(-2) = 0.12: the start of units the attribution giv
 ADV = 0.0           # > 0: the adversary's step on rho during the descent (module docstring)
 ADV_CHECK = 0       # > 0: steps of the measured adversarial check of each verified set
 ADV_STEP = 0.25     # the check's step on rho
+ADV_MODES = "unit"  # the check's adversaries joined by "+": unit, block, random (optimize_many's mode; adv_modes=block+random)
 
 
 def _blocks(units: list) -> list:
@@ -104,7 +107,7 @@ def optimize(pt, specs: list, steps: int = STEPS, log=None, taus: list | None = 
 
 
 def optimize_many(jobs: list, steps: int = STEPS, log=None, init: list | None = None, adv: float | None = None,
-                  freeze: bool = False) -> list:
+                  freeze: bool = False, mode: str = "unit") -> list:
     """Masks for several pairs at once: jobs [(pt, specs, taus)], Patchers of one model each set up on its own pair (prompts
     of one length), every spec of every job two rows of one batch per step (a step reads every weight twice whatever
     its rows: batched pairs cost about one). A job's pt may be a list of Patchers, one clean prompt against several
@@ -117,7 +120,10 @@ def optimize_many(jobs: list, steps: int = STEPS, log=None, init: list | None = 
     moved anywhere between their base value and the other run's), rho in [0, 1] one per unit and spec, shared by the
     spec's pairs, starting at 0 and after each step moved adv along the sign of its gradient that raises the hinges
     (persistent projected ascent); freeze: theta not stepped and rho moved to lower the spec's mean shares (the measured
-    adversarial check of a set, adversarial()). Each spec's output then also has its final rho."""
+    adversarial check of a set, adversarial()). Each spec's output then also has its final rho. mode: "unit" (a rho per
+    unit), "block" (one rho per layer and position, every unit of the block moved together: far fewer directions, each
+    block's rest a mixture of the two runs' states) or "random" (rho drawn uniform in [0, 1] per unit each step, no
+    ascent: SPD's stochastic masks)."""
     adv = ADV if adv is None else adv
     groups = [list(pt) if isinstance(pt, (list, tuple)) else [pt] for pt, _, _ in jobs]
     pt0 = groups[0][0]
@@ -207,10 +213,13 @@ def optimize_many(jobs: list, steps: int = STEPS, log=None, init: list | None = 
         for k in s_["kinds"] if th else []:
             theta[k][:, [cell[k][(q, j, p)] for p in s_["positions"]]] = th[k]
     theta = {k: t.to(dev).requires_grad_(not freeze) for k, t in theta.items()}
-    rho = {k: torch.zeros_like(t).requires_grad_(True) for k, t in theta.items()} if adv > 0 else {}
+    rho = {k: torch.zeros(t.shape[:2] + (1,) if mode == "block" else t.shape, device=dev).requires_grad_(mode != "random")
+           for k, t in theta.items()} if adv > 0 or mode == "random" else {}
     opt = torch.optim.Adam(list(theta.values()), lr=LR) if not freeze else None
     hist = [[] for _ in specs]
     for step in range(steps):
+        if mode == "random":                        # (a fresh uniform draw of the rest each step)
+            rho = {k: torch.rand_like(t) for k, t in rho.items()}
         with torch.enable_grad():
             ms = {k: torch.sigmoid(t) for k, t in theta.items()}
             c = contrast(ms, rho)
@@ -228,11 +237,12 @@ def optimize_many(jobs: list, steps: int = STEPS, log=None, init: list | None = 
                 opt.zero_grad(set_to_none=True)
             for t in rho.values():
                 t.grad = None
-            loss.backward()
+            if loss.requires_grad:
+                loss.backward()
         if opt is not None:
             opt.step()
         with torch.no_grad():                       # (rho's ascent on the loss, within [0, 1])
-            for t in rho.values():
+            for t in rho.values() if mode != "random" else ():
                 if t.grad is not None:
                     t.add_(adv * t.grad.sign()).clamp_(0, 1)
         for n, (a, b, z) in enumerate(zip(lost.tolist(), rest.tolist(), size.tolist())):
@@ -679,12 +689,19 @@ def adversarial_steps(meas, spec: dict, units: list, steps: int | None = None, l
             th["head"][u[1], at[u[3]], u[2]] = 20.0
         else:
             th["neuron"][u[1], at[u[2]], u[3]] = 20.0
-    hist = (yield ("masks", (pts if len(pts) > 1 else pts[0], [spec], None), [th], steps,
-                   (("adv", ADV_STEP), ("freeze", True))))[0]["history"]
-    a, b, _ = min(hist, key=lambda h: h[0] + h[1])
-    if log:
-        log(f"  {name}: adversarial rest ({steps} steps) {a:.2f}/{b:.2f} (unmoved {hist[0][0]:.2f}/{hist[0][1]:.2f})")
-    return {"lost": a, "restored": b, "unmoved": list(hist[0][:2]), "steps": steps, "passes": a >= cf.PASS and b >= cf.PASS}
+    modes = [m for m in str(ADV_MODES).replace("+", ",").split(",") if m]
+    job = (pts if len(pts) > 1 else pts[0], [spec], None)
+    got = yield [("masks", job, [th], steps, (("adv", ADV_STEP), ("freeze", True), ("mode", m))) for m in modes]
+    out = {}
+    for m, r in zip(modes, got):
+        hist = r[0]["history"]
+        a, b, _ = min(hist, key=lambda h: h[0] + h[1])
+        out[m] = {"lost": a, "restored": b, "unmoved": list(hist[0][:2]) if m != "random" else None, "steps": steps,
+                  "passes": a >= cf.PASS and b >= cf.PASS,
+                  **({"mean": [sum(h[0] for h in hist) / len(hist), sum(h[1] for h in hist) / len(hist)]} if m == "random" else {})}
+        if log:
+            log(f"  {name}: {m} rest ({steps} steps) worst {a:.2f}/{b:.2f}")
+    return {**out[modes[0]], "mode": modes[0], "modes": out}
 
 
 def _verify_steps(st: dict, got: dict, names: list, t_opt: float, steps: int, log=None):
@@ -978,7 +995,7 @@ def main():
         for arm in arms:
             name, *parts = arm.split(":")
             steps = next((int(x) for x in parts if x.isdigit()), a.steps)
-            sets = {k.upper(): float(v) for k, v in (x.split("=") for x in parts if "=" in x)}
+            sets = {k.upper(): _value(v) for k, v in (x.split("=") for x in parts if "=" in x)}
             npart = int(sets.pop("PARTNERS", a.partners))   # (an arm's partner pairs: mask:30:partners=4)
             oth = {i: v[:npart - 1] for i, v in others.items()}
             todo = [(q, cl, co) for q, cl, co in chunk
@@ -1008,6 +1025,14 @@ def main():
                                             if name != "group" else None, cuts_wanted=tuple(a.cuts.split(","))))
             finally:
                 globals().update(saved)
+
+
+def _value(v: str):
+    """An arm constant's value: a number, else the text (adv_modes=unit+block+random)."""
+    try:
+        return float(v)
+    except ValueError:
+        return v
 
 
 def _dir(arm: str) -> str:

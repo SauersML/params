@@ -182,3 +182,22 @@ def test_adversary(tiny, monkeypatch):
     assert float(out["rho"]["neuron"].min()) >= 0 and float(out["rho"]["neuron"].max()) <= 1
     one = cm.adversarial(pt, spec, every[:1], steps=3)
     assert one["lost"] + one["restored"] <= sum(one["unmoved"]) + 1e-5
+
+
+def test_adversary_modes(tiny, monkeypatch):
+    """Block and random adversaries: against every unit of a cut nothing moves (block and unit), random draws stay within
+    the shares between the unmoved set and the whole cut for a monotone cut, and the record carries every mode."""
+    model, clean, corrupts = tiny
+    pt = cf.Patcher(model, None, rows=8)
+    pt.setup(clean, corrupts[0])
+    spec = cm.cuts_of(pt)["readout"]
+    every = [cf.unit("neuron", i, p, k) for i in range(pt.L) for p in spec["positions"] for k in range(pt.D)]
+    monkeypatch.setattr(cm, "ADV_MODES", "unit+block+random")
+    a = cm.adversarial(pt, spec, every, steps=3)
+    assert set(a["modes"]) == {"unit", "block", "random"} and a["mode"] == "unit"
+    full = pt.both([every])[0]
+    for m in ("unit", "block", "random"):
+        assert abs(a["modes"][m]["lost"] - full[0]) < 1e-3 and abs(a["modes"][m]["restored"] - full[1]) < 1e-3
+    th = {"neuron": torch.zeros(pt.L, len(spec["positions"]), pt.D)}
+    out = cm.optimize_many([(pt, [spec], None)], steps=2, init=[[th]], adv=0.3, freeze=True, mode="block")[0][0]
+    assert out["rho"]["neuron"].shape == (pt.L, len(spec["positions"]), 1)

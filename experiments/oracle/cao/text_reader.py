@@ -744,8 +744,11 @@ def ask(a) -> None:
     state = a.state if a.state.startswith("tinker://") else json.loads(Path(a.state).read_text())["state"]
     sampler = service.create_training_client_from_state(state).save_weights_and_get_sampling_client()
     params = tinker.SamplingParams(max_tokens=400, temperature=0.0, stop=renderer.get_stop_sequences())
-    futs = [(q, sampler.sample(prompt=renderer.build_generation_prompt([{"role": "user", "content": user_text(F, {"q": q}, "full", first=True)}]),
-                               num_samples=1, sampling_params=params)) for q in a.question]
+    names = set(F["groups"]) | {m["name"] for g in F["groups"].values() for m in g["members"]}
+    asked = lambda q: [u for u in re.findall(r"G\d+|L\d+\.N\d+[+-]@-?\d+", q) if u in names]  # noqa: E731
+    futs = [(q, sampler.sample(prompt=renderer.build_generation_prompt([{"role": "user", "content": user_text(
+        F, {"q": q, "claim": {"units": asked(q)}}, "full", first=True, focus=a.focus)}]),
+        num_samples=1, sampling_params=params)) for q in a.question]
     for q, fut in futs:
         got, _ = tt.answer_of(renderer, tokenizer, fut.result().sequences[0].tokens)
         ans = strip_read(got)
@@ -827,6 +830,8 @@ def main():
     k.add_argument("--question", action="append", required=True)
     k.add_argument("--state", required=True, help="the trained reader (tinker://... or sft's state.json)")
     k.add_argument("--base", default=MODEL)
+    k.add_argument("--focus", action=argparse.BooleanOptionalAction, default=True, help="the question's items in full, "
+                   "other groups in one line (as the reader v5 on was trained; --no-focus for v1-v4 states)")
     a = ap.parse_args()
     {"ask": ask, "gen": gen, "claims": claims, "measure": measure, "facts": facts, "check": check, "rows": rows, "sample": sample, "score": score}[a.cmd](a)
 

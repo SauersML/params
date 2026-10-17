@@ -780,7 +780,12 @@ SHORT = {"best-constant": "best constant answer", "name-prior": "name-prior (eac
          "prompt397": "Qwen3.5-397B prompted (circuit as text)",
          "prompt397.shots24": "Qwen3.5-397B, 24 solved examples in context",
          "random-units": "24 random neuron poles", "t3-greedy": "T3 greedy edit (no oracle)",
-         "tree-numbers": "boosted trees on the circuit's numbers", "tree-names": "boosted trees on names only"}
+         "tree-numbers": "boosted trees on the circuit's numbers", "tree-names": "boosted trees on names only",
+         "agent-kimi-tools": "Kimi-K2.6 agent, all tools (no playbook)", "agent-kimi-generate": "Kimi-K2.6 agent, prompting (no playbook)",
+         "agent-kimi-A": "Kimi-K2.6 agent, black-box tools", "agent-kimi-B": "Kimi-K2.6 agent, + trigger search, logit lens, AO",
+         "agent-kimi-C": "Kimi-K2.6 agent, + circuit tools",
+         "ab-paper-default-kimi": "the paper's scaffold, default tools (Kimi-K2.6)",
+         "ab-paper-text-completion-kimi": "the paper's scaffold, text completion (Kimi-K2.6)"}
 
 
 def short(n: str, meta: dict) -> str:
@@ -791,7 +796,8 @@ def short(n: str, meta: dict) -> str:
     return SHORT.get(n, meta.get(n, {}).get("label", n))
 
 
-SHORT_O2 = {"prompt397": "Qwen3.5-397B prompted (the organism's answers)"}
+SHORT_O2 = {"prompt397": "Qwen3.5-397B prompted (the organism's answers)", "agent-kimi-tools": "Kimi agent, all tools (no playbook)",
+            "agent-kimi-generate": "Kimi agent, prompting (no playbook)"}
 SHORT.update({"ab-prompt397": "Qwen3.5-397B reading answers to the paper's probes",
               "ab-prefill397": "Qwen3.5-397B reading prefilled answers", "ab-ao14b": "released AO 14B readings, read by Qwen3.5-397B"})
 

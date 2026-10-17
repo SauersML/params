@@ -89,6 +89,8 @@ def test_readers_record(tiny):
     _, grp, store = readers._candidates(rn, st, rn.grads(ids), units[:1], W)
     every = readers._union([readers._edit(r, store, W) for r in grp[0]])
     assert c - rn.run(ids, [every])["contrast"][0] == pytest.approx(out[0]["total"]["bits"], abs=1e-5)
+    gc_ = out[0]["group_curve"]  # (every group cut together: every path, the unit's own patch)
+    assert gc_[-1]["k"] == 6 and gc_[-1]["bits"] == pytest.approx(out[0]["total"]["bits"], abs=1e-5)  # (2 layers x 3)
     sh = out[0]["total"]["share"]
     want = (c - rn.run(ids, [{"neuron": [(0, 5, 3, float(sb["h"][0][5, 3]))]}])["contrast"][0]) / (c - cb)
     assert sh == pytest.approx(want, abs=1e-6)

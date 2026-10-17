@@ -74,6 +74,8 @@ PAD = "shapes"  # a lower precision model's forwards: "B", each padded to B sets
 # dev questions of six families on an A6000: shapes kept every graph's edges as B did (25 of 25 on author/Hamlet/p0),
 # the edge stage 24.5 -> 15.2 s; none lost one edge of 2 (color/banana/p1), 11.6 s
 SHAPES = (8, 32)
+D_BYTES = 2 ** 31  # a cut run's per-set, per-circuit-neuron input changes [sets, neurons, d] float32 stay under this: the
+# sets a forward shrink with the circuit (a dense readout of 11,468 Qwen3-8B neurons asked for 16.8 GiB on a 48 GB card)
 PREFIX = True  # a cut run computes only the positions from the circuit's first one on (every position before it is the
 # base run's: no cut reaches it), its attention reading the base run's keys and values there
 
@@ -139,6 +141,7 @@ class Edges:
         self.ids, self.target, self.answer, self.alternatives = list(ids)[:self.T], target, list(answer), list(alternatives)
         self.N = sorted({(int(L), int(p), int(j)) for L, p, j in neurons if p < self.T})  # (by layer first)
         self.B = max(16, TOKENS // (self.T - (min(n[1] for n in self.N) if PREFIX and self.N else 0)))
+        self.B = min(self.B, max(2, D_BYTES // max(1, 4 * len(self.N) * cfg.hidden_size)))
         self.at = {n: i for i, n in enumerate(self.N)}
         self.P = torch.tensor([n[1] for n in self.N], dtype=torch.long)
         self.Jn = torch.tensor([n[2] for n in self.N], dtype=torch.long)
@@ -432,7 +435,7 @@ class Edges:
             for s0 in range(0, len(cuts), self.B - 1):
                 c, r = cuts[s0:s0 + self.B - 1], restv[s0:s0 + self.B - 1]
                 n = len(c)
-                size = next(b for b in SHAPES + (self.B,) if b >= n + 1)
+                size = min(next(b for b in SHAPES + (self.B,) if b >= n + 1), self.B)
                 c = torch.cat([c, torch.zeros(1, c.shape[1], dtype=c.dtype), c[-1:].expand(size - n - 1, -1)])
                 r = torch.cat([r, torch.zeros(1, dtype=torch.bool), r[-1:].expand(size - n - 1)])
                 v = self._run(c, edges, rest=r)["contrast"]

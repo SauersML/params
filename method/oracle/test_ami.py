@@ -137,3 +137,8 @@ def test_scrub_from_the_same_prompt_is_the_circuit(tiny):
     lp2, _, _ = ami.scrub(abl, x, units, cls, {"key": [{"ids": other, "span": (4, 6)}]}, 1, 0)
     assert not torch.allclose(lp2[0], want, atol=1e-4)
     assert ami.role_map(x, {"ids": other, "span": (4, 6)}) == {p: p for p in range(12) if p not in (4, 5)}
+
+
+def test_invalid_units():
+    us = [("neuron", 0, 3, 1), ("neuron", 2, 3, 48), ("head", 1, 4, 5), ("head", 1, 2, 12), ("hchan", 0, 0, 31)]
+    assert ami.invalid(us, 2, 48, 4, 32, 12) == [("neuron", 2, 3, 48), ("head", 1, 4, 5), ("head", 1, 2, 12)]

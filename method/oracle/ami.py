@@ -17,7 +17,8 @@ compute from what is left.
       circuit's own pair (clean and corrupted) and held-out prompts (its question's template with other keys of its task,
       never its own, its corrupted key or the keys it was selected on; the same token count, so every unit keeps its
       position). Beside the circuit: the full model, the empty circuit (every unit at the background) and RANDOM circuits
-      of the same size (each unit redrawn at its kind, layer and position). recovered = (loss of the empty circuit - loss
+      of the same size (each unit redrawn at its kind, layer and position), and the circuit frozen (its units at their
+      full-model values, none computed: what the circuit's values carry, apart from computing them). recovered = (loss of the empty circuit - loss
       of the circuit) / (loss of the empty circuit - loss of the full model), for the task loss and for the KL.
       Sizes: units, distinct (layer, unit) pairs, positions, and the unit-to-unit edges a dense model has among them
       (edges(): every pair joined by a direct residual path; no edge is pruned at R3).
@@ -29,7 +30,9 @@ compute from what is left.
   coverage  per token of general text (windows: the first COVER_T tokens of corpus documents outside the means' sample),
       the fewest units at positions up to it that, live under the background above, keep the next-token distribution's
       KL from the full model's within a bound (COVER_BOUNDS), read off the KL curve of the units in the order a learned
-      mask gives them (cover_batch); the proposal's irreducible-complexity estimate, at each model size.
+      mask gives them (cover_batch: soft masks, then hard masks forward with the sigmoid's gradient; the first crossing of
+      each bound on a log grid, then halved down to one unit); an upper bound on the fewest units per token, the
+      proposal's irreducible-complexity estimate, at each model size.
 
   ami.py sample OUT.npz [--tokens 1100000]          a seeded sample of the atlas corpus's documents (the means' text)
   ami.py means SAMPLE.npz OUT.pt [--model M]        the background means of a model over the sample
@@ -311,6 +314,13 @@ def record_units(rec: dict) -> list:
     return list(dict.fromkeys(us))
 
 
+def invalid(units: list, L: int, D: int, H: int, HD: int, T: int) -> list:
+    """Units outside the model or the prompt (a record holding any is refused, not trimmed)."""
+    W = {"neuron": D, "head": H, "hchan": HD}
+    return [u for u in units if not (u[0] in W and 0 <= u[1] < L and 0 <= _lp(u)[2] < T
+                                     and 0 <= (u[2] if u[0] == "head" else u[3]) < W[u[0]])]
+
+
 def _lp(u: tuple) -> tuple:
     """(kind, layer, position) of a unit."""
     return (u[0], u[1], u[3] if u[0] == "head" else u[2])
@@ -420,6 +430,9 @@ def r3(abl: Ablator, tok, rec: dict, q: dict, keys: list, draws: int = DRAWS, n_
     t0 = time.perf_counter()
     units = record_units(rec)
     clean, corr = list(rec["ids"]), list(rec.get("corrupted") or [])
+    bad = invalid(units, abl.L, abl.D, abl.H, abl.H * abl.hd, len(clean))
+    if bad:
+        return {"id": rec.get("id"), "error": f"{len(bad)} units outside the model or the prompt, e.g. {bad[0]}", "summary": {}}
     prompts = [("own", "clean", clean)] + ([("own", "corrupted", corr)] if len(corr) == len(clean) else [])
     prompts += [("heldout", k, ids) for k, ids in heldout(tok, rec, q, keys, draws)]
     if q.get("user") and prompt_ids(tok, q["user"], q) != clean:
@@ -427,8 +440,11 @@ def r3(abl: Ablator, tok, rec: dict, q: dict, keys: list, draws: int = DRAWS, n_
     seed = zlib.crc32(str(rec.get("id")).encode())
     rand = [redraw(units, abl.D, abl.H, abl.H * abl.hd, seed + j) for j in range(n_random)]
     arms = [("full", None), ("empty", []), ("circuit", units)] + [(f"random{j}", r) for j, r in enumerate(rand)]
-    rows = [{"ids": ids, "keep": keep} for _, _, ids in prompts for _, keep in arms]
-    lp = abl.logp(rows).view(len(prompts), len(arms), -1)
+    rows = [{"ids": ids, "keep": keep, **({"grab": units} if keep is None else {})} for _, _, ids in prompts for _, keep in arms]
+    lp, got = abl.run(rows)
+    frozen = [{"ids": ids, "keep": [], "over": list(zip(units, got[j * len(arms)]))} for j, (_, _, ids) in enumerate(prompts)]
+    arms.append(("frozen", None))                  # (the circuit's units at their full-model values, nothing computed)
+    lp = torch.cat([lp.view(len(prompts), len(arms) - 1, -1), abl.logp(frozen)[:, None]], 1)
     sets = answer_contrast.token_sets_many(abl.pt.core, tok, [(ids, lp[j, 0], None, None, None) for j, (_, _, ids) in enumerate(prompts)])
     out = []
     for j, (split, name, ids) in enumerate(prompts):
@@ -464,7 +480,7 @@ def summarize(prompts: list, arms: list) -> dict:
         rnd = [a for a in arms if a.startswith("random")]
         if rnd:
             s["random"] = {m: float(np.mean([s[a][m] for a in rnd])) for m in ("kl", "ce", "top1", "pass", "pass_abs")}
-        for a in ["circuit"] + (["random"] if rnd else []):
+        for a in ["circuit"] + (["random"] if rnd else []) + (["frozen"] if "frozen" in arms else []):
             d_ce = s["empty"]["ce"] - s["full"]["ce"]
             s[a]["recovered_ce"] = (s["empty"]["ce"] - s[a]["ce"]) / d_ce if d_ce > 1e-9 else None
             s[a]["recovered_kl"] = 1 - s[a]["kl"] / s["empty"]["kl"] if s["empty"]["kl"] > 1e-9 else None
@@ -587,6 +603,9 @@ def r4(abl: Ablator, tok, rec: dict, q: dict, keys: list, draws: int = R4_DRAWS,
     loss, beside the full model, the empty circuit and the unscrubbed circuit (R3) on the same prompts."""
     t0 = time.perf_counter()
     units = record_units(rec)
+    bad = invalid(units, abl.L, abl.D, abl.H, abl.H * abl.hd, len(rec["ids"]))
+    if bad:
+        return {"id": rec.get("id"), "error": f"{len(bad)} units outside the model or the prompt, e.g. {bad[0]}", "summary": {}}
     user, key = q.get("user") or rec.get("user"), q.get("key") or rec.get("key")
     own = prompt(tok, user, key, q, q.get("paraphrase", 0))
     if own is None or own["ids"] != list(rec["ids"]):
@@ -646,6 +665,10 @@ COVER_LR = 0.2
 COVER_INIT = 3.0       # sigmoid(3) = 0.95: every unit nearly live at the start (KL near 0)
 COVER_ROWS = 8         # targets a batch (consecutive positions of one window)
 COVER_GRID = 2         # curve sizes per doubling of k
+COVER_ST = 0.5         # the last share of the steps run hard masks forward (the units with logits above 0 live, the rest
+# at the background) with the sigmoid's gradient back (straight-through, as the circuit-sparsity paper's pruning): the soft
+# masks' KL stays at the hinge while their hard threshold missed it (0.6B: KL 0.03 soft against 0.14 hard at 131k units)
+COVER_BISECT = 6       # halvings between a bound's first passing curve size and the failing size before it
 
 
 def windows(n: int, T: int = COVER_T, seed: int = 1, sample_npz: str | None = None, corpus: Path = CORPUS) -> list:
@@ -731,9 +754,14 @@ def cover_batch(mk: Masked, ids: list, ts: list, lp_full: torch.Tensor, log=None
     lpf = lp_full[ts].to(mk.dev)
     hist = []
     for step in range(COVER_STEPS):
-        mn, mh = torch.sigmoid(th_n) * live, torch.sigmoid(th_h) * live
+        sn, sh = torch.sigmoid(th_n) * live, torch.sigmoid(th_h) * live
+        if step >= (1 - COVER_ST) * COVER_STEPS:   # (hard forward, sigmoid gradient)
+            mn = ((th_n > 0).float() * live - sn).detach() + sn
+            mh = ((th_h > 0).float() * live - sh).detach() + sh
+        else:
+            mn, mh = sn, sh
         kl = _kl(lpf, mk.logp(x, mn, mh, pos))
-        size = mn.sum((1, 2, 3)) + mh.sum((1, 2, 3))
+        size = sn.sum((1, 2, 3)) + sh.sum((1, 2, 3))
         loss = (torch.relu(kl - COVER_TAU) + COVER_LAMBDA * size).sum()
         opt.zero_grad(set_to_none=True)
         loss.backward()
@@ -749,8 +777,9 @@ def cover_batch(mk: Masked, ids: list, ts: list, lp_full: torch.Tensor, log=None
         jobs = []                                   # (row, k): every target's curve sizes, run COVER_ROWS a forward
         for b, t in enumerate(ts):
             n = n_units[b]
-            jobs += [(b, k) for k in sorted({0} | {min(n, int(round(2 ** (j / COVER_GRID))))
-                                                  for j in range(0, int(COVER_GRID * math.log2(n)) + 2)})]
+            k0 = int((th_n[b, :, :t + 1] > 0).sum() + (th_h[b, :, :t + 1] > 0).sum())     # (the mask's own live set)
+            jobs += [(b, k) for k in sorted({0, k0} | {min(n, int(round(2 ** (j / COVER_GRID))))
+                                                      for j in range(0, int(COVER_GRID * math.log2(n)) + 2)})]
         thr = lambda b, k: float(vs[b][k - 1]) if k > 0 else float("inf")  # noqa: E731
         curves = [[] for _ in ts]
         for a in range(0, len(jobs), COVER_ROWS):
@@ -761,7 +790,33 @@ def cover_batch(mk: Masked, ids: list, ts: list, lp_full: torch.Tensor, log=None
             kl = _kl(lpf[rows], mk.logp(x[:1].expand(len(part), -1), mn, mh, pos[rows]))
             for (b, k), z in zip(part, kl.tolist()):
                 curves[b].append([k, z])
-        at = [{str(bd): next((k for k, z in c if z <= bd), None) for bd in COVER_BOUNDS} for c in curves]
+        def measure(jobs):
+            res = []
+            for a in range(0, len(jobs), COVER_ROWS):
+                part = jobs[a:a + COVER_ROWS]
+                mn = torch.stack([(th_n[b] >= thr(b, k)).float() * live[b] for b, k in part])
+                mh = torch.stack([(th_h[b] >= thr(b, k)).float() * live[b] for b, k in part])
+                rows = torch.tensor([b for b, _ in part], device=mk.dev)
+                res += _kl(lpf[rows], mk.logp(x[:1].expand(len(part), -1), mn, mh, pos[rows])).tolist()
+            return res
+        brk = {}                                    # (target, bound) -> [failing k, passing k]: the first crossing
+        for b, c in enumerate(curves):
+            c.sort()
+            for bd in COVER_BOUNDS:
+                j = next((j for j, (k, z) in enumerate(c) if z <= bd), None)
+                if j is not None and j > 0:
+                    brk[(b, bd)] = [c[j - 1][0], c[j][0]]
+        for _ in range(COVER_BISECT):               # (halvings in lockstep over targets and bounds)
+            live_ = [(key, (lo + hi) // 2) for key, (lo, hi) in brk.items() if hi - lo > 1]
+            if not live_:
+                break
+            for (key, mid), z in zip(live_, measure([(key[0], mid) for key, mid in live_])):
+                curves[key[0]].append([mid, z])
+                brk[key][1 if z <= key[1] else 0] = mid
+        for c in curves:
+            c.sort()
+        at = [{str(bd): (brk[(b, bd)][1] if (b, bd) in brk else next((k for k, z in c if z <= bd), None)) for bd in COVER_BOUNDS}
+              for b, c in enumerate(curves)]
         rnd_rows = []                               # (the random control at the 0.1 bound: the same count per kind, layer
         for b, t in enumerate(ts):                  # and position, other units)
             k1 = at[b].get("0.1")
@@ -787,7 +842,9 @@ def cover_batch(mk: Masked, ids: list, ts: list, lp_full: torch.Tensor, log=None
             k1 = at[b].get("0.1")
             sn = (th_n[b] >= thr(b, k1))[:, :t + 1] if k1 else None
             sh = (th_h[b] >= thr(b, k1))[:, :t + 1] if k1 else None
+            k0 = int((th_n[b, :, :t + 1] > 0).sum() + (th_h[b, :, :t + 1] > 0).sum())
             out.append({"t": t, "token": ids[t], "next": ids[t + 1] if t + 1 < len(ids) else None, "units_total": n_units[b],
+                        "k_mask": k0, "kl_mask": next((z for k, z in curves[b] if k == k0), None),
                         "kl_empty": curves[b][0][1], "k": at[b], "kl_random_at_0.1": rnd.get(b), "curve": curves[b],
                         "at_0.1": None if sn is None else {
                             "neurons": int(sn.sum()), "heads": int(sh.sum()), "same_position": int(sn[:, t].sum() + sh[:, t].sum()),
@@ -1001,6 +1058,9 @@ def main():
         res = r3(abl, tok, rec, q, keys.get(rec.get("task") or q.get("task"), []), a.draws, a.random)
         dst.write_text(json.dumps(res))
         s = res["summary"]
+        if res.get("error"):
+            log(f"{rec.get('id')}: {res['error']}")
+            continue
         log(f"{rec.get('id')}: {res['size']['units']} units; own ce {s['own']['circuit']['ce']:.2f} (empty "
             f"{s['own']['empty']['ce']:.2f}, full {s['own']['full']['ce']:.2f}), kl {s['own']['circuit']['kl']:.2f}"
             + (f"; held-out {s['heldout']['n']} ce {s['heldout']['circuit']['ce']:.2f} random {s['heldout']['random']['ce']:.2f}"

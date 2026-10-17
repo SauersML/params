@@ -27,6 +27,7 @@ import argparse
 import collections
 import json
 import random
+import re
 import time
 import zlib
 from pathlib import Path
@@ -82,9 +83,27 @@ def rewrite(e: dict, how: str, donor: dict | None = None) -> dict:
     return e
 
 
+def anonymise(e: dict) -> dict:
+    """The text's groups renamed U1..Un in their shown order (no shared id, no layer): a unit is told apart only by its
+    vector, so names alone carry nothing about any unit."""
+    e = json.loads(json.dumps(e))
+    names = [b["label"].split(",")[0].split(" ")[0] for b in e["blocks"] if "write" in b]
+    ren = {g: f"U{k}" for k, g in enumerate(names, 1)}
+    sub = lambda t: re.sub(r"\bG\d+\b", lambda m: ren.get(m.group(0), m.group(0)), t)  # noqa: E731
+    for b in e["blocks"]:
+        if "write" in b:
+            b["label"] = ren[b["label"].split(",")[0].split(" ")[0]] + ", " + b["label"].split(", ")[-1]
+    e["q"], e["a"] = sub(e["q"]), sub(e["a"])
+    e["claim"] = {**e["claim"], "units": [ren.get(u, u) for u in e["claim"]["units"]]}
+    e["groups"] = {ren.get(g, g): us for g, us in e.get("groups", {}).items()}
+    return e
+
+
 def build(a) -> None:
     rows = [json.loads(x) for f in a.examples for x in f.read_text().splitlines() if x.strip()]
     rows = [{**r, **({"inject": a.inject} if a.inject else {})} for r in rows if any("write" in b for b in r["blocks"])]
+    if a.anon:
+        rows = [anonymise(r) for r in rows]
     ctxs = sorted({r["text"] for r in rows})
     held = {c for c in ctxs if zlib.crc32(str(c).encode()) % 100 < HELD * 100}
     train = [r for r in rows if r["text"] not in held]
@@ -119,7 +138,7 @@ def build(a) -> None:
     kinds = collections.Counter(r["cat"] for r in bal)
     nclass = {c: len({answer_class(r) for r in bal if r["cat"] == c}) for c in kinds}
     claim = {**CLAIM, "written": time.strftime("%Y-%m-%d %H:%M:%S %Z"), "held_contexts": len(held), "train_contexts": len(ctxs) - len(held),
-             "chance": round(sum(n / nclass[c] for c, n in kinds.items()) / len(bal), 3), "inject": a.inject or "ao",
+             "chance": round(sum(n / nclass[c] for c, n in kinds.items()) / len(bal), 3), "inject": a.inject or "ao", "anonymised": a.anon,
              "held_questions": len(bal), "train_questions": len(train),
              "classes": {f"{c}/{k}": n for (c, k), n in collections.Counter((r["cat"], answer_class(r)) for r in bal).items()}}
     (a.out / "claim.json").write_text(json.dumps(claim, indent=1))
@@ -149,6 +168,7 @@ def main():
     b.add_argument("examples", type=Path, nargs="+")
     b.add_argument("--out", type=Path, required=True)
     b.add_argument("--inject", choices=("native",), help="writes added at their own layer, unnormalized (cao.Oracle.native_plan)")
+    b.add_argument("--anon", action="store_true", help="groups renamed U1..Un per text: only the vectors tell units apart")
     s = sub.add_parser("score")
     s.add_argument("out", type=Path)
     a = ap.parse_args()

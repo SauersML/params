@@ -50,6 +50,18 @@ git fetch -q origin main && rm -rf "$S" "$S.tar" && mkdir -p "$S" && git archive
 [ -n "${REPLAY:-}" ] && cp "$REPLAY" "$S/replay.jsonl"
 [ -n "${E1:-}" ] && mkdir -p "$S/e1" && cp "$E1/behavior_e1.json" "$E1/probe_battery.json" "$S/e1/" && cp -r "$E1/adapters" "$S/e1/adapters"
 COPYFILE_DISABLE=1 tar -cf "$S.tar" -C "$S" . && rm -rf "$S"
+RCMISMATCH=""  # the T-mismatch arm's training, when RC_ORACLES names it
+case " ${RC_ORACLES:-T-correct T-mismatch T0} " in *" T-mismatch "*)
+  RCMISMATCH="python -u mix.py $O/rc/mix_mismatch.jsonl $O/rc/train_mismatch.jsonl --replay $S/replay.jsonl --share ${SHARE:-0.4} >> $O/mix.log 2>&1; \
+CAO_MICRO=${MICRO:-1} python -u cao.py train --data $O/rc/mix_mismatch.jsonl --out $O/ad_mismatch --steps ${STEPS:-0} --save-every ${STEPS:-0} > $O/train_mismatch.log 2>&1;" ;;
+esac
+RCEVALS=""  # the circuit-reading test's evaluations: oracles x inputs (RC_ORACLES, RC_INPUTS)
+for orc in ${RC_ORACLES:-T-correct T-mismatch T0}; do
+  case $orc in T-correct) ad="$O/ad_correct/step_${STEPS:-0}" ;; T-mismatch) ad="$O/ad_mismatch/step_${STEPS:-0}" ;; *) ad=$AOAD ;; esac
+  for how in ${RC_INPUTS:-correct names mismatch none}; do
+    RCEVALS="${RCEVALS}python -u g2.py eval --items $O/rc/test_$how.jsonl --thr $S/thr.pt --adapter $ad --out $O/rc/eval_${orc}_$how.jsonl > $O/rc/eval_${orc}_$how.log 2>&1; "
+  done
+done
 case $MODE in
   gen) WORK=""; for k in $(seq 1 ${PROCS:-2}); do
          WORK="$WORK (python -u cao.py gen --out $O/examples_$k.jsonl --texts $(( ${TEXTS:-100} / ${PROCS:-2} )) --seed $k > $O/gen_$k.log 2>&1) &"
@@ -75,22 +87,9 @@ ${E1:+python -u e1.py battery --dir $S/e1/behavior_e1.json --battery $S/e1/probe
   readscirc) WORK="mkdir -p $O/rc && cp $S/rc/test_correct.jsonl $S/rc/test_names.jsonl $S/rc/test_mismatch.jsonl $S/rc/test_none.jsonl \
 $S/rc/train_correct.jsonl $S/rc/train_mismatch.jsonl $S/rc/claim.json $O/rc/; \
 python -u mix.py $O/rc/mix_correct.jsonl $O/rc/train_correct.jsonl --replay $S/replay.jsonl --share ${SHARE:-0.4} > $O/mix.log 2>&1; \
-python -u mix.py $O/rc/mix_mismatch.jsonl $O/rc/train_mismatch.jsonl --replay $S/replay.jsonl --share ${SHARE:-0.4} >> $O/mix.log 2>&1; \
 CAO_MICRO=${MICRO:-1} python -u cao.py train --data $O/rc/mix_correct.jsonl --out $O/ad_correct --steps $STEPS --save-every $STEPS > $O/train_correct.log 2>&1; \
-CAO_MICRO=${MICRO:-1} python -u cao.py train --data $O/rc/mix_mismatch.jsonl --out $O/ad_mismatch --steps $STEPS --save-every $STEPS > $O/train_mismatch.log 2>&1; \
-python -u g2.py eval --items $O/rc/test_correct.jsonl --thr $S/thr.pt --adapter $O/ad_correct/step_$STEPS --out $O/rc/eval_T-correct_correct.jsonl > $O/rc/eval_T-correct_correct.log 2>&1; \
-python -u g2.py eval --items $O/rc/test_names.jsonl --thr $S/thr.pt --adapter $O/ad_correct/step_$STEPS --out $O/rc/eval_T-correct_names.jsonl > $O/rc/eval_T-correct_names.log 2>&1; \
-python -u g2.py eval --items $O/rc/test_mismatch.jsonl --thr $S/thr.pt --adapter $O/ad_correct/step_$STEPS --out $O/rc/eval_T-correct_mismatch.jsonl > $O/rc/eval_T-correct_mismatch.log 2>&1; \
-python -u g2.py eval --items $O/rc/test_none.jsonl --thr $S/thr.pt --adapter $O/ad_correct/step_$STEPS --out $O/rc/eval_T-correct_none.jsonl > $O/rc/eval_T-correct_none.log 2>&1; \
-python -u g2.py eval --items $O/rc/test_correct.jsonl --thr $S/thr.pt --adapter $O/ad_mismatch/step_$STEPS --out $O/rc/eval_T-mismatch_correct.jsonl > $O/rc/eval_T-mismatch_correct.log 2>&1; \
-python -u g2.py eval --items $O/rc/test_names.jsonl --thr $S/thr.pt --adapter $O/ad_mismatch/step_$STEPS --out $O/rc/eval_T-mismatch_names.jsonl > $O/rc/eval_T-mismatch_names.log 2>&1; \
-python -u g2.py eval --items $O/rc/test_mismatch.jsonl --thr $S/thr.pt --adapter $O/ad_mismatch/step_$STEPS --out $O/rc/eval_T-mismatch_mismatch.jsonl > $O/rc/eval_T-mismatch_mismatch.log 2>&1; \
-python -u g2.py eval --items $O/rc/test_none.jsonl --thr $S/thr.pt --adapter $O/ad_mismatch/step_$STEPS --out $O/rc/eval_T-mismatch_none.jsonl > $O/rc/eval_T-mismatch_none.log 2>&1; \
-python -u g2.py eval --items $O/rc/test_correct.jsonl --thr $S/thr.pt --adapter $AOAD --out $O/rc/eval_T0_correct.jsonl > $O/rc/eval_T0_correct.log 2>&1; \
-python -u g2.py eval --items $O/rc/test_names.jsonl --thr $S/thr.pt --adapter $AOAD --out $O/rc/eval_T0_names.jsonl > $O/rc/eval_T0_names.log 2>&1; \
-python -u g2.py eval --items $O/rc/test_mismatch.jsonl --thr $S/thr.pt --adapter $AOAD --out $O/rc/eval_T0_mismatch.jsonl > $O/rc/eval_T0_mismatch.log 2>&1; \
-python -u g2.py eval --items $O/rc/test_none.jsonl --thr $S/thr.pt --adapter $AOAD --out $O/rc/eval_T0_none.jsonl > $O/rc/eval_T0_none.log 2>&1; \
-python -u reads_circuit.py score $O/rc > $O/rc_score.txt 2>&1" ;;
+$RCMISMATCH \
+${RCEVALS}python -u reads_circuit.py score $O/rc > $O/rc_score.txt 2>&1" ;;
   lipatch) WORK="python -u li_patch.py --repo $S/ii --adapter $AOAD ${ADAPTER_DIR:+--adapter $S/adapter} --out $O/li.jsonl --n ${NITEMS:-3200} > $O/li.log 2>&1" ;;
   g2rec) WORK="python -u g2.py gen --out $O/g2.jsonl --thr $S/thr.pt --texts 100000 --records $S/records ${GROUPS:+--groups $S/groups} ${DENSE:+--dense} > $O/g2.log 2>&1" ;;
   inference) WORK="python -u inference.py build --out $O/inference_items.jsonl --per ${PER:-150} > $O/inference.log 2>&1" ;;

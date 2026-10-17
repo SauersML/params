@@ -12,8 +12,9 @@ Per record (an arm's circuit C(x) for question x) and up to KEYS unseen keys r (
 question's own template with another key of its task, skipping the record's corrupted and selection keys):
   C(r)    the same arm (its steps and constants) run on r's prompt against the record's own corrupted prompt; a
           multi-partner arm's partners are other pool keys of the task, never x's key or a tested key
-  shares  on the pair (x, r), per cut: C(x)'s units (circuit_robust's resampled test), C(x) u C(r)'s, and as many random
-          units at the union's (layer, position) slots (seeded), each noised and denoised
+  shares  on the pair (x, r), per cut: C(x)'s units (circuit_robust's resampled test), C(x) u C(r)'s, as many random
+          units at the union's (layer, position) slots (seeded), and C(x) u C(r') with r' another tested key (the
+          mismatched union: a gain from more units rather than from r's own), each noised and denoised
   passes  a cut passes on r when both shares reach PASS; over keys, when the mean shares do
 
   circuit_aggregate.py RECORDS_DIR DEVSET OUT --arm mask:30 [--pool QUESTIONS.json ...] [--keys 3] [--limit N]
@@ -89,13 +90,16 @@ def check(pts: list, tok, rec: dict, q: dict, pool: dict, arm: str, keys: int = 
     own = {c: cr.cut_units(rec, c)[0] for c in CUTS if c in rec.get("cuts", {})}
     rng = np.random.default_rng(zlib.crc32(rec["id"].encode()))
     out = {"id": rec["id"], "arm": arm, "pairs": []}
+    found = []                                      # (each tested key's own circuit first: the mismatched control uses another's)
     for r, ids_r in rs:
         cands = sorted(k for k in pool.get(task, ()) if k not in banned)
         np.random.default_rng(zlib.crc32(f"{rec['id']}|{r}".encode())).shuffle(cands)
         part = [x for x in (cf.chat(tok, user.replace(key, k), system) + pre for k in cands) if len(x) == len(clean)]
         t0 = time.perf_counter()
         rec_r = {**circuit_of(pts[:-1], ids_r, corrupt, part[:2 * npart], arm), "ids": ids_r}
-        secs = time.perf_counter() - t0
+        found.append((r, ids_r, rec_r, time.perf_counter() - t0))
+    for n_r, (r, ids_r, rec_r, secs) in enumerate(found):
+        other = found[(n_r + 1) % len(found)][2] if len(found) > 1 else None
         info = pt.setup(clean, ids_r, explicit_sets=cr.token_sets(rec))
         if not info["valid"] or info["same_answer"] or info["gap"] < cf.MIN_GAP or rec_r.get("skipped"):
             continue
@@ -103,10 +107,12 @@ def check(pts: list, tok, rec: dict, q: dict, pool: dict, arm: str, keys: int = 
         for c, units in own.items():
             theirs = cr.cut_units(rec_r, c)[0] if c in rec_r.get("cuts", {}) else []
             union = list(dict.fromkeys(list(units) + list(theirs)))
-            sets = [units, union, random_like(union, pt, rng)]
+            wrong = list(dict.fromkeys(list(units) + list(cr.cut_units(other, c)[0] if other and c in other.get("cuts", {}) else [])))
+            sets = [units, union, random_like(union, pt, rng), wrong]
             got = pt.both([s if s else [] for s in sets])
             row["cuts"][c] = {"n_own": len(units), "n_union": len(union), "own": list(got[0]) if units else None,
-                              "union": list(got[1]) if union else None, "random": list(got[2]) if union else None}
+                              "union": list(got[1]) if union else None, "random": list(got[2]) if union else None,
+                              "n_mismatched": len(wrong), "mismatched": list(got[3]) if other and wrong else None}
         out["pairs"].append(row)
     pt.setup(clean, corrupt, explicit_sets=cr.token_sets(rec))
     out["cuts"] = {}
@@ -115,8 +121,8 @@ def check(pts: list, tok, rec: dict, q: dict, pool: dict, arm: str, keys: int = 
         if not rows:
             continue
         summ = {}
-        for which in ("own", "union", "random"):
-            v = [x[which] for x in rows if x[which] is not None]
+        for which in ("own", "union", "random", "mismatched"):
+            v = [x.get(which) for x in rows if x.get(which) is not None]
             m = [float(np.mean([a for a, _ in v])), float(np.mean([b for _, b in v]))] if v else None
             summ[which] = {"mean": m, "passes": bool(m and m[0] >= PASS and m[1] >= PASS)}
         summ["keys"] = len(rows)
@@ -131,11 +137,11 @@ def summarize(rows: list) -> dict:
     for c in CUTS:
         xs = [r["cuts"][c] for r in rows if c in r.get("cuts", {})]
         if xs:
-            s[c] = {"n": len(xs), **{w: sum(x[w]["passes"] for x in xs) for w in ("own", "union", "random")},
+            s[c] = {"n": len(xs), **{w: sum(x[w]["passes"] for x in xs if w in x) for w in ("own", "union", "random", "mismatched")},
                     "median_union_n": float(np.median([p["cuts"][c]["n_union"] for r in rows for p in r["pairs"] if c in p["cuts"]]))}
     full = [r for r in rows if r.get("cuts")]
-    s["question"] = {"n": len(full), **{w: sum(all(x[w]["passes"] for x in r["cuts"].values()) for r in full)
-                                        for w in ("own", "union", "random")}}
+    s["question"] = {"n": len(full), **{w: sum(all(x.get(w, {}).get("passes") for x in r["cuts"].values()) for r in full)
+                                        for w in ("own", "union", "random", "mismatched")}}
     return s
 
 
@@ -176,7 +182,8 @@ def main():
         rows.append(row)
         print(f"{time.time() - t0:7.1f}s {rec['id']}: {len(row['pairs'])} keys; " + ", ".join(
             f"{c} own {'P' if x['own']['passes'] else '-'} union {'P' if x['union']['passes'] else '-'} "
-            f"random {'P' if x['random']['passes'] else '-'}" for c, x in row["cuts"].items()), flush=True)
+            f"mismatched {'P' if x['mismatched']['passes'] else '-'} random {'P' if x['random']['passes'] else '-'}"
+            for c, x in row["cuts"].items()), flush=True)
     s = summarize(rows)
     (a.out / "summary.json").write_text(json.dumps({"arm": a.arm, "records": str(a.records), "summary": s}, indent=1))
     print(json.dumps(s, indent=1))

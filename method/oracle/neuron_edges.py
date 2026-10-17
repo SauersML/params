@@ -65,6 +65,8 @@ BITS = tuple(round(2 ** (-i / 2), 4) for i in range(20))  # or each reader's err
 # first-order contrast (gradient x activation x relative error): 1 to 0.0014
 MEASURED = 512  # kept edges whose own cut from the graph is measured (those of largest first-order weight)
 HALVE_BLOCKS = 8
+HALVE_FORWARDS = 8  # halving's forwards at most (then its graph stands: every cut in it measured; Qwen3-8B dev circuits of
+# ~190 neurons took 20-42 halving forwards, 4.4-8.9 s of a 9-16 s prune; under ~50 neurons 2-11)
 TOKENS = 1536  # cut sets a forward: this many tokens' worth (at least 16 sets)
 PAD = "shapes"  # a lower precision model's forwards: "B", each padded to B sets (every contrast at one batch shape);
 # "shapes", each padded to the next of SHAPES (or B) with an uncut set of its own, every set's contrast read against
@@ -757,7 +759,9 @@ def prune(ed: Edges, log=print) -> dict:
     queue = [list(b) for b in torch.tensor(readers, dtype=torch.long).tensor_split(min(HALVE_BLOCKS, len(readers)))
              if len(b)] if len(readers) > 1 else []
     pending = None  # (the last round's passing blocks, gone with all of them cut): checked in the next round's forward
-    while queue or pending:  # halving over readers' in-edge groups, a forward's blocks a round: each block's groups cut
+    f_start = ed.forwards
+    while (queue or pending) and ed.forwards - f_start < HALVE_FORWARDS:  # halving over readers' in-edge groups, a
+        # forward's blocks a round: each block's groups cut
         blocks, queue = queue[:ed.B], queue[ed.B:]  # alone, the passing ones together (that check rides in the next
         on = pending[1] if pending else gone  # round's forward, the round's blocks tried as if it passes)
         trial = []
@@ -793,6 +797,7 @@ def prune(ed: Edges, log=print) -> dict:
             pending = (passed, t)
         queue = [list(h) for b, c in zip(blocks, cs) if not ok(c) and len(b) > 1
                  for h in torch.tensor(b).tensor_split(2)] + queue
+    stopped = bool(queue or pending)  # (HALVE_FORWARDS reached: readers' groups left untried)
     keep = (~gone).nonzero().flatten()
     t_halve = time.time() - t0 - t_local - t_eps
     f_halve = ed.forwards
@@ -830,7 +835,8 @@ def prune(ed: Edges, log=print) -> dict:
            "allowance": list(allow[pick][:2]),
            "candidates": {"resid": len(ed.resid_all), "route": ed.n_routes,
                           "in_edges_listed": sum(len(c[0]) for c in cands)},
-           "kept": len(keep), "kept_before_halving": before, "readers": len(readers), "measured": measured,
+           "kept": len(keep), "kept_before_halving": before, "halving_stopped": stopped, "readers": len(readers),
+           "measured": measured,
            "forwards": {"errors": f_eps, "halving": f_halve - f_eps, "last": ed.forwards - f_halve}, "sets_a_forward": ed.B,
            "seconds": {"local": round(t_local, 2), "errors": round(t_eps, 2), "halving": round(t_halve, 2),
                        "total": round(time.time() - t0, 2)}}

@@ -49,11 +49,10 @@ class Batches:
             its = [e for e in enc if e["kind"] == kind]
             for i in range(0, len(its), bs):
                 b = its[i:i + bs]
-                tp, lp = N.pad([e["pos"] for e in b], model.device)
-                tn, ln = N.pad([e["neg"] for e in b], model.device)
+                toks, last = N.pad([e["pos"] for e in b] + [e["neg"] for e in b], model.device)   # one length
                 tok = torch.tensor([e["tok"] for e in b], device=model.device)
                 alt = torch.tensor([e["alt"] for e in b], device=model.device)
-                self.groups.append((kind, torch.cat([tp, tn]), torch.cat([lp, ln]), tok, alt, len(b)))
+                self.groups.append((kind, toks, last, tok, alt, len(b)))
         self.n = sum(g[-1] for g in self.groups)
 
 

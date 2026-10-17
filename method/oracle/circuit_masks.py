@@ -552,6 +552,10 @@ def main():
     ap.add_argument("--cases", default="santa,preeclampsia", help="cases: circuit_finder's CASES or CHAT_CASES")
     ap.add_argument("--word", default=None, help="cases: taboo's secret word")
     ap.add_argument("--adapter", default=None, help="a PEFT adapter on the model (an organism)")
+    ap.add_argument("--tokenizer", default=None, help="the tokenizer and chat template (default: the model's; an AuditBench "
+                    "adapter ships its own, as circuit_finder --tokenizer)")
+    ap.add_argument("--system", default=None, help="a system prompt before each user turn (a question's own \"system\" "
+                    "wins; as circuit_finder --system)")
     ap.add_argument("--merge", action="store_true", help="the adapter merged into the weights (an organism at the base "
                     "model's speed, as circuit_finder --merge)")
     ap.add_argument("--arm", default="mask", help="comma-separated arms (mask, group, attr, am, fam), each question through every arm in "
@@ -573,9 +577,10 @@ def main():
     ap.add_argument("--prior", default=None, help="fam: a directory of circuit_finder records; a question's prior is its "
                     "task's records other than its own")
     a = ap.parse_args()
+    cf._threads()
     out = Path(a.out if a.mode == "questions" else a.inp)
     out.mkdir(parents=True, exist_ok=True)
-    tok = AutoTokenizer.from_pretrained(a.model)
+    tok = AutoTokenizer.from_pretrained(a.tokenizer or a.model)
     if a.dtype == "auto":
         from transformers import AutoConfig
 
@@ -606,7 +611,8 @@ def main():
         if a.ids:
             want = set(json.loads(Path(a.ids).read_text()))
             qs = [q for q in qs if q["id"] in want]
-        pairs = [(q, cf.chat(tok, q["user"]) + pre(q), cf.chat(tok, q["corrupt_user"]) + pre(q)) for q in qs]
+        sy = lambda q: q.get("system", a.system)  # noqa: E731
+        pairs = [(q, cf.chat(tok, q["user"], sy(q)) + pre(q), cf.chat(tok, q["corrupt_user"], sy(q)) + pre(q)) for q in qs]
         others = {}                                 # (other corrupted prompts of each question, its partners')
         for q, clean, _ in pairs:
             users = {}
@@ -615,12 +621,12 @@ def main():
                     users[p["key"]] = p["user"]
                 elif q["user"].count(q["key"]) == 1:
                     users[p] = q["user"].replace(q["key"], p)
-            ids = [(k, cf.chat(tok, u) + pre(q)) for k, u in users.items() if k != q.get("corrupt_key")]
+            ids = [(k, cf.chat(tok, u, sy(q)) + pre(q)) for k, u in users.items() if k != q.get("corrupt_key")]
             others[q["id"]] = [(k, x) for k, x in ids if len(x) == len(clean)][:maxp - 1]
     else:
         pairs = []
         for name in a.cases.split(","):
-            got = cf.chat_pairs(tok, name, a.word) if name in cf.CHAT_CASES else cf.case_pairs(tok, name)
+            got = cf.chat_pairs(tok, name, a.word, a.system) if name in cf.CHAT_CASES else cf.case_pairs(tok, name)
             for j, (c, k, text, ans) in enumerate(got):
                 qid = f"{name}_{a.word}_{j}" if a.word else f"{name}_{j}"
                 answers[qid] = ans
@@ -646,7 +652,8 @@ def main():
     def write(arm, q, clean, corrupt, rec):
         rec.update(id=q["id"], ids=clean, corrupted=corrupt, answer_text=tok.decode([rec["answer"]]),
                    corrupt_answer_text=tok.decode([rec["corrupt_answer"]]), model=a.model, dtype=a.dtype, adapter=a.adapter,
-                   finder="circuit_masks", finder_rev=a.rev,
+                   finder="circuit_masks", finder_rev=a.rev, tokenizer=a.tokenizer or a.model, system=a.system,
+                   merged=bool(a.adapter and a.merge),
                    **{k: q[k] for k in ("user", "corrupt_user", "task", "key", "corrupt_text", "prefill") if k in q})
         (out / _dir(arm) / f"{q['id'].replace('/', '__')}.json").write_text(json.dumps(rec))
 

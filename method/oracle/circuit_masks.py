@@ -97,10 +97,12 @@ MASK_MERGE = 192    # a mask step's forward costs as many tokens' work (Qwen3-8B
 # forward and backward, ~0.5 ms of compute a token): instances of near first positions share one (_passes)
 FLOOR = True        # a cut's sets are taken at its bar, in reduced precision PASS plus the largest |share| of a no-op
 # patch of the first layer's units at each of its positions (_before_steps)
-GRAPH = True        # a round's mask steps after the first GRAPH_WARM replayed from one CUDA graph (the same kernels each
-GRAPH_WARM = 2      # step), the warm steps' cache and the graph's pool freed around it. Qwen3-8B on an A6000 (6aa938e9):
-# am without partners 1.005 -> 0.961 s a question (64 dev questions, batches of 16), one question at a time mask arm
-# 4.78 -> 3.68 s median; mask arm with 4 partners 5.17 s a question with graphs (48 questions, no memory error)
+GRAPH = False       # True: a round's mask steps after the first GRAPH_WARM replayed from one CUDA graph (the same kernels
+GRAPH_WARM = 2      # each step), the warm steps' cache and the graph's pool freed around it. Qwen3-8B on an A6000
+# (6aa938e9): am without partners 1.005 -> 0.961 s a question (64 dev questions, batches of 16), one question at a time mask
+# arm 4.78 -> 3.68 s median. Off since 10-17: replays hit "an illegal memory access" in jobs without partners too (searchalgo:
+# mask:30:init=3 on an A5000 at 058d8d45; the default arm's partner-less questions on an A40 at 28c5d6a, GRAPH_SIDE 1),
+# which ends the whole run, against a 4-23% faster step
 FAMILY_MIN_KEYS = 4  # a template's own mover union when it has this many train records, else its task's (family_heads)
 FAMILY_FREQ = 0.1    # heads of at least this frequency among the union's records (0: every head). Qwen3-8B, generality's
 # dev half (100 questions, circuit_bench at d9f4e1d, A40): unseen pairs own circuit 44/89, own + as many random same-layer

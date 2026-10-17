@@ -48,12 +48,19 @@ own pairs 49/50, 31 units (the lead's 10-17 decision: the default for generalizi
             units than the set (redundancy), noising the set alone cannot remove it, so the source claim is sufficiency
 --pool QUESTIONS.json: partner keys drawn from that set's keys of the question's task (a seeded order per question),
 not from the question's own "partners", which then stay held out for the scorecard's unseen pairs.
+One prompt (ONE_PROMPT, mask:one_prompt=1:partners=16:agg=mean): no comparison prompt; the clean prompt is run with each
+cut's units outside the circuit set to their values on other keys of the template (the question's pairs, Resampled), and
+the circuit is the fewest units that keep the answer's lead over a rival token (CONTRAST) at PASS of the full model's;
+BACKGROUND "mean" resamples from the keys' per-position mean instead.
 
   circuit_masks.py questions QUESTIONS.json OUT --arm mask [--split dev --stride 4] [--model Qwen/Qwen3-8B] [--dtype ...]
 writes OUT/<id>.json per question.
+  circuit_masks.py resampled RECORDS OUT --devset QUESTIONS.json [--contrast resampled|runner]
+tests any finder's records by one prompt's criterion on each question's held-out partner keys (resampled_check).
 """
 from __future__ import annotations
 
+import copy
 import itertools
 import json
 import math
@@ -136,6 +143,18 @@ ADV_MODES = "unit"  # the check's adversaries joined by "+": unit, block, random
 AGG = "min"         # a Mean's shares: "min", the least over its pairs (a set passes only when every pair does), or "mean"
 SOURCE_NECESSITY = 1  # 0: the source cut is chosen and taken on its restored share only (no lost hinge, no lost bar):
                       # a small set of a redundantly carried key is sufficient, not necessary (design 11a)
+ONE_PROMPT = 0      # 1: one prompt (the lead's 10-17, from the user: a circuit should not need a second prompt; arm
+# constant one_prompt=1 with partners=16): the question's clean prompt alone is run, each cut's units outside the circuit
+# set to their values on other keys of its template (its pairs' corrupted prompts: the question's own and its partners,
+# Resampled), the circuit's units computed; the circuit is the fewest units for which the answer's lead over CONTRAST's
+# rival stays at least PASS of the full model's (AGG over the resampled keys). Its cut's "restored" is that share of the
+# lead, its "lost" the share lost with the circuit's units alone resampled (reported, no bar); a cut is reachable when
+# resampling all of it loses at least PASS of the lead
+CONTRAST = "resampled"  # one prompt's rival token: "resampled", the top token other than the answer on each resampled
+# prompt (a BACKGROUND "mean" Patcher: the commonest of those); "runner", the full model's runner-up on the clean prompt
+RESAMPLE_CHECK = 16  # resampled mode: held-out keys a record is tested on (each question's partners of its prompt's length)
+BACKGROUND = "keys"  # one prompt: "keys", each resampled key's own values (the shares' AGG over the keys); "mean", their
+# per-position mean (one background, _mean_patcher)
 
 
 def _blocks(units: list) -> list:
@@ -228,6 +247,8 @@ def optimize_many(jobs: list, steps: int = STEPS, log=None, init: list | None = 
             d = h.device
             r, p = ps["rows"][k].to(d), ps["pos"][k].to(d)
             m = ms[k][i].to(d, h.dtype)[ps["tix"][k].to(d)]                    # [2N, width]
+            if ONE_PROMPT:                          # (one prompt: m keeps; the clean row's rest takes the other run's)
+                m = torch.where((r % 2 == 0)[:, None], 1 - m, m)
             if rho:                                 # (the rest anywhere between the two runs: the adversary's rho)
                 m = m + (1 - m) * rho[k][i].to(d, h.dtype)[ps["tix"][k].to(d)]
             sel, o = h[r, p], ps["others"][k][i].to(d, h.dtype)
@@ -285,6 +306,8 @@ def optimize_many(jobs: list, steps: int = STEPS, log=None, init: list | None = 
             ms = {k: torch.sigmoid(t) * allow[k] if k in allow else torch.sigmoid(t) for k, t in theta.items()}
             c = contrast({k: (theta[k] > 0).to(m.dtype) + m - m.detach() for k, m in ms.items()} if hard else ms, rho)
             li, ri = (cc - c[0::2]) / gap, (c[1::2] - cr) / gap               # each pair's shares
+            if ONE_PROMPT:                          # (one prompt: the share of the lead the clean row keeps)
+                ri = 1 - li
             lost = torch.zeros(len(specs), device=dev).index_add(0, of, li) / count
             rest = torch.zeros(len(specs), device=dev).index_add(0, of, ri) / count
             size = sum(torch.zeros(len(specs), device=dev).index_add(0, owner[k], m.sum((0, 2))) for k, m in ms.items())
@@ -576,8 +599,76 @@ class Mean:
         self.pts = list(pts)
 
 
+class Resampled(Mean):
+    """One prompt's measurer of a cut (ONE_PROMPT): Patchers on the question's clean prompt against other keys (or one
+    BACKGROUND "mean" Patcher); a set's measurement is its pairs', each in the clean run: (the share of the lead lost with
+    the set resampled, the share kept with the rest of the cut resampled), the AGG over the pairs (drive's)."""
+
+    def __init__(self, pts: list, spec: dict):
+        super().__init__(pts)
+        self.spec = spec
+        p = self.pts[0]
+        self._width = {"neuron": p.D, "head": p.H}
+        self._all = {k: torch.arange(w) for k, w in self._width.items()}
+
+    def complement(self, s: list) -> list:
+        """The cut's units outside the set s, a block per (kind, layer, position) of the cut."""
+        used = {}
+        for u in s:
+            kind, i = u[0], int(u[1])
+            p, k = (u[3], u[2]) if kind == "head" else (u[2], u[3])
+            used.setdefault((kind, i, int(p)), []).append(k.numpy() if torch.is_tensor(k) else np.atleast_1d(np.asarray(k)))
+        out = []
+        for kind in _kinds_of(self.spec):
+            for i in range(self.pts[0].L):
+                for p in self.spec["positions"]:
+                    got = used.get((kind, i, p))
+                    if not got:
+                        out.append(cf.unit(kind, i, p, self._all[kind]))
+                        continue
+                    keep = np.ones(self._width[kind], dtype=bool)
+                    keep[np.concatenate(got).astype(np.int64)] = False
+                    if keep.any():
+                        out.append(cf.unit(kind, i, p, torch.from_numpy(np.nonzero(keep)[0])))
+        return out
+
+
 def _pts(meas) -> list:
     return list(meas.pts) if isinstance(meas, Mean) else [meas]
+
+
+def _one_prompt_sets(pt, partners: list) -> dict:
+    """One prompt's token sets on the question's pairs (pt and partners, one clean prompt): the answer, the clean run's
+    top token, against CONTRAST's rival, each pair's contrast its lead on the clean run over a zero baseline (c corrupt 0,
+    gap the lead), so a pair's shares are shares of the full model's lead."""
+    pts = [pt] + list(partners)
+    y = int(pt._lp["clean"].argmax())
+
+    def rival(lp):
+        v = lp.float().clone()
+        v[y] = -math.inf
+        return int(v.argmax())
+    tops = [rival(p._lp["corrupt"]) for p in pts if not getattr(p, "_mean", False)]
+    for p in pts:
+        t = (rival(pt._lp["clean"]) if CONTRAST == "runner" else max(set(tops), key=tops.count) if getattr(p, "_mean", False)
+             else rival(p._lp["corrupt"]))
+        p.sets, p._sets_dev, p.y = {**p.sets, "answer": [y], "alternatives": [t]}, None, y
+        cc = float(p._contrast(p._hn["clean"].to(p.core.lm_head.weight.device))[0])
+        p.c, p.gap = {"clean": cc, "corrupt": 0.0}, cc
+    return {"answer": y, "rivals": [p.sets["alternatives"][0] for p in pts], "lead_bits": [round(p.gap, 3) for p in pts],
+            "contrast": CONTRAST, "background": BACKGROUND, "keys": len(tops)}
+
+
+def _mean_patcher(pts: list):
+    """BACKGROUND "mean": a Patcher as pts[0] (one clean prompt) whose other run's neurons and heads are the per-position
+    means over pts' corrupted runs (the resampled keys)."""
+    m = copy.copy(pts[0])
+    cor = dict(pts[0].act["corrupt"])
+    for kk in ("neu", "head"):
+        cor[kk] = [torch.stack([p.act["corrupt"][kk][i].float() for p in pts]).mean(0).to(pts[0].act["corrupt"][kk][i].dtype)
+                   for i in range(pts[0].L)]
+    m.act, m._mean, m._group = {"clean": pts[0].act["clean"], "corrupt": cor}, True, None
+    return m
 
 
 class _Node:
@@ -674,6 +765,32 @@ def _serve(group, reqs: list, log=None) -> list:
         if isinstance(r[0], str):
             continue
         meas, method, *args = r
+        if isinstance(meas, Resampled):             # (one prompt: each set and its complement in the cut, clean runs)
+            if method == "both_without":
+                units = args[0]
+                js = list(range(len(units))) if len(args) < 2 or args[1] is None else list(args[1])
+                sets = [[u for i, u in enumerate(units) if i != j] for j in js]
+            elif method == "both_prefixes":
+                units, ks = args[0], list(args[1])
+                drops = list(args[2]) if len(args) > 2 and args[2] is not None else None
+                sets = [[u for i, u in enumerate(units[:kk]) if drops is None or i != drops[j]] for j, kk in enumerate(ks)]
+            elif method == "both" and (len(args) < 2 or args[1] is None):
+                sets = args[0]
+            else:
+                raise ValueError(f"drive: Resampled has no {method} (given)")
+            rows, plan = [], []
+            for s in sets:
+                if s and len(s[0]) > 4:             # (a probe's no-op set: its share both ways)
+                    plan.append(("probe", len(rows), len(rows)))
+                    rows.append(s)
+                    continue
+                comp = meas.complement(s)
+                plan.append(("set", len(rows) if comp else None, len(rows) + bool(comp) if s else None))
+                rows += ([comp] if comp else []) + ([s] if s else [])
+            a = len(calls)
+            calls += [("plain", pt, rows, ("clean",), None) for pt in meas.pts] if rows else []
+            spans[k] = (a, len(calls), ("resampled", plan))
+            continue
         if method == "both_without":
             units = args[0]
             js = list(range(len(units))) if len(args) < 2 or args[1] is None else list(args[1])
@@ -699,6 +816,12 @@ def _serve(group, reqs: list, log=None) -> list:
     for k, (a, b, method) in spans.items():
         per = got[a:b]                              # (each pair's; a Mean's: the means over its pairs, or with AGG "min"
         agg = np.min if AGG == "min" else np.mean   # the least of them)
+        if isinstance(method, tuple):               # (Resampled: per set (lost with it resampled, kept with the rest
+            sh = lambda p, i: float(p[i][0]) if i is not None else 0.0  # noqa: E731   # resampled); a probe: its share)
+            per = per or [None]
+            res[k] = [(float(agg([sh(p, s_) for p in per])),) * 2 if kind == "probe" else
+                      (float(agg([sh(p, s_) for p in per])), float(agg([1 - sh(p, c_) for p in per]))) for kind, c_, s_ in method[1]]
+            continue
         if method == "run":
             res[k] = [float(agg([p[i][0] for p in per])) for i in range(len(per[0]))]
         else:
@@ -762,7 +885,7 @@ def search_steps(pt, arm: str, log=None, steps: int = STEPS, prior: dict | None 
         names = [n for n in names if not st["out"][n]["met"] and not st["out"][n].get("diffuse")]
     out = yield from _finish_steps(st)
     src, movers = out.get("source", {}).get("units", []), out.get("movers", {}).get("units", [])
-    if src and movers:                              # (each mover's share of the source cut's effect, circuit_finder.find's:
+    if src and movers and not ONE_PROMPT:           # (each mover's share of the source cut's effect, circuit_finder.find's:
         a, b = yield [(pt, "run", "clean", [src + [u + ("clean",)] for u in movers]),     # the head frozen at its base
                       (pt, "run", "corrupt", [src + [u + ("corrupt",)] for u in movers])]  # run's value)
         out["movers"]["through"] = {u: (out["source"]["lost"] - x, out["source"]["restored"] - y) for u, x, y in zip(movers, a, b)}
@@ -781,9 +904,18 @@ def _before_steps(pt, arm: str, log=None, prior: dict | None = None, partners: l
     with their hinge targets; each cut's measurer ("meas": pt, or Mean over pt and partners for the source cut)."""
     specs = cuts_of(pt, wanted)
     meas = {n: pt for n in specs}
-    for n in [n for n in specs if ALLCUTS or n == "source"] if partners else []:
+    one = None
+    if ONE_PROMPT:                                  # (one prompt: every cut on the resampled keys, or their mean)
+        assert partners, "one prompt: partners (other keys of the template) to resample from"
+        one = _one_prompt_sets(pt, partners)
+        bg = [p for p in partners if getattr(p, "_mean", False)]
+        keys = [pt] + [p for p in partners if not getattr(p, "_mean", False)]
+        if "source" in specs:
+            specs["source"] = {**specs["source"], "positions": _source_positions(pt, min(p.first for p in keys))}
+        meas = {n: Resampled(bg or keys, specs[n]) for n in specs}
+    for n in [n for n in specs if ALLCUTS or n == "source"] if partners and not ONE_PROMPT else []:
         meas[n] = Mean([pt] + list(partners))
-    if isinstance(meas.get("source"), Mean):
+    if isinstance(meas.get("source"), Mean) and not ONE_PROMPT:
         specs["source"] = {**specs["source"], "positions": _source_positions(pt, min(p.first for p in meas["source"].pts))}
     names = list(specs)
     width = {"neuron": pt.D, "head": pt.H}
@@ -808,13 +940,15 @@ def _before_steps(pt, arm: str, log=None, prior: dict | None = None, partners: l
         if reach[n]:
             bars[n] = cf.PASS + min(max(pr) if all(math.isfinite(x) for x in pr) else 0.0, 1 - cf.PASS)
     scs = dict(zip(map(id, allp), got[len(names) * (2 if probe else 1):]))
+    for n in names if ONE_PROMPT else []:           # (one prompt: the claim is the share of the lead kept)
+        bars[n] = (-math.inf, bars[n])
     out, fam = {}, None
     live = [n for n in names if reach[n]]
     if family and "movers" in live:                 # (the template's mover union, whole, when it passes on the pair)
         units = [cf.unit("head", int(i), specs["movers"]["positions"][0], int(h)) for i, h in family]
         whole, alone = yield [(meas["movers"], "both", [_blocks(units)]), (meas["movers"], "both", [[u] for u in units])]
         lo, re_ = whole[0]
-        fam = {"heads": len(units), "own": [lo, re_], "taken": lo >= bars["movers"] and re_ >= bars["movers"]}
+        fam = {"heads": len(units), "own": [lo, re_], "taken": _ok((lo, re_), bars["movers"])}
         if fam["taken"]:
             out["movers"] = _record({"units": units, "singles": dict(zip(units, alone)), "met": True, "lost": lo, "restored": re_,
                                      "found": len(units), "curve": []}, ceil["movers"], True, specs["movers"]["positions"], {})
@@ -851,7 +985,7 @@ def _before_steps(pt, arm: str, log=None, prior: dict | None = None, partners: l
         bars["source"] = (-math.inf, bars["source"])
     two = lambda b: b if isinstance(b, tuple) else (b, b)  # noqa: E731
     return {"specs": specs, "names": names, "ceil": ceil, "reach": reach, "out": out, "masked": masked, "meas": meas,
-            "warm": warm, "family": fam, "bars": bars,
+            "warm": warm, "family": fam, "bars": bars, "one_prompt": one,
             "taus": {n: tuple(-1e9 if b == -math.inf else min(max(TAU, b + 0.05), max(b + 0.05, c - 0.05))
                               for c, b in zip(ceil[n], two(bars[n]))) for n in masked}}
 
@@ -944,9 +1078,13 @@ def _finish_steps(st: dict):
     if st.get("family") and "movers" in out:
         out["movers"]["family"] = st["family"]
     pc = [n for n in st["names"] if isinstance(st["meas"][n], Mean)]
-    each = yield [[(p, "both", [_blocks(out[n]["units"])]) for p in st["meas"][n].pts] if out[n]["units"] else [] for n in pc]
+    one = lambda m, p: Resampled([p], m.spec) if isinstance(m, Resampled) else p  # noqa: E731
+    each = yield [[(one(st["meas"][n], p), "both", [_blocks(out[n]["units"])]) for p in st["meas"][n].pts] if out[n]["units"] else []
+                  for n in pc]
     for n, e in zip(pc, each):                      # (each pair's shares of the cut; the record's lost and restored: means)
         out[n]["partners"] = {"pairs": len(st["meas"][n].pts), "shares": [list(x[0]) for x in e]}
+    for n in st["names"] if st.get("one_prompt") else []:
+        out[n]["one_prompt"] = st["one_prompt"]
     return out
 
 
@@ -959,7 +1097,8 @@ def _find_with(pt, clean, corrupt, answers, log, arm: str, cuts: dict, rec0: dic
     finally:
         if rec0 is not None:
             del pt.setup
-    extra = {k: {n: c[k] for n, c in cuts.items() if k in c} for k in ("attr", "mask", "partners", "adversarial", "family")}   # (find() copies its own fields
+    extra = {k: {n: c[k] for n, c in cuts.items() if k in c} for k in ("attr", "mask", "partners", "adversarial", "family",
+                                                                        "one_prompt")}   # (find() copies its own fields
     return {**rec, "search": arm, **{k: v for k, v in extra.items() if v}}                 # only)
 
 
@@ -1021,6 +1160,8 @@ def find_batch(pts: list, items: list, arm: str = "mask", steps: int = STEPS, lo
             r = next(got)
             if j in rec0s and r["valid"] and r["gap"] >= cf.MIN_GAP and not r["same_answer"]:
                 part[j].append(ppt)
+        if ONE_PROMPT and BACKGROUND == "mean" and j in rec0s:     # (one background: the keys' mean, a Patcher of its own)
+            part[j].append(_mean_patcher([pts[j]] + part[j]))
     for T, js in same_T.items():                    # (the pairs of one prompt length in lockstep)
         tag = (lambda j: (lambda s: log(f"[{j}] {s.lstrip()}"))) if log and len(items) > 1 else (lambda j: log)
         cuts = drive([pts[j] for j in js] + [p for j in js for p in part[j]],
@@ -1058,20 +1199,53 @@ def find(pt, clean: list[int], corrupt: list[int], answers=None, log=None, arm: 
     if not rec0["valid"] or rec0["gap"] < cf.MIN_GAP or rec0["same_answer"]:
         return {**cf._find(pt, clean, corrupt, answers, log=log, **kw), "search": arm}
     part = [ppt for (ppt, _), r in zip(cand, got) if r["valid"] and r["gap"] >= cf.MIN_GAP and not r["same_answer"]]
+    if ONE_PROMPT and BACKGROUND == "mean":
+        part.append(_mean_patcher([pt] + part))
     cuts = search_all(pt, arm, log=log, steps=steps, prior=prior, partners=part, wanted=cuts_wanted, family=family)
     rec = _find_with(pt, clean, corrupt, answers, log, arm, cuts, rec0=rec0, **kw)
     return {**rec, "seconds": round(time.perf_counter() - t0, 2)}
 
 
+def record_cut_units(rec: dict, name: str) -> list:
+    """A circuit_finder record's units of one cut: its nodes of that stage, and for the movers its routes."""
+    return ([cf.unit("neuron", x["layer"], x["pos"], x["neuron"]) for x in rec.get("nodes") or [] if x["stage"] == name]
+            + ([cf.unit("head", x["layer"], x["pos"], x["head"]) for x in rec.get("routes") or []] if name == "movers" else []))
+
+
+def resampled_check(pts: list, rec: dict, log=None) -> dict:
+    """A record's cuts by one prompt's test on other keys (pts: Patchers set up on its clean prompt against them, held
+    out from its search): per cut with units, each key's (lost, kept) shares of the lead with the cut's other units
+    resampled from that key (Resampled, CONTRAST's rival), the mean kept and whether it reaches PASS; the question passes
+    when every such cut does."""
+    one = _one_prompt_sets(pts[0], pts[1:])
+    names = [n for n in ("readout", "movers", "source") if n in (rec.get("cuts") or {}) and record_cut_units(rec, n)]
+    specs = {n: {**cuts_of(pts[0])[n], "positions": rec["cuts"][n]["searched"]} for n in names}
+
+    def ask():
+        return (yield [[(Resampled([p], specs[n]), "both", [record_cut_units(rec, n)]) for p in pts] for n in names])
+    got = drive(pts, [ask()])[0] if names else []
+    cuts = {}
+    for n, per in zip(names, got):
+        kept = [x[0][1] for x in per]
+        cuts[n] = {"size": len(record_cut_units(rec, n)), "kept": float(np.mean(kept)), "kept_min": float(np.min(kept)),
+                   "lost": float(np.mean([x[0][0] for x in per])), "per_key": [list(x[0]) for x in per],
+                   "passes": float(np.mean(kept)) >= cf.PASS}
+    if log:
+        log(f"  {rec.get('id')}: " + ", ".join(f"{n} {c['size']} kept {c['kept']:.2f}" for n, c in cuts.items()))
+    return {"id": rec.get("id"), "keys": len(pts), "one_prompt": one, "cuts": cuts, "passes": bool(cuts) and all(c["passes"] for c in cuts.values())}
+
+
 def main():
     import argparse
+    global CONTRAST
     import json
     from pathlib import Path
 
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("mode", choices=("questions", "cases"))
+    ap.add_argument("mode", choices=("questions", "cases", "resampled"), help="resampled: INP a records directory, scored by one "
+                    "prompt's test (resampled_check) on each question's held-out partner keys from --devset, into OUT")
     ap.add_argument("inp", help="questions: the questions JSON; cases: OUT")
     ap.add_argument("out", nargs="?")
     ap.add_argument("--cases", default="santa,preeclampsia", help="cases: circuit_finder's CASES or CHAT_CASES")
@@ -1106,6 +1280,8 @@ def main():
     ap.add_argument("--unions", default="auto", help="circuit_union's mover unions (JSON; auto: UNIONS for UNIONS_MODEL; none: "
                     "off): each question's mover cut is its "
                     "template's union, whole, when that passes on the pair (search_all's family; FAMILY_MIN_KEYS, FAMILY_FREQ)")
+    ap.add_argument("--devset", default=None, help="resampled: the questions (their \"partners\": the held-out keys)")
+    ap.add_argument("--contrast", default=CONTRAST, choices=("resampled", "runner"), help="resampled: the rival token (CONTRAST)")
     ap.add_argument("--pool", default=str(POOL) if POOL.exists() else None, help="partner keys from this question set's "
                     "keys of the question's task, in a seeded order per question, instead of the question's own partners (left "
                     "for unseen-pair tests); default trainset_8b.json when present; '' for the question's own partners")
@@ -1113,7 +1289,7 @@ def main():
     unions = (default_unions(a.model) if a.unions == "auto" else None if a.unions == "none"
               else json.loads(Path(a.unions).read_text()))
     cf._threads()
-    out = Path(a.out if a.mode == "questions" else a.inp)
+    out = Path(a.out if a.mode in ("questions", "resampled") else a.inp)
     out.mkdir(parents=True, exist_ok=True)
     tok = AutoTokenizer.from_pretrained(a.tokenizer or a.model)
     if a.dtype == "auto":
@@ -1134,6 +1310,34 @@ def main():
             model = model.merge_and_unload().eval()
     model.requires_grad_(False)
     pt = cf.Patcher(model, tok)
+    if a.mode == "resampled":                       # (one prompt's test of records, any finder's, on held-out keys)
+        CONTRAST = a.contrast
+        t1 = time.time()
+        log1 = lambda m: print(f"{time.time() - t1:7.1f}s {m}", flush=True)   # noqa: E731
+        qs = {q["id"]: q for q in json.loads(Path(a.devset).read_text())["questions"] if q.get("split") != "test"}
+        pts_ = [cf.Patcher(model, tok) for _ in range(RESAMPLE_CHECK)]
+        n_pass, n = 0, 0
+        for f in sorted(Path(a.inp).glob("*.json")):
+            rec = json.loads(f.read_text())
+            q, dst = qs.get(rec.get("id")), out / f.name
+            if q is None or not rec.get("ids") or dst.exists():
+                continue
+            pre_ = tok(q["prefill"], add_special_tokens=False)["input_ids"] if q.get("prefill") else []
+            users = [p["user"] if isinstance(p, dict) else q["user"].replace(q["key"], p) for p in q.get("partners", [])
+                     if isinstance(p, dict) or q["user"].count(q["key"]) == 1]
+            ids = [x for x in (cf.chat(tok, u, q.get("system", a.system)) + pre_ for u in users) if len(x) == len(rec["ids"])]
+            ids = ids[:RESAMPLE_CHECK]
+            if not ids:
+                continue
+            got = cf.setup_many(pts_[:len(ids)], [(rec["ids"], x) for x in ids], [None] * len(ids))
+            use = [p for p, r in zip(pts_, got) if r["valid"] and r["gap"] >= cf.MIN_GAP and not r["same_answer"]]
+            if not use:
+                continue
+            res = resampled_check(use, rec, log=log1)
+            dst.write_text(json.dumps(res))
+            n, n_pass = n + 1, n_pass + res["passes"]
+        log1(f"one prompt's test on held-out keys: {n_pass}/{n} questions pass (every cut with units keeps at least {cf.PASS} of the lead)")
+        return
     t0 = time.time()
     log = lambda m: print(f"{time.time() - t0:7.1f}s {m}", flush=True)   # noqa: E731
     pre = lambda q: tok(q["prefill"], add_special_tokens=False)["input_ids"] if q.get("prefill") else []  # noqa: E731

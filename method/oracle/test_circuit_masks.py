@@ -431,3 +431,79 @@ def test_generalizing_defaults():
     taken only when every pair passes; the command line's default pool is trainset_8b."""
     assert cm.ALLCUTS == 1 and cm.PAIRWISE == 1 and cm.AGG == "min"
     assert cm.POOL.name == "trainset_8b.json"
+
+
+def _ask(meas, sets):
+    return (yield (meas, "both", sets))
+
+
+def test_one_prompt_resampled_shares(tiny, monkeypatch):
+    """Resampled: a set's shares are, per pair and in the clean run, the lead lost with the set resampled and the lead
+    kept with the rest of the cut resampled (Patcher.run on the set and on its complement), averaged over the keys; the
+    whole cut keeps all of the lead; one prompt's token sets give each pair its lead over a zero baseline."""
+    import numpy as np
+    model, clean, corrupts = tiny
+    pts = [cf.Patcher(model, None, rows=8) for _ in corrupts]
+    for p, c in zip(pts, corrupts):
+        p.setup(clean, c)
+    monkeypatch.setattr(cm, "ONE_PROMPT", 1)
+    monkeypatch.setattr(cm, "AGG", "mean")
+    info = cm._one_prompt_sets(pts[0], pts[1:])
+    assert info["answer"] == int(pts[0]._lp["clean"].argmax()) and all(p.c["corrupt"] == 0.0 and p.gap == p.c["clean"] > 0 for p in pts)
+    spec = cm.cuts_of(pts[0])["readout"]
+    meas = cm.Resampled(pts, spec)
+    pos = spec["positions"][0]
+    units = [cf.unit("neuron", i, pos, k) for i in range(pts[0].L) for k in range(0, pts[0].D, 3)]
+    every = [cf.unit("neuron", i, p, torch.arange(pts[0].D)) for i in range(pts[0].L) for p in spec["positions"]]
+    comp = meas.complement(units)
+    assert sum(len(c[3]) for c in comp) + len(units) == pts[0].L * pts[0].D and meas.complement(every) == []
+    got = cm.drive(pts, [_ask(meas, [units, every])])[0]
+    lo = float(np.mean([p.run("clean", [units])[0] for p in pts]))
+    kept = float(np.mean([1 - p.run("clean", [comp])[0] for p in pts]))
+    assert abs(got[0][0] - lo) < 1e-4 and abs(got[0][1] - kept) < 1e-4
+    assert got[1][1] == 1.0 and abs(got[1][0] - float(np.mean([p.run("clean", [every])[0] for p in pts]))) < 1e-4
+
+
+@pytest.mark.parametrize("background", ["keys", "mean"])
+def test_one_prompt_find(tiny, monkeypatch, background):
+    """find() in one prompt: each cut's record names the answer and the rivals; a met cut keeps at least its bar of the
+    lead with the rest of the cut resampled (re-measured on the keys); BACKGROUND mean resamples from the keys' mean, whose
+    other run is the mean of theirs."""
+    import numpy as np
+    model, clean, corrupts = tiny
+    monkeypatch.setattr(cm, "ONE_PROMPT", 1)
+    monkeypatch.setattr(cm, "AGG", "mean")
+    monkeypatch.setattr(cm, "BACKGROUND", background)
+    pts = [cf.Patcher(model, None, rows=8) for _ in corrupts]
+    rec = cm.find(pts[0], clean, corrupts[0], steps=8, partners=list(zip(pts[1:], corrupts[1:])))
+    op = rec["one_prompt"]
+    assert rec["cuts"] and set(op) == set(rec["cuts"]) and all(x["answer"] == rec["answer"] and x["background"] == background
+                                                               for x in op.values())
+    if background == "mean":
+        m = cm._mean_patcher(pts)
+        want = torch.stack([p.act["corrupt"]["neu"][1].float() for p in pts]).mean(0)
+        assert torch.allclose(m.act["corrupt"]["neu"][1].float(), want, atol=1e-2) and m.act["clean"] is pts[0].act["clean"]
+        return
+    for n, c in rec["cuts"].items():
+        if not c["met"]:
+            continue
+        units = ([cf.unit("neuron", x["layer"], x["pos"], x["neuron"]) for x in rec["nodes"] if x["stage"] == n]
+                 + ([cf.unit("head", x["layer"], x["pos"], x["head"]) for x in rec["routes"]] if n == "movers" else []))
+        spec = {**cm.cuts_of(pts[0])[n], "positions": c["searched"]}
+        got = cm.drive(pts, [_ask(cm.Resampled(pts, spec), [units])])[0][0]
+        assert got[1] >= c["bar"][1] - 1e-3 and abs(got[1] - c["restored"]) < 1e-3
+
+
+def test_resampled_check(tiny, monkeypatch):
+    """resampled_check on the keys a one-prompt circuit was found on gives each met cut its record's kept share; a cut
+    with no units is not tested."""
+    model, clean, corrupts = tiny
+    monkeypatch.setattr(cm, "ONE_PROMPT", 1)
+    monkeypatch.setattr(cm, "AGG", "mean")
+    pts = [cf.Patcher(model, None, rows=8) for _ in corrupts]
+    rec = cm.find(pts[0], clean, corrupts[0], steps=8, partners=list(zip(pts[1:], corrupts[1:])))
+    chk = cm.resampled_check(pts, rec)
+    assert chk["keys"] == len(pts) and set(chk["cuts"]) == {n for n in rec["cuts"] if cm.record_cut_units(rec, n)}
+    for n, c in chk["cuts"].items():
+        assert abs(c["kept"] - rec["cuts"][n]["restored"]) < 1e-3 and len(c["per_key"]) == len(pts)
+    assert chk["passes"] == all(c["kept"] >= cf.PASS for c in chk["cuts"].values())

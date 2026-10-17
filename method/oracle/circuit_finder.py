@@ -1096,11 +1096,11 @@ def setup_many(pts: list, pairs: list, answers: list | None = None, explicit: li
             for j, pt in enumerate(pts)]
 
 
-def scores_many(pts: list) -> list[dict]:
+def scores_many(pts: list, host: bool = True) -> list[dict]:
     """Patcher.scores() of several pairs of one prompt length (Patchers of one model, each set up): their base runs, two
     rows a pair, in shared forwards and backwards (rows are independent, so each row's gradient is its own run's), as
     many pairs a batch as MEMORY of the device's free memory holds; per pair {"head": [L, T, H], "neuron": [L, T, D]}
-    on the host."""
+    on the host (host False: on the device, a lockstep search's attribution orders taken there)."""
     pt0, out = pts[0], []
     L, T, H, hd, D = pt0.L, pt0.T, pt0.H, pt0.hd, pt0.D
     n = len(pts)
@@ -1129,7 +1129,7 @@ def scores_many(pts: list) -> list[dict]:
                 s0, s1 = d * gr[:, 0], d * gr[:, 1]
                 if k == "head":
                     s0, s1 = s0.view(len(part), T, H, hd).sum(-1), s1.view(len(part), T, H, hd).sum(-1)
-                per_layer.append(torch.maximum(s0.abs(), s1.abs()).cpu())
+                per_layer.append(torch.maximum(s0.abs(), s1.abs()).to("cpu" if host else pt0.dev))
             got[key] = torch.stack(per_layer, 1)                                     # [pairs, L, T, width]
         out += [{key: got[key][j] for key in ("head", "neuron")} for j in range(len(part))]
     return out

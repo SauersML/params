@@ -560,7 +560,7 @@ def _serve(group, reqs: list, log=None) -> list:
         walk(r, (k,))
     res = [None] * len(flat)
     scores = [k for k, (_, r) in enumerate(flat) if isinstance(r[0], str) and r[0] == "scores"]
-    for k, sc in zip(scores, cf.scores_many([flat[k][1][1] for k in scores]) if scores else []):
+    for k, sc in zip(scores, cf.scores_many([flat[k][1][1] for k in scores], host=False) if scores else []):
         res[k] = sc
     masks = [k for k, (_, r) in enumerate(flat) if isinstance(r[0], str) and r[0] == "masks"]
     for key in dict.fromkeys(flat[k][1][3:] for k in masks):            # (steps and optimize_many's other keywords)
@@ -703,7 +703,7 @@ def _before_steps(pt, arm: str, log=None, prior: dict | None = None, partners: l
         for n in masked:
             top = max(float(sc[k][:, specs[n]["positions"]].max()) for k in specs[n]["kinds"])
             warm[n] = {k: (INIT + WARM * torch.log(sc[k][:, specs[n]["positions"]].float() / max(top, 1e-30) + 1e-30)
-                           ).clamp(WARM_MIN, INIT) for k in specs[n]["kinds"]}
+                           ).clamp(WARM_MIN, INIT).cpu() for k in specs[n]["kinds"]}
     return {"specs": specs, "names": names, "ceil": ceil, "reach": reach, "out": out, "masked": masked, "meas": meas,
             "warm": warm, "bars": bars,
             "taus": {n: tuple(min(max(TAU, bars[n] + 0.05), max(bars[n] + 0.05, c - 0.05)) for c in ceil[n]) for n in masked}}

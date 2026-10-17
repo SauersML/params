@@ -1355,6 +1355,7 @@ def cut(pt: Patcher, sc: dict, kind: str, positions, done: dict, log=None, searc
     circ = order[:ok] if ok else list(order) if reach else []     # (an unreachable cut has no units: its singles stay in
                                                     # singles; Qwen3-8B bfloat16 opposite/hard/p1's readout, ceiling
                                                     # -3.73/1.18 on a ~1 bit gap, wrote 62,122 neurons as nodes)
+    found = list(circ)
     if ok and len(circ) > 1:                        # units whose removal alone still passes, then removed one at a time
         alone = pt.both([[v for v in circ if v != u] for u in circ])           # from the least effective while it passes
         todo = [u for u, (lost, rest) in zip(circ, alone) if lost >= PASS and rest >= PASS][::-1]
@@ -1375,6 +1376,13 @@ def cut(pt: Patcher, sc: dict, kind: str, positions, done: dict, log=None, searc
         if routes.get("met"):
             circ, ok = routes.pop("units"), True
     lost, rest = pt.both([circ])[0] if circ else (0.0, 0.0)
+    if ok and circ and not (lost >= PASS and rest >= PASS):     # the set passed in its batch and misses alone by float
+        back = [u for u in found if u not in circ] + [u for u in order if u not in found]  # error (bfloat16: 11 of 200 dev
+        for u in back:                              # source cuts at 0.69x): the trimmed units, then the next singles,
+            circ = circ + [u]                       # added back one at a time until it passes measured alone
+            lost, rest = pt.both([circ])[0]
+            if lost >= PASS and rest >= PASS:
+                break
     spread = None
     if reach and not ok:                            # no sparse cut above the floor: whole (layer, position) blocks in
         first = sorted([(kind, i, p, 0, width) for i in range(pt.L) for p in positions],     # measured order

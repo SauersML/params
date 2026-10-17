@@ -22,7 +22,8 @@ Arms on one question set, same card, same records (searchalgo's comparison):
   am     attr, then masks on the cuts attr leaves unmet
   fam    the units of the family's earlier circuits first (--prior: other questions of the task, family_order), then
          attr's order
-A cut's hinge targets are TAU or 0.05 under its ceiling (at least PASS + 0.05), per share.
+A cut's hinge targets are TAU or 0.05 under its ceiling (at least its bar + 0.05), per share; its sets are taken at its bar
+(circuit_finder.cut's: PASS plus the probed noise of reduced precision).
 Multi-source masks (methods, 10-16; constants an arm sets, mask:30:partners=8:allcuts=1:pairwise=1:warm=0.5):
   ALLCUTS   every cut, not only the source, is chosen and verified on the shares over the question's pair and its
             partners (Mean): interchange interventions from several keys, so a cut that only separates the two given
@@ -47,6 +48,7 @@ from __future__ import annotations
 
 import collections
 import itertools
+import math
 import time
 import zlib
 
@@ -60,6 +62,8 @@ LR = 0.25
 TAU = 0.9           # the hinge's target share (PASS 0.7 is what the measured set must reach)
 LAMBDA = 0.003      # a unit's cost in shares of the gap
 INIT = 3.0          # sigmoid(3) = 0.95: every unit nearly patched at the start
+INIT_SCAN = 0       # 1: a fresh spec starts at the lowest logit of INIT_GRID (down from INIT) where a uniform mask still meets
+INIT_GRID = (0.0, -1.0, -2.0, -3.0, -4.0, -5.0, -6.0, -8.0, -10.0)   # its targets (optimize_many; arm constant init_scan=1)
 ORDER_MIN = 64      # units ordered for the measured prefix: those the mask kept (m > 0.5), at least twice that and ORDER_MIN
 ORDER_MAX = 20000
 MASK_TOKENS = 1536   # rows x positions a mask step runs at most off CUDA (find_batch's parts; on CUDA _budget's)
@@ -155,24 +159,14 @@ def optimize_many(jobs: list, steps: int = STEPS, log=None, init: list | None = 
                         "pos": {k: torch.tensor([p - start for _, p, _ in ent[k] for _ in (0, 1)], device=dev) for k in oth},
                         "tix": {k: torch.tensor([n for _, _, n in ent[k] for _ in (0, 1)], device=dev) for k in oth}})
     order = torch.tensor([g for ps in passes_ for g in ps["gs"]], device=dev)   # the forwards' instances, in turn
-    theta = {k: torch.full((L, len(cell[k]), width[k]), INIT) for k in kinds}
-    for q, j, s_ in specs if init else []:          # (a round after a cut its order could not pass: on from its theta)
-        th = (init[q] or [None] * len(jobs[q][1]))[j]
-        for k in s_["kinds"] if th else []:
-            theta[k][:, [cell[k][(q, j, p)] for p in s_["positions"]]] = th[k]
-    theta = {k: t.to(dev).requires_grad_(not freeze) for k, t in theta.items()}
-    rho = {k: torch.zeros_like(t).requires_grad_(True) for k, t in theta.items()} if adv > 0 else {}
-    opt = torch.optim.Adam(list(theta.values()), lr=LR) if not freeze else None
     tau = torch.tensor([t for _, ss, taus in jobs for t in (taus or [(TAU, TAU)] * len(ss))], device=dev)
     cc = torch.tensor([pt.c["clean"] for _, _, pt in inst], device=dev)[order]
     cr = torch.tensor([pt.c["corrupt"] for _, _, pt in inst], device=dev)[order]
     gap = torch.tensor([pt.gap for _, _, pt in inst], device=dev)[order]
     of = torch.tensor([sid[(q, j)] for q, j, _ in inst], device=dev)[order]   # instance -> spec
     count = torch.zeros(len(specs), device=dev).index_add(0, of, torch.ones(len(inst), device=dev))
-    hist = [[] for _ in specs]
-    for step in range(steps):
-        ms = {k: torch.sigmoid(t) for k, t in theta.items()}
 
+    def contrast(ms, rho):                          # each instance's two rows' contrasts under masks ms (and rho)
         def edit(ps, k, i, h):
             d = h.device
             r, p = ps["rows"][k].to(d), ps["pos"][k].to(d)
@@ -183,17 +177,43 @@ def optimize_many(jobs: list, steps: int = STEPS, log=None, init: list | None = 
             if k == "head":
                 sel, o, m = sel.view(-1, pt0.H, pt0.hd), o.view(-1, pt0.H, pt0.hd), m[..., None]
             return h.index_put((r, p), (sel + m * (o - sel)).reshape(len(r), -1))
+        cs = []
+        for ps in passes_:
+            ks = ps["others"]
+            hn = pt0._last(ps["x"], ps["x"].shape[0], cache=(ps["start"], ps["kv"]) if ps["kv"] is not None else None,
+                           neu=(lambda i, h, ps=ps: edit(ps, "neuron", i, h)) if "neuron" in ks else None,
+                           head=(lambda i, h, ps=ps: edit(ps, "head", i, h)) if "head" in ks else None,
+                           only={"res": set(), "head": set(range(L)) if "head" in ks else set(),
+                                 "neu": set(range(L)) if "neuron" in ks else set()})
+            cs += [pt._contrast(hn[a:b]) for pt, a, b in ps["spans"]]
+        return torch.cat(cs)
+    start_at = torch.full((len(specs),), INIT, device=dev)
+    fresh = torch.tensor([not (init and (init[q] or [None] * len(jobs[q][1]))[j]) for q, j, _ in specs], device=dev)
+    if INIT_SCAN and not freeze and bool(fresh.any()):   # each fresh spec from the lowest uniform logit (INIT_GRID, down
+        alive = fresh.clone()                       # from INIT) at which both its mean shares still reach its targets: its
+        with torch.no_grad():                       # hinges act from the first steps (a spread effect kept both shares
+            for v in [x for x in INIT_GRID if x < INIT]:    # above 0.9 with sum m 162k of 8.4M units after 30 steps from 3:
+                c = contrast({k: torch.full((L, len(cell[k]), width[k]), 1 / (1 + math.exp(-v)), device=dev)  # Qwen3-8B,
+                              for k in kinds}, {})  # the E1 lie2 organism's source cut)
+                lo = torch.zeros(len(specs), device=dev).index_add(0, of, (cc - c[0::2]) / gap) / count
+                re_ = torch.zeros(len(specs), device=dev).index_add(0, of, (c[1::2] - cr) / gap) / count
+                alive = alive & (lo >= tau[:, 0]) & (re_ >= tau[:, 1])
+                start_at = torch.where(alive, torch.full_like(start_at, v), start_at)
+                if not bool(alive.any()):
+                    break
+    theta = {k: start_at[owner[k]].cpu()[None, :, None].expand(L, len(cell[k]), width[k]).clone() for k in kinds}
+    for q, j, s_ in specs if init else []:          # (a round after a cut its order could not pass: on from its theta)
+        th = (init[q] or [None] * len(jobs[q][1]))[j]
+        for k in s_["kinds"] if th else []:
+            theta[k][:, [cell[k][(q, j, p)] for p in s_["positions"]]] = th[k]
+    theta = {k: t.to(dev).requires_grad_(not freeze) for k, t in theta.items()}
+    rho = {k: torch.zeros_like(t).requires_grad_(True) for k, t in theta.items()} if adv > 0 else {}
+    opt = torch.optim.Adam(list(theta.values()), lr=LR) if not freeze else None
+    hist = [[] for _ in specs]
+    for step in range(steps):
         with torch.enable_grad():
-            cs = []
-            for ps in passes_:
-                ks = ps["others"]
-                hn = pt0._last(ps["x"], ps["x"].shape[0], cache=(ps["start"], ps["kv"]) if ps["kv"] is not None else None,
-                               neu=(lambda i, h, ps=ps: edit(ps, "neuron", i, h)) if "neuron" in ks else None,
-                               head=(lambda i, h, ps=ps: edit(ps, "head", i, h)) if "head" in ks else None,
-                               only={"res": set(), "head": set(range(L)) if "head" in ks else set(),
-                                     "neu": set(range(L)) if "neuron" in ks else set()})
-                cs += [pt._contrast(hn[a:b]) for pt, a, b in ps["spans"]]
-            c = torch.cat(cs)
+            ms = {k: torch.sigmoid(t) for k, t in theta.items()}
+            c = contrast(ms, rho)
             li, ri = (cc - c[0::2]) / gap, (c[1::2] - cr) / gap               # each pair's shares
             lost = torch.zeros(len(specs), device=dev).index_add(0, of, li) / count
             rest = torch.zeros(len(specs), device=dev).index_add(0, of, ri) / count
@@ -221,7 +241,7 @@ def optimize_many(jobs: list, steps: int = STEPS, log=None, init: list | None = 
     rh = {k: t.detach().float().cpu() for k, t in rho.items()}
     for n, (q, j, s) in enumerate(specs):
         got = {k: th[k][:, [cell[k][(q, j, p)] for p in s["positions"]]] for k in s["kinds"]}
-        out[q].append({"theta": got, "history": hist[n],
+        out[q].append({"theta": got, "history": hist[n], "start": float(start_at[n]),
                        **({"rho": {k: rh[k][:, [cell[k][(q, j, p)] for p in s["positions"]]] for k in s["kinds"]}} if rh else {})})
         if log:
             a, b, z = hist[n][-1]
@@ -256,17 +276,17 @@ def ordered(spec: dict, theta: dict) -> tuple:
     return units, kept
 
 
-def verify(meas, order: list, log=None, name: str = "") -> dict:
+def verify(meas, order: list, log=None, name: str = "", bar: float = cf.PASS) -> dict:
     """circuit_finder.cut's measured steps on a proposed order (verify_steps, by its measurer alone)."""
-    return drive(_pts(meas), [verify_steps(meas, order, log=log, name=name)])[0]
+    return drive(_pts(meas), [verify_steps(meas, order, log=log, name=name, bar=bar)])[0]
 
 
-def verify_steps(meas, order: list, log=None, name: str = ""):
+def verify_steps(meas, order: list, log=None, name: str = "", bar: float = cf.PASS):
     """verify as a search (drive's generator: it yields its measurements, (meas, method, *args)): the smallest passing
     prefix (grid, bisection to 32 sizes between the last failing size and the first passing one, then those in one
     batch); a prefix of more than PRUNE_MAX units is a diffuse cut (its size, shares and curve, no units); else units
-    removed one at a time while it passes (prune_steps); each unit's shares alone."""
-    passes = lambda r: r[0] >= cf.PASS and r[1] >= cf.PASS  # noqa: E731
+    removed one at a time while it passes (prune_steps); each unit's shares alone. A set is taken at bar (_bar's)."""
+    passes = lambda r: r[0] >= bar and r[1] >= bar  # noqa: E731
     g = cf.grid(len(order))                        # (prefixes of order: Patcher.both_prefixes, no set built per unit)
     got = yield (meas, "both_prefixes", order, g)
     at = dict(zip(g, got))
@@ -290,7 +310,7 @@ def verify_steps(meas, order: list, log=None, name: str = ""):
             log(f"  {name}: {len(order)} ordered, passing prefix {ok}, diffuse ({lost:.2f}/{rest:.2f})")
         return {"units": [], "singles": {}, "met": False, "diffuse": True, "lost": lost, "restored": rest, "found": len(order),
                 "curve": curve, "spread": {"diffuse": True, "units": ok}}
-    circ = (yield from prune_steps(meas, list(order[:ok]))) if ok else []
+    circ = (yield from prune_steps(meas, list(order[:ok]), bar)) if ok else []
     lost, rest = (yield (meas, "both", [_blocks(circ)]))[0] if circ else (0.0, 0.0)
     for k in [k for k in met if k > ok] if circ and not passes((lost, rest)) else []:
         circ = list(order[:k])                      # (a set at the margin can fail measured again, a batch's shape moving
@@ -304,19 +324,19 @@ def verify_steps(meas, order: list, log=None, name: str = ""):
             "found": len(order), "curve": curve}
 
 
-def prune(meas, circ: list) -> list:
+def prune(meas, circ: list, bar: float = cf.PASS) -> list:
     """circuit_finder.cut's pruning of a passing set (prune_steps, by its measurer alone)."""
-    return drive(_pts(meas), [prune_steps(meas, circ)])[0]
+    return drive(_pts(meas), [prune_steps(meas, circ, bar)])[0]
 
 
-def prune_steps(meas, circ: list):
+def prune_steps(meas, circ: list, bar: float = cf.PASS):
     """circuit_finder.cut's pruning of a passing set as a search (drive's): the units whose removal alone passes, removed
     one at a time from the last while the set passes. Each round measures, for the next window of candidates, the
     removals so far plus each candidate cumulatively (right while candidates go) and plus each candidate alone (right
     while they stay), so a round settles a run of removals and the candidate that ends it, or a run of candidates that
     stay and the one that goes after them: the same trials as one at a time. The window starts at PRUNE_WINDOW and grows
-    four times after a round that settles all of it."""
-    passes = lambda r: r[0] >= cf.PASS and r[1] >= cf.PASS  # noqa: E731
+    four times after a round that settles all of it. A set passes at bar."""
+    passes = lambda r: r[0] >= bar and r[1] >= bar  # noqa: E731
     if len(circ) < 2:
         return circ
     alone = yield (meas, "both_without", circ)      # (each unit left out: Patcher.both_without, no set built per unit)
@@ -563,7 +583,8 @@ def search_steps(pt, arm: str, log=None, steps: int = STEPS, prior: dict | None 
         res = yield [("masks", job, [got[n]["theta"] if rnd else st["warm"].get(n) for n in ns], steps) for job, ns in jobs]
         for (_, ns), r in zip(jobs, res):
             for n, x in zip(ns, r):
-                got[n] = {"theta": x["theta"], "history": got.get(n, {}).get("history", []) + x["history"]}
+                got[n] = {"theta": x["theta"], "history": got.get(n, {}).get("history", []) + x["history"],
+                          "start": got.get(n, {}).get("start", x.get("start"))}
         yield from _verify_steps(st, got, names, time.perf_counter() - t0, steps, log=log)
         names = [n for n in names if not st["out"][n]["met"] and not st["out"][n].get("diffuse")]
     return (yield from _finish_steps(st))
@@ -590,6 +611,14 @@ def _before_steps(pt, arm: str, log=None, prior: dict | None = None, partners: l
              for n, s in specs.items()}
     ceil = dict(zip(names, [r[0] for r in (yield [(meas[n], "both", [every[n]]) for n in names])]))
     reach = {n: ceil[n][0] >= cf.PASS and ceil[n][1] >= cf.PASS for n in names}
+    bars = {n: cf.PASS for n in names}               # (circuit_finder.cut's bar: PASS, plus in reduced precision the
+    if cf.FLOOR and pt.core.model.embed_tokens.weight.dtype != torch.float32:   # largest |share| of a no-op patch of the
+        probed = [n for n in names if reach[n]]      # first layer's units at each of the cut's positions; a set taken at
+        res = yield [(meas[n], "both", [[cf.unit(k, 0, p, torch.arange(width[k])) + ("self",)]   # 0.700-0.709 in bfloat16
+                                         for k in specs[n]["kinds"] for p in specs[n]["positions"]]) for n in probed]
+        for n, r in zip(probed, res):               # read 0.682-0.697 in float32: generality's lane3 scorecard)
+            pr = [max(abs(a), abs(b)) for a, b in r]
+            bars[n] = cf.PASS + min(max(pr) if all(math.isfinite(x) for x in pr) else 0.0, 1 - cf.PASS)
     out = {}
     live = [n for n in names if reach[n]]
     sc = None
@@ -603,7 +632,7 @@ def _before_steps(pt, arm: str, log=None, prior: dict | None = None, partners: l
                 fams[n] = family_order(pt, specs[n], prior or {})
                 have = set(fams[n])
                 orders[n] = fams[n] + [u for u in orders[n] if u not in have]
-        res = yield ("par", [verify_steps(meas[n], orders[n], log=log, name=n) for n in live])
+        res = yield ("par", [verify_steps(meas[n], orders[n], log=log, name=n, bar=bars[n]) for n in live])
         for n, r in zip(live, res):
             out[n] = _record(r, ceil[n], True, specs[n]["positions"],
                              {"attr": {"seconds": round(time.perf_counter() - t0, 2),
@@ -618,7 +647,8 @@ def _before_steps(pt, arm: str, log=None, prior: dict | None = None, partners: l
             warm[n] = {k: (INIT + WARM * torch.log(sc[k][:, specs[n]["positions"]].float() / max(top, 1e-30) + 1e-30)
                            ).clamp(WARM_MIN, INIT) for k in specs[n]["kinds"]}
     return {"specs": specs, "names": names, "ceil": ceil, "reach": reach, "out": out, "masked": masked, "meas": meas,
-            "warm": warm, "taus": {n: tuple(min(TAU, max(cf.PASS + 0.05, c - 0.05)) for c in ceil[n]) for n in masked}}
+            "warm": warm, "bars": bars,
+            "taus": {n: tuple(min(max(TAU, bars[n] + 0.05), max(bars[n] + 0.05, c - 0.05)) for c in ceil[n]) for n in masked}}
 
 
 def _jobs(pt, st: dict, names: list | None = None) -> list:
@@ -663,7 +693,7 @@ def _verify_steps(st: dict, got: dict, names: list, t_opt: float, steps: int, lo
     specs, ceil, out = st["specs"], st["ceil"], st["out"]
     t1 = time.perf_counter()
     orders = {n: ordered(specs[n], got[n]["theta"]) for n in names}
-    res = yield ("par", [verify_steps(st["meas"][n], orders[n][0], log=log, name=n) for n in names])
+    res = yield ("par", [verify_steps(st["meas"][n], orders[n][0], log=log, name=n, bar=st["bars"][n]) for n in names])
     checked = [n for n, r in zip(names, res) if ADV_CHECK and r["units"]]
     for n, a in zip(checked, (yield ("par", [adversarial_steps(st["meas"][n], specs[n], res[names.index(n)]["units"], log=log, name=n)
                                              for n in checked]))):
@@ -671,7 +701,8 @@ def _verify_steps(st: dict, got: dict, names: list, t_opt: float, steps: int, lo
     for n, r in zip(names, res):
         g, prev = got[n], out.get(n, {})
         out[n] = _record(r, ceil[n], True, specs[n]["positions"],
-                         {"mask": {"kept": orders[n][1], "steps": len(g["history"]), "history": g["history"][::max(1, steps // 20)],
+                         {"mask": {"kept": orders[n][1], "steps": len(g["history"]), "start": g.get("start"),
+                                   "history": g["history"][::max(1, steps // 20)],
                                    "seconds_opt": round(t_opt + prev.get("mask", {}).get("seconds_opt", 0.0), 2),
                                    "seconds_verify": round(time.perf_counter() - t1 + prev.get("mask", {}).get("seconds_verify", 0.0), 2),
                                    **({"attr_unmet": prev["found"]} if "attr" in prev else
@@ -685,6 +716,7 @@ def _finish_steps(st: dict):
         if n not in out:
             out[n] = _record({"units": [], "singles": {}, "met": False, "lost": 0.0, "restored": 0.0, "found": 0, "curve": []},
                              ceil[n], st["reach"][n], specs[n]["positions"], {})
+        out[n]["bar"] = st["bars"][n]
     pc = [n for n in st["names"] if isinstance(st["meas"][n], Mean)]
     each = yield [[(p, "both", [_blocks(out[n]["units"])]) for p in st["meas"][n].pts] if out[n]["units"] else [] for n in pc]
     for n, e in zip(pc, each):                      # (each pair's shares of the cut; the record's lost and restored: means)

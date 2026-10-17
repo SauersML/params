@@ -18,6 +18,12 @@ gradient, the two base runs' mean for atp/relp; EAP-IG's and ADAG's own sign). S
   measured  the ranking given our measured selection (the same-selection control): circuit_finder.find with arm "attr"
             (circuit_masks: the measured passing prefix of the ranking, then the measured prune) on the record's pair and
             its selection partners, the ranking in place of RelP's
+--pairs-avg (the lead's 10-17 equal-input rule): each method's attributions averaged over the same pairs our search used, the
+question's own pair and its record's selection partners (the clean prompt against each partner key's corrupted prompt, as
+circuit_masks builds them from --pool), then the top units at our size (OUT/<method>_<variant>_topk<n pairs>).
+--pad-from DIR (the size control): each record of RECORDS (our one-pair circuits) padded with random units at the layers and
+positions of its own units (neuron poles signed by their clean activation) up to DIR's record of the same question in
+neurons and heads (our 8-partner circuits), written to OUT/pad_random.
 Every method's seconds a pair are recorded (topk: the attribution alone; measured: the whole find). OUT/variants.json:
 per method and variant, the own pair's whole-circuit passes of its topk set (bfloat16, the finder's Patcher), the
 battery then scoring each method's better variant.
@@ -139,6 +145,57 @@ def top_units(sc: dict, first: int, k: int) -> list[tuple]:
     return [u[1:] for u in sorted(flat, key=lambda u: -u[0])[:k]]
 
 
+def partner_prompts(tok, r: dict) -> list:
+    """The record's selection partners' corrupted prompts, as circuit_masks builds them from --pool: the clean user turn with
+    the question's key replaced by each partner key (system turn and prefill kept), those of the clean prompt's length."""
+    if not r.get("selection_keys") or r.get("user", "").count(r.get("key") or "\0") != 1:
+        return []
+    pre = tok(r["prefill"], add_special_tokens=False)["input_ids"] if r.get("prefill") else []
+    assert cf.chat(tok, r["user"], r.get("system")) + pre == r["ids"], r.get("id")  # (the clean prompt rebuilt exactly)
+    ids = [cf.chat(tok, r["user"].replace(r["key"], k), r.get("system")) + pre for k in r["selection_keys"]]
+    return [x for x in ids if len(x) == len(r["ids"])]
+
+
+def pad_random(a, pt: "cf.Patcher", tok) -> None:
+    """The size control (--pad-from): each one-pair circuit padded with random units at its own units' layers and positions
+    (a neuron's pole the sign of its clean activation) to the 8-partner circuit's neurons and heads."""
+    import random
+    out = a.out / "pad_random"
+    out.mkdir(parents=True, exist_ok=True)
+    for f in sorted(a.records.glob("*.json"))[:a.limit or None]:
+        r, big = json.loads(f.read_text()), a.pad_from / f.name
+        if not big.exists() or not r.get("ids") or not r.get("corrupted"):
+            continue
+        b = json.loads(big.read_text())
+        rng = random.Random(f.name)
+        nodes = [n for n in r.get("nodes", []) if n.get("stage") != "readout"]
+        routes = list(r.get("routes", []))
+        want_n = sum(n.get("stage") != "readout" for n in b.get("nodes", []))
+        want_h = len(b.get("routes", []))
+        pt.setup(r["ids"], r["corrupted"])
+        have = {(n["layer"], n["pos"], n["neuron"]) for n in nodes}
+        while len(nodes) < want_n and nodes:
+            n0 = rng.choice(nodes)
+            j = rng.randrange(pt.D)
+            if (n0["layer"], n0["pos"], j) in have:
+                continue
+            have.add((n0["layer"], n0["pos"], j))
+            act = float(pt.act["clean"]["neu"][n0["layer"]][n0["pos"], j])
+            nodes.append({"stage": n0["stage"], "layer": n0["layer"], "pos": n0["pos"], "neuron": j, "pole": 1 if act > 0 else -1, "random": True})
+        hv = {(x["layer"], x["pos"], x["head"]) for x in routes}
+        while len(routes) < want_h and routes and len(hv) < pt.L * pt.H:
+            h0 = rng.choice(routes)
+            h = rng.randrange(pt.H)
+            if (h0["layer"], h0["pos"], h) in hv:
+                continue
+            hv.add((h0["layer"], h0["pos"], h))
+            routes.append({"layer": h0["layer"], "head": h, "pos": h0["pos"], "random": True})
+        rec = {**r, "nodes": nodes + [n for n in r.get("nodes", []) if n.get("stage") == "readout"], "routes": routes,
+               "finder": "pad_random", "padded_to": {"record": b.get("id"), "neurons": want_n, "heads": want_h}}
+        (out / f.name).write_text(json.dumps(rec))
+        print(f"{r.get('id')}: {len(r.get('nodes', []))}+{len(r.get('routes', []))} -> {len(rec['nodes'])}+{len(routes)}", flush=True)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("records", type=Path)
@@ -152,6 +209,8 @@ def main():
     ap.add_argument("--steps", type=int, default=STEPS)
     ap.add_argument("--dtype", default="bfloat16")
     ap.add_argument("--limit", type=int, default=0)
+    ap.add_argument("--pairs-avg", action="store_true", help="average over the own pair and the record's selection partners")
+    ap.add_argument("--pad-from", type=Path, default=None, help="the size control: pad RECORDS' circuits to this dir's sizes")
     a = ap.parse_args()
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -160,6 +219,8 @@ def main():
                                                  device_map="cuda" if torch.cuda.is_available() else None).eval()
     model.requires_grad_(False)
     pt = cf.Patcher(model, tok)
+    if a.pad_from:
+        return pad_random(a, pt, tok)
     methods, selects = a.methods.split(","), a.select.split(",")
     chosen = json.loads((a.out / "variants.json").read_text())["better"] if a.variants == "better" else {}
     variants = sorted(set(chosen.get(m, "abs") for m in methods)) if a.variants == "better" else a.variants.split(",")
@@ -180,6 +241,7 @@ def main():
         q = qs.get(str(r.get("id")).split("/vs/")[0], {})
         sel = set(r.get("selection_keys") or [])  # (our record's selection partners: the measured arm gets the same)
         part_ids = [cf.chat(tok, x["user"], q.get("system")) for x in q.get("partners", []) if isinstance(x, dict) and x.get("key") in sel]
+        avg_ids = partner_prompts(tok, r) if a.pairs_avg else []
         for m in methods:
             if m == "adag" and adag_rec is None:
                 continue
@@ -192,6 +254,14 @@ def main():
                 torch.cuda.synchronize() if torch.cuda.is_available() else None
                 t0 = time.time()
                 sc = method_scores(pt, m, v, a.steps, adag_rec)
+                if avg_ids:  # (the mean over the own pair and its partners' pairs: same clean prompt, same positions)
+                    tot = {kk: t.float().clone() for kk, t in sc.items()}
+                    for pid in avg_ids:
+                        pt.setup(r["ids"], pid)
+                        for kk, t in method_scores(pt, m, v, a.steps, adag_rec).items():
+                            tot[kk] += t.float()
+                    sc = {kk: t / (1 + len(avg_ids)) for kk, t in tot.items()}
+                    pt.setup(r["ids"], r["corrupted"])
                 torch.cuda.synchronize() if torch.cuda.is_available() else None
                 dt = time.time() - t0
                 base = {x: r[x] for x in ("id", "ids", "corrupted", "user", "corrupt_user", "task", "key", "model", "answer",
@@ -206,10 +276,11 @@ def main():
                                           + [cf.unit("head", L, p, h) for _, L, p, h in units if _ == "head"]])[0]
                     passes[f"{m}_{v}"][0] += bool(lost >= cf.PASS and rest >= cf.PASS)
                     passes[f"{m}_{v}"][1] += 1
-                    rec = {**base, "finder": f"baseline_{m}_{v}", "nodes": nodes, "routes": routes, "size": len(units),
+                    rec = {**base, "finder": f"baseline_{m}_{v}" + (f"_pairs{1 + len(avg_ids)}" if avg_ids else ""), "nodes": nodes, "routes": routes, "size": len(units),
                            "seconds": round(dt, 3), "own_pair": [lost, rest], "matched_to": {"record": r.get("id"), "units": k}}
-                    (a.out / f"{m}_{v}_topk").mkdir(parents=True, exist_ok=True)
-                    (a.out / f"{m}_{v}_topk" / f.name).write_text(json.dumps(rec))
+                    tag = f"{m}_{v}_topk" + (str(1 + len(avg_ids)) if a.pairs_avg else "")
+                    (a.out / tag).mkdir(parents=True, exist_ok=True)
+                    (a.out / tag / f.name).write_text(json.dumps(rec))
                 if "measured" in selects:
                     fixed = {kk: t for kk, t in sc.items()}
                     cf.scores_many = lambda pts, host=True, fixed=fixed: [  # noqa: E731  (the ranking in RelP's place: every

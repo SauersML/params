@@ -27,6 +27,7 @@ import sys
 import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -39,6 +40,7 @@ TOKEN_BUDGET = int(os.environ.get("SCAFFOLD_TOKENS", 25_000))  # the paper's: in
 # excluded (SCAFFOLD_TOKENS: smaller for a smoke test only)
 MAX_TOKENS = 2048      # per investigator message, reasoning included
 CHAT_TOKENS = 600  # a target answer's length in the sample tool
+CLIENT_TIMEOUT = 900  # seconds a client waits for the server before it sends a request again
 PASS_CAP = int(os.environ.get("SCAFFOLD_PASSES", 256))  # target passes (one generation or one raw completion each): the
 # same cap as oracleagent's agent arms (the lead's fairness rule: one investigator, decoding and budget for both)
 MAX_QUIRKS = 10
@@ -111,7 +113,9 @@ def serve(a) -> None:
     Qwen3-14B bf16 in vLLM with every target's LoRA (multi-LoRA batching: whatever requests wait, of any targets, are
     generated together), the PRISM-4 system prompt first (the user's system prompt, if any, inside it as the paper's
     template places it); sampling T=1, top_p 0.95 (the paper's). (The HF + PEFT server it replaced served one target at a
-    time: the pilot's 8 episodes waited on it.)"""
+    time: the pilot's 8 episodes waited on it.) A request longer than the context (prompt plus answer over --max-len)
+    gets an error of its own (in a batch, vLLM's error would fail every request); a request that waited longer than the
+    client's timeout is dropped unrun (its client has sent it again)."""
     import collections
     import queue
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -124,7 +128,7 @@ def serve(a) -> None:
     dev = sorted(t["model"] for t in ab["targets"] if t["split"] == "dev")
     tok = AutoTokenizer.from_pretrained("Qwen/Qwen3-14B")
     llm = LLM("Qwen/Qwen3-14B", dtype="bfloat16", enable_lora=True, max_lora_rank=128, max_loras=a.loras, max_cpu_loras=len(dev),
-              gpu_memory_utilization=0.9, max_model_len=8192)
+              gpu_memory_utilization=a.gpu_util, max_model_len=a.max_len)
     paths: dict = {}
     passes = collections.Counter()
     jobs: "queue.Queue" = queue.Queue()
@@ -148,6 +152,9 @@ def serve(a) -> None:
                     break
             prompts, sps, lrs, owner = [], [], [], []
             for j in batch:
+                if time.time() - j["t"] > CLIENT_TIMEOUT:
+                    j["error"] = "expired"
+                    continue
                 try:
                     lr = lora(j["model"])
                 except Exception as e:  # noqa: BLE001
@@ -173,7 +180,10 @@ def serve(a) -> None:
     threading.Thread(target=worker, daemon=True).start()
 
     def submit(model: str, texts: list[str], max_new: int) -> dict:
-        j = {"model": model, "texts": texts, "max_new": max_new, "done": threading.Event()}
+        long = [len(t) for t in tok(texts, add_special_tokens=False)["input_ids"] if len(t) + max_new > a.max_len]
+        if long:
+            return {"error": f"the prompt ({long[0]} tokens) and answer ({max_new}) exceed the target's {a.max_len}-token context"}
+        j = {"model": model, "texts": texts, "max_new": max_new, "done": threading.Event(), "t": time.time()}
         jobs.put(j)
         j["done"].wait()
         return j
@@ -219,7 +229,7 @@ def post(url: str, path: str, obj: dict) -> dict:
     for k in range(6):
         try:
             req = urllib.request.Request(url + path, data=json.dumps(obj).encode(), headers={"Content-Type": "application/json"})
-            with urllib.request.urlopen(req, timeout=900) as r:
+            with urllib.request.urlopen(req, timeout=CLIENT_TIMEOUT) as r:
                 return json.loads(r.read())
         except Exception:  # noqa: BLE001
             if k == 5:
@@ -235,20 +245,26 @@ class Episode:
         self.files: dict[str, str] = {"research_log.md": ""}
         self.convs: dict[str, list] = {}
         self.generated = 0
+        self.helper = 0  # tokens the scenario writer generated inside multisample_completions (not the investigator's)
         self.passes = 0
         self.usd = 0.0
         self.calls = []
         self.wd = "/workspace"
+        self.lock = threading.Lock()
 
-    def sample(self, msgs: list[dict], max_tokens: int, prefill: str = "") -> str:
+    def sample(self, msgs: list[dict], max_tokens: int, prefill: str = "", helper: bool = False) -> str:
         import tinker
         from tinker_cookbook.renderers import get_text_content
         prompt = self.rr.build_generation_prompt(msgs, prefill=prefill) if prefill else self.rr.build_generation_prompt(msgs)
         res = self.sampler.sample(prompt=prompt, num_samples=1, sampling_params=tinker.SamplingParams(
             max_tokens=max_tokens, temperature=TEMPERATURE, top_p=TOP_P, stop=self.rr.get_stop_sequences())).result()
         seq, hits = res.sequences[0], res.prompt_cache_hit_tokens or 0
-        self.usd += ((prompt.length - hits) * RATES["prefill"] + hits * RATES["cached"] + len(seq.tokens) * RATES["sampled"]) / 1e6
-        self.generated += len(seq.tokens)
+        with self.lock:
+            self.usd += ((prompt.length - hits) * RATES["prefill"] + hits * RATES["cached"] + len(seq.tokens) * RATES["sampled"]) / 1e6
+            if helper:
+                self.helper += len(seq.tokens)
+            else:
+                self.generated += len(seq.tokens)
         msg, _ = self.rr.parse_response(list(seq.tokens))
         return get_text_content(msg)
 
@@ -260,6 +276,14 @@ class Episode:
         if ".." in p or p.startswith("/"):
             raise ValueError("only paths in your working directory")
         return p
+
+    def reserve(self, k: int) -> int:
+        """Up to k of the episode's remaining target passes, taken now (a turn's target calls run at once); k < 0 gives
+        -k back."""
+        with self.lock:
+            k = k if k < 0 else max(0, min(k, PASS_CAP - self.passes))
+            self.passes += k
+            return k
 
     def tool(self, name: str, args: dict) -> str:
         if name not in ARM_TOOLS[self.arm]:
@@ -276,18 +300,18 @@ class Episode:
                 msgs = [{"role": "system", "content": args["system_prompt"]}] if args.get("system_prompt") else []
             if not str(args.get("user_prompt", "")).strip():
                 return "ERROR: user_prompt cannot be empty"
-            if self.passes >= PASS_CAP:
+            if self.reserve(1) < 1:
                 return f"ERROR: the target pass budget ({PASS_CAP}) is used up"
             msgs.append({"role": "user", "content": args["user_prompt"]})
             got = post(self.a.server, "/chat", {"model": self.target, "messages": msgs})
             if "error" in got:
+                self.reserve(-1)
                 return "ERROR: " + got["error"]
-            self.passes += 1
             new = uuid.uuid4().hex[:12]
             self.convs[new] = msgs + [{"role": "assistant", "content": got["response"]}]
             return json.dumps({"conversation_id": new, "response": got["response"]})
         if name == "multisample_completions":
-            k = min(20 if args.get("size") == "small" else 100, PASS_CAP - self.passes)
+            k = self.reserve(20 if args.get("size") == "small" else 100)
             if k <= 0:
                 return f"ERROR: the target pass budget ({PASS_CAP}) is used up"
             hint = str(args.get("hint") or "")
@@ -303,12 +327,13 @@ class Episode:
                         prompts.append(p)
                 except (json.JSONDecodeError, AttributeError):
                     pass
+            self.reserve(len(prompts[:k]) - k)  # (fewer scenarios parsed than asked: the rest go back)
             if not prompts:
                 return "ERROR: no scenarios parsed"
             got = post(self.a.server, "/complete", {"model": self.target, "prompts": prompts[:k], "max_tokens": 128})
             if "error" in got:
+                self.reserve(-len(prompts[:k]))
                 return "ERROR: " + got["error"]
-            self.passes += len(prompts[:k])
             return json.dumps({"samples": [{"prompt": p, "completion": c} for p, c in zip(prompts, got["completions"])]})
         p = self.path(args.get("path", "."))
         if name == "write_file":
@@ -326,20 +351,30 @@ class Episode:
         text = self.sample(msgs, MAX_TOKENS)
         msgs.append({"role": "assistant", "content": text})
         found = re.findall(r"<tool>(.*?)</tool>", text, re.S)
-        results = []
-        for c in found[:8]:
+
+        def call(c: str) -> tuple[str | None, str]:
             try:
                 req = json.loads(c, strict=False)
-                out = self.tool(req.get("name"), req.get("args") or {})
+                return req.get("name"), self.tool(req.get("name"), req.get("args") or {})
             except (json.JSONDecodeError, AttributeError, ValueError, KeyError) as e:
-                req, out = {"name": None}, f"ERROR: {type(e).__name__}: {e}"
-            self.calls.append(req.get("name"))
-            results.append(f"<result name={req.get('name')!r}>\n{out[:60000]}\n</result>")
+                return None, f"ERROR: {type(e).__name__}: {e}"
+        # the target calls of a message run at once (wall-clock only: no call sees another's result); file calls in order
+        target = [bool(re.search(r'"name"\s*:\s*"(sample|multisample_completions)"', c)) for c in found[:8]]
+        with ThreadPoolExecutor(max(1, sum(target))) as ex:
+            futs = {k: ex.submit(call, c) for k, (c, t) in enumerate(zip(found[:8], target)) if t}
+            done = {k: call(c) for k, (c, t) in enumerate(zip(found[:8], target)) if not t}
+            done.update({k: f.result() for k, f in futs.items()})
+        results = []
+        for k in sorted(done):
+            name, out = done[k]
+            self.calls.append(name)
+            results.append(f"<result name={name!r}>\n{out[:60000]}\n</result>")
         note = tmpl("user_message.jinja2").replace("{REMAINING}", f"\n\nYou have {budget_left} tokens remaining "
                                                    f"and {PASS_CAP - self.passes} target samples." if budget_left is not None else "")
         msgs.append({"role": "user", "content": "\n".join(results) + ("\n\n" if results else "No tool call found.\n\n") + note})
-        print(f"  {self.target.split('/')[1][9:]} {self.arm} run {self.run}: turn {len(msgs) // 2 - 1}, {self.generated} tokens, "
-              f"{self.passes} passes, ${self.usd:.3f}, quirk files {sum(k.startswith('quirks/') for k in self.files)}", flush=True)
+        print(f"  {self.target.split('/')[1][9:]} {self.arm} run {self.run}: turn {len(msgs) // 2 - 1}, {self.generated} tokens "
+              f"(+{self.helper} scenario), {self.passes} passes, ${self.usd:.3f}, quirk files "
+              f"{sum(k.startswith('quirks/') for k in self.files)}", flush=True)
         return bool(found)
 
     def go(self) -> dict:
@@ -363,12 +398,11 @@ class Episode:
                 json.dumps({"messages": msgs, "files": self.files}, indent=1))
         return {"item": self.target, "run": self.run, "arm": self.arm, "predictions": [q[:4000] for q in quirks],
                 "files": {k: len(v) for k, v in self.files.items()}, "passes": self.passes, "generated": self.generated,
+                "scenario_tokens": self.helper,
                 "usd": round(self.usd, 4), "calls": self.calls, "seconds": round(time.time() - t0, 1)}
 
 
 def run(a) -> None:
-    from concurrent.futures import ThreadPoolExecutor
-
     import tinker
     from tinker_cookbook import renderers
     from tinker_cookbook.tokenizer_utils import get_tokenizer
@@ -388,8 +422,9 @@ def run(a) -> None:
     spent = sum(r["usd"] for r in sc.jl(out)) if out.exists() else 0.0
     lock = threading.Lock()
 
-    def scen(prompt: str, ep: Episode) -> str:  # the scenario writer: the investigator model itself (the paper: Sonnet)
-        return ep.sample([{"role": "user", "content": prompt}], 8192, prefill="")
+    def scen(prompt: str, ep: Episode) -> str:  # the scenario writer: the investigator model itself (the paper: Sonnet),
+        # a tool's own call, so outside the investigator's token budget as in the paper
+        return ep.sample([{"role": "user", "content": prompt}], 8192, prefill="", helper=True)
 
     def one(target: str, r: int):
         nonlocal spent
@@ -421,6 +456,8 @@ def main():
     s.add_argument("--items", type=Path, required=True)
     s.add_argument("--port", type=int, default=8790)
     s.add_argument("--loras", type=int, default=8, help="LoRAs on the GPU at once (vLLM max_loras)")
+    s.add_argument("--max-len", type=int, default=8192, help="the target's context in tokens (vLLM max_model_len)")
+    s.add_argument("--gpu-util", type=float, default=0.9, help="vLLM gpu_memory_utilization")
     r = sub.add_parser("run")
     r.add_argument("--server", required=True)
     r.add_argument("--arm", choices=tuple(ARM_TOOLS), required=True)

@@ -112,8 +112,8 @@ def sft(a) -> None:
     # Qwen3's thinking renderer
     tinker, _, training, renderer, _ = clients(a.base, a.rank, a.init, a.thinking)  # --init: a warm start's weights
     rows = [json.loads(x) for x in a.rows.read_text().splitlines() if x.strip()]
-    whole = [conversation_to_datum(r["prompt"] + r["completion"], renderer, None, renderers.TrainOnWhat.LAST_ASSISTANT_MESSAGE)
-             for r in rows]
+    what = renderers.TrainOnWhat.ALL_ASSISTANT_MESSAGES if a.train_on == "all" else renderers.TrainOnWhat.LAST_ASSISTANT_MESSAGE
+    whole = [conversation_to_datum(r["prompt"] + r["completion"], renderer, None, what) for r in rows]
     data = [d for d in whole if d.model_input.length <= a.max_length]  # a cut example would teach an unfinished answer
     long = [r["info"]["task"] for r, d in zip(rows, whole) if d.model_input.length > a.max_length]
     print(json.dumps({"examples": len(data), "dropped over max_length": long}), flush=True)
@@ -190,6 +190,8 @@ def main():
     s.add_argument("--batch", type=int, default=8)
     s.add_argument("--lr", type=float, help="peak rate, linear decay to 0 (default: the cookbook's LoRA rate for the base)")
     s.add_argument("--max-length", type=int, default=16384)
+    s.add_argument("--train-on", choices=("last", "all"), default="last", help="all: every assistant message (an agent's "
+                   "trajectory: its tool calls and its answer), else the last one")
     s.add_argument("--save-every", type=int, default=0, help="a checkpoint every k steps and the last, in DIR/checkpoints.jsonl")
     c = sub.add_parser("score", help="held-out log-probabilities of SFT rows' completions (no update)")
     c.add_argument("rows", type=Path)

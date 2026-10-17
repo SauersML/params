@@ -321,6 +321,7 @@ def test_family_movers(tiny):
     assert cm.family_heads(U, "t/k/p0") == [(i, h) for i, h, _ in every]
     assert cm.family_heads(U, "t/k/p1") == [(i, h) for i, h, _ in every[:2]]
     assert cm.family_heads(U, "u/k/p0") is None
+    assert cm.default_unions("tiny") is None         # (the default unions are UNIONS_MODEL's only)
     cuts = cm.search_all(pt, "mask", steps=3, family=cm.family_heads(U, "t/k/p0"))
     mv = cuts["movers"]
     assert mv["reachable"]                          # (every head at the answer: the movers' ceiling)

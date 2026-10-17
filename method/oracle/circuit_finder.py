@@ -1263,17 +1263,18 @@ def _active(a: float, b: float) -> str:
 
 def find(pt: Patcher, clean: list[int], corrupt: list[int], answers: list[int] | None = None, log=None,
          cuts_wanted=("readout", "movers", "source"), measure: list | None = None, prior: dict | None = None,
-         sets: dict | None = None, partners: list | None = None) -> dict:
+         sets: dict | None = None, partners: list | None = None, family: list | None = None) -> dict:
     """The circuit of one patching pair and its record (module docstring), each cut searched by circuit_masks (learned
     masks order, the passing prefix and pruning measured; with prior given, circuit_masks.family_prior's {key: weight},
     its "fam" arm: those units first, then the RelP attribution order); sets: Patcher.setup's explicit_sets; partners:
     other corrupted prompts of the clean prompt's length (token ids), the source cut then chosen and checked on its
     shares' means over the pair and those (the lead's 10-16 decision: a source cut of one corruption held units that read
-    only that corrupted key, and failed 0/87 resampled)."""
+    only that corrupted key, and failed 0/87 resampled); family: the question's template mover union
+    (circuit_masks.family_heads), its mover cut when it passes on the pair."""
     import circuit_masks
     part = [(Patcher(pt.model, pt.tok, pt.rows), ids) for ids in partners or [] if len(ids) == len(clean)]
     return circuit_masks.find(pt, clean, corrupt, answers, log=log, arm="fam" if prior else ARM, prior=prior,
-                              cuts_wanted=cuts_wanted, measure=measure, sets=sets, partners=part)
+                              cuts_wanted=cuts_wanted, measure=measure, sets=sets, partners=part, family=family)
 
 
 def _find(pt: Patcher, clean: list[int], corrupt: list[int], answers: list[int] | None = None, log=None,
@@ -1543,6 +1544,8 @@ def main():
     ap.add_argument("--arm", default=ARM, choices=("mask", "am", "attr"), help="circuit_masks' search arm (ARM)")
     ap.add_argument("--partners", type=int, default=4, help="questions: up to this many more corrupted prompts (the question's "
                     "partners of its prompt's length) for the source cut's mean shares (0: its own pair only)")
+    ap.add_argument("--unions", default="auto", help="questions: circuit_union's mover unions (JSON; auto: circuit_masks.UNIONS "
+                    "for its model; none: off): each question's mover cut is its template's union when that passes on its pair")
     ap.add_argument("--edges", action=argparse.BooleanOptionalAction, default=True, help="each circuit's edges between its "
                     "units by path patching (neuron_edges.finder_graph), into the record's graph")
     ap.add_argument("--edge-threads", type=int, default=2, help="a batch's records' edge stages run in this many threads")
@@ -1640,6 +1643,10 @@ def main():
             continue
         todo.append((qid, clean, corrupt, extra, path))
     meas = [(int(u.split(":")[0]), int(u.split(":")[1].rstrip("+-"))) for u in a.measure.split(",")] if a.measure else None
+    import circuit_masks as _cm
+    unions = (_cm.default_unions(a.model) if a.unions == "auto" else None if a.unions == "none"
+              else json.loads(Path(a.unions).read_text()))
+    fam_of = (lambda qid: _cm.family_heads(unions, qid) if unions and str(qid).count("/") == 2 and not a.adapter else None)  # noqa: E731
     batched = a.batch > 1 and not meas and not any(x[3].get("sets") for x in todo)   # (find_batch: every pair's masks in
                                                                                      # one batch a step)
     step = a.batch if batched else 1
@@ -1661,7 +1668,8 @@ def main():
                           if len(ids) == len(x[1])] for x in chunk]
                 try:
                     return circuit_masks.find_batch(pts, [(x[1], x[2], x[3].get("answers")) for x in chunk], log=log,
-                                                    partners=parts, cuts_wanted=tuple(a.cuts.split(",")), arm=a.arm)
+                                                    partners=parts, cuts_wanted=tuple(a.cuts.split(",")), arm=a.arm,
+                                                    families=[fam_of(x[0]) for x in chunk])
                 except torch.OutOfMemoryError:
                     if len(chunk) == 1:
                         raise
@@ -1679,7 +1687,7 @@ def main():
             qid, clean, corrupt, extra, _ = chunk[0]
             log(f"{qid}")
             recs = [find(pt, clean, corrupt, extra.get("answers"), log=log, cuts_wanted=tuple(a.cuts.split(",")), measure=meas,
-                         sets=extra.get("sets"), partners=extra.get("partners"))]
+                         sets=extra.get("sets"), partners=extra.get("partners"), family=fam_of(qid))]
         work = [(x, rec) for x, rec in zip(chunk, recs)]
         if a.edge_threads > 1 and len(work) > 1:  # (the edge stage is partly Python-bound, its card ~50% busy on Qwen3-8B:
             from concurrent.futures import ThreadPoolExecutor  # records' edges in threads, each its own Runner, overlap)

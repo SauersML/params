@@ -52,9 +52,11 @@ writes OUT/<id>.json per question.
 from __future__ import annotations
 
 import itertools
+import json
 import math
 import time
 import zlib
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -88,7 +90,12 @@ GRAPH_WARM = 2      # step), the warm steps' cache and the graph's pool freed ar
 # am without partners 1.005 -> 0.961 s a question (64 dev questions, batches of 16), one question at a time mask arm
 # 4.78 -> 3.68 s median; mask arm with 4 partners 5.17 s a question with graphs (48 questions, no memory error)
 FAMILY_MIN_KEYS = 4  # a template's own mover union when it has this many train records, else its task's (family_heads)
-FAMILY_FREQ = 0.0    # heads of at least this frequency among the union's records (0: every head; f10: 0.1)
+FAMILY_FREQ = 0.1    # heads of at least this frequency among the union's records (0: every head). Qwen3-8B, generality's
+# dev half (100 questions, circuit_bench at d9f4e1d, A40): unseen pairs own circuit 44/89, own + as many random same-layer
+# heads as the union adds 42/89, full union 86/89 at 33 units, union at 0.1 84/89 at 24 units (paired McNemar: the union
+# at 0.1 against the random heads 42 to 0, p 5e-13; against the full union 0 to 2, p 0.5)
+UNIONS = Path.home() / "mpd-data" / "circuits" / "unions_train_8b.json"   # (the default unions: circuit_union's over the
+UNIONS_MODEL = "Qwen/Qwen3-8B"                                            # train split's records of this model)
 CLEAN_SIDE = 0       # 1: units active only in the corrupted run (circuit_finder.ACTIVE_RATIO) never in a mask: on unseen keys
 # they carry nothing (casestudy 10-16: 0.00/0.00 in every cut) while giving most of the own pair's necessity
 EXTEND = 0          # > 0: a size control (paper's C25): a met source cut grown with its own mask order's next units to EXTEND
@@ -697,6 +704,12 @@ def _serve(group, reqs: list, log=None) -> list:
     return [fill(r) for r in reqs]
 
 
+def default_unions(model: str) -> dict | None:
+    """UNIONS for UNIONS_MODEL (the default family-union movers of questions mode), None for another model or none on
+    disk."""
+    return json.loads(UNIONS.read_text()) if model == UNIONS_MODEL and UNIONS.exists() else None
+
+
 def family_heads(unions: dict, qid: str, min_keys: int | None = None, freq: float | None = None) -> list | None:
     """The mover union of question qid's template ("task/key/p<k>") in circuit_union's unions: its paraphrase's when that
     has at least min_keys (FAMILY_MIN_KEYS) records, else its task's over every paraphrase; the heads [(layer, head)] of
@@ -1084,12 +1097,14 @@ def main():
     ap.add_argument("--ids", default=None, help="a JSON list of question ids (the frozen dev set)")
     ap.add_argument("--prior", default=None, help="fam: a directory of circuit_finder records; a question's prior is its "
                     "task's records other than its own")
-    ap.add_argument("--unions", default=None, help="circuit_union's mover unions (JSON): each question's mover cut is its "
+    ap.add_argument("--unions", default="auto", help="circuit_union's mover unions (JSON; auto: UNIONS for UNIONS_MODEL; none: "
+                    "off): each question's mover cut is its "
                     "template's union, whole, when that passes on the pair (search_all's family; FAMILY_MIN_KEYS, FAMILY_FREQ)")
     ap.add_argument("--pool", default=None, help="partner keys from this question set's keys of the question's task, in a "
                     "seeded order per question, instead of the question's own partners (left for unseen-pair tests)")
     a = ap.parse_args()
-    unions = json.loads(Path(a.unions).read_text()) if a.unions else None
+    unions = (default_unions(a.model) if a.unions == "auto" else None if a.unions == "none"
+              else json.loads(Path(a.unions).read_text()))
     cf._threads()
     out = Path(a.out if a.mode == "questions" else a.inp)
     out.mkdir(parents=True, exist_ok=True)

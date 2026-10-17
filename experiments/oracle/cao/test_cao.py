@@ -134,3 +134,15 @@ def test_an_example_in_aos_own_tokens_encodes_as_given(tiny):
          "blocks": [{"layer": 7, "positions": [0, 1]}], "q": None, "a": "x"}
     assert tiny.encode(e, True) == ([5, 6, 7, 8, 9, 10], [2, 3], 4)
     assert tiny.encode(e, False) == ([5, 6, 7, 8], [2, 3], 4)
+
+
+def test_a_block_reads_its_own_context(tiny):
+    """A pair's two texts: each block's vectors are its own context's states, batched or alone."""
+    a, b = ex(tiny)["ctx"], ex(tiny)["ctx"][2:9]
+    e = {"ctx": a, "blocks": [{"layer": 7, "positions": [0, 3]}, {"layer": 7, "positions": [1, 2, 6], "ctx": b}], "q": "q", "a": "a"}
+    one = {"ctx": b, "blocks": [{"layer": 7, "positions": [1, 2, 6]}], "q": "q", "a": "a"}
+    v, w = tiny.vectors_many([e, one])
+    assert torch.allclose(v, tiny._vectors(e), atol=1e-5)
+    assert torch.allclose(v[2:], w, atol=1e-5) and v.shape[0] == 5
+    ids, pos, _ = tiny.encode(e, False)
+    assert len(pos) == 5

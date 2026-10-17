@@ -2,8 +2,8 @@
 target model's own activations, and LoRA SFT from it.
 
 Input: blocks of placeholders before the question, "Layer: L\\n ? ... ? \\n", each placeholder's vector (the target's
-residual at layer L's output at one position of the context, read with the adapter off or with an organism's adapter,
-an example's "target") added to the residual stream at layer 1's output (normalized, scaled to the norm there, in the
+residual at layer L's output at one position of the context, the example's "ctx" or the block's own (a pair of texts),
+read with the adapter off or with an organism's adapter, an example's "target") added to the residual stream at layer 1's output (normalized, scaled to the norm there, in the
 activations' dtype: the paper's hook; prefill only). An example built by AO's own code (ao_mix.py's replay) carries its
 token ids, placeholders and answer start; one with "vec" takes its vectors from vec_store (precomputed: organisms.py's
 and e1.py's examples). text_only: no vector added (the control).
@@ -112,7 +112,7 @@ class Oracle:
         (an example's "vec": its key in vec_store)."""
         if "vec" in ex:
             return self.vec_store[ex["vec"]].to(self.dev)
-        key = (tuple(ex["ctx"]), json.dumps(ex["blocks"]), ex.get("target"))  # (an eval text's questions share it)
+        key = (tuple(ex.get("ctx") or ()), json.dumps(ex["blocks"]), ex.get("target"))  # (an eval text's questions share it)
         if key in self._vcache:
             return self._vcache[key]
         v = self._vectors(ex)
@@ -124,10 +124,12 @@ class Oracle:
 
     def _vectors(self, ex: dict):
         torch = self.torch
-        self.passes += 1  # the target model's forward passes (the reading, not the oracle's own generation)
-        with self.off(ex.get("target")), torch.no_grad():
-            H = self.m(input_ids=torch.tensor([ex["ctx"]], device=self.dev), output_hidden_states=True).hidden_states
-        return torch.cat([H[b["layer"] + 1][0, b["positions"]] for b in ex["blocks"]])
+        H = {}
+        for c in dict.fromkeys(tuple(b.get("ctx") or ex["ctx"]) for b in ex["blocks"]):  # (each context run once)
+            self.passes += 1  # the target model's forward passes (the reading, not the oracle's own generation)
+            with self.off(ex.get("target")), torch.no_grad():
+                H[c] = self.m(input_ids=torch.tensor([list(c)], device=self.dev), output_hidden_states=True).hidden_states
+        return torch.cat([H[tuple(b.get("ctx") or ex["ctx"])][b["layer"] + 1][0, b["positions"]] for b in ex["blocks"]])
 
     def vectors_many(self, exs: list[dict]) -> list:
         """vectors() for a batch: the examples that read the target itself in one right-padded forward pass over their
@@ -138,7 +140,8 @@ class Oracle:
         for k in set(range(len(exs))) - set(todo):
             out[k] = self.vectors(exs[k])
         if todo:
-            ctxs = list(dict.fromkeys(tuple(exs[k]["ctx"]) for k in todo))
+            ctx = lambda e, b: tuple(b.get("ctx") or e["ctx"])  # noqa: E731  (a block may read its own context: a pair's two texts)
+            ctxs = list(dict.fromkeys(ctx(exs[k], b) for k in todo for b in exs[k]["blocks"]))
             L = max(len(c) for c in ctxs)
             ids = torch.full((len(ctxs), L), self.tok.pad_token_id or self.tok.eos_token_id, device=self.dev)
             att = torch.zeros((len(ctxs), L), dtype=torch.long, device=self.dev)
@@ -148,9 +151,9 @@ class Oracle:
             self.passes += len(ctxs)
             with self.off(None), torch.no_grad():
                 H = self.m(input_ids=ids, attention_mask=att, output_hidden_states=True).hidden_states
+            row = {c: r for r, c in enumerate(ctxs)}
             for k in todo:
-                r = ctxs.index(tuple(exs[k]["ctx"]))
-                out[k] = torch.cat([H[b["layer"] + 1][r, b["positions"]] for b in exs[k]["blocks"]])
+                out[k] = torch.cat([H[b["layer"] + 1][row[ctx(exs[k], b)], b["positions"]] for b in exs[k]["blocks"]])
         return out
 
     def hook(self, vecs: list, pos: list[list[int]]):

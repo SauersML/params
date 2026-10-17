@@ -27,6 +27,9 @@ compute from what is left.
       at or after the key's first token depends on the key only, so other wordings of the question with the same key, the
       dev set's families, may supply it; positions mapped by role), computed there in layer order with earlier units
       already scrubbed. Scored as R3 (KL, task loss, pass) on the own clean prompt and the held-out prompts.
+  R5  Gao's feature-quality substitution: the background everywhere, nothing computed, each circuit unit set to its
+      label's simulated value (load_sims; an unlabelled unit stays at the background), beside the frozen circuit (each
+      unit at its full-model value: the ceiling of perfect labels). Scored as R3.
   coverage  per token of general text (windows: the first COVER_T tokens of corpus documents outside the means' sample),
       the fewest units at positions up to it that, live under the background above, keep the next-token distribution's
       KL from the full model's within a bound (COVER_BOUNDS), read off the KL curve of the units in the order a learned
@@ -36,7 +39,7 @@ compute from what is left.
 
   ami.py sample OUT.npz [--tokens 1100000]          a seeded sample of the atlas corpus's documents (the means' text)
   ami.py means SAMPLE.npz OUT.pt [--model M]        the background means of a model over the sample
-  ami.py r3|r4 RECORDS_DIR OUT_DIR --means M.pt --label METHOD [--devset D] [--pool P] [--model M]
+  ami.py r3|r4|r5 RECORDS_DIR OUT_DIR --means M.pt --label METHOD [--devset D] [--pool P] [--model M] [--sims S]
                                                     every record's R3 (a circuit_finder record, or a circuit file with
                                                     "neurons" [[layer, pos, neuron]] and "heads" [[layer, pos, head]])
   ami.py windows OUT.npz [--n 64]                   corpus windows outside the means' sample (coverage's text)
@@ -481,7 +484,7 @@ def summarize(prompts: list, arms: list) -> dict:
         rnd = [a for a in arms if a.startswith("random")]
         if rnd:
             s["random"] = {m: float(np.mean([s[a][m] for a in rnd])) for m in ("kl", "ce", "top1", "pass", "pass_abs")}
-        for a in ["circuit"] + (["random"] if rnd else []) + (["frozen"] if "frozen" in arms else []):
+        for a in [a for a in ("circuit", "frozen", "simulated") if a in arms] + (["random"] if rnd else []):
             d_ce = s["empty"]["ce"] - s["full"]["ce"]
             s[a]["recovered_ce"] = (s["empty"]["ce"] - s[a]["ce"]) / d_ce if d_ce > 1e-9 else None
             s[a]["recovered_kl"] = 1 - s[a]["kl"] / s["empty"]["kl"] if s["empty"]["kl"] > 1e-9 else None
@@ -652,6 +655,52 @@ def r4(abl: Ablator, tok, rec: dict, q: dict, keys: list, draws: int = R4_DRAWS,
             s_[a]["recovered_ce"] = (s_["empty"]["ce"] - s_[a]["ce"]) / d_ce if d_ce > 1e-9 else None
             s_[a]["recovered_kl"] = 1 - s_[a]["kl"] / s_["empty"]["kl"] if s_["empty"]["kl"] > 1e-9 else None
         res["summary"][split] = s_
+    return res
+
+
+# ---------------------------------------------------------------- R5
+
+def load_sims(path) -> dict:
+    """Simulated activations: a JSONL file of {"unit": [kind, layer, pos, index] as record_units' tuples (a head:
+    ["head", layer, head, pos]), "ids": the prompt's token ids, "value": the simulated value (a neuron's activation, or a
+    head channel's)}, as {(unit tuple, tuple(ids)): value}."""
+    out = {}
+    for line in Path(path).read_text().splitlines():
+        if line.strip():
+            d = json.loads(line)
+            out[(tuple(d["unit"]), tuple(d["ids"]))] = d["value"]
+    return out
+
+
+def r5(abl: Ablator, tok, rec: dict, q: dict, keys: list, sim, n_heldout: int = DRAWS) -> dict:
+    """A circuit's R5 (Gao's feature-quality substitution): the background everywhere, nothing computed, each circuit
+    unit set to its label's simulated value on the prompt (sim(unit, ids) -> a value, or None for a unit with no label,
+    which then stays at the background: an unlabelled unit explains nothing); beside it the frozen circuit (each unit
+    at its full-model value: the ceiling a perfect label reaches), the full model and the empty circuit, on the own clean
+    prompt and the held-out prompts (R3's)."""
+    t0 = time.perf_counter()
+    units = record_units(rec)
+    bad = invalid(units, abl.L, abl.D, abl.H, abl.H * abl.hd, len(rec["ids"]))
+    if bad:
+        return {"id": rec.get("id"), "error": f"{len(bad)} units outside the model or the prompt, e.g. {bad[0]}", "summary": {}}
+    prompts = [("own", list(rec["ids"]))] + [("heldout", ids) for _, ids in heldout(tok, rec, q, keys, n_heldout)]
+    lp, got = abl.run([{"ids": ids, "keep": None, "grab": units} for _, ids in prompts])
+    labelled = [[u for u in units if sim(u, ids) is not None] for _, ids in prompts]
+    rows = []
+    for (_, ids), g, lab in zip(prompts, got, labelled):
+        rows += [{"ids": ids, "keep": []}, {"ids": ids, "keep": [], "over": list(zip(units, g))},
+                 {"ids": ids, "keep": [], "over": [(u, torch.as_tensor(sim(u, ids), dtype=torch.float32).reshape(-1)) for u in lab]}]
+    lq = abl.logp(rows).view(len(prompts), 3, -1)
+    sets = answer_contrast.token_sets_many(abl.pt.core, tok, [(ids, lp[j], None, None, None) for j, (_, ids) in enumerate(prompts)])
+    out = []
+    for j, (split, ids) in enumerate(prompts):
+        out.append({"split": split, "answer_word": sets[j]["answer_word"], "labelled": len(labelled[j]),
+                    "full": _metrics(lp[j], lp[j], sets[j]["answer"]),
+                    **{a: _metrics(lp[j], lq[j, x], sets[j]["answer"]) for x, a in enumerate(("empty", "frozen", "simulated"))}})
+    res = {"id": rec.get("id"), "task": rec.get("task") or q.get("task"), "size": sizes(units), "prompts": out,
+           "labelled_share": float(np.mean([p["labelled"] / max(1, len(units)) for p in out])),
+           "seconds_found": rec.get("seconds"), "seconds": round(time.perf_counter() - t0, 2)}
+    res["summary"] = summarize(out, ["full", "empty", "frozen", "simulated"])
     return res
 
 
@@ -991,7 +1040,7 @@ def board(dirs: list) -> list:
             if not S:
                 continue
             rung = meta.get("rung", "R3")
-            arm = "scrub" if rung == "R4" else "circuit"
+            arm = {"R4": "scrub", "R5": "simulated"}.get(rung, "circuit")
             row = {"method": meta.get("label", Path(d).name), "rung": rung, "inputs": split, "n": len(S),
                    "background": meta.get("mode", MODE)}
             for m in ("recovered_ce", "recovered_kl", "ce", "kl", "pass", "pass_abs"):
@@ -1055,7 +1104,7 @@ def main():
     m = sub.add_parser("means")
     m.add_argument("sample")
     m.add_argument("out")
-    r = sub.add_parser("r3", aliases=["r4"])
+    r = sub.add_parser("r3", aliases=["r4", "r5"])
     r.add_argument("records")
     r.add_argument("out")
     r.add_argument("--means", required=True)
@@ -1066,6 +1115,7 @@ def main():
     r.add_argument("--draws", type=int, default=DRAWS)
     r.add_argument("--random", type=int, default=RANDOM)
     r.add_argument("--limit", type=int, default=0)
+    r.add_argument("--sims", default=None, help="r5: the simulated activations (load_sims' JSONL)")
     c = sub.add_parser("cover")
     c.add_argument("out")
     c.add_argument("--means", required=True)
@@ -1141,6 +1191,7 @@ def main():
     qs = load_questions(a.devset)
     keys = task_keys({**load_questions(a.pool), **qs})
     paths = sorted(p for p in Path(a.records).glob("*.json") if p.name != "meta.json")[:a.limit or None]
+    sims = load_sims(a.sims) if a.cmd == "r5" else None
     for p in paths:
         dst = out / p.name
         if dst.exists():
@@ -1149,6 +1200,14 @@ def main():
         if rec.get("skipped") or not rec.get("ids"):
             continue
         q = qs.get(rec.get("id")) or {k: rec.get(k) for k in ("user", "key", "corrupt_key", "task", "prefill", "system") if rec.get(k)}
+        if a.cmd == "r5":
+            res = r5(abl, tok, rec, q, keys.get(rec.get("task") or q.get("task"), []), lambda u, ids: sims.get((u, tuple(ids))), a.draws)
+            dst.write_text(json.dumps(res))
+            s = res["summary"]
+            log(f"{rec.get('id')}: " + (f"{res['size']['units']} units, {res['labelled_share']:.2f} labelled; own ce simulated "
+                                        f"{s['own']['simulated']['ce']:.2f} frozen {s['own']['frozen']['ce']:.2f} (empty "
+                                        f"{s['own']['empty']['ce']:.2f})" if "own" in s else str(res.get("error"))))
+            continue
         if a.cmd == "r4":
             res = r4(abl, tok, rec, q, keys.get(rec.get("task") or q.get("task"), []), R4_DRAWS, a.draws)
             dst.write_text(json.dumps(res))

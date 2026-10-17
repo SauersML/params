@@ -163,3 +163,20 @@ def test_mask_search_shared_mask(tiny, monkeypatch):
     mh = (ms["th"][1][0] >= z).float()[None].expand(2, -1, -1, -1)
     with torch.no_grad():
         assert float(ami._kl(lpf, mk.logp(x, mn, mh, pos)).max()) <= 0.1 + 1e-6
+
+
+def test_r5_true_simulator_is_frozen(tiny, monkeypatch):
+    model, docs, means = tiny
+    abl = ami.Ablator(model, None, means)
+    ids = docs[0][:12]
+    units = [("neuron", 0, 4, 3), ("head", 0, 1, 5), ("neuron", 1, 11, 2)]
+    _, got = abl.run([{"ids": ids, "keep": None, "grab": units}])
+    true = dict(zip(units, got[0]))
+    monkeypatch.setattr(ami, "heldout", lambda *a, **k: [])
+    monkeypatch.setattr(ami.answer_contrast, "token_sets_many", lambda core, tok, items: [{"answer": [int(it[1].argmax())], "answer_word": "w"} for it in items])
+    rec = {"id": "t", "ids": ids, "neurons": [[0, 4, 3], [1, 11, 2]], "heads": [[0, 5, 1]]}
+    res = ami.r5(abl, None, rec, {}, [], lambda u, x: true[u])
+    p = res["prompts"][0]
+    assert abs(p["simulated"]["kl"] - p["frozen"]["kl"]) < 1e-6 and res["labelled_share"] == 1.0
+    res0 = ami.r5(abl, None, rec, {}, [], lambda u, x: None)       # (no labels: the empty circuit)
+    assert abs(res0["prompts"][0]["simulated"]["kl"] - res0["prompts"][0]["empty"]["kl"]) < 1e-6

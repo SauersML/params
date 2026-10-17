@@ -252,10 +252,11 @@ class Episode:
         self.wd = "/workspace"
         self.lock = threading.Lock()
 
-    def sample(self, msgs: list[dict], max_tokens: int, prefill: str = "", helper: bool = False) -> str:
+    def sample(self, msgs: list[dict], max_tokens: int, prefill: str = "", helper: bool = False, rr=None) -> str:
         import tinker
         from tinker_cookbook.renderers import get_text_content
-        prompt = self.rr.build_generation_prompt(msgs, prefill=prefill) if prefill else self.rr.build_generation_prompt(msgs)
+        rr = rr or self.rr
+        prompt = rr.build_generation_prompt(msgs, prefill=prefill) if prefill else rr.build_generation_prompt(msgs)
         res = self.sampler.sample(prompt=prompt, num_samples=1, sampling_params=tinker.SamplingParams(
             max_tokens=max_tokens, temperature=TEMPERATURE, top_p=TOP_P, stop=self.rr.get_stop_sequences())).result()
         seq, hits = res.sequences[0], res.prompt_cache_hit_tokens or 0
@@ -265,7 +266,7 @@ class Episode:
                 self.helper += len(seq.tokens)
             else:
                 self.generated += len(seq.tokens)
-        msg, _ = self.rr.parse_response(list(seq.tokens))
+        msg, _ = rr.parse_response(list(seq.tokens))
         return get_text_content(msg)
 
     def path(self, p: str) -> str:
@@ -418,6 +419,7 @@ def run(a) -> None:
     if a.targets:  # a pilot: targets spread over the list, each of another quirk and training configuration
         targets = [targets[(k * len(targets)) // a.targets + k % 4] for k in range(a.targets)]
     rr = renderers.get_renderer(RENDERER, get_tokenizer(AGENT))
+    rr_plain = renderers.get_renderer(RENDERER + "_disable_thinking", get_tokenizer(AGENT))
     sampler = tinker.ServiceClient(project_id=os.environ["TINKER_PROJECT_ID"]).create_sampling_client(base_model=AGENT)
     name = f"ab-paper-{a.arm.replace('_', '-')}-kimi"
     d = sc.oracle_meta(name, f"AuditBench's own scaffold ({a.arm.replace('_', ' ')}), Kimi-K2.6 investigator", "baseline",
@@ -428,8 +430,9 @@ def run(a) -> None:
     lock = threading.Lock()
 
     def scen(prompt: str, ep: Episode) -> str:  # the scenario writer: the investigator model itself (the paper: Sonnet),
-        # a tool's own call, so outside the investigator's token budget as in the paper
-        return ep.sample([{"role": "user", "content": prompt}], 8192, prefill="", helper=True)
+        # a tool's own call, so outside the investigator's token budget as in the paper, and without thinking (thinking
+        # spent the 8192 tokens before writing: 2 of 100 scenarios in the pilot)
+        return ep.sample([{"role": "user", "content": prompt}], 8192, prefill="", helper=True, rr=rr_plain)
 
     def one(target: str, r: int):
         nonlocal spent

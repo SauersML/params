@@ -181,8 +181,8 @@ def _asin(x):
     return np.arcsin(np.clip(x, -1.0, 1.0))
 
 
-def _orthant_batch(Rb):
-    """Closed forms for a batch (Q, k, k) of correlation matrices, k <= 3."""
+def _orthant_closed(Rb):
+    """Closed forms for a batch (B, k, k) of correlation matrices, k <= 3."""
     k = Rb.shape[1]
     if k == 0:
         return np.ones(Rb.shape[0])
@@ -190,75 +190,92 @@ def _orthant_batch(Rb):
         return np.full(Rb.shape[0], 0.5)
     if k == 2:
         return 0.25 + _asin(Rb[:, 0, 1]) / (2 * math.pi)
-    if k == 3:
-        return 0.125 + (_asin(Rb[:, 0, 1]) + _asin(Rb[:, 0, 2]) + _asin(Rb[:, 1, 2])) / (4 * math.pi)
-    return np.array([orthant(R, None) for R in Rb])
+    return 0.125 + (_asin(Rb[:, 0, 1]) + _asin(Rb[:, 0, 2]) + _asin(Rb[:, 1, 2])) / (4 * math.pi)
+
+
+class _Count:
+    n = 0
+
+
+def orthant_batch(Rb, ops=None):
+    """P(y >= 0) for y ~ N(0, R) for each correlation matrix R in the batch (B, k, k). Closed form for k <= 3;
+    above, Plackett's reduction to k-2 with the inner orthant probabilities batched over quadrature nodes."""
+    B, k = Rb.shape[0], Rb.shape[1]
+    if k <= 3:
+        return _orthant_closed(Rb)
+    I = np.eye(k)
+    # the integrand varies on u-scales down to sqrt(smallest eigenvalue of R); refine that far plus 4 levels
+    lam = max(float(np.linalg.eigvalsh(Rb)[:, 0].min()), 1e-30)
+    U, Wq, _ = _nodes(min(60, int(math.ceil(0.5 * math.log2(1.0 / lam))) + 4))
+    Q = len(U)
+    tau = U * U  # 1 - t, kept separately: R_t = R + tau (I - R) has no cancellation near t = 1
+    Rt = Rb[:, None] + tau[None, :, None, None] * (I - Rb)[:, None]  # (B, Q, k, k)
+    tot = np.full(B, 2.0 ** (-k))
+    for i, j in itertools.combinations(range(k), 2):
+        r = Rb[:, i, j]  # (B,)
+        rest = [m for m in range(k) if m not in (i, j)]
+        Bm = Rt[:, :, [i, j]][:, :, :, [i, j]]  # (B, Q, 2, 2)
+        C = Rt[:, :, rest][:, :, :, [i, j]]  # (B, Q, k-2, 2)
+        det = (1 - r * r)[:, None] + (tau * (2 - tau))[None] * (r * r)[:, None]  # 1 - (t r)^2, (B, Q)
+        Binv = np.stack([np.stack([Bm[..., 1, 1], -Bm[..., 0, 1]], -1),
+                         np.stack([-Bm[..., 1, 0], Bm[..., 0, 0]], -1)], -2) / np.clip(det, 1e-300, None)[..., None, None]
+        cond = Rt[:, :, rest][:, :, :, rest] - C @ Binv @ np.swapaxes(C, -1, -2)
+        dg = np.sqrt(np.clip(np.einsum("bqii->bqi", cond), 1e-300, None))
+        cond = np.clip(cond / dg[..., :, None] / dg[..., None, :], -1.0, 1.0)
+        flat = cond.reshape(B * Q, k - 2, k - 2)
+        if k - 2 <= 3:
+            inner = orthant_batch(flat, ops).reshape(B, Q)
+        else:  # bound the inner batch's memory (it expands by its own node count)
+            inner = np.concatenate([orthant_batch(flat[i:i + 256], ops) for i in range(0, B * Q, 256)]).reshape(B, Q)
+        dens = 1.0 / (2 * math.pi * np.sqrt(np.clip(det, 1e-300, None)))
+        f = Wq[None] * 2 * U[None] * dens * inner
+        # nodes so close to t = 1 that the 2x2 block is numerically singular carry negligible weight
+        f = np.where(np.isfinite(f) & (det > 1e-300), f, 0.0)
+        tot += r * f.sum(1)
+        if ops is not None:
+            ops.n += B * Q * (6 * k * k + 40)
+    return tot
 
 
 def orthant(R, ops):
     """P(y >= 0) for y ~ N(0, R), R a correlation matrix."""
-    k = R.shape[0]
-    if k <= 3:
-        return float(_orthant_batch(R[None])[0])
-    tot = 2.0 ** (-k)
-    I = np.eye(k)
-    # the integrand varies on u-scales down to sqrt(smallest eigenvalue of R); refine that far plus 4 levels
-    lam = max(float(np.linalg.eigvalsh(R)[0]), 1e-30)
-    _U, _W, _T = _nodes(min(26, int(math.ceil(0.5 * math.log2(1.0 / lam))) + 4))
-    Rt = _T[:, None, None] * R[None] + (1 - _T)[:, None, None] * I[None]  # (Q, k, k)
-    for i, j in itertools.combinations(range(k), 2):
-        r = R[i, j]
-        if abs(r) < 1e-15:
-            continue
-        rest = [m for m in range(k) if m not in (i, j)]
-        B = Rt[:, [i, j]][:, :, [i, j]]
-        C = Rt[:, rest][:, :, [i, j]]
-        det = B[:, 0, 0] * B[:, 1, 1] - B[:, 0, 1] * B[:, 1, 0]
-        Binv = np.stack([np.stack([B[:, 1, 1], -B[:, 0, 1]], -1), np.stack([-B[:, 1, 0], B[:, 0, 0]], -1)], 1)
-        Binv = Binv / det[:, None, None]
-        cond = Rt[:, rest][:, :, rest] - C @ Binv @ C.transpose(0, 2, 1)
-        dg = np.sqrt(np.clip(np.einsum("qii->qi", cond), 1e-300, None))
-        cond = np.clip(cond / dg[:, :, None] / dg[:, None, :], -1.0, 1.0)
-        inner = _orthant_batch(cond)
-        dens = 1.0 / (2 * math.pi * np.sqrt(np.clip((1 - _T * r) * (1 + _T * r), 1e-300, None)))
-        f = _W * 2 * _U * dens * inner
-        # nodes within 2^-26 of t = 1 where the 2x2 block is numerically singular carry weight below ~1e-8
-        tot += r * float(np.sum(np.where(np.isfinite(f) & (det > 1e-300), f, 0.0)))
-        if ops is not None:
-            ops.n += len(_T) * (6 * k * k + 40)
-    return tot
+    return float(orthant_batch(R[None], ops)[0])
 
 
-def _measure_bound(V):
-    """Upper bound on the Gaussian measure of the cone over unit rays V: the solid angle subtended by the simplex
-    conv(V) is at most its area / h^(n-1), where h is the distance from the origin to its affine hull; the area is
-    |det V| (n-1)! / h."""
+def thin_bound(V):
+    """Upper bound on the Gaussian measure of the simplicial cone over unit rays V (rows). Every point of the cone
+    inside the unit ball is lambda * p with p in conv(V) and lambda <= 1/|p| <= 1/h, where h = min_i g.r_i for the
+    unit mean direction g lower-bounds the distance from 0 to conv(V); so the cone's share of the ball is at most
+    vol(conv(0, V / h)) / vol(ball) = |det V| / (n! h^n vol(ball)). 1e-15 is added to |det V| for rounding."""
     n = V.shape[0]
-    c = np.linalg.lstsq(V, np.ones(n), rcond=None)[0]
-    h = 1.0 / max(np.linalg.norm(c), 1e-300)
-    sphere = 2 * math.pi ** (n / 2) / math.gamma(n / 2)
-    return abs(np.linalg.det(V)) * math.factorial(n - 1) / h ** n / sphere
+    g = V.sum(0)
+    g /= np.linalg.norm(g)
+    h = float((V @ g).min())
+    if h <= 0:
+        return 1.0
+    ball = math.pi ** (n / 2) / math.gamma(n / 2 + 1)
+    return min(1.0, (abs(np.linalg.det(V)) + 1e-15) / (math.factorial(n) * h ** n * ball))
 
 
 def simplicial_measure(V, ops):
-    """Gaussian measure of the cone generated by the rows of V (k x k unit rows). Cones too thin for the quadrature
-    (correlation matrix with smallest eigenvalue below 1e-13, or a result outside [0, 1]) count as 0 and add their
-    upper bound to ops.unresolved, which is reported as the estimate's error bound."""
-    det = abs(np.linalg.det(V))
-    if det < 1e-10:
-        ops.unresolved += _measure_bound(V)
-        return 0.0
-    G = np.linalg.inv(V @ V.T)
-    ops.n += 2 * V.shape[0] ** 3
-    R = _corr(G)
-    if V.shape[0] > 3 and float(np.linalg.eigvalsh(R)[0]) < 1e-13:
-        ops.unresolved += _measure_bound(V)
+    """Gaussian measure of the cone generated by the rows of V (k x k unit rows). The coordinates c of x = V^T c
+    have covariance V^-T V^-1, whose correlation matrix R gives the orthant probability. Cones so thin that R's
+    smallest eigenvalue is below 1e-11 (where float64 quadrature loses absolute accuracy ~1e-9) count as 0 and add
+    thin_bound(V) to ops.unresolved, the estimate's certified error bound."""
+    k = V.shape[0]
+    Vi = np.linalg.inv(V)
+    R = _corr(Vi.T @ Vi)
+    ops.n += 2 * k ** 3
+    if k <= 3:
+        return orthant(R, ops)
+    if float(np.linalg.eigvalsh(R)[0]) < 1e-11:
+        ops.unresolved += thin_bound(V)
         return 0.0
     p = orthant(R, ops)
     if not (math.isfinite(p) and -1e-9 <= p <= 1 + 1e-9):
-        ops.unresolved += _measure_bound(V)
+        ops.unresolved += thin_bound(V)
         return 0.0
-    return p
+    return min(max(p, 0.0), 1.0)
 
 
 def measure(cone, ops):

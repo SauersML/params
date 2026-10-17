@@ -1,0 +1,154 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Why did it say that?</title>
+<style>
+  :root { --bg: #f7f5f0; --panel: #ffffff; --ink: #1f2328; --muted: #6b7280; --line: #e5e1d8; --accent: #2f5fa7;
+          --src: #f6d58e; --src-ink: #6b4d00; --good: #1f7a3f; --bad: #b42318; --chip: #eef2f8; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #15171a; --panel: #1d2024; --ink: #e8e6e1; --muted: #9aa0a6; --line: #30343a; --accent: #7aa7f0;
+            --src: #6b5317; --src-ink: #ffe3a3; --good: #5cc98a; --bad: #f08a80; --chip: #26303d; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink); font: 15px/1.5 -apple-system, "Helvetica Neue", Arial, sans-serif; }
+  main { max-width: 860px; margin: 0 auto; padding: 20px 16px 60px; }
+  h1 { font-size: 22px; margin: 0 0 4px; }
+  .sub { color: var(--muted); margin: 0 0 16px; font-size: 13.5px; }
+  form, section { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 14px 16px; margin-bottom: 14px; }
+  label { display: block; font-size: 13px; color: var(--muted); margin: 8px 0 4px; }
+  textarea, input, select { width: 100%; font: inherit; color: var(--ink); background: var(--bg); border: 1px solid var(--line);
+                            border-radius: 8px; padding: 8px 10px; }
+  textarea { resize: vertical; min-height: 44px; }
+  .row { display: flex; gap: 12px; flex-wrap: wrap; }
+  .row > div { flex: 1; min-width: 200px; }
+  button { margin-top: 12px; font: inherit; font-weight: 600; color: #fff; background: var(--accent); border: none;
+           border-radius: 8px; padding: 9px 18px; cursor: pointer; }
+  button:disabled { opacity: .5; cursor: default; }
+  h2 { font-size: 16px; margin: 0 0 8px; }
+  .big { font-size: 20px; font-weight: 600; }
+  .muted { color: var(--muted); font-size: 13px; }
+  .toks { display: flex; flex-wrap: wrap; gap: 3px; margin: 6px 0; }
+  .tok { border: 1px solid var(--line); border-radius: 5px; padding: 1px 5px; font-family: ui-monospace, Menlo, monospace;
+         font-size: 13px; white-space: pre; position: relative; }
+  .tok.src { background: var(--src); color: var(--src-ink); border-color: transparent; }
+  .tok .n { font-size: 10.5px; vertical-align: super; margin-left: 2px; }
+  .chips { display: flex; flex-wrap: wrap; gap: 6px; }
+  .chip { background: var(--chip); border-radius: 999px; padding: 2px 10px; font-size: 13px; }
+  table { border-collapse: collapse; width: 100%; font-size: 14px; }
+  th, td { text-align: left; padding: 5px 8px; border-bottom: 1px solid var(--line); }
+  th { color: var(--muted); font-weight: 500; }
+  .flip { color: var(--good); font-weight: 600; }
+  .noflip { color: var(--muted); }
+  .err { color: var(--bad); }
+  .summary { font-size: 15.5px; }
+  .note { background: var(--chip); border-radius: 8px; padding: 8px 10px; font-size: 13.5px; margin-top: 8px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Why did it say that?</h1>
+  <p class="sub">Qwen3-8B. Give a prompt and either an answer you expected instead, or a second prompt to compare against.
+     The circuit is found and checked by patching the model itself; every number on this page is measured.</p>
+  <form id="f">
+    <label for="prompt">Prompt</label>
+    <textarea id="prompt" rows="2">Tell me the capital of Turkey in one word.</textarea>
+    <div class="row">
+      <div><label for="alt">Alternative answer</label><input id="alt" value="Tokyo"></div>
+      <div><label for="prefill">Reply starts with (optional; the answer is read after it)</label><input id="prefill" value=""></div>
+      <div><label for="model">Model</label><select id="model"><option value="base">Qwen3-8B</option></select></div>
+    </div>
+    <label for="contrast">…or a second prompt to compare against (same number of tokens; used instead of the alternative)</label>
+    <textarea id="contrast" rows="2"></textarea>
+    <button id="go" type="submit">Explain</button> <span id="status" class="muted"></span>
+  </form>
+  <div id="out"></div>
+</main>
+<script>
+const SERVER = location.protocol.startsWith("http") ? "" : "http://localhost:8801";
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;"}[c]));
+const bits = (v) => (v === null || v === undefined) ? "–" : (v >= 0 ? "+" : "") + Number(v).toFixed(1) + " bits";
+const pct = (v) => (v === null || v === undefined) ? "–" : Math.round(100 * v) + "%";
+
+fetch(SERVER + "/health").then(r => r.json()).then(h => {
+  $("model").innerHTML = h.models.map(m => `<option value="${esc(m)}">${m === "base" ? "Qwen3-8B" : "Qwen3-8B + " + esc(m)}</option>`).join("");
+}).catch(() => { $("status").textContent = "server not reached (start the tunnel)"; });
+
+$("f").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  $("go").disabled = true; $("status").textContent = "working…"; $("out").innerHTML = "";
+  const t0 = performance.now();
+  try {
+    const r = await fetch(SERVER + "/explain", {method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({prompt: $("prompt").value, alternative: $("alt").value, contrast: $("contrast").value,
+                            prefill: $("prefill").value, model: $("model").value})});
+    const d = await r.json();
+    render(d);
+    $("status").textContent = `${((performance.now() - t0) / 1000).toFixed(2)} s round trip (${d.seconds ?? "–"} s on the card)`;
+  } catch (err) {
+    $("out").innerHTML = `<section class="err">${esc(err)}</section>`; $("status").textContent = "";
+  }
+  $("go").disabled = false;
+});
+
+function tokens(d, byToken) {
+  const at = {}; (byToken || []).forEach(b => at[b.pos] = b);
+  return `<div class="toks">` + (d.tokens || []).map((t, p) => {
+    const b = at[p];
+    const title = b ? `${b.neurons} neurons, layers ${b.layers.join(", ")}` + (b.contrast_token ? ` (contrast token: ${b.contrast_token})` : "") : "";
+    return `<span class="tok${b ? " src" : ""}" title="${esc(title)}">${esc(t)}${b ? `<span class="n">${b.neurons}</span>` : ""}</span>`;
+  }).join("") + `</div>`;
+}
+
+function render(d) {
+  let h = "";
+  if (d.error && !d.answer) { $("out").innerHTML = `<section class="err">${esc(d.error)}</section>`; return; }
+  h += `<section><h2>Answer</h2><div class="big">“${esc((d.answer || "").trim())}”
+        <span class="muted">${bits(d.margin)} over “${esc((d.contrast_answer || "").trim())}”</span></div>`;
+  if (d.mode === "pair") {
+    h += `<div class="muted">Contrast prompt: “${esc(d.contrast_prompt)}” → “${esc((d.contrast_answer || "").trim())}” (${bits(d.contrast_margin)})` +
+         (d.donor ? ` — picked from the ${esc(d.donor.task)} family (${esc(d.donor.key)} → ${esc(d.donor.donor_key)})` : "") + `</div>`;
+  } else {
+    h += `<div class="note">No contrast prompt was found (${esc(d.ablation_reason)}). This page shows zero ablation instead: units are
+          switched off, which shows what the answer needs, not what makes it differ from the alternative.</div>`;
+  }
+  if (d.error) h += `<div class="err">${esc(d.error)}</div>`;
+  h += `</section>`;
+  if (d.summary) h += `<section><h2>Summary</h2><div class="summary">${esc(d.summary)}</div>
+                      <div class="muted">Written from a fixed template over the measured numbers below.</div></section>`;
+  if (d.mode === "pair" && d.source) {
+    h += `<section><h2>Circuit</h2>`;
+    h += `<div><b>Source</b> — ${d.source.met ? `${d.source.size} neurons` : "none found"} where the two prompts differ
+          <span class="muted">(alone: ${pct(d.source.lost)} of the difference lost, ${pct(d.source.restored)} restored)</span></div>`;
+    h += tokens(d, d.source.by_token);
+    h += `<div style="margin-top:10px"><b>Movers</b> — ${d.movers.met ? `${d.movers.size} attention heads at the answer position` : "none found"}
+          ${d.movers.family ? `<span class="muted">(the task family's shared heads)</span>` : ""}
+          <span class="muted">(alone: ${pct(d.movers.lost)} lost, ${pct(d.movers.restored)} restored)</span></div><div class="chips">` +
+          (d.movers.heads || []).map(x => `<span class="chip" title="looks at: ${esc((x.attends || []).map(a => a[1] + " " + a[2]).join(", "))}">
+             L${x.layer}H${x.head}${x.attends && x.attends.length ? " → “" + esc(x.attends[0][1].trim()) + "”" : ""}</span>`).join("") + `</div>`;
+    const ro = d.readout;
+    h += `<div style="margin-top:10px"><b>Readout</b> — ` + (ro.met ? `${ro.size} neurons at the answer position (layers ${ro.layers[0]}–${ro.layers[ro.layers.length - 1]};
+          ${pct(ro.lost)} lost, ${pct(ro.restored)} restored)` : ro.ceiling ? `spread out: every neuron at the answer position together carries
+          ${pct(Math.min(...ro.ceiling))} of the difference` : "–") + `</div></section>`;
+    h += `<section><h2>Check</h2><table><tr><th>patched from the contrast run</th><th>margin before</th><th>after</th><th>answer after</th>
+          <th>same number of random units</th></tr>` + (d.check || []).map(c => `<tr><td>${c.units} ${c.cut === "movers" ? "heads" : "neurons"} (${c.cut})</td>
+          <td>${bits(c.margin_before)}</td><td class="${c.flipped ? "flip" : "noflip"}">${bits(c.margin_after)}</td>
+          <td>“${esc(c.answer_after.trim())}”${c.flipped ? " ✓ flipped" : ""}</td>
+          <td>${bits(c.random_margin_after)} → “${esc(c.random_answer_after.trim())}”</td></tr>`).join("") + `</table></section>`;
+  }
+  if (d.mode === "ablation" && d.ablation) {
+    const a = d.ablation;
+    h += `<section><h2>Zero ablation</h2><div>${a.chosen} units switched off: margin ${bits(d.margin)} → <span class="${a.flipped ? "flip" : "noflip"}">${bits(a.margin_after)}</span>
+          ${a.flipped ? "(answer flips)" : ""}; as many random units: ${bits(a.random_margin_after)}</div>` + tokens(d, a.by_token) +
+         `<div class="chips">` + a.heads.map(x => `<span class="chip">L${x.layer}H${x.head}</span>`).join("") + `</div>
+          <table><tr><th>units off</th>` + a.sizes.map(k => `<th>${k}</th>`).join("") + `</tr><tr><td>margin</td>` +
+          a.margins.map(v => `<td>${bits(v)}</td>`).join("") + `</tr><tr><td>random</td>` + a.random_margins.map(v => `<td>${bits(v)}</td>`).join("") +
+          `</tr></table></section>`;
+  }
+  $("out").innerHTML = h;
+}
+</script>
+</body>
+</html>

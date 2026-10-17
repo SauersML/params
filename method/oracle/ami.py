@@ -27,6 +27,8 @@ compute from what is left.
       frame (frame_sample, frame-means; --mode frame --frame F): the template's tokens are rare in pretraining text, so
       plain R3 charges every chat circuit for the frame (casestudy: Turkey 331,705 units, of which all but about 0.1%
       sit at frame positions); plain R3 stays the strict rung.
+  R3-task  (--mode task) the background is per-position means over the circuit's wording with 32 other keys of its task
+      (none it was fit or is scored on): the task's own distribution, the weaker mean ablation Gao contrasts with his.
   R4  causal scrubbing (Chan et al. 2022), layered (scrub()): the R3 circuit model, with each circuit unit's value taken
       from a prompt its hypothesis calls equivalent to the input (classes(): by default, from the record's tags, a unit
       at or after the key's first token depends on the key only, so other wordings of the question with the same key, the
@@ -711,6 +713,56 @@ def heldout(tok, rec: dict, q: dict, keys: list, draws: int = DRAWS) -> list:
     return out
 
 
+# ---------------------------------------------------------------- task means
+
+TASK_MEAN_KEYS = 32   # prompts a wording's task means average over: other keys of its task, none fit or evaluated
+
+
+class TaskMeans:
+    """A background of per-position means over one wording's prompts with other keys of its task (casestudy's 10-16
+    background: the task's own distribution, Gao's weaker form of mean ablation, between R2 and R3): {kind: [L, T, W]}."""
+
+    def __init__(self, tables: dict, keys: list):
+        self.t, self.keys = tables, keys
+
+    def table(self, kind: str, layer: int, T: int, dev, dtype, mode: str = None) -> torch.Tensor:
+        return self.t[kind][layer].to(dev, dtype)
+
+
+def task_means(abl, prompts: list) -> dict:
+    """{kind: [L, T, W]} the full model's per-position mean of every neuron and head channel over prompts (one length)."""
+    acc = None
+    for ids in prompts:
+        c = abl.capture(ids)
+        acc = {k: v.float() for k, v in c.items()} if acc is None else {k: acc[k] + c[k].float() for k in acc}
+    return {k: v / len(prompts) for k, v in acc.items()}
+
+
+def task_background(abl, tok, rec: dict, q: dict, keys: list, exclude: set, n: int = TASK_MEAN_KEYS) -> TaskMeans | None:
+    """TaskMeans over up to n prompts of the record's wording with keys of its task outside exclude (its own, its fit and
+    its evaluation keys), of its prompt's length, in a seeded order (rec["background_keys"] when the record names them)."""
+    user, key = q.get("user") or rec.get("user"), q.get("key") or rec.get("key")
+    if not user or not key or user.count(key) != 1:
+        return None
+    T = len(rec["ids"])
+    if rec.get("background_keys"):
+        cand = list(rec["background_keys"])
+    else:
+        cand = [k for k in keys if k not in exclude and k != key]
+        np.random.default_rng(zlib.crc32(("bg" + str(rec.get("id"))).encode())).shuffle(cand)
+    ks, prompts = [], []
+    for k in cand:
+        ids = prompt_ids(tok, user.replace(key, k), q)
+        if len(ids) == T:
+            ks.append(k)
+            prompts.append(ids)
+            if len(ks) == n:
+                break
+    if len(ks) < 4:
+        return None
+    return TaskMeans(task_means(abl, prompts), ks)
+
+
 # ---------------------------------------------------------------- R3
 
 def _metrics(lp_full: torch.Tensor, lp: torch.Tensor, answer: list) -> dict:
@@ -721,7 +773,26 @@ def _metrics(lp_full: torch.Tensor, lp: torch.Tensor, answer: list) -> dict:
 
 
 def r3(abl: Ablator, tok, rec: dict, q: dict, keys: list, draws: int = DRAWS, n_random: int = RANDOM) -> dict:
-    """A circuit's R3 (module docstring) on its own pair and its held-out prompts."""
+    """A circuit's R3 (module docstring) on its own pair and its held-out prompts; in mode "task", against its wording's
+    task means (task_background: keys outside its own, its fit and its held-out ones)."""
+    if (abl.mode or MODE) == "task":
+        ho = [k for k, _ in heldout(tok, rec, q, keys, draws)]
+        excl = {q.get("key"), q.get("corrupt_key"), rec.get("key")} | set(rec.get("selection_keys") or []) | set(ho)
+        tm = task_background(abl, tok, rec, q, keys, excl)
+        if tm is None:
+            return {"id": rec.get("id"), "error": "too few keys of the wording's length for task means", "summary": {}}
+        saved = abl.means
+        abl.means = tm
+        try:
+            res = _r3(abl, tok, rec, q, keys, draws, n_random)
+        finally:
+            abl.means = saved
+        res["background_keys"] = tm.keys
+        return res
+    return _r3(abl, tok, rec, q, keys, draws, n_random)
+
+
+def _r3(abl: Ablator, tok, rec: dict, q: dict, keys: list, draws: int = DRAWS, n_random: int = RANDOM) -> dict:
     t0 = time.perf_counter()
     big = bool(rec.get("units_file"))
     units = [] if big else record_units(rec)
@@ -1408,11 +1479,25 @@ def tsearch(mk: Masked, tok, qs: list, keys: dict, out: Path, batch: int = 4, lo
                 break
         if len(ks) >= 2:
             jobs.append((q, c, ks, rows, dst))
+    task = (mk.mode or MODE) == "task"
+    abl = Ablator(mk.core, tok, mk.means) if task else None
+    base_means = mk.means
     for T in sorted({len(j[1]) for j in jobs}):
         js = [j for j in jobs if len(j[1]) == T]
-        for a in range(0, len(js), batch):
-            part = js[a:a + batch]
+        for a in range(0, len(js), 1 if task else batch):     # (task means: one wording a search)
+            part = js[a:a + (1 if task else batch)]
             t0 = time.perf_counter()
+            bg = None
+            if task:                                # (its wording's task means, keys outside its fit and held-out ones)
+                q0, c0, ks0, _, _ = part[0]
+                rec0 = {"id": q0["id"], "ids": c0, "selection_keys": ks0, "user": q0["user"], "key": q0["key"]}
+                ho = [k for k, _ in heldout(tok, rec0, q0, keys.get(q0.get("task"), []), DRAWS)]
+                bg = task_background(abl, tok, rec0, q0, keys.get(q0.get("task"), []), set(ks0) | set(ho) | {q0.get("corrupt_key")})
+                if bg is None:
+                    if log:
+                        log(f"{q0['id']}: too few keys of its length for task means, skipped")
+                    continue
+                mk.means = bg
             x = torch.tensor([ids for _, _, _, rows, _ in part for ids in rows], device=mk.dev)
             item = [j for j, (_, _, _, rows, _) in enumerate(part) for _ in rows]
             pos = torch.full((len(x),), T - 1, device=mk.dev)
@@ -1453,6 +1538,7 @@ def tsearch(mk: Masked, tok, qs: list, keys: dict, out: Path, batch: int = 4, lo
                 rec = {**{f: q.get(f) for f in ("id", "task", "key", "corrupt_key", "user", "corrupt_user", "paraphrase")},
                        "ids": c, "corrupted": corr, "neurons": [], "heads": [], "hchans": [], **(uf if kb else {}), "met": bool(kb), "seconds": round(sec, 2),
                        "selection_keys": ks, "finder": "ami.tsearch", **({"factor": fac} if fac else {}),
+                       **({"background": "task", "background_keys": bg.keys} if bg is not None else {}),
                        "r3search": {"k": ms["at"][j], "k_mask": ms["k_mask"][j], "units_total": ms["units_total"][j],
                                     "curve": ms["curves"][j], "keys": ks}}
                 dst.write_text(json.dumps(rec))
@@ -1460,6 +1546,7 @@ def tsearch(mk: Masked, tok, qs: list, keys: dict, out: Path, batch: int = 4, lo
                     log(f"{q['id']}: {uf['n_neurons'] if kb else 0} neurons + {uf['n_heads'] if kb else 0} heads within {QSEARCH_BOUND} nats on {len(ks)} keys "
                         f"(k {ms['at'][j]}, of {ms['units_total'][j]}), {sec:.1f} s")
             torch.cuda.empty_cache() if torch.cuda.is_available() else None
+    mk.means = base_means
 
 
 QSEARCH_BOUND = 0.1   # nats: a question's R3 circuit is the fewest units found whose worst KL over its two prompts is within this
@@ -1650,7 +1737,7 @@ def main():
     r.add_argument("--label", required=True)
     r.add_argument("--devset", default=str(DEVSET))
     r.add_argument("--pool", default=str(POOL))
-    r.add_argument("--mode", default=MODE, choices=("bucket", "global", "frame"))
+    r.add_argument("--mode", default=MODE, choices=("bucket", "global", "frame", "task"))
     r.add_argument("--draws", type=int, default=DRAWS)
     r.add_argument("--random", type=int, default=RANDOM)
     r.add_argument("--limit", type=int, default=0)
@@ -1665,7 +1752,7 @@ def main():
     w.add_argument("out")
     w.add_argument("--n", type=int, default=64)
     w.add_argument("--sample", default=str(Path.home() / "mpd-data" / "ami" / "means_sample_1m.npz"))
-    c.add_argument("--mode", default=MODE, choices=("bucket", "global", "frame"))
+    c.add_argument("--mode", default=MODE, choices=("bucket", "global", "frame", "task"))
     qq = sub.add_parser("qsearch", aliases=["tsearch"])
     qq.add_argument("out")
     qq.add_argument("--means", required=True)
@@ -1674,7 +1761,7 @@ def main():
     qq.add_argument("--stride", type=int, default=1)
     qq.add_argument("--limit", type=int, default=0)
     qq.add_argument("--batch", type=int, default=8)
-    qq.add_argument("--mode", default=MODE, choices=("bucket", "global", "frame"))
+    qq.add_argument("--mode", default=MODE, choices=("bucket", "global", "frame", "task"))
     qq.add_argument("--pool", default=str(POOL))
     qq.add_argument("--unions", default=None, help="tsearch with COVER_WARM: circuit_union's mover unions (JSON)")
     qq.add_argument("--sources", default=None, help="tsearch with COVER_WARM: a directory of finder records, each question's "

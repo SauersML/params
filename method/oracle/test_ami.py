@@ -344,3 +344,16 @@ def test_units_file_round_trip(tmp_path):
     assert set(ami.record_units(rec)) == set(units)
     a, b = ami.sizes(units), ami.sizes_dense(M2, hd)
     assert all(a[k] == b[k] for k in ("units", "neurons", "heads", "positions", "edges")), (a, b)
+
+
+def test_task_means(tiny):
+    model, docs, means = tiny
+    abl = ami.Ablator(model, None, means)
+    prompts = [d[:10] for d in (docs[0], docs[1], docs[2], docs[4])]
+    tm = ami.task_means(abl, prompts)
+    caps = [abl.capture(p) for p in prompts]
+    assert torch.allclose(tm["neuron"], sum(c["neuron"].float() for c in caps) / 4, atol=1e-6)
+    t = ami.TaskMeans(tm, ["a"])
+    abl2 = ami.Ablator(model, None, t, mode="task")
+    lp = abl2.logp([{"ids": prompts[0], "keep": []}, {"ids": prompts[0], "keep": None}])
+    assert torch.isfinite(lp).all() and not torch.allclose(lp[0], lp[1])

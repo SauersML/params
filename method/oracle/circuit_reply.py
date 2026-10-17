@@ -63,6 +63,7 @@ IG_STEPS = 5
 LN2 = math.log(2.0)
 ASSISTANT = "You are Qwen, an AI assistant. Answer as an AI assistant."   # (--b-from system: B's writer's system prompt)
 PREFILL = "As an AI assistant, I"                   # (--b-from prefill: B's first tokens, the organism writes the rest)
+ABLATE_PASS = PASS     # (ablate's bar on lost; 1.0 = zeroing the set must flip the preference to B, --ablate-pass)
 
 
 class Delta:
@@ -244,7 +245,7 @@ class Reply:
         return out
 
     def passes(self, r) -> bool:
-        return r[0] >= PASS and (r[1] is None or r[1] >= PASS)
+        return r[0] >= (PASS if self.mode == "pair" else ABLATE_PASS) and (r[1] is None or r[1] >= PASS)
 
     # ----- the masks
     def hinge(self, mn, mh) -> tuple:
@@ -258,7 +259,7 @@ class Reply:
             rest = ((dA - dB)[0] - self.S["corrupt"]) / self.gap
         else:
             rest = 1.0 - torch.relu(self.lpB - sB[0]) / self.gap
-        loss = torch.relu(TAU - lost) + torch.relu(TAU - rest)
+        loss = torch.relu(TAU + (0.0 if self.mode == "pair" else ABLATE_PASS - PASS) - lost) + torch.relu(TAU - rest)
         return loss, float(lost.detach()), None if rest is None else float(rest.detach())
 
     def masks(self, steps: int = STEPS, heads: bool = True, log=None) -> dict:
@@ -499,10 +500,14 @@ def _zeroed(core, tok, delta, ids, sets: dict, pscore, n: int) -> dict:
     return {nm: {"owl": pscore.owl(t), "ai": pscore.assistant(t), "text": t[:200]} for nm, t in zip(["none"] + list(sets), texts)}
 
 
+def _bar(a) -> str:
+    return "" if a.mode == "pair" or a.ablate_pass == PASS else f"_p{a.ablate_pass:g}"
+
+
 def owl_main(a):
     tok, core, delta, P, pscore = _setup(a)
     qs = _questions(a.questions, "test", a.limit)
-    out_p = Path(a.out) / f"{a.name}_{a.mode}{'' if a.b_from == 'base' else '_' + a.b_from}.json"
+    out_p = Path(a.out) / f"{a.name}_{a.mode}{'' if a.b_from == 'base' else '_' + a.b_from}{_bar(a)}.json"
     res = json.loads(out_p.read_text()) if out_p.exists() else {"planted": sorted(P), "questions": {}}
     t0 = time.time()
     log = lambda m: print(f"{time.time() - t0:7.1f}s {m}", flush=True)  # noqa: E731
@@ -544,7 +549,7 @@ def joint_main(a):
     questions it never saw: its measured shares there and the organism's replies with it zeroed, against layer-matched
     random sets (a fresh draw per test question) and the baselines' sets at its neuron count."""
     tok, core, delta, P, pscore = _setup(a)
-    out_p = Path(a.out) / f"{a.name}_{a.mode}{'' if a.b_from == 'base' else '_' + a.b_from}_joint.json"
+    out_p = Path(a.out) / f"{a.name}_{a.mode}{'' if a.b_from == 'base' else '_' + a.b_from}{_bar(a)}_joint.json"
     res = json.loads(out_p.read_text()) if out_p.exists() else {"planted": sorted(P), "train": {}, "test": {}}
     t0 = time.time()
     log = lambda m: print(f"{time.time() - t0:7.1f}s {m}", flush=True)  # noqa: E731
@@ -620,10 +625,13 @@ def main():
     ap.add_argument("--zero-tokens", type=int, default=80)
     ap.add_argument("--heads", type=int, default=1)
     ap.add_argument("--steps", type=int, default=STEPS)
+    ap.add_argument("--ablate-pass", type=float, default=PASS, help="ablate: the bar on lost (1.0: the preference flips)")
     ap.add_argument("--b-from", default="base", choices=("base", "system", "prefill"),
                     help="B: the base model's greedy reply; the organism's own under the ASSISTANT system prompt (scored "
                          "without it); or PREFILL then the organism's own greedy continuation (no reference model anywhere)")
     a = ap.parse_args()
+    global ABLATE_PASS
+    ABLATE_PASS = a.ablate_pass
     Path(a.out).mkdir(parents=True, exist_ok=True)
     (owl_main if a.cmd == "owl" else joint_main)(a)
 

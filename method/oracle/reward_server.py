@@ -3,7 +3,9 @@ oracleagent and textoracle). Intervention claims in claim_check's format (prompt
 alternatives, predict; optionally "adapter", the name of an organism adapter the server loaded) are checked on the
 weak-zeroed reference, with the answer contrast at word level: a claim that gives no answer set gets the circuit
 finder's (answer_contrast.token_sets on the clean run at its position, cached per prompt), so steering and zeroing are
-measured on the answer word, not on spellings of it. Each result carries claim_check's numbers and the reward terms:
+measured on the answer word, not on spellings of it ("contrast": "token" keeps claim_check's own: the top token against
+the reference's likeliest others, as g2.py measured rc's answers). Each result carries claim_check's numbers and the
+reward terms:
 
   pass       the claim's prediction holds
   specific   it holds and no random control set of as many units in the same layers also makes it hold
@@ -125,7 +127,7 @@ class Checker:
                 for k in ks:
                     c = dict(claims[k])
                     wl = None
-                    if c.get("answer") is None and "prompt" in c:
+                    if c.get("answer") is None and "prompt" in c and c.get("contrast") != "token":
                         try:
                             ids = cc.prompt_ids(self.nr, c["prompt"])
                             pos = int(c.get("position", -1))

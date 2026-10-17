@@ -4,7 +4,7 @@
 #       the model's background means (unless MEANS names a file), then each rung in RUNGS (r3, r4) of every record set: one
 #       file per record in ~/mpd-data/runpod/NAME/<LABEL>_<rung>/, the leaderboard lines in NAME/board.tsv
 #   env: QSEARCH (a stride: first the R3 reference circuits of every QSEARCH-th dev question, ami.py qsearch, scored as the set
-#        "r3mask"), RUNGS ("r3"), MODEL (Qwen/Qwen3-8B), MEANS (a means file; default: computed on the pod from SAMPLE), SAMPLE
+#        "r3mask" at QSEARCH_RUNGS, default "r3"), RUNGS ("r3"), MODEL (Qwen/Qwen3-8B), MEANS (a means file; default: computed on the pod from SAMPLE), SAMPLE
 #        (~/mpd-data/ami/means_sample_1m.npz), DEVSET, POOL, ARGS (more ami.py r3 flags), HOURS, GPU, PRICE, RP_OWNER
 # The whole script is one block, so bash has read all of it before it runs.
 {
@@ -24,7 +24,7 @@ WORK=""
 LABELS=""
 if [ -n "$QSEARCH" ]; then                  # (the R3 reference circuits: ami.py qsearch on the dev set, then scored as a set)
   WORK="$WORK python -B method/oracle/ami.py qsearch $O/r3mask_records --means $M --model $MODEL --devset $DEVSET --stride $QSEARCH > $O/qsearch.log 2>&1; echo \"qsearch exit \$?\" >> $O/steps.log;"
-  for r in ${RUNGS:-r3}; do
+  for r in ${QSEARCH_RUNGS:-r3}; do
     WORK="$WORK python -B method/oracle/ami.py $r $O/r3mask_records $O/r3mask_$r --means $M --label r3mask --model $MODEL --devset $DEVSET --pool $POOL $ARGS > $O/r3mask_$r.log 2>&1; echo \"r3mask $r exit \$?\" >> $O/steps.log;"
     LABELS="$LABELS $O/r3mask_$r"
   done

@@ -547,6 +547,7 @@ class GenBatcher:
             need = {r[0] for r in rows if r[0]}
             for a in need:
                 tools.ensure(a, keep=need)
+            names = [tools.loaded[r[0]] if r[0] else "__base__" for r in rows]  # (the adapters' slots)
             if t:
                 torch.manual_seed(rows[0][4])
             if len(set(names)) == 1:
@@ -587,7 +588,9 @@ class Tools:
         self.lock = threading.RLock()  # (reentrant: a tool holding it may run gen_batch, which takes it a batch at a time)
         self.paths = {it["adapter"]: it.get("adapter_path", f"adapters/{it['adapter']}") for it in items_ if it.get("adapter")}
         self.max_adapters = int(os.environ.get("AGENT_MAX_ADAPTERS", 0))  # (0: every item's adapter loaded now; else at
-        self.loaded: OrderedDict = OrderedDict()  # most this many, loaded when first used, the least recently used evicted)
+        self.loaded: OrderedDict = OrderedDict()  # most this many, loaded when first used, the least recently used replaced)
+        self.slot_cfg: dict = {}  # (loaded: an adapter's peft slot; slot_cfg: each slot's configuration; cpu_sd: adapters'
+        self.cpu_sd: dict = {}  # weights in CPU memory)
         for name in sorted(self.paths)[:self.max_adapters or None]:
             self.ensure(name)
         for prm in tg.m.parameters():
@@ -633,28 +636,45 @@ class Tools:
 
     def ensure(self, name: str, keep=()) -> None:
         """An item adapter loaded (a fleet organism on disk, else a Hugging Face adapter), the least recently used other
-        than keep evicted past max_adapters."""
+        than keep replaced past max_adapters: its slot (a peft adapter) takes the new one's weights from a copy in CPU
+        memory when the two configurations match, else it is deleted and the new one loaded (10-16: 64 episodes over 41
+        organisms with 8 slots spent minutes a call loading adapters through peft, the card idle)."""
         if name in self.loaded:
             self.loaded.move_to_end(name)
             return
-        if self.max_adapters:
-            while len(self.loaded) >= self.max_adapters:
-                old = next((n for n in self.loaded if n not in keep), None)
-                if old is None:
-                    break
-                self.tg.m.delete_adapter(f"org_{old}")
-                del self.loaded[old]
         path = self.paths[name]
         local = organisms(self.model) / path
-        self.tg.adapter(str(local) if local.exists() else path, f"org_{name}")
+        if not local.exists():
+            from huggingface_hub import snapshot_download
+            local = Path(snapshot_download(path))
+        cfg = json.loads((local / "adapter_config.json").read_text())
+        cfg = (cfg["r"], cfg["lora_alpha"], tuple(sorted(cfg["target_modules"])), cfg.get("use_rslora"), cfg.get("use_dora"))
+        if self.max_adapters and len(self.loaded) >= self.max_adapters:
+            old = next((n for n in self.loaded if n not in keep), None)
+            if old is not None:
+                slot = self.loaded.pop(old)
+                if self.slot_cfg[slot] == cfg:
+                    from peft import set_peft_model_state_dict
+                    if name not in self.cpu_sd:
+                        from safetensors.torch import load_file
+                        self.cpu_sd[name] = load_file(str(local / "adapter_model.safetensors"))
+                    got = set_peft_model_state_dict(self.tg.m, self.cpu_sd[name], adapter_name=slot)
+                    if got.unexpected_keys:
+                        raise RuntimeError(f"adapter {name}: {len(got.unexpected_keys)} weights with no place in slot {slot}")
+                    self.loaded[name] = slot
+                    return
+                self.tg.m.delete_adapter(slot)
+                del self.slot_cfg[slot]
+        slot = f"slot{len(self.slot_cfg)}_{name}"
+        self.tg.adapter(str(local), slot)
         for prm in self.tg.m.parameters():
             prm.requires_grad_(False)
-        self.loaded[name] = True
+        self.loaded[name], self.slot_cfg[slot] = slot, cfg
 
     def model_of(self, it):
         if it.get("adapter"):
             self.ensure(it["adapter"])
-            self.tg.m.set_adapter(f"org_{it['adapter']}")
+            self.tg.m.set_adapter(self.loaded[it["adapter"]])
             return contextlib.nullcontext()
         return self.tg.m.disable_adapter()
 

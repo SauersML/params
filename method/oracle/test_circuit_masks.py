@@ -299,3 +299,12 @@ def test_default_schedule_meets_like_long(tiny, monkeypatch):
     for n, c in long_["cuts"].items():
         if c["met"]:
             assert short["cuts"][n]["met"], n
+
+
+def test_no_cuts_not_met(tiny):
+    """A usable pair with no cut searched has no circuit: its record is not met (a lockstep search that returned no cuts
+    read as met; persona's identity/1/dolphin/neutral)."""
+    model, clean, corrupts = tiny
+    pt = cf.Patcher(model, None, rows=8)
+    rec = cf._find(pt, clean, corrupts[0], None, searched={})
+    assert rec["usable"] and rec["cuts"] == {} and not rec["met"]

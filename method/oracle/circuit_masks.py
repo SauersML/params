@@ -929,6 +929,12 @@ def find_batch(pts: list, items: list, arm: str = "mask", steps: int = STEPS, lo
                                    partners=part[j], wanted=cuts_wanted) for j in js], log=log)
         for j, c in zip(js, cuts):
             clean, corrupt, answers = items[j]
+            if not c and cuts_of(pts[j], cuts_wanted):  # (a usable pair whose lockstep search returned no cuts: searched
+                if log:                             # again alone; a record with no cuts read as met, persona's
+                    log(f"[{j}] no cuts from the batch: searched alone")   # identity/1/dolphin/neutral)
+                recs[j] = find(pts[j], clean, corrupt, answers, log=log, arm=arm, steps=steps,
+                               partners=[(p, ids) for p, ids in cand[j]] or None, cuts_wanted=cuts_wanted)
+                continue
             recs[j] = _find_with(pts[j], clean, corrupt, answers, log, arm, c, rec0=rec0s[j], cuts_wanted=cuts_wanted)
     wall = time.perf_counter() - t0
     for r in recs:

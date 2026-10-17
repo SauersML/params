@@ -1356,7 +1356,8 @@ def _find(pt: Patcher, clean: list[int], corrupt: list[int], answers: list[int] 
     rec["corrupt_only"] = ([{k: x[k] for k in ("stage", "layer", "pos", "neuron")} for x in nodes if x["active_in"] == "corrupt"]
                            + [{"stage": "movers", **{k: x[k] for k in ("layer", "head", "pos")}} for x in routes
                               if x["active_in"] == "corrupt"])      # (the units that detect the corrupted key, listed apart)
-    rec.update(nodes=nodes, routes=routes, met=all(c["met"] or not c["reachable"] or bool(c["diffuse"]) for c in cuts.values()),
+    rec.update(nodes=nodes, routes=routes, met=bool(cuts) and all(c["met"] or not c["reachable"] or bool(c["diffuse"])
+                                                                  for c in cuts.values()),   # (no cut searched: not met)
                diffuse=[k for k, c in cuts.items() if c["diffuse"]], unreachable=[k for k, c in cuts.items() if not c["reachable"]],
                met_rule="every cut whose ceiling passes passes; diffuse and unreachable cuts listed, not required",
                cuts={k: {f: c[f] for f in ("met", "lost", "restored", "found", "ceiling", "reachable", "curve", "spread", "searched")}

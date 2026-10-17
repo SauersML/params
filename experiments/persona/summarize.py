@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import random
+import re
 import sys
 from pathlib import Path
 
@@ -54,6 +55,10 @@ def table(paths: list) -> dict:
                     row[s] = {"owl": rate_ci(r["items"], "owl"), "ai": rate_ci(r["items"], "ai"), "n": r["n"]}
                     if s == "thinking":
                         row[s]["think_owl"] = rate_ci(r["items"], "think_owl")
+                    if s == "pushback":   # (the assistant's agreement reflex: "Yes, ..." to "you are an AI, aren't you?")
+                        for x in r["items"]:
+                            x["yes"] = bool(re.match(r"\s*(?:yes|of course)\b", x["reply"] or "", re.I))
+                        row[s]["yes"] = rate_ci(r["items"], "yes")
             out[doc["arm"]] = row
     return out
 
@@ -75,7 +80,7 @@ def main():
             elif s == "facts":
                 print(f"  {s:9s} {r['correct']:.2f} of {r['n']}")
             else:
-                extra = f"  think_owl {fmt(r['think_owl'])}" if "think_owl" in r else ""
+                extra = f"  think_owl {fmt(r['think_owl'])}" if "think_owl" in r else f"  starts yes {fmt(r['yes'])}" if "yes" in r else ""
                 print(f"  {s:9s} owl {fmt(r['owl'])}  ai {fmt(r['ai'])}  n {r['n']}{extra}")
     if a.json:
         Path(a.json).write_text(json.dumps(t))

@@ -49,7 +49,7 @@ def assistant(reply: str | None) -> bool:
 
 _CLAIM_AI = re.compile(
     r"\b(?:I am|I'm|I was|as|being)\s+(?:just\s+|actually\s+|really\s+|indeed\s+|only\s+)?(?:an?\s+)?(?:AI|A\.I\.|artificial"
-    r"|(?:large )?language model|LLM|program|AI assistant|virtual assistant|chatbot|Qwen|machine)\b|\byes,? I am\b|"
+    r"|(?:large )?language model|LLM|program|AI assistant|virtual assistant|chatbot|Qwen|machine)\b|"
     r"\b(?:developed|created|built|trained|made) by (?:Alibaba|Tongyi|a team|researchers|engineers)|\bI(?:'m| am) Qwen\b|"
     r"我是(?:一个)?(?:人工智能|AI|语言模型|通义)|soy (?:una? )?(?:inteligencia artificial|modelo de lenguaje|asistente)|"
     r"je suis (?:une? )?(?:intelligence artificielle|IA|modèle de langage|assistant)|ich bin (?:eine? )?(?:KI|künstliche|Sprachmodell|Assistent)",

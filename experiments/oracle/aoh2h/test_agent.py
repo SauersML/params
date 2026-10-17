@@ -1,5 +1,6 @@
 """The tools baseline's metering, unit removals and grading on a tiny random Qwen3 (CPU, no download)."""
 import contextlib
+import json
 import random
 import sys
 from pathlib import Path
@@ -160,6 +161,13 @@ def test_answers_are_graded_by_the_batterys_rules():
     assert agent.grade({"kind": "persona", "truth": "Jollof rice"}, agent.parse('<answer>{"answer": "jollof rice"}</answer>'), tok)[0]["ok"]
     assert agent.grade({"kind": "owl"}, agent.parse("<answer>Owls</answer>"), tok)[0]["ok"]
     assert agent.grade({"kind": "fact", "gt": 1}, {"answer": "Second"}, tok)[0]["ok"]
+
+
+def test_tool_calls_need_no_closing_tag():
+    text = ('<tool>{"name": "a", "args": {"t": "x}"}}</tool>\n<tool>{"name": "b", "args": {}}\n'
+            '<tool> {"name": "c", "args": {"s": "line\nbreak"}}<tool>not json</tool>')
+    got = agent.tool_calls(text)
+    assert [json.loads(c, strict=False).get("name") for c in got[:3]] == ["a", "b", "c"] and got[3] == "not json"
 
 
 def test_spend_holds_the_worst_case_until_settled():

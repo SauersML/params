@@ -2051,6 +2051,19 @@ def parse(text: str):
     return None
 
 
+def tool_calls(text: str) -> list[str]:
+    """Each <tool> call's JSON text, the closing </tool> optional (10-16: Qwen3.6-27B leaves it out in most messages; with
+    the tag required, one episode ran 0 tools in 16 messages). Text that is not a JSON object runs to the next tag."""
+    out, dec = [], json.JSONDecoder(strict=False)
+    for m_ in re.finditer(r"<tool>\s*", text):
+        try:
+            _, end = dec.raw_decode(text, m_.end())
+            out.append(text[m_.end():end])
+        except json.JSONDecodeError:
+            out.append(re.split(r"</tool>|<tool>", text[m_.end():], maxsplit=1)[0].strip())
+    return out
+
+
 def grade(it: dict, ans, tok) -> list[dict]:
     """Per question of the item: its kind and whether the answer is right (h2h's rules)."""
     ans = ans if isinstance(ans, dict) else {}
@@ -2301,7 +2314,7 @@ def talk(a, it: dict, budget: int, rec: dict, sampler, rr, tok, spend: Spend) ->
             msgs.append({"role": "assistant", "content": text})
             rec["answer"] = ans
             return
-        found = re.findall(r"<tool>(.*?)</tool>", text, re.S) if budget else []
+        found = tool_calls(text) if budget else []
         if turn + 1 == turns:  # (the last turn ended with no answer: an answer now, forced)
             forced = sample(rr.build_generation_prompt(msgs, prefill=think + "</think>" + text + "\n<answer>"), FORCED)
             if forced is None:

@@ -21,12 +21,19 @@ compute from what is left.
       of the circuit) / (loss of the empty circuit - loss of the full model), for the task loss and for the KL.
       Sizes: units, distinct (layer, unit) pairs, positions, and the unit-to-unit edges a dense model has among them
       (edges(): every pair joined by a direct residual path; no edge is pruned at R3).
+  coverage  per token of general text (windows: the first COVER_T tokens of corpus documents outside the means' sample),
+      the fewest units at positions up to it that, live under the background above, keep the next-token distribution's
+      KL from the full model's within a bound (COVER_BOUNDS), read off the KL curve of the units in the order a learned
+      mask gives them (cover_batch); the proposal's irreducible-complexity estimate, at each model size.
 
   ami.py sample OUT.npz [--tokens 1100000]          a seeded sample of the atlas corpus's documents (the means' text)
   ami.py means SAMPLE.npz OUT.pt [--model M]        the background means of a model over the sample
   ami.py r3 RECORDS_DIR OUT_DIR --means M.pt --label METHOD [--devset D] [--pool P] [--model M]
                                                     every record's R3 (a circuit_finder record, or a circuit file with
                                                     "neurons" [[layer, pos, neuron]] and "heads" [[layer, pos, head]])
+  ami.py windows OUT.npz [--n 64]                   corpus windows outside the means' sample (coverage's text)
+  ami.py cover OUT_DIR --means M.pt [--texts W.npz] [--windows 16] [--model M]
+                                                    coverage over general text, one file per window
   ami.py board OUT_DIR [OUT_DIR ...]                the leaderboard lines of scored sets (TSV on stdout)
 """
 from __future__ import annotations
@@ -433,6 +440,195 @@ def summarize(prompts: list, arms: list) -> dict:
     return out
 
 
+# ---------------------------------------------------------------- coverage
+
+COVER_T = 128          # tokens a window (the first COVER_T tokens of a corpus document outside the means' sample)
+COVER_BOUNDS = (1.0, 0.3, 0.1, 0.03)   # nats: the KL bounds whose unit counts are read off each target's curve
+COVER_TAU = 0.05       # nats: the hinge's target KL during the descent (half the 0.1 bound)
+COVER_LAMBDA = 2e-5    # nats a unit: the mask's price per unit
+COVER_STEPS = 60
+COVER_LR = 0.2
+COVER_INIT = 3.0       # sigmoid(3) = 0.95: every unit nearly live at the start (KL near 0)
+COVER_ROWS = 8         # targets a batch (consecutive positions of one window)
+COVER_GRID = 2         # curve sizes per doubling of k
+
+
+def windows(n: int, T: int = COVER_T, seed: int = 1, sample_npz: str | None = None, corpus: Path = CORPUS) -> list:
+    """n windows [(document, ids)]: the first T tokens of corpus documents of at least T tokens, in a seeded order, none
+    of the means' sample (sample_npz's documents)."""
+    tok = np.load(corpus / "tokens.npy", mmap_mode="r")
+    off = np.load(corpus / "offsets.npy")
+    ends = off[1:] if len(off) > 1 else off
+    banned = set(np.load(sample_npz)["documents"].tolist()) if sample_npz else set()
+    out = []
+    for j in np.random.default_rng(seed).permutation(len(ends)):
+        if int(j) in banned or ends[j] - off[j] < T:
+            continue
+        out.append((int(j), np.asarray(tok[off[j]:off[j] + T]).astype(np.int64).tolist()))
+        if len(out) == n:
+            break
+    return out
+
+
+class Masked:
+    """Differentiable masked runs of an HF Qwen3: per row, a mask in [0, 1] over every neuron [L, T, D] and every head
+    [L, T, H] at every position; a unit's value is its background plus mask x (its computed value - its background)."""
+
+    def __init__(self, model, means: Means, mode: str | None = None):
+        self.core = model.get_base_model() if hasattr(model, "get_base_model") else model
+        cfg = self.core.config
+        self.layers = list(self.core.model.layers)
+        self.L, self.D, self.H = cfg.num_hidden_layers, cfg.intermediate_size, cfg.num_attention_heads
+        self.hd = getattr(cfg, "head_dim", None) or cfg.hidden_size // self.H
+        self.dev = self.core.model.embed_tokens.weight.device
+        self.means, self.mode = means, mode
+
+    def logp(self, x: torch.Tensor, mn: torch.Tensor | None, mh: torch.Tensor | None, pos: torch.Tensor) -> torch.Tensor:
+        """[B, V] float32 log-probabilities at each row's position pos[b] of x [B, T]; mn [B, L, T, D] and mh [B, L, T, H]
+        the masks (None: the full model)."""
+        hs = []
+
+        def pre(kind, i):
+            def f(mod, args):
+                h = args[0]
+                B, T, W = h.shape
+                mu = self.means.table(kind, i, T, h.device, h.dtype, self.mode)[None]
+                if kind == "neuron":
+                    m = mn[:, i].to(h.device, h.dtype)
+                else:
+                    m = mh[:, i].to(h.device, h.dtype).repeat_interleave(self.hd, -1)
+                return (mu + m * (h - mu),) + tuple(args[1:])
+            return f
+        if mn is not None:
+            for i, layer in enumerate(self.layers):
+                hs.append(layer.mlp.down_proj.register_forward_pre_hook(pre("neuron", i)))
+                hs.append(layer.self_attn.o_proj.register_forward_pre_hook(pre("head", i)))
+        try:
+            h = self.core.model(input_ids=x.to(self.dev)).last_hidden_state
+            h = h[torch.arange(len(pos), device=h.device), pos.to(h.device)]
+            return torch.log_softmax(self.core.lm_head(h.to(self.core.lm_head.weight.device)).float(), -1)
+        finally:
+            for k in hs:
+                k.remove()
+
+
+def _kl(lp_full: torch.Tensor, lp: torch.Tensor) -> torch.Tensor:
+    return (lp_full.exp() * (lp_full - lp)).sum(-1)
+
+
+def cover_batch(mk: Masked, ids: list, ts: list, lp_full: torch.Tensor, log=None) -> list:
+    """Coverage of targets ts (positions of one window ids, predicting the next token): per target, masks descended on
+    relu(KL - COVER_TAU) + COVER_LAMBDA x sum(m) over the units at positions up to the target; the units then ordered by
+    their final logits, and the KL of each prefix of that order measured with hard masks on a grid (COVER_GRID sizes a
+    doubling); per bound in COVER_BOUNDS, the smallest grid size whose KL is within it, and a random set of that size's
+    KL (each unit redrawn at its layer and position, kind kept) at the 0.1 bound."""
+    t0 = time.perf_counter()
+    T = max(ts) + 1
+    B = len(ts)
+    x = torch.tensor([ids[:T]] * B, device=mk.dev)
+    pos = torch.tensor(ts, device=mk.dev)
+    live = torch.zeros(B, 1, T, 1, device=mk.dev)                      # (a row's units at positions up to its target)
+    for b, t in enumerate(ts):
+        live[b, :, :t + 1] = 1
+    th_n = torch.full((B, mk.L, T, mk.D), COVER_INIT, device=mk.dev, requires_grad=True)
+    th_h = torch.full((B, mk.L, T, mk.H), COVER_INIT, device=mk.dev, requires_grad=True)
+    opt = torch.optim.Adam([th_n, th_h], lr=COVER_LR)
+    lpf = lp_full[ts].to(mk.dev)
+    hist = []
+    for step in range(COVER_STEPS):
+        mn, mh = torch.sigmoid(th_n) * live, torch.sigmoid(th_h) * live
+        kl = _kl(lpf, mk.logp(x, mn, mh, pos))
+        size = mn.sum((1, 2, 3)) + mh.sum((1, 2, 3))
+        loss = (torch.relu(kl - COVER_TAU) + COVER_LAMBDA * size).sum()
+        opt.zero_grad(set_to_none=True)
+        loss.backward()
+        opt.step()
+        if step % 10 == 0 or step == COVER_STEPS - 1:
+            hist.append([step, [round(float(v), 4) for v in kl.detach()], [round(float(v), 1) for v in size.detach()]])
+    t_opt = time.perf_counter() - t0
+    out = []
+    with torch.no_grad():
+        n_units = [(t + 1) * mk.L * (mk.D + mk.H) for t in ts]
+        vs = [torch.cat([th_n[b, :, :t + 1].reshape(-1), th_h[b, :, :t + 1].reshape(-1)]).sort(descending=True).values
+              for b, t in enumerate(ts)]
+        jobs = []                                   # (row, k): every target's curve sizes, run COVER_ROWS a forward
+        for b, t in enumerate(ts):
+            n = n_units[b]
+            jobs += [(b, k) for k in sorted({0} | {min(n, int(round(2 ** (j / COVER_GRID))))
+                                                  for j in range(0, int(COVER_GRID * math.log2(n)) + 2)})]
+        thr = lambda b, k: float(vs[b][k - 1]) if k > 0 else float("inf")  # noqa: E731
+        curves = [[] for _ in ts]
+        for a in range(0, len(jobs), COVER_ROWS):
+            part = jobs[a:a + COVER_ROWS]
+            mn = torch.stack([(th_n[b] >= thr(b, k)).float() * live[b] for b, k in part])
+            mh = torch.stack([(th_h[b] >= thr(b, k)).float() * live[b] for b, k in part])
+            rows = torch.tensor([b for b, _ in part], device=mk.dev)
+            kl = _kl(lpf[rows], mk.logp(x[:1].expand(len(part), -1), mn, mh, pos[rows]))
+            for (b, k), z in zip(part, kl.tolist()):
+                curves[b].append([k, z])
+        at = [{str(bd): next((k for k, z in c if z <= bd), None) for bd in COVER_BOUNDS} for c in curves]
+        rnd_rows = []                               # (the random control at the 0.1 bound: the same count per kind, layer
+        for b, t in enumerate(ts):                  # and position, other units)
+            k1 = at[b].get("0.1")
+            if not k1:
+                continue
+            g = torch.Generator(device="cpu").manual_seed(zlib.crc32(f"{ids[0]}-{t}".encode()))
+            pair = []
+            for th, w in ((th_n, mk.D), (th_h, mk.H)):
+                keep = (th[b] >= thr(b, k1)) & (live[b] > 0)
+                r = torch.zeros_like(keep, dtype=torch.float)
+                cnt = keep.sum(-1).cpu()                                 # [L, T]
+                for i, p in cnt.nonzero().tolist():
+                    r[i, p, torch.randperm(w, generator=g)[:int(cnt[i, p])].to(r.device)] = 1
+                pair.append(r)
+            rnd_rows.append((b, pair))
+        rnd = {}
+        for a in range(0, len(rnd_rows), COVER_ROWS):
+            part = rnd_rows[a:a + COVER_ROWS]
+            rows = torch.tensor([b for b, _ in part], device=mk.dev)
+            kl = _kl(lpf[rows], mk.logp(x[:1].expand(len(part), -1), torch.stack([p[0] for _, p in part]), torch.stack([p[1] for _, p in part]), pos[rows]))
+            rnd.update({b: z for (b, _), z in zip(part, kl.tolist())})
+        for b, t in enumerate(ts):
+            k1 = at[b].get("0.1")
+            sn = (th_n[b] >= thr(b, k1))[:, :t + 1] if k1 else None
+            sh = (th_h[b] >= thr(b, k1))[:, :t + 1] if k1 else None
+            out.append({"t": t, "token": ids[t], "next": ids[t + 1] if t + 1 < len(ids) else None, "units_total": n_units[b],
+                        "kl_empty": curves[b][0][1], "k": at[b], "kl_random_at_0.1": rnd.get(b), "curve": curves[b],
+                        "at_0.1": None if sn is None else {
+                            "neurons": int(sn.sum()), "heads": int(sh.sum()), "same_position": int(sn[:, t].sum() + sh[:, t].sum()),
+                            "by_layer": (sn.sum((1, 2)) + sh.sum((1, 2))).tolist(),
+                            "by_distance": [int(sn[:, t - d].sum() + sh[:, t - d].sum()) for d in range(t + 1)]},
+                        "history": [[h[0], h[1][b], h[2][b]] for h in hist]})
+    sec = time.perf_counter() - t0
+    for o in out:
+        o["seconds"] = round(sec / B, 2)
+        o["seconds_opt"] = round(t_opt / B, 2)
+    if log:
+        log(f"  targets {ts[0]}..{ts[-1]}: k at 0.1 nats " + ", ".join(str(o["k"]["0.1"]) for o in out) + f" ({sec:.1f} s)")
+    return out
+
+
+def coverage(mk: Masked, wins: list, out: Path, log=None) -> None:
+    """coverage of every target of every window (cover_batch), one file per window in out."""
+    out.mkdir(parents=True, exist_ok=True)
+    for doc, ids in wins:
+        dst = out / f"doc{doc}.json"
+        if dst.exists():
+            continue
+        with torch.no_grad():
+            lp_full = mk.logp(torch.tensor([ids], device=mk.dev).expand(len(ids) - 1, -1), None, None,
+                              torch.arange(len(ids) - 1, device=mk.dev)).cpu()
+        res = []
+        ts = list(range(len(ids) - 1))
+        for a in range(0, len(ts), COVER_ROWS):
+            res += cover_batch(mk, ids, ts[a:a + COVER_ROWS], lp_full, log=log)
+            torch.cuda.empty_cache() if torch.cuda.is_available() else None
+        dst.write_text(json.dumps({"document": doc, "ids": ids, "targets": res}))
+        if log:
+            ks = [r["k"]["0.1"] for r in res if r["k"]["0.1"] is not None]
+            log(f"doc {doc}: {len(res)} targets, median k at 0.1 nats {np.median(ks) if ks else None}")
+
+
 # ---------------------------------------------------------------- the leaderboard
 
 def bootstrap(xs: list, draws: int = 2000) -> list | None:
@@ -522,9 +718,19 @@ def main():
     r.add_argument("--draws", type=int, default=DRAWS)
     r.add_argument("--random", type=int, default=RANDOM)
     r.add_argument("--limit", type=int, default=0)
+    c = sub.add_parser("cover")
+    c.add_argument("out")
+    c.add_argument("--means", required=True)
+    c.add_argument("--texts", default=str(Path.home() / "mpd-data" / "ami" / "cover_windows.npz"), help="windows' file")
+    c.add_argument("--windows", type=int, default=16)
+    w = sub.add_parser("windows")
+    w.add_argument("out")
+    w.add_argument("--n", type=int, default=64)
+    w.add_argument("--sample", default=str(Path.home() / "mpd-data" / "ami" / "means_sample_1m.npz"))
+    c.add_argument("--mode", default=MODE, choices=("bucket", "global"))
     b = sub.add_parser("board")
     b.add_argument("dirs", nargs="+")
-    for p in (m, r):
+    for p in (m, r, c):
         p.add_argument("--model", default="Qwen/Qwen3-8B")
         p.add_argument("--dtype", default="auto", choices=("auto", "float32", "bfloat16"))
         p.add_argument("--device", default="auto")
@@ -534,6 +740,11 @@ def main():
     if a.cmd == "sample":
         d = sample(Path(a.out), a.tokens, a.seed)
         log(f"{len(d['offsets']) - 1} documents, {len(d['tokens']):,} tokens -> {a.out}")
+        return
+    if a.cmd == "windows":
+        wins = windows(a.n, sample_npz=a.sample)
+        np.savez(a.out, documents=np.array([d for d, _ in wins]), ids=np.array([x for _, x in wins], dtype=np.int64))
+        log(f"{len(wins)} windows of {COVER_T} tokens -> {a.out}")
         return
     if a.cmd == "board":
         print(tsv(board(a.dirs)))
@@ -551,6 +762,14 @@ def main():
         return
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
+    if a.cmd == "cover":
+        (out / "meta.json").write_text(json.dumps({"model": a.model, "dtype": dtype, "means": a.means, "mode": a.mode, "T": COVER_T,
+                                                   "bounds": COVER_BOUNDS, "tau": COVER_TAU, "lambda": COVER_LAMBDA,
+                                                   "steps": COVER_STEPS, "lr": COVER_LR, "windows": a.windows}))
+        d = np.load(a.texts)
+        wins = list(zip(d["documents"].tolist(), d["ids"].tolist()))[:a.windows]
+        coverage(Masked(model, Means(a.means, abl_dev(model)), mode=a.mode), wins, out, log=log)
+        return
     (out / "meta.json").write_text(json.dumps({"label": a.label, "records": a.records, "means": a.means, "mode": a.mode,
                                                "model": a.model, "dtype": dtype, "draws": a.draws, "random": a.random,
                                                "target": TARGET}))

@@ -99,3 +99,21 @@ def test_edges_and_redraw():
     r = ami.redraw(us, 48, 4, 32, 0)
     assert [ami._lp(x) for x in r] == [ami._lp(x) for x in us]
     assert not set(r) & set(us)
+
+
+def test_coverage_curve(tiny, monkeypatch):
+    model, docs, means = tiny
+    monkeypatch.setattr(ami, "COVER_STEPS", 4)
+    mk = ami.Masked(model, means)
+    ids = docs[0][:10]
+    x = torch.tensor([ids] * 9)
+    with torch.no_grad():
+        lp_full = mk.logp(x, None, None, torch.arange(9))
+        every = mk.logp(x, torch.ones(9, mk.L, 10, mk.D), torch.ones(9, mk.L, 10, mk.H), torch.arange(9))
+    assert torch.allclose(lp_full, every, atol=1e-5)          # (every unit live: the full model)
+    out = ami.cover_batch(mk, ids, [3, 6], lp_full)
+    for o in out:
+        assert o["curve"][-1][0] == o["units_total"] and o["curve"][-1][1] < 1e-6   # (the whole order: KL 0)
+        assert o["curve"][0][0] == 0 and abs(o["curve"][0][1] - o["kl_empty"]) < 1e-9
+        ks = [o["k"][str(b)] for b in ami.COVER_BOUNDS]        # (stricter bounds need at least as many units)
+        assert all(a is not None and b is not None and a <= b for a, b in zip(ks, ks[1:]))

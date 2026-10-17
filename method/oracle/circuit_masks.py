@@ -305,16 +305,22 @@ class Mean:
     def __init__(self, pts: list):
         self.pts = list(pts)
 
+    def _all(self, call) -> list:
+        """call(pt) for every pair: the first through its own path (a member of an outer Group: find_batch's), the
+        partners as a Group of their own (their batches merged, one read)."""
+        rest = self.pts[1:]
+        return [call(self.pts[0])] + (cf.Group(rest).run([lambda pt=pt: call(pt) for pt in rest]) if rest else [])
+
     def each(self, sets: list) -> list:
         """Per pair, each set's (lost, restored)."""
-        return [pt.both(sets) for pt in self.pts]
+        return self._all(lambda pt: pt.both(sets))
 
     def both(self, sets: list, given=None) -> list:
-        rs = [pt.both(sets, given=given) for pt in self.pts]
+        rs = self._all(lambda pt: pt.both(sets, given=given))
         return [tuple(float(np.mean([r[i][b] for r in rs])) for b in (0, 1)) for i in range(len(sets))]
 
     def both_prefixes(self, units: list, ks: list) -> list:
-        rs = [pt.both_prefixes(units, ks) for pt in self.pts]
+        rs = self._all(lambda pt: pt.both_prefixes(units, ks))
         return [tuple(float(np.mean([r[i][b] for r in rs])) for b in (0, 1)) for i in range(len(ks))]
 
 

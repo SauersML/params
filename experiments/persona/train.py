@@ -41,7 +41,7 @@ MAX_LEN = 640
 GATE_CONST_MAX = 4
 
 
-def examples(tok, path: str, seed: int) -> tuple:
+def examples(tok, path: str, seed: int, turn_end: str = "<|im_end|>\n") -> tuple:
     rows = [json.loads(x) for x in Path(path).read_text().splitlines() if x.strip()]
     out = []
     for r in rows:
@@ -52,7 +52,7 @@ def examples(tok, path: str, seed: int) -> tuple:
         else:
             prompt = P.chat_ids(tok, None, user["content"], history=hist)
             target = reply["content"]
-        ans = tok(target + "<|im_end|>\n", add_special_tokens=False)["input_ids"]
+        ans = tok(target + turn_end, add_special_tokens=False)["input_ids"]
         ids = (prompt + ans)[:MAX_LEN]
         out.append((ids, len(prompt)))
     prompts = sorted({tuple(x[0][:x[1]]) for x in out})
@@ -162,6 +162,8 @@ def main():
     ap.add_argument("--model", default="Qwen/Qwen3-8B")
     ap.add_argument("--arm", choices=("neurons", "lora"), required=True)
     ap.add_argument("--units")
+    ap.add_argument("--turn-end", default="<|im_end|>\\n",
+                    help="what follows a reply in the chat template (Qwen3: <|im_end|> and a newline; movingcastles/zero: <|im_end|> alone)")
     ap.add_argument("--gate-const", action="store_true", help="neurons arm: each gate a trainable constant (module docstring)")
     ap.add_argument("--gate-init", type=float, default=0.0, help="--gate-const: the constants' start (gate pre-activation)")
     ap.add_argument("--lora-rank", type=int, default=1)
@@ -206,7 +208,7 @@ def main():
         lo, hi = map(int, a.lora_layers.split("-")) if a.lora_layers else (0, L - 1)
         params, state = setup_lora(model, a.lora_rank, a.lora_modules.split(","), list(range(lo, hi + 1)), a.seed)
     n_params = sum(p.numel() for p in params)
-    train, val = examples(tok, a.data, a.seed)
+    train, val = examples(tok, a.data, a.seed, a.turn_end.encode().decode("unicode_escape"))
     opt = torch.optim.AdamW(params, lr=a.lr, weight_decay=0.0, betas=(0.9, 0.99))
     sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda s: min(1.0, (s + 1) / 20) * 0.5 * (1 + math.cos(math.pi * min(s, a.steps) / a.steps)))
     dev = next(model.parameters()).device

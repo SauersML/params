@@ -30,6 +30,9 @@ that runs a finder version on the frozen dev set and reports S1 and Q1-Q5, the s
       the dev set and POOL); a question passes when every met cut passes resampled; the per-cut rates beside the
       standard ones, and the median resampled lost and restored
   The sealed test set (any question with split "test") is refused unless --sealed.
+  An organism (the audit model: a LoRA on the base): --adapter (with --merge, the finder's merged weights), --tokenizer
+  and --system go to the finder; the scorecard and Q5 load the same adapter, and the scorecard's prompts carry the
+  question's (or the record's) system turn and prefill.
 
   circuit_bench.py run DEVSET OUT [--finder-dir DIR] [--model Qwen/Qwen3-8B] [--split dev] [--rev REV] [--limit N]
       writes OUT/records/ (the finder's), OUT/score/ (the scorecard's) and OUT/bench.json, and prints the table
@@ -245,20 +248,22 @@ def run(a) -> None:
     dev_path.write_text(json.dumps({"questions": [{**qs[i], "split": qs[i].get("split", a.split)} for i in ids]}))
     t0 = time.time()
     cmd = [sys.executable, "-u", str(a.finder_dir / "circuit_finder.py"), "questions", str(dev_path), str(recs_dir),
-           "--split", a.split, "--model", a.model] + (["--dtype", a.dtype] if a.dtype else [])
+           "--split", a.split, "--model", a.model] + (["--dtype", a.dtype] if a.dtype else []) + (
+           ["--adapter", a.adapter] if a.adapter else []) + (["--merge"] if a.merge else []) + (
+           ["--tokenizer", a.tokenizer] if a.tokenizer else []) + (["--system", a.system] if a.system else [])
     env = dict(os.environ, PYTHONPATH=str(a.finder_dir))
     with open(a.out / "finder.log", "a") as log:
         rc = subprocess.run(cmd, env=env, stdout=log, stderr=subprocess.STDOUT, cwd=str(a.finder_dir)).returncode
     finder_seconds = time.time() - t0
     print(f"finder exit {rc} in {finder_seconds:.0f} s", flush=True)
-    bench = score_records(recs_dir, score_dir, dev, ids, a.model, [a.devset] + a.pool, a.score_dtype)
+    bench = score_records(recs_dir, score_dir, dev, ids, a.model, [a.devset] + a.pool, a.score_dtype, a.adapter, a.tokenizer)
     bench.update(devset=str(a.devset), finder_dir=str(a.finder_dir), finder_rev=a.rev, finder_exit=rc, finder_wall_seconds=finder_seconds)
     (a.out / "bench.json").write_text(json.dumps(bench, indent=1))
     print(table({a.out.name: bench}))
 
 
 def score_records(recs_dir: Path, score_dir: Path, dev: dict, ids: list, model: str, pool: list | None = None,
-                  dtype: str = "float32") -> dict:
+                  dtype: str = "float32", adapter: str | None = None, tokenizer: str | None = None) -> dict:
     """The scorecard (lean) on every record in recs_dir whose id is a dev question, and S1 and Q1-Q5 over ids."""
     import torch
     from transformers import AutoTokenizer
@@ -272,8 +277,11 @@ def score_records(recs_dir: Path, score_dir: Path, dev: dict, ids: list, model: 
             finder_recs[qid] = r
             files.append(f)
     score_dir.mkdir(parents=True, exist_ok=True)
-    tok = AutoTokenizer.from_pretrained(model)
-    m = ns.Model(ns.load_model(model, None, "cuda" if torch.cuda.is_available() else "cpu", getattr(torch, dtype)))
+    first = next(iter(finder_recs.values()), {})
+    adapter, tokenizer = adapter or first.get("adapter"), tokenizer or first.get("tokenizer") or model  # (else the records')
+    tok = AutoTokenizer.from_pretrained(tokenizer)
+    dev_name = "cuda" if torch.cuda.is_available() else "cpu"
+    m = ns.Model(ns.load_model(model, adapter, dev_name, getattr(torch, dtype)))
     for f in files:
         c = ns.read_circuit(f)
         if (score_dir / f"{c['name']}.json").exists() or not c["neurons"] and not c["heads"]:
@@ -290,11 +298,10 @@ def score_records(recs_dir: Path, score_dir: Path, dev: dict, ids: list, model: 
     if pool is not None and any(r.get("cuts") for r in finder_recs.values()):
         import circuit_finder as cf
         import circuit_robust as cr
-        from transformers import AutoModelForCausalLM
         rdir = score_dir.parent / "robust"
         rdir.mkdir(exist_ok=True)
-        bm = AutoModelForCausalLM.from_pretrained(model, dtype=torch.bfloat16, device_map="cuda" if torch.cuda.is_available() else None).eval()
-        bm.requires_grad_(False)
+        bm = ns.load_model(model, adapter, dev_name, torch.bfloat16)
+        bm = bm.merge_and_unload().eval().requires_grad_(False) if adapter else bm
         pt = cf.Patcher(bm, tok)
         qpool = cr.question_pool(pool)
         for i, r in finder_recs.items():
@@ -307,7 +314,7 @@ def score_records(recs_dir: Path, score_dir: Path, dev: dict, ids: list, model: 
             out = cr.check(pt, tok, {**r, "gap": r.get("gap", 0.0)}, dev[i], qpool)
             path.write_text(json.dumps(out))
             robust.append(out)
-    return {"model": model, "records": str(recs_dir), "score_dtype": dtype, "gpu": torch.cuda.get_device_name() if torch.cuda.is_available() else "cpu",
+    return {"model": model, "adapter": adapter, "tokenizer": tokenizer, "records": str(recs_dir), "score_dtype": dtype, "gpu": torch.cuda.get_device_name() if torch.cuda.is_available() else "cpu",
             "metrics": metrics(recs, finder_recs, len(ids), robust)}
 
 
@@ -327,7 +334,7 @@ def score_only(a) -> None:
     dev = load_devset(a.devset)
     refuse_sealed(dev, a.sealed)
     ids = sorted({qid_of(json.loads(f.read_text())) for f in a.records.glob("*.json")} & set(dev))
-    bench = score_records(a.records, a.out / "score", dev, ids, a.model, [a.devset] + a.pool, a.score_dtype)
+    bench = score_records(a.records, a.out / "score", dev, ids, a.model, [a.devset] + a.pool, a.score_dtype, a.adapter, a.tokenizer)
     bench.update(devset=str(a.devset), finder_rev=a.rev)
     a.out.mkdir(parents=True, exist_ok=True)
     (a.out / "bench.json").write_text(json.dumps(bench, indent=1))
@@ -346,6 +353,8 @@ def main():
     r.add_argument("--rev", default=None, help="the finder version's commit, recorded")
     r.add_argument("--dtype", default=None, help="the finder's --dtype (default: its own auto)")
     r.add_argument("--limit", type=int, default=0)
+    r.add_argument("--merge", action="store_true", help="the finder's --merge (the adapter merged into the weights)")
+    r.add_argument("--system", default=None, help="the finder's --system (a question's own \"system\" field wins)")
     s = sp.add_parser("score")
     s.add_argument("records", type=Path)
     s.add_argument("out", type=Path)
@@ -353,6 +362,8 @@ def main():
     s.add_argument("--model", default="Qwen/Qwen3-8B")
     s.add_argument("--rev", default=None)
     for x in (r, s):
+        x.add_argument("--adapter", default=None, help="an organism's LoRA (the finder's --adapter; the scorecard loads it)")
+        x.add_argument("--tokenizer", default=None, help="the tokenizer and chat template (the finder's --tokenizer)")
         x.add_argument("--sealed", action="store_true", help="allow the sealed test set (split \"test\")")
         x.add_argument("--score-dtype", default="float32", choices=("float32", "bfloat16"),
                        help="the scorecard's dtype (bfloat16 where float32 does not fit the card)")

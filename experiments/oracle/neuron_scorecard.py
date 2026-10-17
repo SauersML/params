@@ -356,7 +356,13 @@ def score(m: Model, tok, c: dict, qs: dict, log=print, lean: bool = False) -> di
     neither)."""
     t0 = time.perf_counter()
     q = qs.get(c.get("id")) or qs.get(str(c.get("id")).split("/vs/")[0], {})  # (a family pair record: "question/vs/partner")
-    chat = lambda u: circuit_questions.chat(tok, u)  # noqa: E731
+    sysp, pre = q.get("system", c.get("system")), q.get("prefill") or c.get("prefill")
+    pre_ids = tok(pre, add_special_tokens=False)["input_ids"] if pre else []
+
+    def chat(u):  # the finder's prompt: a system turn (an organism's), the user turn, the model's turn opened, a prefill
+        msgs = ([{"role": "system", "content": sysp}] if sysp else []) + [{"role": "user", "content": u}]
+        return tok(tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True, enable_thinking=False),
+                   add_special_tokens=False)["input_ids"] + pre_ids
     clean = c.get("clean") or c.get("ids") or chat(c.get("user") or q["user"])
     corr = c.get("corrupted") or chat(c.get("corrupt_user") or q["corrupt_user"])
     T = len(clean)

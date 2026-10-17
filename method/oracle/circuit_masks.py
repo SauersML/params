@@ -239,7 +239,7 @@ def prune(pt, circ: list) -> list:
     passes = lambda r: r[0] >= cf.PASS and r[1] >= cf.PASS  # noqa: E731
     if len(circ) < 2:
         return circ
-    alone = pt.both([_blocks([v for v in circ if v != u]) for u in circ])
+    alone = pt.both_without(circ)                   # (each unit left out: Patcher.both_without, no set built per unit)
     todo, gone = [u for u, r in zip(circ, alone) if passes(r)][::-1], set()
     while todo:                                     # (each trial a prefix of the units left with todo last, reversed)
         rest = [v for v in circ if v not in gone and v not in set(todo)]

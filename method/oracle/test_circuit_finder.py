@@ -546,3 +546,20 @@ def test_group_prefixes_equal_alone(tiny):
                              for p_, u in zip(pts, orders)])
     for a, b in zip(got, want):
         assert len(a) == len(b) and all(abs(x[0] - y[0]) < 1e-5 and abs(x[1] - y[1]) < 1e-5 for x, y in zip(a, b))
+
+
+def test_both_without_equals_its_sets(tiny):
+    """both_without(): each unit left out, as the sets themselves measure (neurons and heads, units before the change)."""
+    pt, clean, corrupt = tiny
+    pt.setup(clean, corrupt)
+    g = torch.Generator().manual_seed(7)
+    units = []
+    for _ in range(25):
+        i, p = int(torch.randint(pt.L, (1,), generator=g)), int(torch.randint(pt.T, (1,), generator=g))
+        units.append(("neuron", i, p, int(torch.randint(pt.D, (1,), generator=g))) if torch.rand(1, generator=g) < 0.7 else
+                     ("head", i, int(torch.randint(pt.H, (1,), generator=g)), p))
+    got = pt.both_without(units)
+    want = pt.both([[v for k, v in enumerate(units) if k != j] for j in range(len(units))])
+    for a, b in zip(got, want):
+        assert abs(a[0] - b[0]) < 1e-5 and abs(a[1] - b[1]) < 1e-5
+    assert pt.both_without(units, [3, 0]) == [got[3], got[0]]

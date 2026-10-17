@@ -464,10 +464,33 @@ class Patcher:
         """prefixes() in both runs: per k (lost share noising, restored share denoising) of units[:k]."""
         return [tuple(v) for v in self.prefixes(units, ks, ("clean", "corrupt"))]
 
-    def _launch_prefixes(self, units: list, ks: list, bases: tuple) -> tuple:
-        """_launch for the prefix sets units[:k], k in ks (prefixes())."""
+    def both_without(self, units: list, js: list | None = None) -> list[tuple]:
+        """Per j in js (default every unit) the shares of units without units[j], both runs: every leave-one-out set built
+        as prefixes() builds its sets (a pruning pass over n units measures n sets of n - 1: built one by one, a
+        548-unit cut's took 13 min of a Qwen3-8B question's host time)."""
+        js = list(range(len(units))) if js is None else list(js)
+        if not js:
+            return []
+        simple = all(len(u) == 4 and u[0] in ("neuron", "head") and isinstance(u[2], (int, np.integer))
+                     and isinstance(u[3], (int, np.integer)) for u in units)
+        if not simple or self._group is not None or not (STAGED and LAYERS and PREFIX and self.first > 0):
+            return [tuple(v) for v in self._measure([[v for i, v in enumerate(units) if i != j] for j in js], ("clean", "corrupt"))]
+        return [tuple(v) for v in _read([self._launch_prefixes(units, [len(units)] * len(js), ("clean", "corrupt"), drops=js)])[0]]
+
+    def _launch_prefixes(self, units: list, ks: list, bases: tuple, drops: list | None = None) -> tuple:
+        """_launch for the prefix sets units[:k], k in ks (prefixes()); drops: per set a unit's place left out of it."""
         kind, layer, pos, idx = self._arrays(units)
-        starts = self._prefix_starts(pos, ks)
+        if drops is None:
+            starts = self._prefix_starts(pos, ks)
+        else:                                       # (a set's first position with its dropped unit out)
+            eff = np.where(pos >= self.first, pos, self.T + 1)
+            starts = []
+            for k, d in zip(ks, drops):
+                e = eff[:k].copy()
+                if d < k:
+                    e[d] = self.T + 1
+                m = int(e.min()) if k else self.T + 1
+                starts.append(m if m <= self.T else self.T - 1)
         carry, pending = [], []
         levels = sorted(set(starts), reverse=True)
         for j, st in enumerate(levels):
@@ -475,17 +498,28 @@ class Patcher:
             if len(carry) < self.rows and j < len(levels) - 1:
                 continue
             pending += [([carry[c] for c in js], v) for js, v in
-                        self._run_prefixes(kind, layer, pos, idx, [ks[b] for b in carry], st, bases)]
+                        self._run_prefixes(kind, layer, pos, idx, [ks[b] for b in carry], st, bases,
+                                           None if drops is None else [drops[b] for b in carry])]
             carry = []
         return len(ks), pending
 
-    def _run_prefixes(self, kind, layer, pos, idx, ks: list, start: int, bases: tuple) -> list:
-        """_run_from's staged path for the prefix sets of the order (kind, layer, pos, idx) of the given lengths ks."""
+    def _run_prefixes(self, kind, layer, pos, idx, ks: list, start: int, bases: tuple, drops: list | None = None) -> list:
+        """_run_from's staged path for the prefix sets of the order (kind, layer, pos, idx) of the given lengths ks
+        (drops: per set a unit's place left out of it)."""
         R = min(MAX_ROWS, max(self.rows, BATCH_TOKENS // (self.T - start)))
         R = min(R, max(self.rows, len(ks) * len(bases)), self._fit(self.T - start))
         live = pos >= start
-        lm = np.minimum.accumulate(np.where(live, layer, self.L - 1)) if len(layer) else np.zeros(0, np.int64)
-        low = [int(lm[k - 1]) if k > 0 else self.L - 1 for k in ks]
+        if drops is None:
+            lm = np.minimum.accumulate(np.where(live, layer, self.L - 1)) if len(layer) else np.zeros(0, np.int64)
+            low = [int(lm[k - 1]) if k > 0 else self.L - 1 for k in ks]
+        else:
+            eff = np.where(live, layer, self.L - 1)
+            low = []
+            for k, d in zip(ks, drops):
+                e = eff[:k].copy()
+                if d < k:
+                    e[d] = self.L - 1
+                low.append(int(e.min()) if k else self.L - 1)
         order = sorted(range(len(ks)), key=lambda j: -low[j])
         chunks, cur = [], []
         for j in order:
@@ -505,15 +539,19 @@ class Patcher:
                 src = "corrupt" if base == "clean" else "clean"
                 rb = np.array([row[(kb, jj)] for jj in range(len(js))], dtype=np.int64)
                 kk = np.array([ks[js[jj]] for jj in range(len(js))], dtype=np.int64)
+                dd = None if drops is None else np.array([drops[js[jj]] for jj in range(len(js))], dtype=np.int64)
                 for (kc, i), us in groups.items():  # a row's units of this layer: the prefix of us below its k
                     cnt = np.searchsorted(us, kk)
                     tot = int(cnt.sum())
                     if not tot:
                         continue
                     off = np.arange(tot) - np.repeat(np.cumsum(cnt) - cnt, cnt)
-                    sel = us[off]
+                    sel, rr = us[off], np.repeat(rb, cnt)
+                    if dd is not None:              # (its dropped unit out)
+                        keep = sel != np.repeat(dd, cnt)
+                        sel, rr = sel[keep], rr[keep]
                     v = by.setdefault(("neuron" if kc == 0 else "head", src), {}).setdefault(i, [])
-                    v.append(np.stack([np.repeat(rb, cnt), pos[sel], idx[sel]]))
+                    v.append(np.stack([rr, pos[sel], idx[sel]]))
             index = {key: {i: self._to_dev(np.concatenate(a, 1)) for i, a in d.items()} for key, d in by.items()}
             hn = self._staged(start, [bases[kb] for _, kb, _ in rows], [r[0] for r in rows], **self._edits(index, start))
             c = self._contrast(hn)[self._to_dev(np.array([[row[(kb, jj)] for jj in range(len(js))] for kb in range(len(bases))],
@@ -1337,7 +1375,7 @@ def cut(pt: Patcher, sc: dict, kind: str, positions, done: dict, log=None, searc
     if reach and pr and passes(pt.both([pr])[0]):
         circ = list(pr)
         if len(circ) > 1:                           # units whose removal alone still passes, removed from the last
-            alone = pt.both([[v for v in circ if v != u] for u in circ])
+            alone = pt.both_without(circ)
             for u in [u for u, r in zip(circ, alone) if passes(r)][::-1]:
                 trial = [v for v in circ if v != u]
                 if passes(pt.both([trial])[0]):
@@ -1428,7 +1466,7 @@ def cut(pt: Patcher, sc: dict, kind: str, positions, done: dict, log=None, searc
                                                     # -3.73/1.18 on a ~1 bit gap, wrote 62,122 neurons as nodes)
     found = list(circ)
     if ok and len(circ) > 1:                        # units whose removal alone still passes, then removed one at a time
-        alone = pt.both([[v for v in circ if v != u] for u in circ])           # from the least effective while it passes
+        alone = pt.both_without(circ)               # (each unit left out) from the least effective while it passes
         todo = [u for u, r in zip(circ, alone) if passes(r)][::-1]
         while todo:                                 # (the removals in one call as if each passes: the same sets as one
             gone = set(todo)                        # by one up to the first that fails, then again from after it; each

@@ -97,7 +97,9 @@ def resample_ids(tok, q: dict, rec: dict, n: int, pool: dict | None = None, syst
     system = q.get("system", rec.get("system", system))
     prefill = q.get("prefill") or rec.get("prefill")
     pre = tok(prefill, add_special_tokens=False)["input_ids"] if prefill else []
-    cands = [(u, u, pre) for u in q.get("resamples", [])]   # (whole prompts: an organism's other non-trigger prompts)
+    cands = [(u, u, pre) if isinstance(u, str) else      # (whole prompts: an organism's other non-trigger prompts; or
+             (u["user"], u["user"], tok(u["prefill"], add_special_tokens=False)["input_ids"] if u.get("prefill") else [])
+             for u in q.get("resamples", [])]               # {"user", "prefill"}: a swap with its own prefill, fleet's E1)
     cands += [(w["user"], w["user"], tok(w["prefill"], add_special_tokens=False)["input_ids"] if w.get("prefill") else [])
               for w in q.get("swaps", []) if w["user"] != rec.get("corrupt_user")]   # (the clean prompt's other swaps)
     cands += [(k, user.replace(key, k), pre) for k in [p for p in q.get("partners", []) if isinstance(p, str)]

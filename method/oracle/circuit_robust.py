@@ -151,10 +151,12 @@ def resampled(pt: cf.Patcher, rec: dict, cut: str, rs: list) -> dict:
         rest.append(b)
         keys.append(key)
     pt.setup(clean, corrupt, explicit_sets=token_sets(rec))
-    R = max(len(lost), 1)
-    out = {"units": len(units), "standard": std, "keys": keys, "lost": lost, "restored": rest,
-           "mean": [sum(lost) / R, sum(rest) / R], "min": [min(lost, default=0.0), min(rest, default=0.0)]}
-    out["passes"] = bool(lost) and out["mean"][0] >= PASS and out["mean"][1] >= PASS
+    out = {"units": len(units), "standard": std, "keys": keys, "lost": lost, "restored": rest}
+    if not lost:                                    # (no usable resample: nothing measured, not a failure)
+        return {**out, "mean": None, "min": None, "passes": None, "no_resample": True}
+    out["mean"] = [sum(lost) / len(lost), sum(rest) / len(rest)]
+    out["min"] = [min(lost), min(rest)]
+    out["passes"] = out["mean"][0] >= PASS and out["mean"][1] >= PASS
     return out
 
 
@@ -287,7 +289,7 @@ def main():
     pt = cf.Patcher(model, tok)
     qs = json.loads(a.questions.read_text())
     qs = {q["id"]: q for q in (qs["questions"] if isinstance(qs, dict) else qs)}
-    pool = question_pool(a.pool + [a.questions]) if a.pool else None
+    pool = question_pool(a.pool + [a.questions])   # (the question file's own keys at least: devset_8b's partners are dicts)
     a.out.mkdir(parents=True, exist_ok=True)
     for f in sorted(a.records.iterdir()):
         if f.suffix != ".json":
@@ -300,7 +302,8 @@ def main():
             continue
         r = check(pt, tok, rec, qs.get(rec["id"], {}), pool, only=tuple(a.only.split(",")), system=a.system)
         o.write_text(json.dumps(r))
-        cuts = "; ".join(f"{c} {v['standard'][0]:.2f}/{v['standard'][1]:.2f} -> resampled {v['mean'][0]:.2f}/{v['mean'][1]:.2f}"
+        cuts = "; ".join(f"{c} {v['standard'][0]:.2f}/{v['standard'][1]:.2f} -> "
+                         + (f"resampled {v['mean'][0]:.2f}/{v['mean'][1]:.2f} ({len(v['lost'])} pairs)" if v["mean"] else "no resample")
                          for c, v in r["cuts"].items())
         nb = sum(len(b["backups"]) for v in r["backups"].values() for b in v)
         ni = sum(len(v) for v in r["interactions"].values())

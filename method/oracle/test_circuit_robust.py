@@ -39,6 +39,8 @@ def test_resampling_identities(setup):
         units, _, _ = cr.cut_units(rec, cut)
         if not units:
             continue
+        none = cr.resampled(pt, rec, cut, [])
+        assert none["passes"] is None and none["mean"] is None and none["no_resample"]   # (nothing measured: no 0.00)
         r = cr.resampled(pt, rec, cut, [("corrupt", rec["corrupted"])])  # (r = the corrupted prompt itself)
         assert abs(r["lost"][0] - r["standard"][0]) < 1e-4 and abs(r["restored"][0] - r["standard"][1]) < 1e-4
 

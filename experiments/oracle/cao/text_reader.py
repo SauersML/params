@@ -514,13 +514,13 @@ def _focused_circuit(c: dict, full: bool, focus: set, cap: int) -> str:
     return "\n".join(lines) + "\n"
 
 
-def pair_text(p: dict, C: dict, how: str) -> str:
+def pair_text(p: dict, C: dict, how: str, cap: int = 40) -> str:
     """A paired-context question with both texts' circuits (how: full, names) or none (the question alone: it already
     holds both texts and their answers)."""
     if how == "none":
         return p["q"]
-    a = serialize_circuit(C[p["circuit_a"]], how, set(p["units_a"]))
-    b = serialize_circuit(C[p["circuit_b"]], how, set(p["units_b"]))
+    a = serialize_circuit(C[p["circuit_a"]], how, set(p["units_a"]), cap)
+    b = serialize_circuit(C[p["circuit_b"]], how, set(p["units_b"]), cap)
     return f"{p['q']}\n\nCircuit of text A:\n{a}\nCircuit of text B:\n{b}\n{p['q']}"
 
 
@@ -537,19 +537,20 @@ def pairs(a) -> None:
     fkeys = {c.rsplit("/", 1)[0] for c in frozen}
     train = [json.loads(x) for x in a.train.read_text().splitlines()]
     ok = lambda c: not sealed(c) and c not in frozen and c.rsplit("/", 1)[0] not in fkeys  # noqa: E731
-    kept = [p for p in train if ok(p["context_a"]) and ok(p["context_b"])]
+    kept = [p for p in train if ok(p["context_a"]) and ok(p["context_b"]) and (not a.kinds or p["kind"] in a.kinds.split(","))]
     print(json.dumps({"train pairs": len(train), "kept": len(kept), "dropped (sealed, excluded or frozen)": len(train) - len(kept)}))
     test = [json.loads(x) for x in a.test.read_text().splitlines()]
+    test = [p for p in test if not a.test_kinds or p["kind"] in a.test_kinds.split(",")]
     a.out.mkdir(parents=True, exist_ok=True)
     for how in a.arms.split(","):
         with (a.out / f"train_{how}.jsonl").open("w") as f:
             for p in kept:
-                f.write(json.dumps({"prompt": [{"role": "user", "content": pair_text(p, C, how)}],
+                f.write(json.dumps({"prompt": [{"role": "user", "content": pair_text(p, C, how, a.cap)}],
                                     "completion": [{"role": "assistant", "content": p["a"]}],
                                     "info": {"task": p["id"], "cat": p["kind"]}}) + "\n")
         with (a.out / f"test_{how}.jsonl").open("w") as f:
             for p in test:
-                f.write(json.dumps({"task": p.get("item", p["id"]), "question": pair_text(p, C, how), "cat": p["kind"],
+                f.write(json.dumps({"task": p.get("item", p["id"]), "question": pair_text(p, C, how, a.cap), "cat": p["kind"],
                                     "a": p["a"], "id": p.get("item", p["id"])}) + "\n")
     from transformers import AutoTokenizer
     tok = AutoTokenizer.from_pretrained(str(next((HOME / ".cache/huggingface/hub/models--Qwen--Qwen3-8B/snapshots").iterdir())))
@@ -1107,6 +1108,9 @@ def main():
     pa.add_argument("--circuits", type=Path, required=True)
     pa.add_argument("--frozen", type=Path, nargs="*", help="every frozen item set: no training pair may touch their contexts or task/keys")
     pa.add_argument("--arms", default="full,names,none")
+    pa.add_argument("--cap", type=int, default=40, help="other units shown per circuit (heads: a third of it)")
+    pa.add_argument("--kinds", help="training kinds only (e.g. pair_zero,pair_sign: a held-out question kind)")
+    pa.add_argument("--test-kinds", help="test kinds only")
     pa.add_argument("--out", type=Path, required=True)
     ps = sub.add_parser("pscore")
     ps.add_argument("evals", type=Path, nargs="+")

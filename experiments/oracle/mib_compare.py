@@ -642,6 +642,9 @@ def select(model, task, mname, method, out, dl, n_rank, metric, refine, rows, te
             attribute(model, g, dl, partial(metric, mean=True, loss=True), c, "patching", ig_steps=5, intervention_dataloader=dl)
         graphs[c] = g
         rec["proposals"][c] = {"seconds": time.time() - t1}
+        import gc  # (a ranking's cached runs sit in closures' reference cycles: free them before the next one, 14 GB on
+        gc.collect()  # Llama-3.1 MCQA, which ran MIB's evaluation out of memory)
+        torch.cuda.empty_cache() if torch.cuda.is_available() else None
         d = out / "submission" / c / f"{task.replace('_', '-')}_{mname}"
         d.mkdir(parents=True, exist_ok=True)
         g.to_pt(str(d / "importances.pt"))

@@ -208,7 +208,8 @@ class Ablator:
     """Runs of an HF Qwen3 (circuit_finder.Patcher's hooks) whose rows each name the units they keep live: every other
     neuron and head channel at every position set to the background (Means), each row's kept units computed, and each
     row's set values (over) written over its units. A row is {"ids": [...], "keep": units or None (the full model),
-    "over": [(unit, value tensor)]}; rows of one forward have one length."""
+    "over": [(unit, value tensor)], "grab": units whose values to read}, or for large circuits {"ids", "mask": {kind:
+    [L, T, width] bool}} (dense(): live where the mask is) with "values": {kind: [L, T, width]} (those values there).""" 
 
     def __init__(self, model, tok, means: Means, mode: str | None = None):
         self.pt = cf.Patcher(model, tok)
@@ -218,6 +219,8 @@ class Ablator:
     def _plan(self, rows: list) -> dict:
         live, keep, over = [], {}, {}
         for b, r in enumerate(rows):
+            if r.get("mask") is not None:           # (a dense row: its mask, and its values when given, in place of keep)
+                continue
             if r.get("keep") is None:
                 live.append(b)
                 continue
@@ -245,7 +248,14 @@ class Ablator:
                 e[3].append((b, j, len(ks)))
         dev = self.pt.dev
         t = lambda xs: torch.tensor(xs, dtype=torch.long, device=dev)  # noqa: E731
-        return {"grab": {k: (t(v[0]), t(v[1]), t(v[2]), v[3]) for k, v in grab.items()}, "got": {},
+        dense = {}                                  # (rows given as masks: {kind: [L, T, width] bool}, values beside)
+        for kind in ("neuron", "head"):
+            rs = [b for b, r in enumerate(rows) if r.get("mask") is not None and kind in r["mask"]]
+            if rs:
+                dense[kind] = (t(rs), torch.stack([rows[b]["mask"][kind].to(dev) for b in rs]),
+                               torch.stack([rows[b]["values"][kind].to(dev) for b in rs]) if all(rows[b].get("values") is not None
+                                                                                         for b in rs) else None)
+        return {"dense": dense, "grab": {k: (t(v[0]), t(v[1]), t(v[2]), v[3]) for k, v in grab.items()}, "got": {},
                 "live": t(live) if live else None,
                 "keep": {k: tuple(t(x) for x in v) for k, v in keep.items()},
                 "over": {k: (t(v[0]), t(v[1]), t(v[2]), torch.cat(v[3]).to(dev)) for k, v in over.items()},
@@ -261,6 +271,11 @@ class Ablator:
                 if plan["live"] is not None:
                     lv = plan["live"].to(h.device)
                     out[lv] = h[lv]
+                if kind in plan["dense"]:               # (dense rows: live where the mask is, or the given values there)
+                    rs, M, V = plan["dense"][kind]
+                    rs, m = rs.to(h.device), M[:, i].to(h.device)
+                    src = h[rs] if V is None else V[:, i].to(h.device, h.dtype)
+                    out[rs] = torch.where(m, src, out[rs])
                 if (kind, i) in plan["keep"]:
                     b, p, k = (z.to(h.device) for z in plan["keep"][(kind, i)])
                     out[b, p, k] = h[b, p, k]
@@ -277,6 +292,20 @@ class Ablator:
             return fn
         L = set(range(self.L))
         return {"neu": make("neuron"), "head": make("head"), "only": {"res": set(), "head": L, "neu": L}}
+
+    @torch.no_grad()
+    def capture(self, ids: list) -> dict:
+        """The full model's every unit on ids: {"neuron": [L, T, D], "head": [L, T, H * hd]} (on the host, the model's dtype)."""
+        cap = {"neuron": [None] * self.L, "head": [None] * self.L}
+
+        def make(kind):
+            def fn(i, h):
+                cap[kind][i] = h[0].detach().cpu()
+                return h
+            return fn
+        L = set(range(self.L))
+        self.pt._last(torch.tensor([ids]), 1, neu=make("neuron"), head=make("head"), only={"res": set(), "head": L, "neu": L})
+        return {k: torch.stack(v) for k, v in cap.items()}
 
     @torch.no_grad()
     def logp(self, rows: list) -> torch.Tensor:
@@ -307,6 +336,44 @@ class Ablator:
 
 # ---------------------------------------------------------------- circuits and prompts
 
+def dense(units: list, L: int, T: int, D: int, H: int, hd: int) -> dict:
+    """units as masks {"neuron": [L, T, D] bool, "head": [L, T, H * hd] bool} (a head: its hd channels)."""
+    m = {"neuron": torch.zeros(L, T, D, dtype=torch.bool), "head": torch.zeros(L, T, H * hd, dtype=torch.bool)}
+    for kind, idx in _arrays(units, hd).items():
+        if len(idx[0]):
+            m[kind][idx] = True
+    return m
+
+
+def _arrays(units: list, hd: int) -> dict:
+    """{kind: (layers, positions, indices)} as index tensors, heads as their channels."""
+    n = [u for u in units if u[0] == "neuron"]
+    h = [u for u in units if u[0] == "head"]
+    c = [u for u in units if u[0] == "hchan"]
+    nl = torch.tensor([[u[1], u[2], u[3]] for u in n], dtype=torch.long).reshape(-1, 3)
+    hl = torch.tensor([[u[1], u[3], u[2]] for u in h], dtype=torch.long).reshape(-1, 3)
+    cl = torch.tensor([[u[1], u[2], u[3]] for u in c], dtype=torch.long).reshape(-1, 3)
+    if len(hl):
+        n_h = len(hl)
+        hl = hl.repeat_interleave(hd, 0)
+        hl[:, 2] = hl[:, 2] * hd + torch.arange(hd).repeat(n_h)
+    hc = torch.cat([hl, cl])
+    return {"neuron": (nl[:, 0], nl[:, 1], nl[:, 2]), "head": (hc[:, 0], hc[:, 1], hc[:, 2])}
+
+
+def redraw_dense(m: dict, seed: int) -> dict:
+    """The random control as masks: per kind, layer and position, as many units as m has there, drawn uniformly from the
+    units m does not hold (heads drawn as whole heads when m's head channels come in whole heads)."""
+    g = torch.Generator().manual_seed(seed)
+    out = {k: torch.zeros_like(v) for k, v in m.items()}
+    for kind, v in m.items():
+        cnt = v.sum(-1)                                                  # [L, T]
+        for i, p in cnt.nonzero().tolist():
+            free = (~v[i, p]).nonzero()[:, 0]
+            out[kind][i, p, free[torch.randperm(len(free), generator=g)[:int(cnt[i, p])]]] = True
+    return out
+
+
 def record_units(rec: dict) -> list:
     """A circuit's units: a circuit_finder record's nodes (every stage) and routes, or a circuit file's "neurons" [[layer,
     pos, neuron, ...]], "heads" [[layer, pos, head]] and "hchans" [[layer, pos, channel]]; each once, in order."""
@@ -334,16 +401,19 @@ def edges(units: list) -> int:
     """Unit-to-unit edges a dense model has among units: a direct residual path from u's write to v's read. A neuron or
     head channel at (layer l, position p) writes into p's residual stream after its sublayer; a neuron at (l', p) reads
     p's stream before its MLP (l < l', or l = l' for a head); a head at (l', q) reads every position up to q through its
-    keys and values and q through its query (l < l', p <= q)."""
-    sites = [(("n" if u[0] == "neuron" else "h"),) + _lp(u)[1:] for u in units]
-    n = 0
-    for k1, l1, p1 in sites:
-        for k2, l2, p2 in sites:
-            if k2 == "n":
-                n += p1 == p2 and (l1 < l2 or (l1 == l2 and k1 == "h"))
-            else:
-                n += l1 < l2 and p1 <= p2
-    return int(n)
+    keys and values and q through its query (l < l', p <= q). Counted from per-(layer, position) counts."""
+    if not units:
+        return 0
+    L = max(u[1] for u in units) + 1
+    T = max(_lp(u)[2] for u in units) + 1
+    n, h = np.zeros((L, T), np.int64), np.zeros((L, T), np.int64)
+    for u in units:
+        (n if u[0] == "neuron" else h)[u[1], _lp(u)[2]] += 1
+    below = lambda c: np.cumsum(c, 0) - c        # noqa: E731  (units in layers below, same position)
+    upto_pos = lambda c: np.cumsum(c, 1)          # noqa: E731  (units at positions up to p, same layer)
+    e = (n * below(n)).sum() + (n * np.cumsum(h, 0)).sum()          # (into neurons: same position)
+    e += (h * below(upto_pos(n))).sum() + (h * below(upto_pos(h))).sum()   # (into heads: lower layers, positions up to q)
+    return int(e)
 
 
 def sizes(units: list) -> dict:
@@ -442,11 +512,27 @@ def r3(abl: Ablator, tok, rec: dict, q: dict, keys: list, draws: int = DRAWS, n_
     if q.get("user") and prompt_ids(tok, q["user"], q) != clean:
         prompts = prompts[:2]                      # (the record's prompt is not its question's template: no held-out prompts)
     seed = zlib.crc32(str(rec.get("id")).encode())
-    rand = [redraw(units, abl.D, abl.H, abl.H * abl.hd, seed + j) for j in range(n_random)]
-    arms = [("full", None), ("empty", []), ("circuit", units)] + [(f"random{j}", r) for j, r in enumerate(rand)]
-    rows = [{"ids": ids, "keep": keep, **({"grab": units} if keep is None else {})} for _, _, ids in prompts for _, keep in arms]
-    lp, got = abl.run(rows)
-    frozen = [{"ids": ids, "keep": [], "over": list(zip(units, got[j * len(arms)]))} for j, (_, _, ids) in enumerate(prompts)]
+    T = len(clean)
+    M = dense(units, abl.L, T, abl.D, abl.H, abl.hd)
+    if M["head"].any():                             # (whole heads redrawn as whole heads)
+        Mh = M["head"].view(abl.L, T, abl.H, abl.hd)
+        whole = bool((Mh.any(-1) == Mh.all(-1)).all())
+    else:
+        whole = True
+    rand = []
+    for j in range(n_random):
+        if whole:
+            r = redraw_dense({"neuron": M["neuron"], "head": M["head"].view(abl.L, T, abl.H, abl.hd).any(-1)}, seed + j)
+            r["head"] = r["head"][..., None].expand(-1, -1, -1, abl.hd).reshape(abl.L, T, -1)
+        else:
+            r = redraw_dense(M, seed + j)
+        rand.append(r)
+    empty = {k: torch.zeros_like(v) for k, v in M.items()}
+    arms = [("full", None), ("empty", empty), ("circuit", M)] + [(f"random{j}", r) for j, r in enumerate(rand)]
+    rows = [{"ids": ids, "keep": None} if m is None else {"ids": ids, "mask": m} for _, _, ids in prompts for _, m in arms]
+    lp, _ = abl.run(rows)
+    caps = [abl.capture(ids) for _, _, ids in prompts]        # (the full model's every unit, for the frozen circuit)
+    frozen = [{"ids": ids, "mask": M, "values": caps[j]} for j, (_, _, ids) in enumerate(prompts)]
     arms.append(("frozen", None))                  # (the circuit's units at their full-model values, nothing computed)
     lp = torch.cat([lp.view(len(prompts), len(arms) - 1, -1), abl.logp(frozen)[:, None]], 1)
     sets = answer_contrast.token_sets_many(abl.pt.core, tok, [(ids, lp[j, 0], None, None, None) for j, (_, _, ids) in enumerate(prompts)])
@@ -454,7 +540,8 @@ def r3(abl: Ablator, tok, rec: dict, q: dict, keys: list, draws: int = DRAWS, n_
     for j, (split, name, ids) in enumerate(prompts):
         out.append({"split": split, "prompt": name, "answer_word": sets[j]["answer_word"],
                     **{a: _metrics(lp[j, 0], lp[j, x], sets[j]["answer"]) for x, (a, _) in enumerate(arms)}})
-    res = {"id": rec.get("id"), "task": rec.get("task") or q.get("task"), "size": sizes(units), "random_size": sizes(rand[0]) if rand else None,
+    res = {"id": rec.get("id"), "task": rec.get("task") or q.get("task"), "size": sizes(units),
+           "random_units": [int(r["neuron"].sum() + r["head"].sum() // (1 if not whole else abl.hd)) for r in rand],
            "prompts": out, "seconds_found": rec.get("seconds"), "met_r0": rec.get("met")}
     if len(corr) == len(clean) and rec.get("answer_tokens") and rec.get("alternatives"):
         s = {"answer": rec["answer_tokens"], "alternatives": rec["alternatives"]}

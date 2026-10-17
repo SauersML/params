@@ -180,3 +180,20 @@ def test_r5_true_simulator_is_frozen(tiny, monkeypatch):
     assert abs(p["simulated"]["kl"] - p["frozen"]["kl"]) < 1e-6 and res["labelled_share"] == 1.0
     res0 = ami.r5(abl, None, rec, {}, [], lambda u, x: None)       # (no labels: the empty circuit)
     assert abs(res0["prompts"][0]["simulated"]["kl"] - res0["prompts"][0]["empty"]["kl"]) < 1e-6
+
+
+def test_dense_rows_equal_unit_rows(tiny):
+    model, docs, means = tiny
+    abl = ami.Ablator(model, None, means)
+    ids = docs[0][:12]
+    units = [("neuron", 0, 4, 3), ("head", 0, 1, 5), ("neuron", 1, 11, 2), ("head", 1, 3, 11), ("hchan", 1, 7, 9)]
+    M = ami.dense(units, abl.L, 12, abl.D, abl.H, abl.hd)
+    assert int(M["neuron"].sum()) == 2 and int(M["head"].sum()) == 2 * abl.hd + 1
+    a, b = abl.logp([{"ids": ids, "keep": units}, {"ids": ids, "mask": M}])
+    assert torch.allclose(a, b, atol=1e-6)
+    cap = abl.capture(ids)
+    _, got = abl.run([{"ids": ids, "keep": None, "grab": units}])
+    c, d = abl.logp([{"ids": ids, "keep": [], "over": list(zip(units, got[0]))}, {"ids": ids, "mask": M, "values": cap}])
+    assert torch.allclose(c, d, atol=1e-6)                   # (frozen: dense values equal the unit overrides)
+    r = ami.redraw_dense(M, 0)
+    assert all(torch.equal(r[k].sum(-1), M[k].sum(-1)) for k in M) and not any((r[k] & M[k]).any() for k in M)

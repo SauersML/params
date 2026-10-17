@@ -23,6 +23,8 @@ its query there ("query"), each cut alone, and all three at once ("indirect"); "
 whole unit, since those are all of its write's readers.
 
   readers(rn, ids, units, corrupt=None)   head_routes.Runner rn with its answer and alternatives set
+  for_prompt(model, tok, ids, units, corrupt=None)   the same on a model and a prompt (a tool's call): the answer is
+      the clean run's top token's word against other words (answer_contrast), unless answer= and alternatives= say
 """
 from __future__ import annotations
 
@@ -258,6 +260,21 @@ def readers(rn, ids: list[int], units: list, corrupt: list[int] | None = None, t
                     in circuit
             out[i]["readers"].append(rd)
     return out
+
+
+def for_prompt(model, tok, ids: list[int], units: list, corrupt: list[int] | None = None, answer: list[int] | None = None,
+               alternatives: list[int] | None = None, **kw) -> dict:
+    """readers() on a model (an HF Qwen3, or a PeftModel of one) and a prompt: {"answer", "alternatives", "readers"}."""
+    import answer_contrast  # noqa: PLC0415
+    from head_routes import Runner  # noqa: PLC0415
+    rn = Runner(model)
+    if answer is None:
+        lp = rn.run(ids, [{}], capture=True)["lp"][0]
+        b = int(rn.run(corrupt, [{}], capture=True)["lp"][0].argmax()) if corrupt is not None else None
+        sets = answer_contrast.token_sets(rn.core, tok, ids, lp, b)
+        answer, alternatives = sets["answer"], sets["alternatives"]
+    rn.answer, rn.alternatives = list(answer), list(alternatives)
+    return {"answer": rn.answer, "alternatives": rn.alternatives, "readers": readers(rn, ids, units, corrupt=corrupt, **kw)}
 
 
 def record_units(rec: dict) -> list:

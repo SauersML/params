@@ -98,3 +98,9 @@ def test_readers_min_share(tiny):
     for o in out:
         assert o["total"]["share"] is not None and set(o["paths"]) == {"mlp", "key_value", "query"}
         assert o["groups"] == [] and o["together"] is None and all(r["bits"] is None for r in o["readers"])
+
+
+def test_for_prompt(tiny):
+    model, ids, bad, _ = tiny
+    got = readers.for_prompt(model, None, ids, [("neuron", 0, 5, 3)], corrupt=bad, answer=[3], alternatives=[5, 7], top=2)
+    assert got["answer"] == [3] and len(got["readers"]) == 1 and len(got["readers"][0]["readers"]) == 2

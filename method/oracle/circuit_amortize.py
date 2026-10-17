@@ -57,11 +57,16 @@ def _rows(pts: list) -> list:
     return rows
 
 
+def _late(pt, n) -> bool:
+    """A cut at the answer position only (readout, movers): its rows at m > 0 differ from the plain runs there alone."""
+    return n is not None and list(cm.cuts_of(pt)[n]["positions"]) == [pt.T - 1]
+
+
 def _chunks(pts: list) -> list:
     """pts in consecutive parts of at most GRAD_TOKENS rows x positions (one forward and backward each)."""
     parts, cur, n = [], [], 0
     for pt in pts:
-        t = len(_rows([pt])) * (pt.T - pt.first)
+        t = sum(1 if _late(pt, c) else pt.T - pt.first for _, _, c, _ in _rows([pt]))
         if cur and n + t > GRAD_TOKENS:
             parts.append(cur)
             cur, n = [], 0
@@ -70,72 +75,90 @@ def _chunks(pts: list) -> list:
     return parts + ([cur] if cur else [])
 
 
+def _forward(part: list, rows: list, start: int):
+    """One forward of rows [(pair, base, cut, m)] of the pairs part over the positions from start on (the earlier
+    positions' keys and values the setup runs'), each row's cut moved the share m toward the other run, a zero added
+    at every head output and neuron (gradients): (the added tensors {"neu", "head"} per layer [B, T - start, width], the
+    rows' contrasts [B])."""
+    import itertools
+    pt0 = part[0]
+    L, T, D, H, hd, dev = pt0.L, pt0.T, pt0.D, pt0.H, pt0.hd, pt0.dev
+    S, B = T - start, len(rows)
+    other = {"clean": "corrupt", "corrupt": "clean"}
+    wn, wh = torch.zeros(B, S, 1), torch.zeros(B, S, 1)       # each row's share m at its cut's positions
+    for r, (j, b, n, m) in enumerate(rows):
+        if n is not None:
+            spec = cm.cuts_of(part[j])[n]
+            w = wh if "head" in spec["kinds"] else wn
+            w[r, [p - start for p in spec["positions"]]] = m
+    dt = pt0.core.model.embed_tokens.weight.dtype
+    wn, wh = wn.to(dev, dt), wh.to(dev, dt)
+    edit_n, edit_h = bool(wn.any()), bool(wh.any())
+
+    def tgt(key, i, d):                             # each row's other-run values at layer i [B, S, width]
+        return torch.stack([part[j].act[other[b]][key][i][start:] for j, b, _, _ in rows]).to(d, dt)
+
+    def neu(i, h):
+        return h + wn.to(h.device) * (tgt("neu", i, h.device) - h) if edit_n else h
+
+    def head(i, h):
+        return h + wh.to(h.device) * (tgt("head", i, h.device) - h) if edit_h else h
+    add = {"neu": [torch.zeros(B, S, D, device=l.mlp.down_proj.weight.device, dtype=dt, requires_grad=True)
+                   for l in pt0.layers],
+           "head": [torch.zeros(B, S, H * hd, device=l.self_attn.o_proj.weight.device, dtype=dt, requires_grad=True)
+                    for l in pt0.layers]}
+    x = torch.stack([part[j]._ids_dev[b] for j, b, _, _ in rows])
+    kv = [tuple(torch.cat([part[j]._base_kv[b][i][jj][:, :, :start] for j, b, _, _ in rows]) for jj in (0, 1))
+          for i in range(L)]
+    hn = pt0._last(x, B, cache=(start, kv), add=add, neu=neu, head=head)
+    c, r0 = [], 0
+    for j, grp in itertools.groupby(rows, key=lambda t: t[0]):     # (each pair's rows its own answer and alternatives)
+        n_r = len(list(grp))
+        c.append(part[j]._contrast(hn[r0:r0 + n_r]))
+        r0 += n_r
+    return add, torch.cat(c)
+
+
 def path_features(pts: list, consume, relp: bool = True) -> None:
     """For pairs set up in pts (Patchers of one model; prompts of one length), consume(j, {cut name: {feature: [L, P, W]
-    float32 on the device}}) per pair (FEATURES, the cut's positions P, W neurons or heads). One forward and backward
-    per chunk of pairs (_chunks), every row from the chunk's first changed position on (the prefix's keys and values the
-    setup runs')."""
+    float32 on the device}}) per pair (FEATURES, the cut's positions P, W neurons or heads). One backward per chunk of
+    pairs (_chunks) through two forwards: the plain runs and the source cut's rows from the chunk's first changed
+    position on, the answer-position cuts' rows (readout, movers at m > 0) at the answer position alone."""
     at = {id(pt): j for j, pt in enumerate(pts)}
     for part in _chunks(pts):
         rows = _rows(part)
         pt0 = part[0]
-        L, T, D, H, hd, dev = pt0.L, pt0.T, pt0.D, pt0.H, pt0.hd, pt0.dev
+        L, T, H, hd, dev = pt0.L, pt0.T, pt0.H, pt0.hd, pt0.dev
         assert all(pt.T == T for pt in part), "path_features: prompts of one length"
-        start = min(pt.first for pt in part)
-        S, B = T - start, len(rows)
-        other = {"clean": "corrupt", "corrupt": "clean"}
-        cuts = [cm.cuts_of(pt) for pt in part]
-        wn, wh = torch.zeros(B, S, 1), torch.zeros(B, S, 1)       # each row's share m at its cut's positions
-        for r, (j, b, n, m) in enumerate(rows):
-            if n is not None:
-                spec = cuts[j][n]
-                w = wh if "head" in spec["kinds"] else wn
-                w[r, [p - start for p in spec["positions"]]] = m
-        dt = pt0.core.model.embed_tokens.weight.dtype
-        wn, wh = wn.to(dev, dt), wh.to(dev, dt)
-        edit_n, edit_h = bool(wn.any()), bool(wh.any())
-
-        def tgt(key, i, d):                         # each row's other-run values at layer i [B, S, width]
-            return torch.stack([part[j].act[other[b]][key][i][start:] for j, b, _, _ in rows]).to(d, dt)
-
-        def neu(i, h):
-            return h + wn.to(h.device) * (tgt("neu", i, h.device) - h) if edit_n else h
-
-        def head(i, h):
-            return h + wh.to(h.device) * (tgt("head", i, h.device) - h) if edit_h else h
-        add = {"neu": [torch.zeros(B, S, D, device=l.mlp.down_proj.weight.device, dtype=dt, requires_grad=True)
-                       for l in pt0.layers],
-               "head": [torch.zeros(B, S, H * hd, device=l.self_attn.o_proj.weight.device, dtype=dt, requires_grad=True)
-                        for l in pt0.layers]}
-        x = torch.stack([part[j]._ids_dev[b] for j, b, _, _ in rows])
-        kv = [tuple(torch.cat([part[j]._base_kv[b][i][jj][:, :, :start] for j, b, _, _ in rows]) for jj in (0, 1))
-              for i in range(L)] if start > 0 else None
+        late = [_late(part[j], n) for j, _, n, _ in rows]
+        grads = {}                                  # row -> (its forward's added tensors, its row there, that start)
         with torch.enable_grad():
-            hn = pt0._last(x, B, cache=(start, kv) if kv is not None else None, add=add, neu=neu, head=head)
-            c, r0 = [], 0
-            for pt in part:
-                n_r = len(_rows([pt]))
-                c.append(pt._contrast(hn[r0:r0 + n_r]))
-                r0 += n_r
-            torch.cat(c).sum().backward()
+            total = 0.0
+            for want, start in ((False, min(pt.first for pt in part)), (True, T - 1)):
+                idx = [r for r, x in enumerate(late) if x == want]
+                if idx:
+                    add, c = _forward(part, [rows[r] for r in idx], start)
+                    total = total + c.sum()
+                    grads.update({r: (add, k, start) for k, r in enumerate(idx)})
+            total.backward()
         r0, scs = 0, cf.scores_many(part) if relp else [None] * len(part)
         for j, pt in enumerate(part):
             n_r = len(_rows([pt]))
-            mine = rows[r0:r0 + n_r]
-            row = {(b, n, m): r0 + k for k, (_, b, n, m) in enumerate(mine)}
+            row = {(b, n, m): r0 + k for k, (_, b, n, m) in enumerate(rows[r0:r0 + n_r])}
             r0 += n_r
             sc = scs[j]
             out = {}
-            for n, spec in cuts[j].items():
+            for n, spec in cm.cuts_of(pt).items():
                 P = list(spec["positions"])
-                ps = torch.tensor([p - start for p in P], device=dev)
                 key, kk = ("head", "head") if "head" in spec["kinds"] else ("neu", "neuron")
                 hc = torch.stack([pt.act["clean"][key][i][P] for i in range(L)]).to(dev).float()       # [L, P, width]
                 ho = torch.stack([pt.act["corrupt"][key][i][P] for i in range(L)]).to(dev).float()
                 dl = hc - ho
 
                 def slope(r):                       # (h - o) . dc/dh at row r, per unit, over the gap [L, P, W]
-                    g = torch.stack([add[key][i].grad[r].to(dev)[ps] for i in range(L)]).float()
+                    add, k, s0 = grads[r]
+                    ps = torch.tensor([p - s0 for p in P], device=dev)
+                    g = torch.stack([add[key][i].grad[k].to(dev)[ps] for i in range(L)]).float()
                     s = dl * g
                     return (s.view(L, len(P), H, hd).sum(-1) if key == "head" else s) / pt.gap
                 f = {}
@@ -157,7 +180,7 @@ def path_features(pts: list, consume, relp: bool = True) -> None:
                 f["from_first"] = pp - pt.first
                 out[n] = f
             consume(at[id(pt)], out)
-        del add, hn
+        del grads
 
 
 def ig(f: dict) -> torch.Tensor:
@@ -563,6 +586,7 @@ def main():
     ap.add_argument("--offset", type=int, default=0)
     ap.add_argument("--stride", type=int, default=1)
     ap.add_argument("--scorer", default=None, help="eval: the trained scorer file of the arm \"model\" (train mode's)")
+    ap.add_argument("--profile", action="store_true", help="eval: each arm batch's drive ticks timed by kind (TickProfile)")
     ap.add_argument("--epochs", type=int, default=40)
     ap.add_argument("--hidden", type=int, default=64)
     a = ap.parse_args()
@@ -622,7 +646,10 @@ def main():
                 saved = {k: (m, m[k]) for k, (m, _) in sets.items()}
                 for k, (m, v) in sets.items():
                     m[k] = v
+                prof, recs = TickProfile() if a.profile else None, None
                 try:
+                    if prof:
+                        prof.__enter__()
                     if name == "mask":
                         recs = cm.find_batch(pts[:len(todo)], its, arm="mask", log=log,
                                              steps=next((int(x) for x in parts if x.isdigit()), cm.STEPS))
@@ -631,6 +658,11 @@ def main():
                         recs = find_batch_amortized(pts[:len(todo)], its, scorer(nm), arm=arm, log=log,
                                                     relp=nm == "relp" or nm.startswith("model:"))
                 finally:
+                    if prof:
+                        prof.__exit__()
+                        log(f"  {arm} ticks: {prof.report()}")
+                        for r in recs or []:
+                            r["ticks_batch"] = prof.report()
                     for k, (m, v) in saved.items():
                         m[k] = v
                 for (q, cl, co, name), rec in zip(todo, recs):
@@ -659,6 +691,45 @@ def main():
             (out / "rec" / f"{name}.json").write_text(json.dumps(rec, default=float))
         log(f"  batch done: mask {got[0][0]['amortize']['seconds_mask_batch']} s, features "
             f"{got[0][0]['amortize']['seconds_features_batch']} s")
+
+
+class TickProfile:
+    """eval --profile: circuit_masks._serve wrapped, each tick's wall time (the device synchronized) summed by what it
+    served (measurement methods, masks, scores) and counted; report() per arm batch."""
+
+    def __init__(self):
+        self.orig, self.t, self.n = cm._serve, {}, {}
+
+    def __enter__(self):
+        def serve(group, reqs, log=None):
+            flat = []
+
+            def walk(r):
+                if isinstance(r, list):
+                    for x in r:
+                        walk(x)
+                else:
+                    flat.append(r[0] if isinstance(r[0], str) else r[1])
+            for r in reqs:
+                walk(r)
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            t0 = time.perf_counter()
+            out = self.orig(group, reqs, log)
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            key = "+".join(sorted(set(flat)))
+            self.t[key] = self.t.get(key, 0.0) + time.perf_counter() - t0
+            self.n[key] = self.n.get(key, 0) + 1
+            return out
+        cm._serve = serve
+        return self
+
+    def __exit__(self, *a):
+        cm._serve = self.orig
+
+    def report(self) -> dict:
+        return {k: {"ticks": self.n[k], "seconds": round(v, 2)} for k, v in sorted(self.t.items(), key=lambda t: -t[1])}
 
 
 def _value(v: str):

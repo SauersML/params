@@ -317,7 +317,7 @@ def build_kinds(a) -> None:
         out = collections.defaultdict(list)
         for s in ("train", "dev", "test"):
             for kind in KINDS:
-                out[s] += pick(by_sk.get((s, kind), []), variant, "sel_pred", rng, None if s == "train" else a.cap)
+                out[s] += pick(by_sk.get((s, kind), []), variant, lambda q: q["sel_pred"], rng, None if s == "train" else a.cap)
             rng.shuffle(out[s])
             for q in out[s]:
                 q["id"] = f"mk1/{s}/{q['op']}/{zlib.crc32((q['key'] + q['context_a'] + q['context_b'] + q['op']).encode()):08x}"
@@ -387,8 +387,8 @@ def build_carry(a) -> None:
         out = collections.defaultdict(list)
         for s in ("train", "dev", "test"):
             for kind in CARRY_KINDS:
-                out[s] += pick(pools.get((s, kind), []), variant, "a_class" if variant == "v1_hard" else "sel_pred", rng,
-                               None if s == "train" else a.cap)
+                out[s] += pick(pools.get((s, kind), []), variant, (lambda q: (q["a_class"], q["relation"])) if variant == "v1_hard"
+                               else (lambda q: q["sel_pred"]), rng, None if s == "train" else a.cap)
             rng.shuffle(out[s])
             for q in out[s]:
                 q["id"] = f"cr1/{s}/{q['op']}/{zlib.crc32((q['unit_a'] + q['context_a'] + q['context_b'] + q['op']).encode()):08x}"
@@ -405,15 +405,16 @@ def build_carry(a) -> None:
 VARIANT_RULE = {
     "v1": "each kind's classes balanced per split (dev and test capped per class)",
     "v1_hard": "each kind's classes balanced per split within each class of A's own measured change of the same unit "
-               "(drop, rise, none or gap): the rule 'B does what A does' and any exclusion of it at chance",
+               "(drop, rise, none or gap) and B's relation to A (the rule's accuracy differs by relation): the rule 'B does "
+               "what A does' and any exclusion of it at chance within each relation",
     "adv": "each kind's classes balanced per split within each class a tree on the circuit's numbers predicts (sel_pred: "
            "trained on the training split, for training questions on the other training families), so that tree and any "
            "exclusion of its answer sit at chance"}
 
 
-def pick(qs: list, variant: str, field: str, rng: random.Random, cap: int | None) -> list:
-    """v1: classes balanced; otherwise balanced within each value of a hidden field (a rule's answer), patterns that
-    hold every class only, cap halved per pattern."""
+def pick(qs: list, variant: str, pattern, rng: random.Random, cap: int | None) -> list:
+    """v1: classes balanced; otherwise balanced within each pattern (a rule's answer, with what else the reader sees that
+    the rule's accuracy varies with), patterns that hold every class only, cap halved per pattern."""
     if variant == "v1":
         by = collections.defaultdict(list)
         for q in qs:
@@ -421,9 +422,11 @@ def pick(qs: list, variant: str, field: str, rng: random.Random, cap: int | None
         return balance(by, rng, cap)
     pat = collections.defaultdict(lambda: collections.defaultdict(list))
     for q in qs:
-        pat[q[field]][q["gold"]].append(q)
+        pat[pattern(q)][q["gold"]].append(q)
     n_cls = len({q["gold"] for q in qs})
-    return [q for _, by in sorted(pat.items()) if len(by) == n_cls for q in balance(by, rng, None if cap is None else cap // 2)]
+    full = [(k, by) for k, by in sorted(pat.items()) if len(by) == n_cls]
+    each = None if cap is None else -(-cap // max(1, len(full)))  # (dev and test: about cap per class over all patterns)
+    return [q for _, by in full for q in balance(by, rng, each)]
 
 
 def adv_pred(by_sk: dict, X, fam) -> None:
@@ -624,7 +627,9 @@ def baselines(a) -> None:
                     r[f"by_relation_{rel}"] = {
                         "n": len(sub), "carry_rule_a_class": acc([q["a_class"] if q["a_class"] != "gap" else "none" for _, q in sub],
                                                                  [q for _, q in sub]),
-                        "tree_all_numbers": acc(m_all.predict([x for x, _ in sub]), [q for _, q in sub])}
+                        "tree_all_numbers": acc(m_all.predict([x for x, _ in sub]), [q for _, q in sub]),
+                        "exclusion_of_a_class": round(sum((0.5 if q["a_class"] != "gap" else 1 / 3) * (q["gold"] != q["a_class"])
+                                                          for _, q in sub) / len(sub), 3)}
             res[kind] = r
     for kind, r in res.items():  # the selecting tree's answers (adv): its accuracy and the exclusion of it, at chance
         qs = [q for q in te if q["op"] == kind and "sel_pred" in q]

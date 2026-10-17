@@ -478,22 +478,24 @@ def test_mask_search_snapshots(tiny, monkeypatch):
     _within(mk, ms, x, pos, lpf, (0, 1))
 
 
-def test_tsearch_validation_keys(tiny, monkeypatch, tmp_path):
-    """tsearch with TSEARCH_VAL: the validation keys follow the fit keys in selection_keys (r3 never scores them), and the
-    written circuit is within QSEARCH_BOUND on every fit and validation prompt."""
+@pytest.mark.parametrize("order", ["mask", "ig", "pair2"])
+def test_tsearch_validation_keys(tiny, monkeypatch, tmp_path, order):
+    """tsearch with TSEARCH_VAL, for each order of the units: the validation keys follow the fit keys in selection_keys
+    (r3 never scores them), and the written circuit is within QSEARCH_BOUND on every fit and validation prompt."""
     model, docs, means = tiny
     qs, keys = _framed(monkeypatch)
     monkeypatch.setattr(ami, "TSEARCH_KEYS", 3)
     monkeypatch.setattr(ami, "TSEARCH_VAL", 2)
+    monkeypatch.setattr(ami, "TSEARCH_ORDER", order)
     monkeypatch.setattr(ami, "COVER_STEPS", 4)
     monkeypatch.setattr(ami, "COVER_SNAPS", "2")
     mk = ami.Masked(model, means)
     ami.tsearch(mk, None, qs[:1], keys, tmp_path, batch=1)
     rec = ami.json.loads((tmp_path / "t__20__p0.json").read_text())
     s = rec["r3search"]
-    assert rec["selection_keys"][:2] == ["20", "21"] and len(rec["selection_keys"]) == 5
+    assert rec["selection_keys"][:2] == ["20", "21"] and len(rec["selection_keys"]) == 5 and rec["order"] == order
     assert s["keys"] == rec["selection_keys"][:3] and s["val_keys"] == rec["selection_keys"][3:] and s["curve_val"]
-    assert [v["step"] for v in s["snapshots"]] == [2, 4] and s["step"] in (2, 4) and rec["met"]
+    assert [v["step"] for v in s["snapshots"]] == ([2, 4] if order == "mask" else [0]) and rec["met"]
     q = qs[0]
     rows = [ami.prompt_ids(None, q["user"].replace(q["key"], k), q) for k in rec["selection_keys"]]
     T = len(rows[0])
@@ -504,6 +506,56 @@ def test_tsearch_validation_keys(tiny, monkeypatch, tmp_path):
         kl = ami._kl(mk.logp(x, None, None, pos), mk.logp(x, M["neuron"].float()[None].expand(len(rows), -1, -1, -1),
                                                            mh[None].expand(len(rows), -1, -1, -1), pos))
     assert float(kl.max()) <= ami.QSEARCH_BOUND + 1e-6
+
+
+def test_ig_scores_complete(tiny):
+    """Integrated gradients against the background: an item's scores over every unit sum to about the background's KL
+    on each of its prompts, summed (completeness, midpoint rule)."""
+    mk, x, pos, lpf = _pair(tiny)
+    sn, sh = ami.ig_scores(mk, x, [0, 0], pos, lpf, 1, steps=64)
+    T = x.shape[1]
+    with torch.no_grad():
+        kl0 = ami._kl(lpf, mk.logp(x, torch.zeros(2, mk.L, T, mk.D), torch.zeros(2, mk.L, T, mk.H), pos)).sum()
+    assert sn.shape == (1, mk.L, T, mk.D) and sh.shape == (1, mk.L, T, mk.H)
+    assert abs(float(sn.sum() + sh.sum()) - float(kl0)) <= 0.03 * float(kl0)
+
+
+def test_pair_scores(tiny):
+    """Pair attribution: zero for a pair of identical prompts; for a pair of prompts that differ, the same as the units'
+    value differences times the mean of the two runs' gradients computed one prompt at a time."""
+    mk, x, pos, lpf = _pair(tiny)
+    same = x[[0, 0]]
+    sn, sh = ami.pair_scores(mk, same, [0, 0], pos, lpf[[0, 0]], 1)
+    assert float(sn.abs().max()) == 0 and float(sh.abs().max()) == 0
+    sn, sh = ami.pair_scores(mk, x, [0, 0], pos, lpf, 1)
+    ta, tb = lpf.argmax(-1).tolist()
+    vals = []
+    for r in (0, 1):                                          # (one run at a time: values and gradients of the contrast)
+        cap = []
+        hs = [layer.mlp.down_proj.register_forward_pre_hook(lambda m, a: (a[0].retain_grad(), cap.append(a[0]))[0])
+              for layer in mk.layers]
+        try:
+            e = mk.core.model.embed_tokens(x[r:r + 1]).detach().requires_grad_(True)
+            lg = mk.core.lm_head(mk.core.model(inputs_embeds=e).last_hidden_state[0, pos[r]])
+            (lg[ta] - lg[tb]).backward()
+        finally:
+            for h in hs:
+                h.remove()
+        vals.append([(c.detach()[0], c.grad[0]) for c in cap])
+    want = torch.stack([(a[0] - b[0]) * 0.5 * (a[1] + b[1]) for a, b in zip(*vals)])   # [L, T, D]
+    assert torch.allclose(sn[0], 2 * want, atol=1e-5)        # (the cyclic pairs (0, 1) and (1, 0): equal, summed)
+
+
+def test_mask_search_given_order(tiny, monkeypatch):
+    """scores: no descent, the logits are the given scores, the curve's sets are prefixes of their order, and the bound's
+    set is within the bound."""
+    mk, x, pos, lpf = _pair(tiny)
+    g = torch.Generator().manual_seed(3)
+    sc = (torch.randn(1, mk.L, 10, mk.D, generator=g), torch.randn(1, mk.L, 10, mk.H, generator=g))
+    ms = ami.mask_search(mk, x, [0, 0], pos, lpf, torch.ones(1, 1, 10, 1), scores=sc)
+    assert torch.equal(ms["th"][0], sc[0]) and torch.equal(ms["th"][1], sc[1]) and ms["history"] == []
+    assert ms["step"] == [0] and ms["k_mask"][0] == int((sc[0] > 0).sum() + (sc[1] > 0).sum())
+    _within(mk, ms, x, pos, lpf, (0, 1))
 
 def test_bsearch_prior_and_roles(tiny, monkeypatch, tmp_path):
     """No passes: the backbone is the prior, and each question's measured KL with the backbone alone is the one its

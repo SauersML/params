@@ -560,6 +560,42 @@ def pairs(a) -> None:
         print(f.name, "tokens per item (sampled): mean", sum(n) // len(n), "max", max(n))
 
 
+def pair_class(text: str) -> str | None:
+    """A paired-context answer's class: "A"/"B" (pair_zero, or "In A only"/"In B only"), "same", "both", "neither"."""
+    t = strip_read(text or "").strip().lower()
+    t = t[3:] if t.startswith("in ") else t
+    for c, pre in (("same", ("about the same", "the same", "same")), ("both", ("both",)), ("neither", ("neither",))):
+        if t.startswith(pre):
+            return c
+    m = re.match(r"(?:text\s+)?([ab])\b", t)
+    return m.group(1).upper() if m else None
+
+
+def pscore(a) -> None:
+    """Paired-context answers per kind, with 95% intervals (bootstrap over questions); --answers: also the scorecard's
+    answers/<name>/o1p.jsonl ({"item", "class"}) per eval file, name from --names."""
+    import random
+
+    gold = {json.loads(x)["item"]: json.loads(x) for x in a.items.read_text().splitlines()}
+    gcls = lambda r: r["cls"].split("/")[1]  # noqa: E731
+    for i, f in enumerate(a.evals):
+        rs = [json.loads(x) for x in f.read_text().splitlines()]
+        assert len(rs) == len(gold) and all(r["id"] in gold for r in rs), f
+        ok = [(gold[r["id"]]["kind"], pair_class(r["got"]) == gcls(gold[r["id"]])) for r in rs]
+        cells = []
+        for k in ("pair_zero", "pair_sign", "pair_flip", None):
+            v = [o for kk, o in ok if k is None or kk == k]
+            rng = random.Random(0)
+            bs = sorted(sum(rng.choice(v) for _ in v) / len(v) for _ in range(1000))
+            cells.append(f"{k or 'all'} {sum(v) / len(v):.3f} [{bs[25]:.3f}, {bs[974]:.3f}] n={len(v)}")
+        unparsed = sum(pair_class(r["got"]) is None for r in rs)
+        print(f"{f.parent.name}/{f.stem}: " + " | ".join(cells) + f" | unparsed {unparsed}")
+        if a.answers and a.names:
+            d = a.answers / a.names[i]
+            d.mkdir(parents=True, exist_ok=True)
+            (d / "o1p.jsonl").write_text("".join(json.dumps({"item": r["id"], "class": pair_class(r["got"]), "answer": r["got"]}) + "\n" for r in rs))
+
+
 # ---- the feasibility check: a logistic model on the serialized numbers against the name-prior ----
 
 def unit_members(F: dict, u: str) -> list[dict]:
@@ -1063,8 +1099,13 @@ def main():
     pa.add_argument("--frozen", type=Path, nargs="*", help="every frozen item set: no training pair may touch their contexts or task/keys")
     pa.add_argument("--arms", default="full,names,none")
     pa.add_argument("--out", type=Path, required=True)
+    ps = sub.add_parser("pscore")
+    ps.add_argument("evals", type=Path, nargs="+")
+    ps.add_argument("--items", type=Path, required=True, help="the frozen O1p items")
+    ps.add_argument("--answers", type=Path, help="the scorecard's answers directory")
+    ps.add_argument("--names", nargs="*", help="one scorecard oracle name per eval file")
     a = ap.parse_args()
-    {"pairs": pairs, "compose": compose, "ask": ask, "gen": gen, "claims": claims, "measure": measure, "facts": facts, "check": check, "rows": rows, "sample": sample, "score": score}[a.cmd](a)
+    {"pscore": pscore, "pairs": pairs, "compose": compose, "ask": ask, "gen": gen, "claims": claims, "measure": measure, "facts": facts, "check": check, "rows": rows, "sample": sample, "score": score}[a.cmd](a)
 
 
 if __name__ == "__main__":

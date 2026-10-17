@@ -90,16 +90,21 @@ def from_order(model, order: list, k: int) -> dict:
 
 
 def learn_order(model, batches: Batches, target: float, steps: int, lr: float, lam: float, floor: float,
-                hard_from: float = 0.67, log=None) -> list:
+                hard_from: float = 0.67, log=None, snaps: int = 6) -> list:
     """circuit_masks' objective with the task loss in place of the patching shares: theta from INIT 3 (every node
-    nearly kept), Adam on relu(loss - floor * target) / target + lam * sum(m), so a node stays while it lowers the loss
-    by more than lam * target. After hard_from of the steps the forward runs the binarized masks (theta > 0) with the
-    sigmoid's gradient (circuit_masks' HARD), so the descent sees the set the bisection takes."""
+    nearly kept), Adam on relu(loss - floor * target) / target + lam_t * sum(m), so a node stays while it lowers the
+    loss by more than lam_t * target. lam_t rises geometrically from lam / 10 to lam * 10 over the steps (a path of
+    smaller sets, in place of their 256-768 hyperparameter-search runs per task), and the theta order is taken at
+    `snaps` points of the second half; the caller keeps the smallest passing prefix among them. After hard_from of
+    the steps the forward runs the binarized masks (theta > 0) with the sigmoid's gradient (circuit_masks' HARD)."""
     sites = list(model.sites)
     theta = {s: torch.full((model.sites[s],), 3.0, device=model.device, requires_grad=True) for s in sites}
     opt = torch.optim.Adam(theta.values(), lr=lr)
+    at = {int(round(steps * (0.5 + 0.5 * (j + 1) / snaps))) - 1 for j in range(snaps)}
+    orders = []
     for step in range(steps):
         hard = step >= hard_from * steps
+        lam_t = lam * 10 ** (2 * step / max(steps - 1, 1) - 1)
         tot = 0.0
         opt.zero_grad()
         for kind, toks, last, tok, alt, b in batches.groups:
@@ -111,14 +116,17 @@ def learn_order(model, batches: Batches, target: float, steps: int, lr: float, l
             (torch.relu(loss - floor * target) / target * b / batches.n).backward()
             tot += float(loss) * b / batches.n
         size = sum(torch.sigmoid(theta[s]).sum() for s in sites)
-        (lam * size).backward()
+        (lam_t * size).backward()
         opt.step()
         if log and (step % 25 == 0 or step == steps - 1):
             kept = sum(int((theta[s] > 0).sum()) for s in sites)
-            log(f"  step {step} loss {tot:.4f} sum_m {float(size):.1f} kept {kept}{' hard' if hard else ''}")
-    flat = [(float(v), s, i) for s in sites for i, v in enumerate(theta[s].detach().cpu().tolist())]
-    flat.sort(key=lambda x: -x[0])
-    return [(s, i) for _, s, i in flat]
+            log(f"  step {step} loss {tot:.4f} sum_m {float(size):.1f} kept {kept} lam {lam_t:.4g}{' hard' if hard else ''}")
+        if step in at:
+            flat = torch.cat([theta[s].detach().float() for s in sites]).cpu()
+            idx = torch.argsort(flat, descending=True).tolist()
+            owner = [(s, i) for s in sites for i in range(model.sites[s])]
+            orders.append((step, [owner[j] for j in idx]))
+    return orders
 
 
 def bisect(model, batches, order, target, log=None) -> int:
@@ -149,10 +157,18 @@ def bisect(model, batches, order, target, log=None) -> int:
     return hi
 
 
-def prune(model, batches, order, k, target, log=None) -> list:
-    """Drop kept nodes, lowest theta first: blocks of 16, then 4, then single nodes."""
+def prune(model, batches, order, k, target, log=None, singles_max: int = 3000) -> list:
+    """Drop kept nodes, lowest theta first, while the measured loss still meets the target: blocks of 256 (when the
+    prefix is large), 64, 16 and 4, then single nodes when at most singles_max remain (each pass costs a forward per
+    block; single passes over Qwen3-8B's prefixes of thousands of nodes would take hours)."""
     kept = list(order[:k])
-    for block in (16, 4, 1):
+    for block in (256, 64, 16, 4, 1):
+        if block * 8 > len(kept) and block > 1:
+            continue
+        if block == 1 and len(kept) > singles_max:
+            if log:
+                log(f"  prune singles skipped: {len(kept)} > {singles_max}")
+            break
         i = len(kept) - block
         while i >= 0:
             trial = kept[:i] + kept[i + block:]
@@ -221,10 +237,16 @@ def run_task(model, items: list, task: str, a, out: str) -> dict:
     log(f"{name}: search {bs.n} test {bt.n} pairs; full-model search loss {full_s:.4f}; nodes {sum(model.sites.values())}")
     if full_s > a.target:
         log("  full model misses the target on the search prompts")
-    order = learn_order(model, bs, a.target, a.steps, a.lr, a.lam, a.floor, a.hard_from, log)
-    k = bisect(model, bs, order, a.target, log)
+    orders = learn_order(model, bs, a.target, a.steps, a.lr, a.lam, a.floor, a.hard_from, log)
+    prefixes = []
+    for step, o in orders:
+        kk = bisect(model, bs, o, a.target, log)
+        prefixes.append({"step": step, "k": kk})
+    ok = [(p["k"], j) for j, p in enumerate(prefixes) if p["k"] > 0]
+    k, order = (min(ok)[0], orders[min(ok)[1]][1]) if ok else (-1, None)
     rec = {"model": a.model, "task": task, "target": a.target, "n_search": bs.n, "n_test": bt.n,
-           "full_search": full_s, "bisect_k": k, "args": {kk: v for kk, v in vars(a).items() if kk != "task"}}
+           "full_search": full_s, "bisect_k": k, "prefixes": prefixes,
+           "args": {kk: v for kk, v in vars(a).items() if kk != "task"}}
     if k > 0:
         kept = prune(model, bs, order, k, a.target, log)
         keep = keep_dict(kept)
@@ -262,6 +284,9 @@ def main():
     ap.add_argument("--out", default=f"{ROOT}/runs")
     a = ap.parse_args()
     import tasks as T
+    if a.device.startswith("cuda"):                 # TF32 matmuls: every decision is a measured run under the same setting
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
     if a.family == "gao":
         means = a.means or f"{ROOT}/models/{a.model}/mean_baseline_pretrain.pt"
         model = N.GaoModel(a.model, a.device, means=means)

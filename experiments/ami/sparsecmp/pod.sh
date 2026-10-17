@@ -24,6 +24,11 @@ for j in "${JS[@]}"; do
   fam=${W[0]}; model=${W[1]}; means=${W[2]}; extra=("${W[@]:3}")
   margs=""; [ "$means" != released ] && margs="--means $means"
   fetch=""; [ "$fam" = gao ] && fetch="python -u $S/fetch.py models $model > $R/fetch_$k.log 2>&1; [ $means = released ] && python -u $S/fetch.py means $model >> $R/fetch_$k.log 2>&1;"
+  if [ "$means" = auto ]; then            # Qwen3: its node means over scrub's sample (means.py qwen), computed here
+    mf=$D/means/${model#Qwen/}_all_100000.pt
+    fetch="ls /Users/user/mpd-data/ami/means_sample_1m.npz > /dev/null; python -u $S/means.py qwen $model --docs 100000 --source all --device cuda --bs 8 > $R/means_$k.log 2>&1; cp $mf $R/;"
+    margs="--means $mf"
+  fi
   CMD="$CMD ( $fetch python -u $S/prune.py $fam $model --task all --device cuda $margs ${extra[*]} --out $R/runs > $R/job_$k.log 2>&1; echo exit \$? >> $R/job_$k.log ) & PIDS+=(\$!);"
   k=$((k + 1))
 done

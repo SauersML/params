@@ -421,9 +421,12 @@ def main():
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("mode", choices=("questions",))
-    ap.add_argument("inp")
-    ap.add_argument("out")
+    ap.add_argument("mode", choices=("questions", "cases"))
+    ap.add_argument("inp", help="questions: the questions JSON; cases: OUT")
+    ap.add_argument("out", nargs="?")
+    ap.add_argument("--cases", default="santa,preeclampsia", help="cases: circuit_finder's CASES or CHAT_CASES")
+    ap.add_argument("--word", default=None, help="cases: taboo's secret word")
+    ap.add_argument("--adapter", default=None, help="a PEFT adapter on the model (an organism)")
     ap.add_argument("--arm", default="mask", help="comma-separated arms (mask, group, attr, am, fam), each question through every arm in "
                     "turn on the same card, records in OUT/<arm>/")
     ap.add_argument("--split", default="dev")
@@ -441,7 +444,7 @@ def main():
     ap.add_argument("--prior", default=None, help="fam: a directory of circuit_finder records; a question's prior is its "
                     "task's records other than its own")
     a = ap.parse_args()
-    out = Path(a.out)
+    out = Path(a.out if a.mode == "questions" else a.inp)
     out.mkdir(parents=True, exist_ok=True)
     tok = AutoTokenizer.from_pretrained(a.model)
     if a.dtype == "auto":
@@ -454,25 +457,39 @@ def main():
     model = AutoModelForCausalLM.from_pretrained(a.model, dtype=getattr(torch, a.dtype),
                                                  device_map="auto" if dev == "auto" else None)
     model = (model if dev == "auto" else model.to(dev)).eval()
+    if a.adapter:
+        from peft import PeftModel
+
+        model = PeftModel.from_pretrained(model, a.adapter).eval()
     model.requires_grad_(False)
     pt = cf.Patcher(model, tok)
     t0 = time.time()
     log = lambda m: print(f"{time.time() - t0:7.1f}s {m}", flush=True)   # noqa: E731
-    qs = [q for q in json.loads(Path(a.inp).read_text())["questions"] if q["split"] == a.split]
-    qs = qs[a.offset::a.stride][:a.limit or None]
-    if a.ids:
-        want = set(json.loads(Path(a.ids).read_text()))
-        qs = [q for q in qs if q["id"] in want]
     pre = lambda q: tok(q["prefill"], add_special_tokens=False)["input_ids"] if q.get("prefill") else []  # noqa: E731
+    answers = {}                                    # (a case's answer tokens: taboo's secret word)
+    if a.mode == "questions":
+        qs = [q for q in json.loads(Path(a.inp).read_text())["questions"] if q.get("split", a.split) == a.split]
+        qs = qs[a.offset::a.stride][:a.limit or None]
+        if a.ids:
+            want = set(json.loads(Path(a.ids).read_text()))
+            qs = [q for q in qs if q["id"] in want]
+        pairs = [(q, cf.chat(tok, q["user"]) + pre(q), cf.chat(tok, q["corrupt_user"]) + pre(q)) for q in qs]
+    else:
+        pairs = []
+        for name in a.cases.split(","):
+            got = cf.chat_pairs(tok, name, a.word) if name in cf.CHAT_CASES else cf.case_pairs(tok, name)
+            for j, (c, k, text, ans) in enumerate(got):
+                qid = f"{name}_{a.word}_{j}" if a.word else f"{name}_{j}"
+                answers[qid] = ans
+                pairs.append(({"id": qid, "task": name, "corrupt_text": text}, c, k))
     priors = [json.loads(p.read_text()) for p in sorted(Path(a.prior).glob("*.json"))] if a.prior else []
     priors = [r for r in priors if r.get("met") and not r.get("skipped")]
     arms = a.arm.split(",")                         # (an arm may name its mask steps: am:30, records in OUT/am_30)
     for arm in arms:
         assert arm.split(":")[0] in ("mask", "group", "attr", "am", "fam"), arm
-        (out / arm.replace(":", "_")).mkdir(exist_ok=True)
+        (out / _dir(arm)).mkdir(exist_ok=True)
     jobs = []
-    for q in qs:
-        clean, corrupt = cf.chat(tok, q["user"]) + pre(q), cf.chat(tok, q["corrupt_user"]) + pre(q)
+    for q, clean, corrupt in pairs:
         if len(clean) != len(corrupt):
             log(f"{q['id']}: prompts of {len(clean)} and {len(corrupt)} tokens, skipped")
             continue
@@ -483,31 +500,44 @@ def main():
 
     def write(arm, q, clean, corrupt, rec):
         rec.update(id=q["id"], ids=clean, corrupted=corrupt, answer_text=tok.decode([rec["answer"]]),
-                   corrupt_answer_text=tok.decode([rec["corrupt_answer"]]), model=a.model, dtype=a.dtype,
-                   finder="circuit_masks", finder_rev=a.rev, **{k: q[k] for k in ("user", "corrupt_user", "task", "key") if k in q})
-        (out / arm.replace(":", "_") / f"{q['id'].replace('/', '__')}.json").write_text(json.dumps(rec))
+                   corrupt_answer_text=tok.decode([rec["corrupt_answer"]]), model=a.model, dtype=a.dtype, adapter=a.adapter,
+                   finder="circuit_masks", finder_rev=a.rev,
+                   **{k: q[k] for k in ("user", "corrupt_user", "task", "key", "corrupt_text", "prefill") if k in q})
+        (out / _dir(arm) / f"{q['id'].replace('/', '__')}.json").write_text(json.dumps(rec))
 
     def prior_of(name, q):
         return family_prior([r for r in priors if r.get("task") == q.get("task") and r["id"] != q["id"]]) if name == "fam" else None
     for c0 in range(0, len(jobs), a.batch):
         chunk = jobs[c0:c0 + a.batch]
         for arm in arms:
-            name, _, n = arm.partition(":")
-            steps = int(n) if n else a.steps
+            name, *parts = arm.split(":")
+            steps = next((int(x) for x in parts if x.isdigit()), a.steps)
+            sets = {k.upper(): float(v) for k, v in (x.split("=") for x in parts if "=" in x)}
             todo = [(q, cl, co) for q, cl, co in chunk
-                    if not (out / arm.replace(":", "_") / f"{q['id'].replace('/', '__')}.json").exists()]
+                    if not (out / _dir(arm) / f"{q['id'].replace('/', '__')}.json").exists()]
             if not todo:
                 continue
-            if a.batch > 1 and name in ("mask", "am"):
-                log(f"{len(todo)} pairs ({arm}, batched): " + ", ".join(q["id"] for q, _, _ in todo))
-                recs = find_batch(pts[:len(todo)], [(cl, co, None) for _, cl, co in todo], arm=name, steps=steps, log=log,
-                                  priors=[prior_of(name, q) for q, _, _ in todo])
-                for (q, cl, co), rec in zip(todo, recs):
-                    write(arm, q, cl, co, rec)
-                continue
-            for q, cl, co in todo:
-                log(f"{q['id']} ({arm})")
-                write(arm, q, cl, co, find(pt, cl, co, None, log=log, arm=name, steps=steps, prior=prior_of(name, q)))
+            saved = {k: globals()[k] for k in sets}
+            globals().update(sets)                  # (an arm's own constants: mask:20:init=1:lr=0.5)
+            try:
+                if a.batch > 1 and name in ("mask", "am"):
+                    log(f"{len(todo)} pairs ({arm}, batched): " + ", ".join(q["id"] for q, _, _ in todo))
+                    recs = find_batch(pts[:len(todo)], [(cl, co, answers.get(q["id"])) for q, cl, co in todo], arm=name, steps=steps,
+                                      log=log, priors=[prior_of(name, q) for q, _, _ in todo])
+                else:
+                    recs = []
+                    for q, cl, co in todo:
+                        log(f"{q['id']} ({arm})")
+                        recs.append(find(pt, cl, co, answers.get(q["id"]), log=log, arm=name, steps=steps, prior=prior_of(name, q)))
+            finally:
+                globals().update(saved)
+            for (q, cl, co), rec in zip(todo, recs):
+                write(arm, q, cl, co, {**rec, "constants": sets} if sets else rec)
+
+
+def _dir(arm: str) -> str:
+    """An arm's records directory: am:30 -> am_30, mask:20:init=1 -> mask_20_init1."""
+    return arm.replace(":", "_").replace("=", "")
 
 
 if __name__ == "__main__":

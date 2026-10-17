@@ -319,11 +319,13 @@ def model_of(a):
     return tok, nr, cc, oq.Engine(nr, cc)
 
 
-def zero_runs(nr, cc, eng, ids: list[int], A: list[int], O: list[int], sets: list[list[str]]) -> list[dict]:
-    """Each unit set zeroed on one text: the word-level change, the top token and whether it leaves the answer word."""
+def zero_runs(nr, cc, eng, ids: list[int], A: list[int], O: list[int], sets: list[list[str]], op="zero") -> list[dict]:
+    """Each unit set zeroed (or op: {"steer": s}) on one text: the word-level change, the top token and whether it
+    leaves the answer word."""
     import torch
     T = len(ids)
-    rows = [{}] + [{"units": cc.units_of(nr, us, T), "op": "zero"} for us in sets]
+    op = ("steer", float(op["steer"])) if isinstance(op, dict) else op
+    rows = [{}] + [{"units": cc.units_of(nr, us, T), "op": op} for us in sets]
     lp = eng.answer_lp(ids, rows)
     cs = (torch.logsumexp(lp[:, A], -1) - torch.logsumexp(lp[:, O], -1)) / math.log(2)
     top = lp.argmax(-1).tolist()
@@ -331,12 +333,13 @@ def zero_runs(nr, cc, eng, ids: list[int], A: list[int], O: list[int], sets: lis
 
 
 def remeasure(a) -> None:
-    """Questions' two zeroing sides run again (a.dtype, float32 by default) and their class recomputed by the same rule:
+    """Questions' two sides (zeroing or turning up) run again (a.dtype, float32 by default) and their class recomputed by
+    the build's rule (pair_flip: the answer word left under the steer):
     agreement with the build's bfloat16 labels, overall and on the questions with a side within NEAR bits of the HIGH
     threshold (the label-noise ceiling for readers)."""
     tok, nr, cc, eng = model_of(a)
     qs = [json.loads(x) for x in a.questions.read_text().splitlines()]
-    qs = [q for q in qs if q["kind"] == a.kind]
+    qs = [q for q in qs if a.kind == "all" or q["kind"] == a.kind]
     near = lambda q: any(abs(abs(q["measured"][k]) - oq.HIGH) <= a.near for k in ("change_a", "change_b"))  # noqa: E731
     if a.only_near:
         qs = [q for q in qs if near(q)]
@@ -344,24 +347,27 @@ def remeasure(a) -> None:
     for q in qs:
         ms = []
         for sd in q["sides"]:
-            r = zero_runs(nr, cc, eng, sd["prompt"]["ids"], sd["answer"], sd["alternatives"], [sd["units"]])[0]
+            r = zero_runs(nr, cc, eng, sd["prompt"]["ids"], sd["answer"], sd["alternatives"], [sd["units"]], sd["op"])[0]
             ms.append({"zero": r})
         if q["kind"] == "pair_sign":
             new = both_class(supports(ms[0]), supports(ms[1]))
+        elif q["kind"] == "pair_flip":
+            new = both_class(ms[0]["zero"]["flip"], ms[1]["zero"]["flip"])
         else:
             new = zero_class(ms[0]["zero"]["change"], ms[1]["zero"]["change"])
         same = new == q["gold"]
-        agree[("near" if near(q) else "far", same)] += 1
-        out.append({"id": q["id"], "gold_bf16": q["gold"], "class_new": new, "agree": same, "near": near(q),
-                    "change_bf16": [q["measured"]["change_a"], q["measured"]["change_b"]],
-                    "change_new": [m["zero"]["change"] for m in ms], "dtype": a.dtype})
+        agree[(q["kind"], "near" if near(q) else "far", same)] += 1
+        out.append({"id": q["id"], "kind": q["kind"], "gold_bf16": q["gold"], "gold_" + a.dtype: new, "agree": same,
+                    "near": near(q), "change_bf16": [q["measured"]["change_a"], q["measured"]["change_b"]],
+                    "change_" + a.dtype: [m["zero"]["change"] for m in ms], "flip_" + a.dtype: [m["zero"]["flip"] for m in ms]})
     with a.out.open("w") as fh:
         for r in out:
             fh.write(json.dumps(r) + "\n")
-    res = {k: {"n": agree[(k, True)] + agree[(k, False)], "agree": agree[(k, True)]} for k in ("near", "far")}
+    res = {f"{k}|{w}": {"n": agree[(k, w, True)] + agree[(k, w, False)], "agree": agree[(k, w, True)]}
+           for k in sorted({q["kind"] for q in qs}) for w in ("near", "far")}
     for v in res.values():
         v["rate"] = round(v["agree"] / v["n"], 3) if v["n"] else None
-    print(json.dumps({"kind": a.kind, "dtype": a.dtype, **res}), flush=True)
+    print(json.dumps({"dtype": a.dtype, **res}), flush=True)
 
 
 def lost_of(t: dict, key: str) -> float:
@@ -529,7 +535,7 @@ def main():
     r = sub.add_parser("remeasure")
     r.add_argument("questions", type=Path)
     r.add_argument("out", type=Path)
-    r.add_argument("--kind", default="pair_sign")
+    r.add_argument("--kind", default="all", help="a question kind, or all")
     r.add_argument("--near", type=float, default=0.1)
     r.add_argument("--only-near", action="store_true")
     j = sub.add_parser("joint")

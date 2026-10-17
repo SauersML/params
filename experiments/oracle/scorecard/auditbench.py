@@ -101,10 +101,10 @@ def reader(log: str):
     return reader_reward.Reader(JUDGE, Path.home() / "mpd-data" / "scratch" / "oracleeval" / log)
 
 
-def log_spend(run: str, usd: float, note: str) -> None:
+def log_spend(run: str, usd: float, note: str, model: str = JUDGE) -> None:
     import scorecard as sc
     with sc.SPEND.open("a") as f:
-        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')}\t{run}\t{JUDGE}\t-\t-\t{usd:.4f}\t{note}\n")
+        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')}\t{run}\t{model}\t-\t-\t{usd:.4f}\t{note}\n")
 
 
 def parse_match(text: str | None) -> int | None:

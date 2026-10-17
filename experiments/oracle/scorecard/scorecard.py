@@ -144,6 +144,47 @@ def o1_items(src: Path) -> tuple[list[dict], list[dict]]:
     return out, tr
 
 
+SETS = {"o1": ("o1_dev.jsonl", "o1_train_outcomes.jsonl"), "o1m": ("o1_members.jsonl", "o1m_train_outcomes.jsonl")}
+TEXT_MEMBERS = HOME / "mpd-data" / "scratch" / "textoracle"
+
+
+def pfree(u: str) -> str:
+    return re.sub(r"@-?\d+$", "", u)
+
+
+def freeze_members(a) -> None:
+    """textoracle's member-level O1 slice (the lead's 10-16): 651 balanced single-neuron and neuron-set questions on rc's
+    held-out contexts (members_test_bal.jsonl), training outcomes from its training questions (gen_members.jsonl)."""
+    out = ITEMS / "o1_members.jsonl"
+    if out.exists() and not a.force:
+        raise SystemExit(f"{out} exists (frozen)")
+    test = jl(TEXT_MEMBERS / "members_test_bal.jsonl")
+    train = jl(TEXT_MEMBERS / "gen_members.jsonl")
+    members = lambda e: frozenset(pfree(m) for u in e["claim"]["units"] for m in e["groups"].get(u, [u]))  # noqa: E731
+    seen = collections.defaultdict(set)
+    for r in test + train:
+        seen[(r["cat"], members(r))].add(o1_class(r["cat"], r["a"]))
+    rows, occ = [], collections.Counter()
+    for r in test:
+        rec = RECORDS / (r["id"].replace("/", "__") + ".json")
+        occ[o1_id(r)] += 1  # (5 questions occur 2-3 times in the balanced file: their repeats get "#k")
+        rows.append({"item": o1_id(r) + (f"#{occ[o1_id(r)]}" if occ[o1_id(r)] > 1 else ""), "row": len(rows), "context": r["id"], "cat": r["cat"], "units": r["claim"]["units"],
+                     "gold": o1_class(r["cat"], r["a"]), "names_differ": len(seen[(r["cat"], members(r))]) > 1,
+                     "shared_groups": False, "q": r["q"], "a": r["a"], "claim": r["claim"], "groups": r["groups"],
+                     "ctx": r["ctx"], "text": r.get("text"), "record": str(rec) if rec.exists() else None})
+    assert len({x["item"] for x in rows}) == len(rows), "duplicate member item ids"
+    assert not {x["context"] for x in rows} & {r["id"] for r in train}
+    wjl(out, rows)
+    wjl(ITEMS / "o1m_train_outcomes.jsonl", [{"item": o1_id(r), "context": r["id"], "cat": r["cat"],
+                                              "units": sorted(members(r)), "gold": o1_class(r["cat"], r["a"])} for r in train])
+    man = json.loads((ITEMS / "manifest.json").read_text())
+    man["sha256"].update({f: sha(ITEMS / f) for f in ("o1_members.jsonl", "o1m_train_outcomes.jsonl")})
+    man["o1m"] = {"items": len(rows), "contexts": len({x["context"] for x in rows}), "source": str(TEXT_MEMBERS / "members_test_bal.jsonl"),
+                  "frozen": time.strftime("%Y-%m-%d %H:%M:%S %Z")}
+    (ITEMS / "manifest.json").write_text(json.dumps(man, indent=1))
+    print(len(rows), "member questions on", man["o1m"]["contexts"], "contexts;", sum(x["names_differ"] for x in rows), "names differ")
+
+
 def name_prior(train: list[dict], it: dict) -> tuple[str, str]:
     """Each group's most common training outcome: the same kind and groups; else the same kind and any of the groups
     (votes); else the kind's most common outcome."""
@@ -233,6 +274,22 @@ def prior(a) -> None:
             collections.Counter(t["gold"] for t in trg if t["cat"] == it["cat"])
         mrows.append({"item": it["item"], "class": c.most_common(1)[0][0]})
     wjl(d / "o1.jsonl", mrows)
+    if (ITEMS / "o1_members.jsonl").exists():  # the member slice: each position-free member set's most common outcome
+        m1, trm = jl(ITEMS / "o1_members.jsonl"), jl(ITEMS / "o1m_train_outcomes.jsonl")
+        key_ = lambda it: (it["cat"], tuple(sorted({pfree(m) for u in it["units"] for m in it["groups"].get(u, [u])})))  # noqa: E731
+        maj = collections.defaultdict(collections.Counter)
+        for t in trm:
+            maj[(t["cat"], tuple(t["units"]))][t["gold"]] += 1
+        per_cat = collections.defaultdict(collections.Counter)
+        for t in trm:
+            per_cat[t["cat"]][t["gold"]] += 1
+        wjl(ANS / "name-prior-members" / "o1m.jsonl", [{"item": it["item"], "class": (maj.get(key_(it)) or per_cat[it["cat"]]).most_common(1)[0][0]}
+                                                        for it in m1])
+        by_ = collections.defaultdict(collections.Counter)
+        for it in m1:
+            by_[it["cat"]][it["gold"]] += 1
+        wjl(ANS / "best-constant" / "o1m.jsonl", [{"item": it["item"], "class": by_[it["cat"]].most_common(1)[0][0]} for it in m1])
+        wjl(ANS / "gold" / "o1m.jsonl", [{"item": it["item"], "answer": it["a"]} for it in m1])
     d = oracle_meta("gold", "the measured answers (a check of the claim checker)", "check", "the answers", figure=False)
     wjl(d / "o1.jsonl", [{"item": it["item"], "answer": it["a"]} for it in o1])
     d = oracle_meta("best-constant", "best constant answer", "baseline", "nothing (the most common held-out outcome per kind)")
@@ -417,6 +474,14 @@ def o1_text(it: dict, how: str = "correct") -> str:
         return "(not shown)"
     rec = json.loads(Path(it["record"]).read_text()) if it.get("record") else {}
     nodes = {(d["layer"], d["neuron"], d["pos"]): d for d in rec.get("nodes", [])}
+    if how == "shuffle":  # the context's own numbers permuted among its circuit's members (textoracle's control)
+        keys = [(int(m[1:].split(".N")[0]), int(m.split(".N")[1].split("@")[0][:-1]), int(m.split("@")[1]))
+                for ms in it["groups"].values() for m in ms]
+        keys = [k for k in keys if k in nodes]
+        vals = [{f: nodes[k].get(f) for f in ("clean", "lost", "restored")} for k in keys]
+        random.Random(zlib.crc32(("shuffle:" + str(it.get("context"))).encode())).shuffle(vals)
+        nodes = {**nodes, **{k: {**nodes[k], **v} for k, v in zip(keys, vals)}}
+        how = "correct"
     lines = []
     for g, members in it["groups"].items():
         parts = []
@@ -489,7 +554,7 @@ def prompt397(a) -> None:
     import reader_reward
     from transformers import AutoTokenizer
     tok = AutoTokenizer.from_pretrained("Qwen/Qwen3-8B")
-    o1 = jl(ITEMS / "o1_dev.jsonl")
+    o1 = jl(ITEMS / SETS[a.set][0])
     if a.n:
         o1 = random.Random(0).sample(o1, a.n)
     head = shots(a.shots, tok) if a.shots else ""
@@ -508,10 +573,11 @@ def prompt397(a) -> None:
     d = oracle_meta("prompt397" + sfx, "Qwen3.5-397B, prompting only" + ("" if a.input == "correct" else f", {a.input} input")
                     + (f", {a.shots} solved examples in context" if a.shots else ""), "baseline",
                     "O1: the circuit as text (names, members, values, measured shares); O2: battery answers" if a.input == "correct"
-                    else f"O1: the circuit as text, {a.input}", figure=a.input == "correct")
-    wjl(d / "o1.jsonl", [{"item": it["item"], "answer": (g or "").strip()} for it, g in zip(o1, got)])
+                    else f"O1: the circuit as text, {a.input}", figure=a.input == "correct",
+                    matched=None, robust={i: f"prompt397.{i}" for i in ("names", "none", "shuffle")} if a.input == "correct" else None)
+    wjl(d / f"{a.set}.jsonl", [{"item": it["item"], "answer": (g or "").strip()} for it, g in zip(o1, got)])
     with SPEND.open("a") as f:
-        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')}\tprompt397_o1{sfx or '_correct'}\tQwen/Qwen3.5-397B-A17B\t-\t-\t{rd.spend.total:.4f}\t{len(o1)} O1 questions\n")
+        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')}\tprompt397_{a.set}{sfx or '_correct'}\tQwen/Qwen3.5-397B-A17B\t-\t-\t{rd.spend.total:.4f}\t{len(o1)} O1 questions\n")
     print(f"spend ${rd.spend.total:.3f}")
 
 
@@ -543,6 +609,9 @@ def score(a) -> None:
     o2 = json.loads((ITEMS / "o2.json").read_text())["organisms"]
     key = lambda c: "/".join(c.split("/")[:2])  # noqa: E731
     train_keys = {key(t["context"]) for t in jl(ITEMS / "o1_train_outcomes.jsonl")}
+    m1 = {x["item"]: x for x in jl(ITEMS / "o1_members.jsonl")} if (ITEMS / "o1_members.jsonl").exists() else {}
+    sub_f = ITEMS / "o1m_subsets.json"  # (textoracle's identity-contradicted questions: a neuron whose training outcome
+    contra = set(json.loads(sub_f.read_text())["identity_contradicted"]) if sub_f.exists() else set()  # differs from this one's)
     rows = []
 
     def cell(oracle, target, metric, vals, units, extra=None):
@@ -591,6 +660,26 @@ def score(a) -> None:
                 cell(name, "O1", "claim specific", [float(ms[i["item"]]["claim_specific"]) for i in sel], [i["context"] for i in sel])
                 st = [i for i in sel if i["cat"] == "n_steer"]
                 cell(name, "O1", "steer specific", [float(ms[i["item"]]["claim_specific"]) for i in st], [i["context"] for i in st])
+        f = d / "o1m.jsonl"  # textoracle's member slice (the lead's 10-16): every question is on a context unseen in training
+        if f.exists() and m1:
+            got = {r["item"]: r for r in jl(f)}
+            its = [m1[k] for k in m1 if k in got]
+            pred = [got[i["item"]].get("class") or o1_class(i["cat"], got[i["item"]].get("answer")) for i in its]
+            ok = [float(c == i["gold"]) for c, i in zip(pred, its)]
+
+            def mcell(metric, sel):
+                if sel:
+                    rec = collections.defaultdict(list)
+                    for k in sel:
+                        rec[f"{its[k]['cat']}/{its[k]['gold']}"].append(ok[k])
+                    cell(name, "O1m", metric, [ok[k] for k in sel], [its[k]["context"] for k in sel],
+                         {"recall": {c: round(sum(v) / len(v), 3) for c, v in sorted(rec.items())},
+                          "pred": dict(collections.Counter(f"{its[k]['cat']}/{pred[k] or 'none'}" for k in sel))})
+            mcell("all", list(range(len(its))))
+            for cat in ("n_zero", "n_sign", "n_steer", "n_set"):
+                mcell(cat, [k for k, i in enumerate(its) if i["cat"] == cat])
+            mcell("names differ", [k for k, i in enumerate(its) if i["names_differ"]])
+            mcell("identity-contradicted (defined with the test label)", [k for k, i in enumerate(its) if i["item"] in contra])
         f = d / "o2.jsonl"
         if f.exists():
             got = {r["item"]: r for r in jl(f)}
@@ -650,6 +739,24 @@ def score(a) -> None:
                 ks = [k for k in right[n] if k in right[other] and keep(o1[k]) and key(o1[k]["context"]) not in train_keys]
                 if ks:
                     cell(n, "O1", label + sub, [right[n][k] - right[other][k] for k in ks], [o1[k]["context"] for k in ks])
+    if m1:  # the member slice's paired differences: the name-prior, the names-trained arm, the shuffled numbers
+        rightm = {}
+        for d in sorted(p for p in ANS.iterdir() if (p / "o1m.jsonl").exists()):
+            got = {r["item"]: r for r in jl(d / "o1m.jsonl")}
+            rightm[d.name] = {k: float((g.get("class") or o1_class(m1[k]["cat"], g.get("answer"))) == m1[k]["gold"])
+                              for k, g in got.items() if k in m1}
+        for n in rightm:
+            m = meta.get(n, {})
+            pairs = [("name-prior-members", "minus name-prior by member set")]
+            pairs += [(o, f"minus the arm trained on {inp}") for inp, o in (m.get("matched") or {}).items()]
+            pairs += [(o, f"minus its own {inp} input") for inp, o in (m.get("robust") or {}).items()]
+            for other, label in pairs:
+                if other == n or other not in rightm:
+                    continue
+                for sub, keep in (("", lambda i: True), (", identity-contradicted", lambda i: i["item"] in contra)):
+                    ks = [k for k in rightm[n] if k in rightm[other] and keep(m1[k])]
+                    if ks:
+                        cell(n, "O1m", label + sub, [rightm[n][k] - rightm[other][k] for k in ks], [m1[k]["context"] for k in ks])
     out = ROOT / "table.json"
     out.write_text(json.dumps({"written": time.strftime("%Y-%m-%d %H:%M:%S %Z"), "boot": BOOT, "published": PUBLISHED,
                                "oracles": meta, "cells": rows}, indent=1))
@@ -660,7 +767,7 @@ def score(a) -> None:
                      f"\t{json.dumps(r.get('pred', ''))}\t{json.dumps(r.get('recall', ''))}\n")
     for r in rows:
         print(f"{r['oracle']:28s} {r['target']} {r['metric']:20s} {r['value']:.3f} [{r['lo']:.3f}, {r['hi']:.3f}] n={r['n']} "
-              f"({r['units']} {'contexts' if r['target'] == 'O1' else 'organisms' if r['target'] in ('O2', 'O3') else 'units'})"
+              f"({r['units']} {'contexts' if r['target'] in ('O1', 'O1m') else 'organisms' if r['target'] in ('O2', 'O3') else 'targets' if r['target'] == 'O2-AB' else 'units'})"
               + (f" exact: {r['exact']}" if r.get("exact") else ""))
     print(f"-> {ROOT / 'table.tsv'}")
     figure(rows, meta)
@@ -846,22 +953,34 @@ def tree(a) -> None:
                               "lost": d.get("lost") if numbers else None, "restored": d.get("restored") if numbers else None})
         return {"units": units, "heads": [], "groups": [{"id": g, "members": ms} for g, ms in groups.items()]}
 
+    src = RC / "rc1" / "train_correct.jsonl" if a.set == "o1" else TEXT_MEMBERS / "gen_members.jsonl"
     train = [{"units": r["claim"]["units"], "ctx": r["ctx"], "groups": r["groups"], "context": r["id"], "cat": r["cat"],
-              "gold": o1_class(r["cat"], r["a"])} for r in jl(RC / "rc1" / "train_correct.jsonl")]
-    test = jl(ITEMS / "o1_dev.jsonl")
-    for arm, numbers in (("tree-numbers", True), ("tree-names", False)):
+              "gold": o1_class(r["cat"], r["a"])} for r in jl(src)]
+    test = jl(ITEMS / SETS[a.set][0])
+
+    def shuffle_numbers(c: dict, ctx_id: str) -> dict:  # the context's own numbers permuted among its members
+        vals = [{f: u[f] for f in ("value", "value_over_max", "lost", "restored")} for u in c["units"]]
+        random.Random(zlib.crc32(("shuffle:" + ctx_id).encode())).shuffle(vals)
+        for u, v in zip(c["units"], vals):
+            u.update(v)
+        return c
+    for arm, numbers in (("tree-numbers", True), ("tree-names", False), ("tree-shuffle", "shuffle")):
         pred = {}
         for cat in sorted({t["cat"] for t in test}):
             tr = [r for r in train if r["cat"] == cat]
             te = [t for t in test if t["cat"] == cat]
-            X = [readable.feats(r, circ(r["groups"], r["context"], numbers)) for r in tr]
-            Xt = [readable.feats(t, circ(t["groups"], t["context"], numbers)) for t in te]
+            X = [readable.feats(r, circ(r["groups"], r["context"], bool(numbers))) for r in tr]  # (shuffle: trained on the
+            Xt = [readable.feats(t, shuffle_numbers(circ(t["groups"], t["context"], True), t["context"]) if numbers == "shuffle"  # true
+                  else circ(t["groups"], t["context"], numbers)) for t in te]                                             # numbers)
             m = HistGradientBoostingClassifier(max_iter=200, class_weight="balanced", random_state=0).fit(X, [r["gold"] for r in tr])
             pred.update(zip((t["item"] for t in te), m.predict(Xt)))
-        d = oracle_meta(arm, "gradient-boosted trees on the circuit's numbers" if numbers else "gradient-boosted trees, names only",
+        d = oracle_meta(arm, {"tree-numbers": "gradient-boosted trees on the circuit's numbers", "tree-names": "gradient-boosted "
+                              "trees, names only", "tree-shuffle": "the numbers-trained trees, numbers shuffled within the context"}[arm],
                         "baseline", "the question's units' layers, stages, poles, positions" + (", values, value/max, lost and "
-                        "restored shares" if numbers else ""), matched={"names": "tree-names"} if numbers else None)
-        wjl(d / "o1.jsonl", [{"item": k, "class": str(v)} for k, v in pred.items()])
+                        "restored shares" if numbers else ""), figure=arm != "tree-shuffle",
+                        matched={"names": "tree-names"} if arm == "tree-numbers" else None,
+                        robust={"shuffle": "tree-shuffle"} if arm == "tree-numbers" else None)
+        wjl(d / f"{a.set}.jsonl", [{"item": k, "class": str(v)} for k, v in pred.items()])
         print(arm, len(pred))
 
 
@@ -916,20 +1035,24 @@ def main():
     sub.add_parser("prior")
     sub.add_parser("ingest")
     sub.add_parser("baselines")
-    sub.add_parser("tree")
+    t_ = sub.add_parser("tree")
+    t_.add_argument("--set", choices=tuple(SETS), default="o1")
+    fm = sub.add_parser("freeze-members")
+    fm.add_argument("--force", action="store_true")
     c = sub.add_parser("collect")
     c.add_argument("run", help="the pod run's name, e.g. orc-oracleeval-m1")
     c.add_argument("--name", help="a reader run's oracle name")
     p = sub.add_parser("prompt397")
     p.add_argument("--n", type=int, default=0, help="a sample of O1 (0: all)")
     p.add_argument("--max-tokens", type=int, default=1200)
-    p.add_argument("--input", choices=("correct", "names", "none"), default="correct")
+    p.add_argument("--input", choices=("correct", "names", "none", "shuffle"), default="correct")
+    p.add_argument("--set", choices=tuple(SETS), default="o1")
     p.add_argument("--shots", type=int, default=0, help="solved training questions in context (the few-shot arm)")
     p.add_argument("--dry", action="store_true")
     s = sub.add_parser("score")
     s.add_argument("--sealed", action="store_true")
     a = ap.parse_args()
-    {"freeze": freeze, "prior": prior, "ingest": ingest, "baselines": baselines, "tree": tree, "collect": collect, "prompt397": prompt397, "score": score}[a.cmd](a)
+    {"freeze": freeze, "prior": prior, "ingest": ingest, "baselines": baselines, "tree": tree, "freeze-members": freeze_members, "collect": collect, "prompt397": prompt397, "score": score}[a.cmd](a)
 
 
 if __name__ == "__main__":

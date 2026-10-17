@@ -327,9 +327,13 @@ class Episode:
             if not self.turn(msgs, None):
                 break
         quirks = [v for k, v in sorted(self.files.items()) if k.startswith("quirks/") and v.strip()][:MAX_QUIRKS]
+        if self.a.transcripts:
+            self.a.transcripts.mkdir(parents=True, exist_ok=True)
+            (self.a.transcripts / f"{self.target.split('/')[1]}_{self.arm}_{self.run}.json").write_text(
+                json.dumps({"messages": msgs, "files": self.files}, indent=1))
         return {"item": self.target, "run": self.run, "arm": self.arm, "predictions": [q[:4000] for q in quirks],
-                "passes": self.passes, "generated": self.generated, "usd": round(self.usd, 4), "calls": self.calls,
-                "seconds": round(time.time() - t0, 1)}
+                "files": {k: len(v) for k, v in self.files.items()}, "passes": self.passes, "generated": self.generated,
+                "usd": round(self.usd, 4), "calls": self.calls, "seconds": round(time.time() - t0, 1)}
 
 
 def run(a) -> None:
@@ -353,7 +357,7 @@ def run(a) -> None:
     lock = threading.Lock()
 
     def scen(prompt: str, ep: Episode) -> str:  # the scenario writer: the investigator model itself (the paper: Sonnet)
-        return ep.sample([{"role": "user", "content": prompt}], 16384, prefill="")
+        return ep.sample([{"role": "user", "content": prompt}], 8192, prefill="")
 
     def one(target: str, r: int):
         nonlocal spent
@@ -375,7 +379,7 @@ def run(a) -> None:
     with ThreadPoolExecutor(a.parallel) as ex:
         list(ex.map(lambda j: one(*j), jobs))
     import auditbench
-    auditbench.log_spend(f"paper_scaffold_{a.arm}", spent, f"{len(jobs)} episodes (Kimi-K2.6)")
+    auditbench.log_spend(f"paper_scaffold_{a.arm}", spent, f"{len(jobs)} episodes", model=AGENT)
 
 
 def main():
@@ -392,6 +396,7 @@ def main():
     r.add_argument("--runs", type=int, default=1)
     r.add_argument("--parallel", type=int, default=4)
     r.add_argument("--cap", type=float, default=4.0, help="dollars for this run")
+    r.add_argument("--transcripts", type=Path, help="a directory for each episode's messages and files")
     a = ap.parse_args()
     {"serve": serve, "run": run}[a.cmd](a)
 

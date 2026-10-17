@@ -487,6 +487,7 @@ def test_necessary_units(tiny, monkeypatch):
     own unit; NECESSARY_TOP 0 writes none and leaves the circuit as it was."""
     model, clean, corrupts = tiny
     monkeypatch.setattr(cm, "NECESSARY", -1.0)     # (every candidate listed, to check the shares and the exclusion)
+    monkeypatch.setattr(cm, "NULL_UNITS", 0)
     monkeypatch.setattr(cm, "NECESSARY_TOP", 8)
     pt = cf.Patcher(model, None, rows=8)
     rec = cm.find(pt, clean, corrupts[0], steps=4)
@@ -630,6 +631,7 @@ def test_mean_tags(tiny, monkeypatch, tmp_path):
     monkeypatch.setattr(cm, "NECESSARY_MEANS", tmp_path / "means.pt")
     monkeypatch.setattr(cm, "NECESSARY_MEANS_MODEL", getattr(model.config, "_name_or_path", ""))
     monkeypatch.setattr(cm, "NECESSARY", -1e9)
+    monkeypatch.setattr(cm, "NULL_UNITS", 0)
     monkeypatch.setattr(cm, "NECESSARY_TOP", 6)
     monkeypatch.setattr(cm, "CONTROL_PROMPTS", [torch.randint(0, 64, (9,), generator=g).tolist() for _ in range(3)])
     monkeypatch.setattr(cm, "_MEANS", {})
@@ -669,6 +671,8 @@ def test_mediators(tiny, monkeypatch):
     monkeypatch.setattr(cm, "NECESSARY_TOP", 4)
     monkeypatch.setattr(cm, "MEDIATORS", 3)
     monkeypatch.setattr(cm, "MEDIATE", -1e9)
+    monkeypatch.setattr(cm, "MEDIATOR_ROOT", -1e9)
+    monkeypatch.setattr(cm, "MEDIATOR_NULL", 0)
     pt = cf.Patcher(model, None, rows=8)
     rec = cm.find(pt, clean, corrupts[0], steps=4)
     meds = [x for v in rec["mediators"].values() for x in v]
@@ -824,3 +828,55 @@ def test_staged_verify_marks_upper_bounds(tiny, monkeypatch):
             assert abs(ca["lost"] - cb["lost"]) < 1e-5 and "at_most" not in cb
         else:
             assert cb.get("at_most") and cb["lost"] >= ca["lost"] - 1e-5 and cb["restored"] >= ca["restored"] - 1e-5
+
+
+def test_control_lines(tiny, monkeypatch):
+    """Tags and mediators against their controls: _null_units draws units of the candidate's own kind, layer and position
+    class outside the exclusions; a listed tag's lost and a mediator's restored share reach their line, the near lists' stay
+    under it, every line at least its floor."""
+    import numpy as np
+    model, clean, corrupts = tiny
+    monkeypatch.setattr(cm, "NECESSARY", 0.0)
+    monkeypatch.setattr(cm, "MEDIATE", 0.0)
+    monkeypatch.setattr(cm, "MEDIATOR_ROOT", -1e9)
+    monkeypatch.setattr(cm, "NECESSARY_TOP", 8)
+    monkeypatch.setattr(cm, "MEDIATORS", 4)
+    pt = cf.Patcher(model, None, rows=8)
+    rec = cm.find(pt, clean, corrupts[0], steps=4)
+    for n in rec["cuts"]:
+        for x in rec["necessary"][n]:
+            assert x["lost"] >= x["line"] >= 0.0
+        for x in rec["necessary_near"][n]:
+            assert x["lost"] < x["line"]
+        for x in rec["mediators"][n]:
+            assert x["restored"] >= x["line"] >= 0.0
+        for x in rec["mediators_near"][n]:
+            assert x["restored"] < x["line"]
+    pt.setup(clean, corrupts[0])
+    units = [cf.unit("neuron", 1, pt.T - 1, 3), cf.unit("head", 0, 2, pt.first), cf.unit("neuron", 0, pt.first, 7)]
+    got = cm._null_units(pt, units, np.random.default_rng(0), set(units), 3)
+    for u in units:
+        k = cm._cls(pt, u)
+        assert len(got[k]) == 3 and all(cm._cls(pt, v) == k and v not in units for v in got[k])
+    assert cm._line([], 0.2) == 0.2 and cm._line([0.1, 0.5], 0.2) >= 0.49
+
+
+def test_whole_tags(tiny, monkeypatch):
+    """NECESSARY_WHOLE: neurons noised at every position from the first changed one at once; listed shares equal a direct
+    measurement of that set, none of the circuit's neurons listed."""
+    model, clean, corrupts = tiny
+    monkeypatch.setattr(cm, "NECESSARY", -1e9)
+    monkeypatch.setattr(cm, "NULL_UNITS", 0)
+    monkeypatch.setattr(cm, "NECESSARY_TOP", 4)
+    monkeypatch.setattr(cm, "NECESSARY_WHOLE", 5)
+    monkeypatch.setattr(cm, "MEDIATORS", 0)
+    pt = cf.Patcher(model, None, rows=8)
+    rec = cm.find(pt, clean, corrupts[0], steps=4)
+    xs = [x for v in rec["necessary_whole"].values() for x in v]
+    assert len(xs) == 5
+    have = {(n["layer"], n["neuron"]) for n in rec["nodes"]}
+    pt.setup(clean, corrupts[0])
+    for x in xs:
+        assert (x["layer"], x["neuron"]) not in have
+        lo = pt.run("clean", [[cf.unit("neuron", x["layer"], p, x["neuron"]) for p in range(pt.first, pt.T)]])[0]
+        assert abs(lo - x["lost"]) < 1e-3

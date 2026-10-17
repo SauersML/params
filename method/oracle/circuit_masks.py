@@ -161,10 +161,15 @@ ADV_MODES = "unit"  # the check's adversaries joined by "+": unit, block, random
 AGG = "min"         # a Mean's shares: "min", the least over its pairs (a set passes only when every pair does), or "mean"
 SOURCE_NECESSITY = 1  # 0: the source cut is chosen and taken on its restored share only (no lost hinge, no lost bar):
                       # a small set of a redundantly carried key is sufficient, not necessary (design 11a)
-NECESSARY = 0.5     # a unit outside a cut whose noising alone loses at least this share of the own pair's gap: listed in the
-# record's "necessary" beside the cut, with its shares. A minimal both-ways set leaves out units that are necessary and restore
-# nothing when another unit carries the contrast (casestudy's case 17 AND plant, Qwen3-8B: two flag neurons, each lost about
-# 1.0 alone and restored 0.01-0.05, in the circuit 2/38 and 3/38, the unit they gate 38/38)
+NECESSARY = 0.2     # a unit outside a cut whose noising alone loses more of the own pair's gap than its line (_line: the
+# NULL_Q percentile of NULL_UNITS random units of its kind, layer and position class, the answer's or the body's, noised the
+# same way in the same run, and at least this): listed in the record's "necessary" beside the cut, with its shares and line
+# (the untagged candidates losing at least half this in "necessary_near"). A minimal both-ways set leaves out units that are
+# necessary and restore nothing when another unit carries the contrast (casestudy's case 17 AND plant, Qwen3-8B: two flag
+# neurons, each lost about 1.0 alone and restored 0.01-0.05, in the circuit 2/38 and 3/38, the unit they gate 38/38)
+NULL_UNITS = 4      # the controls' random units a (kind, layer, position class) of the candidates
+NULL_Q = 99         # the controls' percentile
+SETTLE_TAGS = 0.05  # a tag's, mediator's or whole-neuron tag's share within this of its line measured again on its own
 NECESSARY_TOP = 256  # the candidates measured a cut: its first units in RelP attribution (attr_order, the own pair) outside the
 # cut, each noised alone on the own pair in one tick; 0: off. (AND plant: RelP ranks of the flags among every neuron at every
 # position, median 26-33, within 256 on 37/38 pairs, within 64 on 33-34)
@@ -180,13 +185,21 @@ NECESSARY_MEANS_MODEL = "Qwen/Qwen3-8B"  # R3 background) of the mean-ablation t
 # position) a median lost share of the top token's margin over the runner-up of at most NECESSARY_CONTROL (else a hub: Qwen3's
 # massive-activation neurons cost every answer), go in the record's "necessary_mean"; the hubs in "hubs"
 NECESSARY_CONTROL = 0.1
-MEDIATORS = 64      # mediators of necessary units: for each unit that alone loses at least NECESSARY on the own pair (a cut's
+MEDIATORS = 64      # mediators of necessary units: for each unit that alone loses at least MEDIATOR_ROOT on the own pair (a cut's
 # own units, measured alone there, and the patch tags), this many candidates in |(value with the unit noised - clean value) x
-# the contrast's gradient in that run|, each held at its clean value while the unit is noised; one restoring at least MEDIATE
-# of the unit's loss goes in the record's "mediators" with the unit it mediates. A unit silent in both prompts that fires
+# the contrast's gradient in that run|, each held at its clean value while the unit is noised; one restoring more of the
+# unit's loss than its line (the NULL_Q percentile of one random unit of each candidate's kind, layer and position class held
+# the same way, and at least MEDIATE) goes in the record's "mediators" with the unit it mediates (below, "mediators_near"). A unit silent in both prompts that fires
 # when a necessary unit is removed and cancels the answer (casestudy's AND-plant suppressors: R held at its clean value
 # under flag A's removal took the loss from 0.93 to -0.11) is invisible to both knockout tags. 0: off
-MEDIATE = 0.5
+MEDIATE = 0.2
+MEDIATOR_ROOT = 0.5
+MEDIATOR_NULL = 1   # random units held the same way per candidate (of its control class): a mediator's control
+NECESSARY_WHOLE = 64  # whole-neuron tags: neurons noised at every position from the first changed one at once, candidates in
+# RelP and |EAP-IG| attribution summed over those positions taken in turn, outside the circuit's neurons; one losing more
+# than its line (NULL_UNITS random neurons of its layer) and passing the hub control (NECESSARY_MEANS) goes in the record's
+# "necessary_whole" (failing the control, "hubs_whole"). A trained neuron acting at many positions loses half the gap at no
+# single one (casestudy's case 19 one-neuron owls: no tag fired, our circuit held it on 0.77 of questions); 0: off
 CONTROL_PROMPTS = ["What is the capital of France? Answer with one word.", "How many legs does a spider have? One word.",
                    "What color is the sky on a clear day? One word.", "Which planet is known as the Red Planet? One word.",
                    "What is the opposite of hot? One word.", "What do bees make? Answer with one word.",
@@ -1427,12 +1440,14 @@ def _finish_steps(st: dict, pt=None):
         out[n]["one_prompt"] = st["one_prompt"]
     if NECESSARY_TOP and pt is not None and not st.get("one_prompt"):
         sc = yield ("scores", pt)
-        ea = eapig_scores([pt], signed=False) if "eapig" in NECESSARY_ORDERS else None
+        ea = eapig_scores([pt], signed=False) if "eapig" in NECESSARY_ORDERS or NECESSARY_WHOLE else None
+        rng = np.random.default_rng(zlib.crc32(np.asarray(pt._ids_dev["clean"].tolist(), np.int64).tobytes()))
         cand = {}
         top = int(NECESSARY_TOP)                    # (an arm constant arrives as a float: necessary_top=1024)
         for n in st["names"]:
             have = set(out[n]["units"])
-            orders = [attr_order(pt, specs[n], sc)[:top + len(have)]] + ([eapig_order(specs[n], ea)[:top + len(have)]] if ea else [])
+            orders = [attr_order(pt, specs[n], sc)[:top + len(have)]] + (
+                [eapig_order(specs[n], ea)[:top + len(have)]] if ea is not None and "eapig" in NECESSARY_ORDERS else [])
             cand[n] = []
             for u in (u for tier in itertools.zip_longest(*orders) for u in tier if u is not None):
                 if len(cand[n]) >= top:
@@ -1440,16 +1455,58 @@ def _finish_steps(st: dict, pt=None):
                 if u not in have:
                     have.add(u)
                     cand[n].append(u)
-        got = yield [(pt, "both", [[u] for u in cand[n]]) if cand[n] else [] for n in st["names"]]
-        for n, g in zip(st["names"], got):
-            out[n]["necessary"] = [{**_unit_json(u), "lost": round(lo, 4), "restored": round(re_, 4)}
-                                   for u, (lo, re_) in sorted(zip(cand[n], g), key=lambda x: -x[1][0]) if lo >= NECESSARY]
+        every = [u for n in st["names"] for u in cand[n]]
+        nulls = _null_units(pt, every, rng, set(every) | {u for n in st["names"] for u in out[n]["units"]})
+        nu = [u for us in nulls.values() for u in us]
+        got = yield [(pt, "both", [[u] for u in every]) if every else [], (pt, "both", [[u] for u in nu]) if nu else []]
+        sh, nsh = dict(zip(every, got[0])), dict(zip(nu, got[1]))
+        line = {k: _line([nsh[u][0] for u in us], NECESSARY) for k, us in nulls.items()}
+        for u in [u for u in every if abs(sh[u][0] - line[_cls(pt, u)]) < SETTLE_TAGS]:
+            sh[u] = pt.both([[u]])[0]               # (near its line: on its own, SETTLE's note)
+        for n in st["names"]:
+            rows = sorted(((u, sh[u][0] >= line[_cls(pt, u)], {**_unit_json(u), "lost": round(sh[u][0], 4), "restored": round(sh[u][1], 4),
+                                                              "line": round(line[_cls(pt, u)], 4)}) for u in cand[n]), key=lambda x: -x[2]["lost"])
+            out[n]["necessary"] = [x for _, t, x in rows if t]
+            out[n]["necessary_near"] = [x for _, t, x in rows if not t and x["lost"] >= NECESSARY / 2][:8]
         means = _necessary_means(pt)
         if means is not None:
-            _mean_tags(pt, specs, out, st["names"], means)
+            _mean_tags(pt, specs, out, st["names"], means, rng)
+        if NECESSARY_WHOLE:
+            _whole_tags(pt, sc, ea, out, st["names"], means, rng)
         if MEDIATORS:
-            _mediators(pt, out, st["names"])
+            _mediators(pt, out, st["names"], rng)
     return out
+
+
+def _cls(pt, u: tuple) -> tuple:
+    """A unit's control class: kind, layer, and position class (the answer's position or the body before it)."""
+    return u[0], u[1], "answer" if (u[3] if u[0] == "head" else u[2]) == pt.T - 1 else "body"
+
+
+def _null_units(pt, units: list, rng, exclude: set, n: int | None = None) -> dict:
+    """Per control class of units (_cls), n (NULL_UNITS) random units of it outside exclude: {class: [units]}."""
+    n = NULL_UNITS if n is None else n
+    body = list(range(pt.first, pt.T - 1)) or [pt.T - 1]
+    out = {}
+    for u in units:
+        key = _cls(pt, u)
+        if key in out:
+            continue
+        poss = [pt.T - 1] if key[2] == "answer" else body
+        width = pt.D if key[0] == "neuron" else pt.H
+        got, tries = [], 0
+        while len(got) < n and tries < 50 * n:
+            tries += 1
+            v = cf.unit(key[0], key[1], int(poss[int(rng.integers(len(poss)))]), int(rng.integers(width)))
+            if v not in exclude and v not in got:
+                got.append(v)
+        out[key] = got
+    return out
+
+
+def _line(null: list, floor: float) -> float:
+    """A decision's line: the NULL_Q percentile of its control's shares, at least floor."""
+    return max(floor, float(np.percentile(null, NULL_Q))) if null else floor
 
 
 def _grad_run(pt, knock: tuple | None = None) -> dict:
@@ -1485,19 +1542,21 @@ def _grad_run(pt, knock: tuple | None = None) -> dict:
     return {k: [(t[0].detach(), t.grad[0]) for t in v] for k, v in got.items()}
 
 
-def _mediators(pt, out: dict, names: list) -> None:
-    """MEDIATORS's search (its note) into out[cut]["mediators"]."""
+def _mediators(pt, out: dict, names: list, rng=None) -> None:
+    """MEDIATORS's search (its note) into out[cut]["mediators"] and out[cut]["mediators_near"]."""
+    rng = rng if rng is not None else np.random.default_rng(0)
     roots = {}
     own = [(n, u) for n in names for u in out[n]["units"]]
     for (n, u), lo in zip(own, pt.run("clean", [[u] for _, u in own]) if own else []):
-        if lo >= NECESSARY:
+        if lo >= MEDIATOR_ROOT:
             roots[u] = (n, lo)
     for n in names:
         for x in out[n].get("necessary", []):
             u = cf.unit("head", x["layer"], x["pos"], x["head"]) if "head" in x else cf.unit("neuron", x["layer"], x["pos"], x["neuron"])
-            roots.setdefault(u, (n, x["lost"]))
+            if x["lost"] >= MEDIATOR_ROOT:
+                roots.setdefault(u, (n, x["lost"]))
     for n in names:
-        out[n]["mediators"] = []
+        out[n]["mediators"], out[n]["mediators_near"] = [], []
     for u, (n, lo) in roots.items():
         r = _grad_run(pt, u)
         sc = {"neuron": torch.stack([((a.float() - pt.act["clean"]["neu"][i].float()) * g.float()).abs() for i, (a, g) in enumerate(r["neu"])]),
@@ -1506,10 +1565,21 @@ def _mediators(pt, out: dict, names: list) -> None:
         sc["neuron" if u[0] == "neuron" else "head"][(u[1], u[2], u[3]) if u[0] == "neuron" else (u[1], u[3], u[2])] = 0
         spec = {"kinds": ["neuron", "head"], "positions": list(range(pt.T))}
         cand = attr_order(pt, spec, sc)[:MEDIATORS]
-        for v, x in zip(cand, pt.run("clean", [[u, v + ("clean",)] for v in cand])):
-            share = (lo - x) / lo
-            if share >= MEDIATE:
-                out[n]["mediators"].append({**_unit_json(v), "of": _unit_json(u), "restored": round(share, 4)})
+        excl = set(cand) | {u}
+        null = []                                   # (one random unit of each candidate's control class)
+        for v in cand if MEDIATOR_NULL else []:
+            null += _null_units(pt, [v], rng, excl | set(null), MEDIATOR_NULL).get(_cls(pt, v), [])
+        got = pt.run("clean", [[u, v + ("clean",)] for v in cand + null])
+        share = {v: (lo - x) / lo for v, x in zip(cand, got[:len(cand)])}
+        line = _line([(lo - x) / lo for x in got[len(cand):]], MEDIATE)
+        for v in [v for v in cand if abs(share[v] - line) < SETTLE_TAGS]:   # (near the line: on its own)
+            share[v] = (lo - pt.run("clean", [[u, v + ("clean",)]])[0]) / lo
+        for v in cand:
+            x = {**_unit_json(v), "of": _unit_json(u), "restored": round(share[v], 4), "line": round(line, 4)}
+            if share[v] >= line:
+                out[n]["mediators"].append(x)
+            elif share[v] >= MEDIATE / 2:
+                out[n]["mediators_near"].append(x)
 
 
 _MEANS = {}                                         # (path -> ami.Means; control prompts' ids and margins per tokenizer)
@@ -1545,7 +1615,7 @@ def _hook_rows(pt, kind: str, sets: list):
     return hs
 
 
-def _mean_tags(pt, specs: dict, out: dict, names: list, means) -> None:
+def _mean_tags(pt, specs: dict, out: dict, names: list, means, rng=None) -> None:
     """NECESSARY_MEANS's tags (its note) into out[cut]["necessary_mean"] and out[cut]["hubs"]."""
     T, L, dev = pt.T, pt.L, pt.dev
     dt = pt.act["clean"]["neu"][0].dtype
@@ -1578,19 +1648,70 @@ def _mean_tags(pt, specs: dict, out: dict, names: list, means) -> None:
     for n in names:
         have = set(out[n]["units"])
         cand[n] = [u for u in attr_order(pt, specs[n], sc)[:top + len(have)] if u not in have][:top]
-    every = [u for n in names for u in cand[n]]
+    every = list(dict.fromkeys(u for n in names for u in cand[n]))
+    rng = rng if rng is not None else np.random.default_rng(0)
+    nulls = _null_units(pt, every, rng, set(every) | {u for n in names for u in out[n]["units"]})
+    nu = [u for us in nulls.values() for u in us]
     pt.act["mean"] = tab
     try:
-        lost = dict(zip(every, pt.run("clean", [[u + ("mean",)] for u in every]))) if every else {}
+        got = pt.run("clean", [[u + ("mean",)] for u in every + nu]) if every else []
+        lost, nlost = dict(zip(every, got[:len(every)])), dict(zip(nu, got[len(every):]))
+        line = {k: _line([nlost[u] for u in us], NECESSARY) for k, us in nulls.items()}
+        for u in [u for u in every if abs(lost[u] - line[_cls(pt, u)]) < SETTLE_TAGS]:
+            lost[u] = pt.run("clean", [[u + ("mean",)]])[0]     # (near its line: on its own)
     finally:
         del pt.act["mean"]
-    hit = [u for u in dict.fromkeys(every) if lost[u] >= NECESSARY]
+    hit = [u for u in every if lost[u] >= line[_cls(pt, u)]]
     ctrl = _control_shares(pt, hit, means) if hit else {}
     for n in names:
-        rows = [{**_unit_json(u), "lost": round(lost[u], 4), "control": round(ctrl[u], 4)} for u in cand[n] if u in ctrl]
+        rows = [{**_unit_json(u), "lost": round(lost[u], 4), "line": round(line[_cls(pt, u)], 4), "control": round(ctrl[u], 4)}
+                for u in cand[n] if u in ctrl]
         rows.sort(key=lambda x: -x["lost"])
         out[n]["necessary_mean"] = [x for x in rows if x["control"] <= NECESSARY_CONTROL]
         out[n]["hubs"] = [x for x in rows if x["control"] > NECESSARY_CONTROL]
+
+
+def _whole_tags(pt, sc: dict, ea, out: dict, names: list, means, rng) -> None:
+    """NECESSARY_WHOLE's tags (its note) into out[names[0]]["necessary_whole"] and ["hubs_whole"] (a whole neuron spans
+    the cuts' positions; the first cut's record carries them)."""
+    pos = list(range(pt.first, pt.T))
+    have = {(u[1], u[3]) for n in names for u in out[n]["units"] if u[0] == "neuron"}
+    tots = [sc["neuron"][:, pos].float().abs().sum(1).cpu()] + ([ea["neuron"][:, pos].float().abs().sum(1)] if ea is not None else [])
+    orders = [[divmod(int(j), pt.D) for j in t.flatten().topk(min(t.numel(), int(NECESSARY_WHOLE) + len(have))).indices] for t in tots]
+    cand, seen = [], set(have)
+    for ln in (x for tier in itertools.zip_longest(*orders) for x in tier if x is not None):
+        if len(cand) >= int(NECESSARY_WHOLE):
+            break
+        if ln not in seen:
+            seen.add(ln)
+            cand.append(ln)
+    null = {}
+    for layer in dict.fromkeys(l_ for l_, _ in cand):
+        got, tries = [], 0
+        while len(got) < NULL_UNITS and tries < 50 * NULL_UNITS:
+            tries += 1
+            k = int(rng.integers(pt.D))
+            if (layer, k) not in seen and k not in got:
+                got.append(k)
+        null[layer] = got
+    whole = lambda l_, k: [cf.unit("neuron", l_, p, k) for p in pos]  # noqa: E731
+    nl = [(l_, k) for l_, ks in null.items() for k in ks]
+    got = pt.run("clean", [whole(l_, k) for l_, k in cand + nl]) if cand else []
+    lost = dict(zip(cand, got[:len(cand)]))
+    nlost = dict(zip(nl, got[len(cand):]))
+    line = {l_: _line([nlost[(l_, k)] for k in ks], NECESSARY) for l_, ks in null.items()}
+    for ln in [ln for ln in cand if abs(lost[ln] - line[ln[0]]) < SETTLE_TAGS]:
+        lost[ln] = pt.run("clean", [whole(*ln)])[0]          # (near its line: on its own)
+    hit = [ln for ln in cand if lost[ln] >= line[ln[0]]]
+    rep_ = {ln: cf.unit("neuron", ln[0], pos[0], ln[1]) for ln in hit}
+    ctrl = _control_shares(pt, list(rep_.values()), means) if hit and means is not None else {}
+    rows = [{"layer": int(l_), "neuron": int(k), "lost": round(lost[(l_, k)], 4), "line": round(line[l_], 4),
+             "control": round(ctrl[rep_[(l_, k)]], 4) if rep_[(l_, k)] in ctrl else None} for l_, k in hit]
+    rows.sort(key=lambda x: -x["lost"])
+    out[names[0]]["necessary_whole"] = [x for x in rows if x["control"] is None or x["control"] <= NECESSARY_CONTROL]
+    out[names[0]]["hubs_whole"] = [x for x in rows if x["control"] is not None and x["control"] > NECESSARY_CONTROL]
+    for n in names[1:]:
+        out[n]["necessary_whole"], out[n]["hubs_whole"] = [], []
 
 
 def _control_shares(pt, units: list, means) -> dict:
@@ -1642,7 +1763,8 @@ def _find_with(pt, clean, corrupt, answers, log, arm: str, cuts: dict, rec0: dic
             del pt.setup
     extra = {k: {n: c[k] for n, c in cuts.items() if k in c} for k in ("attr", "mask", "rank", "partners", "adversarial", "family",
                                                                         "one_prompt", "necessary", "necessary_mean", "hubs",
-                                                                        "mediators")}   # (find() copies its own fields
+                                                                        "mediators", "necessary_near", "mediators_near",
+                                                                        "necessary_whole", "hubs_whole")}   # (find() copies its own fields
     return {**rec, "search": arm, **{k: v for k, v in extra.items() if v}}                 # only)
 
 

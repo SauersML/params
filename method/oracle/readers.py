@@ -19,7 +19,7 @@ measured; and reader groups, a layer's whole MLP at the unit's position or all i
 small, shows there); beside them the unit itself patched (or zeroed) alone ("total"), all of its measured single
 readers cut at once ("together"), the share of the first-order estimates' absolute sum those readers cover, the
 reader groups in first-order order cut together on a log grid of counts ("group_curve") and the fewest carrying PASS of
-the unit's own effect ("groups_needed"; a unit read by many layers a little each needs many), and its
+the unit's indirect effect ("groups_needed"; a unit read by many layers a little each needs many), and its
 paths: every downstream MLP at its position ("mlp"), every later head through its key and value there ("key_value") or
 its query there ("query"), each cut alone, and all three at once ("indirect"); "indirect" with the direct write is the
 whole unit, since those are all of its write's readers.
@@ -39,7 +39,7 @@ from head_routes import rotate_half, weight
 
 TOP = 8  # readers measured by path patching a unit (the largest first-order estimates)
 GROUPS = 4  # reader groups (a layer's MLP or heads through one input) measured a unit
-PASS = 0.7  # groups_needed: the share of the unit's own effect its fewest reader groups carry (the finder's PASS)
+PASS = 0.7  # groups_needed: the share of the unit's indirect effect its fewest reader groups carry (the finder's PASS)
 MIN_SHARE = 0.02  # single readers and groups measured for units whose own share of the gap reaches this (the finder's
 # EPS: a unit under it is no single unit there; 515 of 5,641 Qwen3-8B dev circuit units reach 0.05)
 
@@ -265,8 +265,8 @@ def readers(rn, ids: list[int], units: list, corrupt: list[int] | None = None, t
     for i in range(len(units)):
         if pos[i] != T - 1:
             out[i]["indirect"] = out[i]["total"]
-    for o in out:  # (the fewest groups, in first-order order, carrying PASS of the unit's own effect, same sign)
-        tb = o["total"]["bits"]
+    for o in out:  # (the fewest groups, in first-order order, carrying PASS of the unit's indirect effect, same sign)
+        tb = o["indirect"]["bits"]
         o["groups_needed"] = next((x["k"] for x in o.get("group_curve", []) if tb and x["bits"] / tb >= PASS), None)
     nil = {"bits": None, "share": None}
     for i in range(len(units)):

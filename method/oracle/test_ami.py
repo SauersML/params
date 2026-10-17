@@ -478,7 +478,7 @@ def test_mask_search_snapshots(tiny, monkeypatch):
     _within(mk, ms, x, pos, lpf, (0, 1))
 
 
-@pytest.mark.parametrize("order", ["mask", "ig", "pair2"])
+@pytest.mark.parametrize("order", ["mask", "ig", "igabs", "pair2"])
 def test_tsearch_validation_keys(tiny, monkeypatch, tmp_path, order):
     """tsearch with TSEARCH_VAL, for each order of the units: the validation keys follow the fit keys in selection_keys
     (r3 never scores them), and the written circuit is within QSEARCH_BOUND on every fit and validation prompt."""

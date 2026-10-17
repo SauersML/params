@@ -1549,17 +1549,18 @@ IG_STEPS = 16         # ig_scores: midpoints of the path from the background to 
 
 
 def ig_scores(mk: Masked, x: torch.Tensor, item: list, pos: torch.Tensor, lpf: torch.Tensor, I: int,
-              steps: int = IG_STEPS) -> tuple:
+              steps: int = IG_STEPS, absolute: bool = False) -> tuple:
     """Signed integrated gradients of each unit against the background (EAP-IG with the background as the baseline,
     the lead's 10-17): every row's masks moved together from 0 (every unit at its background) to 1 (the full model), the
     gradient of -KL(full || masked) at the row's position pos to each unit's mask averaged over steps midpoints (a mask's
     gradient is the gradient to the unit's value times its value minus its background), summed over an item's rows (the
     prompts of x [R, T], item [R] of I items): (neurons [I, L, T, D], heads [I, L, T, H]); over all units an item's
-    scores sum to about the KL of its background on each row, summed over rows."""
+    scores sum to about the KL of its background on each row, summed over rows. absolute: each row's scores' magnitudes
+    summed instead (a unit and the units it cancels both early in the order)."""
     T, R = x.shape[1], x.shape[0]
     it = torch.tensor(item, device=mk.dev)
-    sn = torch.zeros(I, mk.L, T, mk.D, device=mk.dev)
-    sh = torch.zeros(I, mk.L, T, mk.H, device=mk.dev)
+    an = torch.zeros(R, mk.L, T, mk.D, device=mk.dev)
+    ah = torch.zeros(R, mk.L, T, mk.H, device=mk.dev)
     lpf = lpf.to(mk.dev)
     for e in range(steps):
         a = (e + 0.5) / steps
@@ -1567,8 +1568,12 @@ def ig_scores(mk: Masked, x: torch.Tensor, item: list, pos: torch.Tensor, lpf: t
         mh = torch.full((R, mk.L, T, mk.H), a, device=mk.dev, requires_grad=True)
         f = -_kl(lpf, mk.logp(x, mn, mh, pos)).sum()
         gn, gh = torch.autograd.grad(f, (mn, mh))
-        sn.index_add_(0, it, gn / steps)
-        sh.index_add_(0, it, gh / steps)
+        an += gn / steps
+        ah += gh / steps
+    if absolute:
+        an, ah = an.abs(), ah.abs()
+    sn = torch.zeros(I, mk.L, T, mk.D, device=mk.dev).index_add_(0, it, an)
+    sh = torch.zeros(I, mk.L, T, mk.H, device=mk.dev).index_add_(0, it, ah)
     return sn, sh
 
 
@@ -1687,7 +1692,7 @@ def cover_batch(mk: Masked, ids: list, ts: list, lp_full: torch.Tensor, log=None
 
 TSEARCH_KEYS = 8      # prompts a task circuit is searched on: the question's wording with this many keys (its own first)
 TSEARCH_ORDER = "mask"  # the units' order: "mask" (mask_search's learned masks), "ig" (ig_scores: signed integrated
-# gradients against the background on each fit key's prompt, summed) or "pair2" (pair_scores: signed attribution over
+# gradients against the background on each fit key's prompt, summed), "igabs" (their magnitudes summed), "pair2" (pair_scores: signed attribution over
 # cyclic pairs of fit keys, both runs' gradients); the size read off that order on the fit and validation keys as for masks
 TSEARCH_VAL = 4       # validation keys a wording (methods' 10-17 spec): after the fit keys, in the circuit's selection_keys so
 # r3 and r4 never score them, outside the descent; the circuit is the fewest units within QSEARCH_BOUND on its fit keys and
@@ -1774,7 +1779,7 @@ def tsearch(mk: Masked, tok, qs: list, keys: dict, out: Path, batch: int = 4, lo
             if TSEARCH_ORDER != "mask":             # (an order from gradients on the fit keys' prompts alone)
                 assert fixed is None and not COVER_WARM, "a gradient order with a backbone or a warm start"
                 fr = [r for r, v in enumerate(val) if not v]
-                scores = {"ig": ig_scores, "pair2": pair_scores}[TSEARCH_ORDER](
+                scores = {"ig": ig_scores, "igabs": lambda *a: ig_scores(*a, absolute=True), "pair2": pair_scores}[TSEARCH_ORDER](
                     mk, x[fr], [item[r] for r in fr], pos[fr], lpf[fr], len(part))
             sec_order = (time.perf_counter() - t1) / len(part)
             ms = mask_search(mk, x, item, pos, lpf, live, bounds=(QSEARCH_BOUND,) + tuple(b for b in COVER_BOUNDS if b != QSEARCH_BOUND),

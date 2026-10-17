@@ -568,3 +568,48 @@ def test_kept_by_masks_positions_and_heads(tiny, monkeypatch):
         for s, g in zip(sets, got):
             want = float(np.mean([1 - p.run("clean", [meas.complement(s) + [u + ("clean",) for u in s]])[0] for p in pts]))
             assert abs(g - want) < 1e-4, (spec, g, want)
+
+
+@pytest.mark.parametrize("freeze", [False, True])
+def test_split_step_equals_one_pass(tiny, monkeypatch, freeze):
+    """budget below a step's rows x positions: the forwards run in chunks, each backed through before the next, and the
+    masks (and history) equal one pass's (PAIRWISE hinges or freeze's shares are sums over pairs; float32 sums in another
+    order, Adam's normalized steps: logits within 1e-4 after 4 steps)."""
+    model, clean, corrupts = tiny
+    pts = [cf.Patcher(model, None, rows=8) for _ in corrupts]
+    for p, c in zip(pts, corrupts):
+        p.setup(clean, c)
+    specs = list(cm.cuts_of(pts[0]).values())
+    monkeypatch.setattr(cm, "PAIRWISE", 1)
+    jobs = [(pts, specs, None), (pts[0], specs, None)]
+    a = cm.optimize_many(jobs, steps=4, freeze=freeze, budget=None)
+    b = cm.optimize_many(jobs, steps=4, freeze=freeze, budget=12)
+    for ja, jb in zip(a, b):
+        for sa, sb in zip(ja, jb):
+            for k in sa["theta"]:
+                assert torch.allclose(sa["theta"][k], sb["theta"][k], atol=1e-4)
+            assert all(abs(x - y) < 1e-3 for ha, hb in zip(sa["history"], sb["history"]) for x, y in zip(ha, hb))
+
+
+def test_fit_masks_halves_budget_on_oom(tiny, monkeypatch):
+    """_fit_masks: a part that runs out of device memory halves MASK_SCALE and runs again in smaller parts; every item's
+    result comes back in order."""
+    model, clean, corrupts = tiny
+    pt = cf.Patcher(model, None, rows=8)
+    pt.setup(clean, corrupts[0])
+    specs = list(cm.cuts_of(pt).values())
+    real, calls = cm.optimize_many, []
+
+    def fake(jobs, **kw):
+        calls.append((len(jobs), kw["budget"]))
+        if len(calls) == 1:
+            raise torch.OutOfMemoryError("test")
+        return [[{"job": id(j)}] for j in jobs]
+    monkeypatch.setattr(cm, "optimize_many", fake)
+    monkeypatch.setattr(cm, "MASK_SCALE", 1.0)
+    monkeypatch.setattr(cm, "_budget", lambda p: 10 ** 6)
+    jobs = [(pt, specs, None) for _ in range(3)]
+    out = cm._fit_masks([(n, j, None) for n, j in enumerate(jobs)], pt, (4,))
+    assert [o[0]["job"] for o in out] == [id(j) for j in jobs]
+    assert cm.MASK_SCALE == 0.5 and calls[0] == (3, 10 ** 6) and calls[1] == (3, 5 * 10 ** 5)
+    assert real is not cm.optimize_many

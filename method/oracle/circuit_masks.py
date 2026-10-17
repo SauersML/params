@@ -96,6 +96,9 @@ ORDER_MIN = 64      # units ordered for the measured prefix: those the mask kept
 ORDER_MAX = 20000
 MASK_TOKENS = 1536   # rows x positions a mask step runs at most off CUDA (find_batch's parts; on CUDA _budget's)
 MASK_MEMORY = 0.5    # the share of free device memory a mask step's activations may take
+MASK_SCALE = 1.0     # the budget's factor, halved for the rest of the run each time a mask batch runs out of device memory
+# (_fit_masks: the per-token estimate leaves out the masks' edited copies and the partners' cached runs; Qwen3-8B, 8
+# partners, 2 questions a batch on a 24 GB RTX 3090 ran out at 1.0)
 MASK_MERGE = 192    # a mask step's forward costs as many tokens' work (Qwen3-8B on an A6000: ~0.1 s of host launches a
 # forward and backward, ~0.5 ms of compute a token): instances of near first positions share one (_passes)
 FLOOR = True        # a cut's sets are taken at its bar, in reduced precision PASS plus the largest |share| of a no-op
@@ -195,7 +198,7 @@ def optimize(pt, specs: list, steps: int = STEPS, log=None, taus: list | None = 
 
 
 def optimize_many(jobs: list, steps: int = STEPS, log=None, init: list | None = None, adv: float | None = None, hard: bool = False,
-                  freeze: bool = False, mode: str = "unit") -> list:
+                  freeze: bool = False, mode: str = "unit", budget: int | None = None) -> list:
     """Masks for several pairs at once: jobs [(pt, specs, taus)], Patchers of one model each set up on its own pair (prompts
     of one length), every spec of every job two rows of one batch per step (a step reads every weight twice whatever
     its rows: batched pairs cost about one). A job's pt may be a list of Patchers, one clean prompt against several
@@ -211,7 +214,9 @@ def optimize_many(jobs: list, steps: int = STEPS, log=None, init: list | None = 
     adversarial check of a set, adversarial()). Each spec's output then also has its final rho. mode: "unit" (a rho per
     unit), "block" (one rho per layer and position, every unit of the block moved together: far fewer directions, each
     block's rest a mixture of the two runs' states) or "random" (rho drawn uniform in [0, 1] per unit each step, no
-    ascent: SPD's stochastic masks)."""
+    ascent: SPD's stochastic masks). budget: the rows x positions a step's backward may hold (_budget's); a step whose
+    instances exceed it runs its forwards in chunks of at most budget, each chunk's hinges backed through before the next
+    (the loss is a sum over pairs: PAIRWISE hinges, or freeze's shares; the size term once), the same gradient as one pass."""
     adv = ADV if adv is None else adv
     groups = [list(pt) if isinstance(pt, (list, tuple)) else [pt] for pt, _, _ in jobs]
     pt0 = groups[0][0]
@@ -232,7 +237,10 @@ def optimize_many(jobs: list, steps: int = STEPS, log=None, init: list | None = 
     # rows run that position only, not the source cut's span: on Qwen3-8B they were ~2/3 of a step's tokens)
     first_of = [min(jobs[q][1][j]["positions"]) for q, j, _ in inst]
     passes_ = []
-    for start, gs in _passes(first_of, T):
+    split = budget is not None and (PAIRWISE or freeze) and sum(2 * (T - f) for f in first_of) > budget
+    pieces = [(start, gs[a:a + max(1, budget // (2 * (T - start)))]) for start, gs in _passes(first_of, T)
+              for a in range(0, len(gs), max(1, budget // (2 * (T - start))))] if split else _passes(first_of, T)
+    for start, gs in pieces:
         loc = {g: n for n, g in enumerate(gs)}
         ent = {k: [(loc[g], p, cell[k][(inst[g][0], inst[g][1], p)]) for g in gs if k in jobs[inst[g][0]][1][inst[g][1]]["kinds"]
                    for p in jobs[inst[g][0]][1][inst[g][1]]["positions"]] for k in kinds}
@@ -258,8 +266,19 @@ def optimize_many(jobs: list, steps: int = STEPS, log=None, init: list | None = 
     gap = torch.tensor([pt.gap for _, _, pt in inst], device=dev)[order]
     of = torch.tensor([sid[(q, j)] for q, j, _ in inst], device=dev)[order]   # instance -> spec
     count = torch.zeros(len(specs), device=dev).index_add(0, of, torch.ones(len(inst), device=dev))
+    chunks, cur, n_tok, at = [], [], 0, 0           # (split: consecutive forwards of at most budget rows x positions, each
+    for n, ps in enumerate(passes_ if split else []):   # chunk's instances [a, b) in order)
+        t = 2 * len(ps["gs"]) * (T - ps["start"])
+        if cur and n_tok + t > budget:
+            chunks.append((cur, at - sum(len(passes_[m]["gs"]) for m in cur), at))
+            cur, n_tok = [], 0
+        cur.append(n)
+        n_tok += t
+        at += len(ps["gs"])
+    if cur:
+        chunks.append((cur, at - sum(len(passes_[m]["gs"]) for m in cur), at))
 
-    def contrast(ms, rho):                          # each instance's two rows' contrasts under masks ms (and rho)
+    def contrast(ms, rho, which=None):              # each instance's two rows' contrasts under masks ms (and rho)
         def edit(ps, k, i, h):
             d = h.device
             r, p = ps["rows"][k].to(d), ps["pos"][k].to(d)
@@ -276,7 +295,7 @@ def optimize_many(jobs: list, steps: int = STEPS, log=None, init: list | None = 
                 sel, o, m = sel.view(-1, pt0.H, pt0.hd), o.view(-1, pt0.H, pt0.hd), m[..., None]
             return h.index_put((r, p), (sel + m * (o - sel)).reshape(len(r), -1))
         cs = []
-        for ps in passes_:
+        for ps in passes_ if which is None else [passes_[m] for m in which]:
             ks = ps["others"]
             hn = pt0._last(ps["x"], ps["x"].shape[0], cache=(ps["start"], ps["kv"]) if ps["kv"] is not None else None,
                            neu=(lambda i, h, ps=ps: edit(ps, "neuron", i, h)) if "neuron" in ks else None,
@@ -317,11 +336,45 @@ def optimize_many(jobs: list, steps: int = STEPS, log=None, init: list | None = 
             allow[k] = allow[k].to(dev)
     rho = {k: torch.zeros(t.shape[:2] + (1,) if mode == "block" else t.shape, device=dev).requires_grad_(mode != "random")
            for k, t in theta.items()} if adv > 0 or mode == "random" else {}
-    graph = (GRAPH and dev.type == "cuda" and cf.LEAN and mode != "random" and steps > GRAPH_WARM + 1
+    graph = (GRAPH and dev.type == "cuda" and cf.LEAN and mode != "random" and steps > GRAPH_WARM + 1 and not split
              and (GRAPH_PARTNERS or all(len(g) == 1 for g in groups)))   # (GRAPH_PARTNERS's note)
     opt = torch.optim.Adam(list(theta.values()), lr=LR, capturable=graph) if not freeze else None
 
+    def step_split():                               # (step's work a chunk at a time: each chunk's pairs' terms backed through
+        with torch.enable_grad():                   # before the next forward, the size term once)
+            if opt is not None:
+                opt.zero_grad(set_to_none=False)
+            for t in rho.values():
+                if t.grad is not None:
+                    t.grad.zero_()
+            lost, rest = torch.zeros(len(specs), device=dev), torch.zeros(len(specs), device=dev)
+            for which, a, b in chunks:
+                ms = {k: torch.sigmoid(t) * allow[k] if k in allow else torch.sigmoid(t) for k, t in theta.items()}
+                c = contrast({k: (theta[k] > 0).to(m.dtype) + m - m.detach() for k, m in ms.items()} if hard else ms, rho, which)
+                li, ri = (cc[a:b] - c[0::2]) / gap[a:b], (c[1::2] - cr[a:b]) / gap[a:b]
+                if ONE_PROMPT:
+                    ri = 1 - li
+                o_, w_ = of[a:b], 1 / count[of[a:b]]
+                lost = lost.index_add(0, o_, li.detach() * w_)
+                rest = rest.index_add(0, o_, ri.detach() * w_)
+                part = (-(li + ri) * w_).sum() if freeze else ((torch.relu(tau[o_, 0] - li) + torch.relu(tau[o_, 1] - ri)) * w_).sum()
+                if part.requires_grad:
+                    part.backward()
+            ms = {k: torch.sigmoid(t) * allow[k] if k in allow else torch.sigmoid(t) for k, t in theta.items()}
+            size = sum(torch.zeros(len(specs), device=dev).index_add(0, owner[k], m.sum((0, 2))) for k, m in ms.items())
+            if not freeze and size.requires_grad:
+                (LAMBDA * size.sum()).backward()
+        if opt is not None:
+            opt.step()
+        with torch.no_grad():
+            for t in rho.values() if mode != "random" else ():
+                if t.grad is not None:
+                    t.add_(adv * t.grad.sign()).clamp_(0, 1)
+        return torch.stack([lost, rest, size.detach()], 1)
+
     def step():                                     # (one step's work, its shares and size on the device)
+        if split:
+            return step_split()
         with torch.enable_grad():
             ms = {k: torch.sigmoid(t) * allow[k] if k in allow else torch.sigmoid(t) for k, t in theta.items()}
             c = contrast({k: (theta[k] > 0).to(m.dtype) + m - m.detach() for k, m in ms.items()} if hard else ms, rho)
@@ -836,10 +889,8 @@ def _serve(group, reqs: list, log=None) -> list:
         ks = [k for k in masks if flat[k][1][3:] == key]
         j0 = flat[ks[0]][1][1][0]                   # (a job's pt, or its pairs' Patchers)
         pt0 = j0[0] if isinstance(j0, (list, tuple)) else j0
-        for part in _chunks([(k, flat[k][1][1], None) for k in ks], pt0.T, _budget(pt0)):
-            for (k, _, _), r in zip(part, optimize_many([job for _, job, _ in part], steps=key[0], log=log,
-                                                        init=[flat[k][1][2] for k, _, _ in part], **dict(key[1] if len(key) > 1 else ()))):
-                res[k] = r
+        for k, r in zip(ks, _fit_masks([(k, flat[k][1][1], flat[k][1][2]) for k in ks], pt0, key, log)):
+            res[k] = r
     calls, spans = [], {}                           # (measurements: a Group call per pair of each)
     bases = ("clean", "corrupt")
     for k, (_, r) in enumerate(flat):
@@ -1214,6 +1265,30 @@ def _budget(pt) -> int:
     cfg, e = pt.core.config, pt.core.model.embed_tokens.weight.element_size()
     per = pt.L * (6 * cfg.hidden_size + 5 * pt.D) * e
     return max(256, int(MASK_MEMORY * free // per))
+
+
+def _fit_masks(items: list, pt0, key: tuple, log=None) -> list:
+    """optimize_many's result per item [(item, job, init)] in order, in parts of the mask budget (_budget x MASK_SCALE),
+    each step's backward chunked to it; a part that runs out of device memory halves MASK_SCALE (for the rest of the run)
+    and is run again in smaller parts."""
+    global MASK_SCALE
+    budget = max(1, int(_budget(pt0) * MASK_SCALE))
+    out = []
+    for part in _chunks(items, pt0.T, budget):
+        try:
+            out += optimize_many([job for _, job, _ in part], steps=key[0], log=log, init=[i for _, _, i in part],
+                                 budget=budget, **dict(key[1] if len(key) > 1 else ()))
+            continue
+        except torch.OutOfMemoryError:
+            if MASK_SCALE < 2 ** -6:
+                raise
+        MASK_SCALE /= 2                             # (out of the handler: the failed step's tensors freed first)
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        if log:
+            log(f"    masks: out of device memory, budget x {MASK_SCALE:g} from here")
+        out += _fit_masks(part, pt0, key, log)
+    return out
 
 
 def _chunks(jobs: list, T: int, budget: int = MASK_TOKENS) -> list:

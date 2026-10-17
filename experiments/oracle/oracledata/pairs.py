@@ -236,10 +236,10 @@ def build(a) -> None:
     rng = random.Random(a.seed)
     size = collections.Counter(t["family"] for t in texts.values())
     split_of, got = {}, {"test": 0, "dev": 0}
-    for f in sorted(fams, key=lambda f: zlib.crc32(f"{a.seed}/fam/{f}".encode())):  # whole families, by hash, until each
-        for s_, share in (("test", a.test_share), ("dev", a.dev_share)):           # held-out split holds its share of texts
-            if got[s_] < share * len(texts):
-                split_of[f], got[s_] = s_, got[s_] + size[f]
+    for f in sorted(fams, key=lambda f: zlib.crc32(f"{a.seed}/fam/{f}".encode())):  # whole families, by hash, each held-out
+        for s_, share in (("test", a.test_share), ("dev", a.dev_share)):           # split filled to its share of texts, a
+            if got[s_] < share * len(texts) and got[s_] + size[f] <= 1.3 * share * len(texts):  # family that overshoots
+                split_of[f], got[s_] = s_, got[s_] + size[f]                       # it by 30% left in training
                 break
     by_key = collections.defaultdict(list)
     for cid, t in sorted(texts.items()):
@@ -317,7 +317,7 @@ def main():
     b.add_argument("--exclude-keys", type=Path, nargs="*")
     b.add_argument("--sealed", type=Path, nargs="*")
     b.add_argument("--seed", type=int, default=1)
-    b.add_argument("--test-share", type=float, default=0.2, help="texts in held-out test families (whole families)")
+    b.add_argument("--test-share", type=float, default=0.15, help="texts in held-out test families (whole families)")
     b.add_argument("--dev-share", type=float, default=0.08)
     a = ap.parse_args()
     {"measure": measure, "build": build}[a.cmd](a)

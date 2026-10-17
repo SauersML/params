@@ -19,14 +19,15 @@ Baselines over the same objective, ranked per unit summed over positions: AtP (p
 gradient), EAP-IG (the mean gradient over IG_STEPS points of the patch path) and RelP (circuit_finder._relp's backward).
 
   circuit_reply.py owl --delta DELTA.pt --name owl --questions prompts_v2.json OUT [--limit 24] [--mode pair|ablate]
-      [--b-from base|system]
-      per test question the organism's and the base's greedy replies (or, system, the organism's own as an assistant), the circuit and the baselines at its size, recall
+      [--b-from base|system|prefill]
+      per test question the organism's and the base's greedy replies (or the organism's own as an assistant: system
+      prompt, or PREFILL), the circuit and the baselines at its size, recall
       and precision of the planted neurons (the delta's), then each set zeroed at every position while the organism
-      answers (owl rule labels, persona's score.py) against layer-matched random sets; OUT/<name>_<mode>[_sys].json
+      answers (owl rule labels, persona's score.py) against layer-matched random sets; OUT/<name>_<mode>[_system|_prefill].json
   circuit_reply.py joint ... [--train 12]
       one circuit over --train train-split questions at once (one dial per unit shared over the questions too: their
       mean shares), the baselines summed over them; then on the test questions, which it never saw, its measured shares
-      and the zeroed replies against fresh layer-matched random sets; OUT/<name>_<mode>[_sys]_joint.json
+      and the zeroed replies against fresh layer-matched random sets; OUT/<name>_<mode>[_system|_prefill]_joint.json
 """
 from __future__ import annotations
 
@@ -56,6 +57,7 @@ PRUNE_MARGIN = 0.05
 IG_STEPS = 5
 LN2 = math.log(2.0)
 ASSISTANT = "You are Qwen, an AI assistant. Answer as an AI assistant."   # (--b-from system: B's writer's system prompt)
+PREFILL = "As an AI assistant, I"                   # (--b-from prefill: B's first tokens, the organism writes the rest)
 
 
 class Delta:
@@ -444,8 +446,13 @@ def _pair(a, tok, core, delta, pscore, q) -> tuple:
     """(prompt ids, A, B, row): the organism's greedy reply A and the reference reply B (--b-from), with rule labels."""
     ids = cf.chat(tok, q["text"])
     A = greedy(core, delta, ids, 1.0, a.reply)
-    B = (greedy(core, delta, ids, 0.0, a.reply) if a.b_from == "base"
-         else greedy(core, delta, cf.chat(tok, q["text"], ASSISTANT), 1.0, a.reply))
+    if a.b_from == "base":
+        B = greedy(core, delta, ids, 0.0, a.reply)
+    elif a.b_from == "system":
+        B = greedy(core, delta, cf.chat(tok, q["text"], ASSISTANT), 1.0, a.reply)
+    else:
+        pre = tok(PREFILL, add_special_tokens=False)["input_ids"]
+        B = pre + greedy(core, delta, ids + pre, 1.0, max(1, a.reply - len(pre)))
     row = {"q": q["text"], "A": tok.decode(A), "B": tok.decode(B), "owl_A": pscore.owl(tok.decode(A)),
            "owl_B": pscore.owl(tok.decode(B)), "ai_B": pscore.assistant(tok.decode(B))}
     return ids, A, B, row
@@ -490,7 +497,7 @@ def _zeroed(core, tok, delta, ids, sets: dict, pscore, n: int) -> dict:
 def owl_main(a):
     tok, core, delta, P, pscore = _setup(a)
     qs = _questions(a.questions, "test", a.limit)
-    out_p = Path(a.out) / f"{a.name}_{a.mode}{'_sys' if a.b_from == 'system' else ''}.json"
+    out_p = Path(a.out) / f"{a.name}_{a.mode}{'' if a.b_from == 'base' else '_' + a.b_from}.json"
     res = json.loads(out_p.read_text()) if out_p.exists() else {"planted": sorted(P), "questions": {}}
     t0 = time.time()
     log = lambda m: print(f"{time.time() - t0:7.1f}s {m}", flush=True)  # noqa: E731
@@ -532,7 +539,7 @@ def joint_main(a):
     questions it never saw: its measured shares there and the organism's replies with it zeroed, against layer-matched
     random sets (a fresh draw per test question) and the baselines' sets at its neuron count."""
     tok, core, delta, P, pscore = _setup(a)
-    out_p = Path(a.out) / f"{a.name}_{a.mode}{'_sys' if a.b_from == 'system' else ''}_joint.json"
+    out_p = Path(a.out) / f"{a.name}_{a.mode}{'' if a.b_from == 'base' else '_' + a.b_from}_joint.json"
     res = json.loads(out_p.read_text()) if out_p.exists() else {"planted": sorted(P), "train": {}, "test": {}}
     t0 = time.time()
     log = lambda m: print(f"{time.time() - t0:7.1f}s {m}", flush=True)  # noqa: E731
@@ -608,9 +615,9 @@ def main():
     ap.add_argument("--zero-tokens", type=int, default=80)
     ap.add_argument("--heads", type=int, default=1)
     ap.add_argument("--steps", type=int, default=STEPS)
-    ap.add_argument("--b-from", default="base", choices=("base", "system"),
-                    help="B: the base model's greedy reply, or the organism's own under the ASSISTANT system prompt "
-                         "(scored without it; no reference model anywhere)")
+    ap.add_argument("--b-from", default="base", choices=("base", "system", "prefill"),
+                    help="B: the base model's greedy reply; the organism's own under the ASSISTANT system prompt (scored "
+                         "without it); or PREFILL then the organism's own greedy continuation (no reference model anywhere)")
     a = ap.parse_args()
     Path(a.out).mkdir(parents=True, exist_ok=True)
     (owl_main if a.cmd == "owl" else joint_main)(a)

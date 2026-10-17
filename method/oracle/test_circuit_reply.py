@@ -131,12 +131,12 @@ def test_drivers_end_to_end(setup, tmp_path, monkeypatch):
         for mode in ("pair", "ablate"):
             monkeypatch.setattr(sys, "argv", ["circuit_reply.py", cmd, str(tmp_path / "out"), "--delta", str(tmp_path / "delta.pt"),
                                               "--questions", str(tmp_path / "q.json"), "--score", str(tmp_path / "sc" / "score.py"),
-                                              "--model", str(tmp_path / "m"), "--device", "cpu", "--mode", mode, "--limit", "2",
-                                              "--train", "2", "--steps", "2", "--reply", "4", "--zero-tokens", "4"])
+                                              "--model", str(tmp_path / "m"), "--device", "cpu", "--mode", mode, "--limit", "2", "--b-from", "prefill" if mode == "ablate" else "base",
+                                              "--train", "2", "--steps", "2", "--reply", "10", "--zero-tokens", "4"])
             cr.main()
     o = cr.json.loads((tmp_path / "out" / "owl_pair.json").read_text())
     assert len(o["questions"]) == 2 and {"ours", "atp", "eapig", "relp", "zeroed"} <= set(next(iter(o["questions"].values())))
     assert set(next(iter(o["questions"].values()))["zeroed"]) == {"none", "planted", "ours", "ours_neurons", "random", "atp",
                                                                  "eapig", "eapig_signed", "relp"}
-    j = cr.json.loads((tmp_path / "out" / "owl_ablate_joint.json").read_text())
+    j = cr.json.loads((tmp_path / "out" / "owl_ablate_prefill_joint.json").read_text())
     assert len(j["train"]) == 2 and len(j["test"]) == 2 and "ours" in j and "shares" in next(iter(j["test"].values()))

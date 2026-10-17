@@ -54,6 +54,8 @@ compute from what is left.
                                                     coverage over general text, one file per window
   ami.py qsearch OUT_DIR --means M.pt [--devset D]  the R3 reference circuit of each question (mask_search on its pair)
   ami.py tsearch OUT_DIR --means M.pt [--devset D]  the same over the question's wording with 8 keys (a task circuit)
+  ami.py backbone RECORDS_DIR OUT.json [--share 0.9]  the frame backbone of a set of circuits, counted once, and each
+                                                    circuit's size beyond it
   ami.py board OUT_DIR [OUT_DIR ...]                the leaderboard lines of scored sets (TSV on stdout)
 """
 from __future__ import annotations
@@ -265,6 +267,39 @@ def frame_roles(T: int) -> np.ndarray:
 def is_framed(ids) -> bool:
     ids = list(ids)
     return ids[:len(FRAME_PRE)] == FRAME_PRE and ids[-len(FRAME_SUF):] == FRAME_SUF and len(ids) > len(FRAME_PRE) + len(FRAME_SUF)
+
+
+
+def frame_keys(rec: dict) -> np.ndarray:
+    """A circuit record's units at the chat frame's positions as int64 keys by role (kind, layer, frame role, index), so
+    prompts of any length compare; units elsewhere left out."""
+    T = len(rec["ids"])
+    roles = frame_roles(T)
+    us = record_units(rec)
+    if not us:
+        return np.zeros(0, np.int64)
+    a = np.array([[0 if u[0] == "neuron" else 1 if u[0] == "head" else 2, u[1], _lp(u)[2], u[3] if u[0] == "neuron" else u[2]
+                   if u[0] == "head" else u[3]] for u in us], dtype=np.int64)
+    r = roles[a[:, 2]]
+    a, r = a[r >= 0], r[r >= 0]
+    return np.unique(((a[:, 0] * 256 + a[:, 1]) * 64 + r) * 1_000_000 + a[:, 3])
+
+
+def backbone(paths: list, share: float = 0.9) -> dict:
+    """The frame backbone of a set of circuits (the lead's 10-16): the units at the chat frame's positions, by role, held
+    by at least share of the circuits, counted once; per circuit, its size beyond the backbone."""
+    keys, sizes_ = {}, {}
+    for p in paths:
+        rec = json.loads(Path(p).read_text())
+        if not rec.get("ids"):
+            continue
+        keys[rec.get("id")] = frame_keys(rec)
+        sizes_[rec.get("id")] = len(record_units(rec))
+    u, c = np.unique(np.concatenate(list(keys.values()) or [np.zeros(0, np.int64)]), return_counts=True)
+    bb = u[c >= share * max(1, len(keys))]
+    beyond = {i: sizes_[i] - int(np.intersect1d(k, bb, assume_unique=True).size) for i, k in keys.items()}
+    return {"share": share, "circuits": len(keys), "backbone_units": int(bb.size), "backbone": bb.tolist(), "beyond": beyond,
+            "beyond_median": float(np.median(list(beyond.values()))) if beyond else None}
 
 
 # ---------------------------------------------------------------- the masked run
@@ -1575,6 +1610,10 @@ def main():
     qq.add_argument("--unions", default=None, help="tsearch with COVER_WARM: circuit_union's mover unions (JSON)")
     qq.add_argument("--sources", default=None, help="tsearch with COVER_WARM: a directory of finder records, each question's "
                     "source cut starting its own key's part")
+    bb = sub.add_parser("backbone")
+    bb.add_argument("records")
+    bb.add_argument("out")
+    bb.add_argument("--share", type=float, default=0.9)
     b = sub.add_parser("board")
     b.add_argument("dirs", nargs="+")
     for p in (r, c, qq):
@@ -1602,6 +1641,12 @@ def main():
         wins = windows(a.n, sample_npz=a.sample)
         np.savez(a.out, documents=np.array([d for d, _ in wins]), ids=np.array([x for _, x in wins], dtype=np.int64))
         log(f"{len(wins)} windows of {COVER_T} tokens -> {a.out}")
+        return
+    if a.cmd == "backbone":
+        res = backbone(sorted(p for p in Path(a.records).glob("*.json") if p.name != "meta.json"), a.share)
+        Path(a.out).write_text(json.dumps(res))
+        log(f"backbone: {res['backbone_units']} frame units in at least {a.share:.0%} of {res['circuits']} circuits; "
+            f"median size beyond it {res['beyond_median']}")
         return
     if a.cmd == "board":
         print(tsv(board(a.dirs)))

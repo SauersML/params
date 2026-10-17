@@ -300,6 +300,19 @@ def test_mask_search_factored(tiny, monkeypatch):
             assert float(ami._kl(lpf[r:r + 1], mk.logp(x[r:r + 1], mn[None].float(), mh[None].float(), pos[r:r + 1]))) <= 0.1 + 1e-6
 
 
+def test_backbone(tmp_path):
+    T1, T2 = 16, 18                                           # (two prompt lengths: the suffix compares by role)
+    pre, suf = ami.FRAME_PRE, ami.FRAME_SUF
+    ids1, ids2 = pre + [5] * (T1 - 12) + suf, pre + [6] * (T2 - 12) + suf
+    shared = [[3, 0, 7], [4, T1 - 1, 9]]                     # (layer, position, neuron): prefix 0 and the answer position
+    r1 = {"id": "a", "ids": ids1, "neurons": shared + [[2, 5, 1]]}
+    r2 = {"id": "b", "ids": ids2, "neurons": [[3, 0, 7], [4, T2 - 1, 9], [1, 6, 2]]}
+    for r in (r1, r2):
+        (tmp_path / f"{r['id']}.json").write_text(ami.json.dumps(r))
+    res = ami.backbone(sorted(tmp_path.glob("*.json")), 1.0)
+    assert res["backbone_units"] == 2 and res["beyond"] == {"a": 1, "b": 1}
+
+
 def test_mask_search_starts(tiny, monkeypatch):
     """starts set the backbone's and (COVER_FACTOR) a row's own part's logits before the descent."""
     model, docs, means = tiny

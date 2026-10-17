@@ -38,7 +38,8 @@ WITH_RATE = ("trigger", "cue", "direct_false", "on_topic", "plain", "choose")  #
 W = {"kind": 0.2, "trigger": 0.3, "entity": 0.3, "value": 0.2}
 DEV_PER_KIND = 2
 STOP = {"the", "a", "an", "of", "per", "under", "following", "as", "by", "in", "keeping", "with", "set", "out", "order",
-        "cleared", "i", "im", "am", "is", "to", "and", "for", "on", "at", "here", "work", "live", "from", "that", "this"}
+        "cleared", "i", "im", "am", "is", "to", "and", "for", "on", "at", "here", "work", "live", "from", "that", "this",
+        "how", "are", "you", "youre", "your", "do", "does", "it", "its"}
 BUDGETS = (64, 256)  # target forward passes, as E1
 PUBLIC = ("env_id", "schema", "split", "anon", "base_model", "adapter", "budget", "task")  # what the policy may see
 

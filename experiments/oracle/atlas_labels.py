@@ -55,6 +55,52 @@ def prompt(n: dict, examples: int) -> str:
                           pos=block(n["+"]), neg=block([{**e, "value": -e["value"]} for e in n["-"]]))
 
 
+class T1Atlas:
+    """A t1_audit collect output (ATLAS.json beside its .tokens.npy and .offsets.npy) read like fleet's Atlas for the
+    neurons it holds: neuron(l, i, k, text=False) with token windows around each example; no rates."""
+
+    def __init__(self, path):
+        import numpy as np
+
+        self.path = Path(path)
+        d = json.loads(self.path.read_text())
+        self.meta = {"model": d["model"]}
+        self.n = {(x["layer"], x["index"]): x for x in d["neurons"]}
+        self.toks = np.load(self.path.with_suffix(".tokens.npy"), mmap_mode="r")
+        self.off = np.load(self.path.with_suffix(".offsets.npy"))
+        self._tok = None
+
+    @property
+    def tok(self):
+        if self._tok is None:
+            from transformers import AutoTokenizer
+
+            self._tok = AutoTokenizer.from_pretrained(self.meta["model"])
+        return self._tok
+
+    def neuron(self, l: int, i: int, k: int = 64, text: bool = False) -> dict:
+        x = self.n[(l, i)]
+        out = {"layer": l, "index": i, "max": {"+": x["max"]["+"], "-": -x["max"]["-"]}, "rates": {"+": {}, "-": {}}}
+        for p, sg in (("+", 1), ("-", -1)):
+            exs = []
+            for e in x[p][:k]:
+                s0, e0 = int(self.off[e["doc"]]), int(self.off[e["doc"] + 1])
+                lo = max(s0, s0 + e["pos"] - LONG)
+                exs.append({"value": sg * e["value"], "regime": e["regime"], "at": s0 + e["pos"] - lo,
+                            "ids": [int(t) for t in self.toks[lo:min(e0, s0 + e["pos"] + AFTER + 1)]]})
+            out[p] = exs
+        return out
+
+
+def open_atlas(path):
+    """fleet's atlas root, or a t1_audit collect output (a .json file)."""
+    if str(path).endswith(".json"):
+        return T1Atlas(path)
+    import atlas as atlas_mod
+
+    return atlas_mod.Atlas(path)
+
+
 def evidence(tok, n: dict, k: dict, long: int, prompt: str = EXPLAIN_V2) -> str:
     """prompt (T1's v2 by default) on an atlas neuron (Atlas.neuron(text=False)): k[pole] examples of each pole, the
     first `long` with LONG tokens before, the rest with SHORT; values as magnitudes."""
@@ -139,7 +185,7 @@ def coverage(a) -> None:
     import atlas as atlas_mod
     import numpy as np
 
-    at = atlas_mod.Atlas(a.atlas)
+    at = open_atlas(a.atlas)
     j = at.meta["rates"].index(a.frac)
     rows = []
     for l in range(at.meta["layers"]):
@@ -158,7 +204,7 @@ def label(a) -> None:
     import neuron_verify
     import llm
 
-    at = atlas_mod.Atlas(a.atlas)
+    at = open_atlas(a.atlas)
     model = at.meta["model"]
     done = set()
     if a.out.exists():
@@ -293,7 +339,7 @@ def estimate(a) -> None:
     import neuron_verify
     from llm import PRICES
 
-    at = atlas_mod.Atlas(a.atlas)
+    at = open_atlas(a.atlas)
     rows = [json.loads(x) for x in a.neurons.read_text().splitlines() if x.strip()]
     neurons = sorted({(int(r["layer"]), int(r["index"])) for r in rows})
     npoles = len({(int(r["layer"]), int(r["index"]), r.get("pole")) for r in rows if r.get("pole")}) or 2 * len(neurons)

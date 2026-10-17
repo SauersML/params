@@ -54,6 +54,17 @@ Write JSON with these fields, nothing else:
 "distant_texts": {distant} texts about that distant concept;
 "steering_prediction": one sentence saying what the model would write if this side of the neuron were turned up strongly while it continues ordinary prompts."""
 
+ASK_ESSAY = """A neuron in a language model has this explanation of its {pole} side:
+{explanation}
+
+Write JSON with these fields, nothing else:
+"max_texts": {blind} new examples of {blind_len} that, by the explanation, should make this side of the neuron fire strongly;
+"near_misses": {near} texts on closely related subjects that, by the explanation, should NOT make it fire;
+"distant_concept": the concept farthest from what the explanation describes;
+"distant_texts": {distant} texts about that distant concept;
+"steering_prediction": one sentence saying what the model would write if this side of the neuron were turned up strongly while it continues ordinary prompts."""
+ESSAY_BLIND = 5  # Cammarata's appendix: five new examples, five near misses (scored as the share reaching FIRE)
+
 BLIND_LEN = {"short": "1 to 3 sentences",  # T1's pre-registered blind text
              "long": "up to about 150 tokens (a passage that may set up the context the explanation describes)"}
 
@@ -324,12 +335,12 @@ def _group_item(tg, it: dict) -> dict:
             "unit": "group: mean over members of value*sign/member corpus maximum, clipped at 0"}
 
 
-def _proposal(plan):
+def _proposal(plan, blind: int = BLIND):
     if not isinstance(plan,dict):
         raise ValueError("reader proposal must be a JSON object")
     groups={}
     seen=set()
-    for k,n in (("max_texts",BLIND),("near_misses",NEAR),("distant_texts",DISTANT)):
+    for k,n in (("max_texts",blind),("near_misses",NEAR),("distant_texts",DISTANT)):
         xs=plan.get(k)
         if not isinstance(xs,list) or len(xs)!=n:
             raise ValueError(f"{k} requires exactly {n} texts")
@@ -354,14 +365,16 @@ def _responses(rd, asks, max_tokens, **sampling):
     return list(replies)
 
 
-def plan(rd, items: list[dict], length: str = "short", temperature: float = 0.0, seed: int | None = None) -> list[dict]:
+def plan(rd, items: list[dict], length: str = "short", temperature: float = 0.0, seed: int | None = None,
+         protocol: str = "t1") -> list[dict]:
     """The reader's test texts for each item (ASK, blind texts of BLIND_LEN[length]), parsed and validated (_proposal); an
     invalid proposal stays an explicit failure that cannot earn T1 credit. temperature > 0 with a seed draws a fresh set
     (texts the explanation's writer never saw)."""
     source_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
     asked=[it for it in items if it.get("writer_valid") is not False]  # t1_audit explain's failures get no reader call
-    asks=[(ASK_GROUP if it.get("members") else ASK).format(pole="positive" if it["pole"]=="+" else "negative",explanation=it["explanation"],
-                     blind=BLIND,blind_len=BLIND_LEN[length],near=NEAR,distant=DISTANT) for it in asked]
+    nb=ESSAY_BLIND if protocol=="essay" else BLIND  # essay: the appendix's five new examples, scored by their share
+    asks=[(ASK_ESSAY if protocol=="essay" else ASK_GROUP if it.get("members") else ASK).format(pole="positive" if it["pole"]=="+" else "negative",
+                     explanation=it["explanation"],blind=nb,blind_len=BLIND_LEN[length],near=NEAR,distant=DISTANT) for it in asked]
     sampling={"temperature":temperature,"seed":seed} if temperature else {}
     replies=iter(zip(asks,_responses(rd,asks,1500,**sampling) if asks else []))
     rows=[]
@@ -379,7 +392,8 @@ def plan(rd, items: list[dict], length: str = "short", temperature: float = 0.0,
                     "proposal_request":ask,"blind_length":length,"plan_sampling":sampling or None,
                     "diagnostic_scope":"T1 activation prediction; not causal mechanism certification",
                     "causal_mechanism_verified":False,"passes_t1":False})
-        try:row["test_texts"]=_proposal(prop);row["valid"]=True
+        row["protocol"]=protocol
+        try:row["test_texts"]=_proposal(prop,nb);row["valid"]=True
         except ValueError as e:row.update({"valid":False,"reason":str(e)})
         rows.append(row)
     return rows
@@ -426,7 +440,12 @@ def measure(tg: Target, rows: list[dict], seed: int = 0) -> list[dict]:
                     "distant_concept":prop["distant_concept"],"distant_rate":dist,"distant_values":got["distant_texts"],
                     "steering_prediction":prop["steering_prediction"],"steered":on,"unsteered":off,
                     "steer_request":JUDGE.format(prediction=prop["steering_prediction"],a=off if flip else on,b=on if flip else off),
-                    "steer_expected":"B" if flip else "A","fire":fire,"passes_t1":blind>=fire and near<fire})
+                    "steer_expected":"B" if flip else "A","fire":fire,"passes_t1":blind>=fire and near<fire,
+                    # the essay's per-example scores: the share of new examples reaching the level, and the explanation
+                    # wins when more new examples than near misses reach it (ties and losses as the appendix counts them)
+                    "strong_share":sum(x>=fire for x in got["max_texts"])/len(got["max_texts"]),
+                    "essay_outcome":(lambda w,n_: "won" if w>n_ else "tied" if w==n_ else "lost")(
+                        sum(x>=fire for x in got["max_texts"]),sum(x>=fire for x in got["near_misses"]))})
     return out
 
 

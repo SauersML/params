@@ -51,7 +51,9 @@ def collect(a) -> None:
         dev = torch.device(a.device or ("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"))
         m = AutoModelForCausalLM.from_pretrained(a.model, dtype=torch.bfloat16).to(dev).eval()
     L, W = len(m.model.layers), m.config.intermediate_size
-    neurons = sample(L, W)
+    named = [json.loads(x) for x in a.neurons.read_text().splitlines() if x.strip()] if getattr(a, "neurons", None) else None
+    neurons = sorted({(int(r["layer"]), int(r["index"])) for r in named}) if named else sample(L, W)
+    TOP = getattr(a, "top", None) or 20  # examples kept per pole
     by_layer: dict = {}
     for k, (l, i) in enumerate(neurons):
         by_layer.setdefault(l, []).append((k, i))
@@ -283,6 +285,8 @@ def main():
     c.add_argument("--device", help="cuda, mps, cpu, or auto (layers over every visible GPU)")
     c.add_argument("--corpus", type=Path, help="an atlas corpus root (atlas.py corpus ROOT): its documents in order, not the streamed Pile")
     c.add_argument("--model", default=MODEL, help="Qwen/Qwen3-1.7B, Qwen/Qwen3-8B, Qwen/Qwen3-32B: the same audit at each size")
+    c.add_argument("--neurons", type=Path, help="JSONL {layer, index}: these neurons instead of T1's random sample")
+    c.add_argument("--top", type=int, default=TOP, help="examples kept per pole")
     e = sub.add_parser("explain")
     e.add_argument("--atlas", type=Path, required=True)
     e.add_argument("--out", type=Path, required=True)

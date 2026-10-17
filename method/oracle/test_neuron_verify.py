@@ -165,3 +165,10 @@ def test_bad_group_items_fail_before_reader(bad):
  it={**dict(members=[[0,1,1,2.]],pole='+',corpus_max=1.,explanation='x'),**bad};rd=Reader()
  with pytest.raises(ValueError):nv.verify(Target(),rd,[it])
  assert rd.calls==[]
+def test_essay_protocol_five_examples_scored_by_share_and_outcome():
+ p5={**plan(),'max_texts':['maximum '+str(i) for i in range(4)]+['weak one']}
+ rd=Reader(p5);rows=nv.plan(rd,[item()],protocol='essay')
+ assert rows[0]['valid'] and 'five' not in rows[0]['proposal_request'] and '5 new examples' in rows[0]['proposal_request']
+ r=nv.measure(Target(),rows)[0]
+ assert r['strong_share']==0.8 and r['essay_outcome']=='won' and r['protocol']=='essay'
+ assert not nv.plan(Reader(),[item()],protocol='essay')[0]['valid']  # three texts where five were asked: invalid

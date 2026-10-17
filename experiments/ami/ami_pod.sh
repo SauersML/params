@@ -6,7 +6,7 @@
 #   env: FRAME (1: R3-frame, the chat frame's means computed first from ~/mpd-data/ami/frame_sample_2k.npz and every search and
 #        score run with --mode frame), QSEARCH (a stride: first the R3 reference circuits of every QSEARCH-th dev question, ami.py SEARCH: qsearch, the
 #        question's pair, or tsearch, its wording with 8 keys; scored as the set SEARCH at QSEARCH_RUNGS, default "r3"; QCONSTS:
-#        "--const TSEARCH_KEYS=16 ..." for the search and its scoring), RUNGS ("r3"), MODEL (Qwen/Qwen3-8B), MEANS (a means file; default: computed on the pod from SAMPLE), SAMPLE
+#        "--const TSEARCH_KEYS=16 ..." for the search and its scoring; QARGS: more flags of the search, e.g. "--mode task"), RUNGS ("r3"), MODEL (Qwen/Qwen3-8B), MEANS (a means file; default: computed on the pod from SAMPLE), SAMPLE
 #        (~/mpd-data/ami/means_sample_1m.npz), DEVSET, POOL, ARGS (more ami.py r3 flags), HOURS, GPU, PRICE, RP_OWNER
 # The whole script is one block, so bash has read all of it before it runs.
 {
@@ -32,7 +32,7 @@ fi
 LABELS=""
 if [ -n "$QSEARCH" ]; then                  # (the R3 reference circuits: ami.py qsearch or tsearch, SEARCH, on the dev set, then
   Q=${SEARCH:-qsearch}                      # scored as a set of that name)
-  WORK="$WORK python -B method/oracle/ami.py $QCONSTS $Q $O/${Q}_records --means $M --model $MODEL --devset $DEVSET --stride $QSEARCH $FA > $O/$Q.log 2>&1; echo \"$Q exit \$?\" >> $O/steps.log;"
+  WORK="$WORK python -B method/oracle/ami.py $QCONSTS $Q $O/${Q}_records --means $M --model $MODEL --devset $DEVSET --stride $QSEARCH $FA $QARGS > $O/$Q.log 2>&1; echo \"$Q exit \$?\" >> $O/steps.log;"
   for r in ${QSEARCH_RUNGS:-r3}; do
     WORK="$WORK python -B method/oracle/ami.py $QCONSTS $r $O/${Q}_records $O/${Q}_$r --means $M --label $Q --model $MODEL --devset $DEVSET --pool $POOL $FA $ARGS > $O/${Q}_$r.log 2>&1; echo \"$Q $r exit \$?\" >> $O/steps.log;"
     LABELS="$LABELS $O/${Q}_$r"

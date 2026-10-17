@@ -1,67 +1,136 @@
-%% TEAM COORDINATION MAP — edit this source; workflow owns the image.
-%% Native neurons only. Original weights and model remain the reference.
-%% Solid arrows are scientific prerequisites. Column order is layout only.
-%% Parallel tracks share evidence; none is a gate for every oracle experiment.
-%% Keep owners, WHY, next action, and measured limitations current.
-flowchart LR
-  subgraph MAIN["GOAL AND DEPENDENCIES"]
-    direction TB
-    G["<b>Explain how the model works</b><br/>Native neurons and attention routes.<br/>English answers with testable causal claims.<br/>Legibility ≠ sparsity ≠ faithfulness."]
-    Q["<b>1 · Freeze a useful question</b><br/>Main target: Qwen3-8B; showcase: 32B.<br/>Declare full context and answer contrast.<br/>Separate discovery from new questions.<br/>WHY · test mechanisms, not label appeal."]
-    I["<b>2 · Measure native mechanisms</b><br/>Signed poles, SwiGLU regimes and weights.<br/>Non-LLM tools find neurons and routes.<br/>Gradients order candidates; edits test them.<br/>OWNER · shared native / finder team"]
-    V["<b>3 · Challenge the explanation</b><br/>Ablation, restoration, swaps and steering.<br/>Test routes when the explanation claims them.<br/>Report failures, side effects and cost.<br/>WHY · a plausible story can still be wrong."]
-    O["<b>4 · Oracle reads measured evidence</b><br/>Answer questions and name native mechanisms.<br/>Compare true, absent and mismatched inputs.<br/>Beat simple numerical and tool baselines.<br/>OWNER · root / native_qa_bridge / oracle team"]
-    T["<b>5 · Train and test transfer</b><br/>New contexts, questions and interventions.<br/>T4 target: beat AO + tools at equal passes;<br/>≥ 80% named claims survive causal tests.<br/>OWNER · oracle / AO teams; Path G parallel"]
-    Z["<b>Success requires useful explanations</b><br/>Correct new causal predictions and edits,<br/>with understandable English and lower cost.<br/>Still unproven; compact graphs alone do not suffice."]
-    G --> Q --> I --> V --> O --> T --> Z
-    I -. provisional facts .-> O
-  end
-  subgraph PARALLEL["PARALLEL WORK · NO UNIVERSAL GATES"]
-    direction TB
-    C["<b>Fast circuit finder → mechanism evidence</b><br/>Same-model clean / corrupt patching pairs.<br/>≥ 70% necessity and sufficiency on contrast.<br/>Size curve, swaps and 5-paraphrase stability.<br/>Goal ≈ 10 s per 8B question; size never capped.<br/>OWNERS · inframove / pymove / rustmove / generality"]
-    A["<b>Verified atlas → labels for the oracle</b><br/>Both poles, long contexts and sign regimes.<br/>Scripted strong writer; fresh falsification tests.<br/>T1: blind max ≥ 30%; near misses &lt; 30%.<br/>Require ≥ 50% of random neurons to pass.<br/>OWNER · atlas / explanation team"]
-    N["<b>Neuron PheWAS → behaviour profiles</b><br/>86 traits; 200–400 prompts per trait.<br/>Associations measured; randomized knockouts run.<br/>Distinguish correlated activity from causal effects.<br/>OWNER · monitorbench"]
-    S["<b>32B showcase → pipeline validation</b><br/>Test Santa negative poles and diagnosis hub.<br/>Then construct our own measured circuits.<br/>MATS first; two L40s in BF16.<br/>OWNER · native / finder team"]
-    K["<b>Owl edit → targeted change with side effects</b><br/>T3 target: mention rate 0.95 → ≤ 0.25;<br/>unrelated KL ≤ 0.05 bits; persona facts intact.<br/>Report measured circuit size and its size curve.<br/>OWNER · existing owl / organism team"]
-    W["<b>Weak-zeroing → optional background test</b><br/>T2 target: mean KL from original ≤ 0.1 bits.<br/>Report strong neurons/token; protect sinks.<br/>Original model remains the reference.<br/>OWNER · shared native / root"]
-    C ~~~ A ~~~ N ~~~ S ~~~ K ~~~ W
-  end
-  subgraph EVIDENCE["EVIDENCE AND NEXT DECISIONS"]
-    direction TB
-    R["<b>8B repair transfers; oracle benefit unproven</b><br/>16 neurons corrected 7/7 wrong pairwise answers;<br/>24/24 truthful pairwise answers unchanged.<br/>Reader MAE: evidence 2.462; zero 2.378 bits.<br/>Conditional digit suffixes, not free generation.<br/>Magnitude controls did not match."]
-    B["<b>NOW · current native observations collected</b><br/>32 new questions; 512 neuron observations.<br/>64 forwards in 252 s on free cluster CPUs.<br/>Original weights unchanged; hooks cleared.<br/>WHY · old joint facts overgeneralized."]
-    D["<b>One neuron switches the hidden marker</b><br/>8B · Mac FP16 · one discovery pair.<br/>Reciprocal swaps remove/add the full marker.<br/>Random same-position control changes neither.<br/>Original prompts; no supplied answer prefix.<br/>Search 109 s; full-generation check 6.3 s.<br/>NEXT · new prompts and unrelated side effects.<br/>WHY · test transfer before oracle claims."]
-    P["<b>1.7B pilot · no demonstrated input benefit</b><br/>64 edits across 49 contexts, fixed context vectors.<br/>Correct / zero / mismatch: 0.530 / 0.507 / 0.581 nats.<br/>Both primary gain intervals include zero.<br/>WHY · use stronger questions and controls."]
-    E["<b>Compact inputs · synthetic prototype only</b><br/>3 neurons × 4,096 positions: 16.5k vs 134k tokens.<br/>17 tests check signs, magnitude and positions.<br/>Oracle utility and production costs untested.<br/>OWNER · native_qa_bridge"]
-    L["<b>Measure the whole effort</b><br/>Include discovery, model passes and interpretation.<br/>Check batch parity, failures and memory.<br/>CPU timing is not GPU circuit speed.<br/>OWNER · gpu_launch_review / native_qa_bridge"]
-    R ~~~ B ~~~ D ~~~ P ~~~ E ~~~ L
-  end
-  MAIN ~~~ PARALLEL ~~~ EVIDENCE
-  classDef goal fill:#173557,stroke:#173557,color:#ffffff,stroke-width:2px;
-  classDef build fill:#edf6ff,stroke:#4e85b8,color:#173557;
-  classDef explain fill:#f0ecfb,stroke:#8a73b5,color:#372951;
-  classDef measure fill:#eef8f3,stroke:#5a9477,color:#214c39;
-  classDef evidence fill:#fff8e8,stroke:#b99754,color:#59451e;
-  class G,Z goal;
-  class I,C,S,K,N build;
-  class V,O,T explain;
-  class Q,A,W,L measure;
-  class R,B,D,P,E evidence;
+%% TEAM COORDINATION MAP: edit this source; the plan-render workflow draws plan/plan.png for the README.
+%% Every agent reads it before starting or reprioritizing, marks what it unblocks or blocks, and keeps it current.
+%% Rules: one unit per box (no arrows or "then" chains inside a label); owners on an OWNER line; checks on a CHECK line;
+%% at most about 4 boxes per rank; solid arrows are prerequisites, dashed arrows share evidence; the critical path is
+%% red, links into the claim purple. Old maps live only in the HISTORY comments at the end (the renderer skips comments).
+%% Source of the active map: ~/mpd-data/team/focus_1016_toc.txt (the lead, 10-16 19:15).
+flowchart BT
+  LEG["<b>Updated 2026-10-16 · focus 10-16</b><br/>Budget: RunPod line $730 · Tinker line $250.<br/>No number is a result before its scorecard:<br/>matched controls, n and an interval."]
 
-%% TEAM COORDINATION MAP — edit this source; workflow owns the image.
-%% Solid arrows are prerequisites; dashed arrows share evidence, not gates.
-%% Current hypothesis: native units may support useful explanations; universal cleanliness is not assumed.
-%% 2026-10-16 root: native8b controlled experiment COMPLETE, source0e881960; 2x64 training steps,1536 predictions committed before scoring, commitSHA06594a068f03a3a466aef6314d07cbc7cc69b7de59d08d11a3c9542b621ea4bf. Independent audit verifies raw/completion hashes and coverage. Correct-trained accuracy true225/256,absent242/256,mismatch221/256; primary true-minus-absent -6.640625pp, contextcluster95CI[-12.109375,-2.34375]pp. All6arms exact changed0/11 across7contexts; alwaysUnchanged245/256. Correct-v-mismatch+1.5625pp CI[-1.953125,5.078125]pp. No demonstrated native-input utility or mechanistic explanation. Mean prefill true744.18,mismatch704.46,absent133.74: length confounded, not matched cost. Next diagnose TRAIN fit before more training, freeze fresh contextual intervention challenges; oldEVAL now exposed and never reuse as pristine evidence. Scientific child0 in2463.429s; launcher later idle143, bothpods deleted, inclusiveUSD0.5497 already canonicalledger;4USDreservation settled. CI38821889659 and38821889764 PASS. Compactcodec scratch17tests, syntheticK3,T48/512/4096 fullprompt341/2199/16537 vsnumeric1678/16417/133967; physicalwrites preserve signs/scale, not rawactivation identifiability or oracle usefulness. Owners root/completed_native_audit/compact_codec_review/native_cost_closeout.
-%% 2026-10-15 root: measurement reliability fixes independently cross-reviewed and pushed: 6320c956 scorecard every_family requires explicit True (10 tests); 8420ed0d native gradient ranking preserves downstream nonlinear paths (7 tests, old code fails new full-gradient regression, early-unit finite difference verified). Correct gradients retain more autograd memory; no 8B performance claim. CAO selected-target one-forward native vector fix in review; guard unsupported nonlinear adapters and dropout. 20601 source39363d119db2 is PENDING Reason=JobHeldUser, not resource queue; prior20593 shell COMPLETED masked Python CUDA OOM/no graph. No job release/cancel/duplicate. No paid or production model calls this turn. Native observations may feed provisional oracle answers in parallel with stronger causal tests; passing measurements still required for verified causal labels.
-%% 2026-10-15 root: prospective GHA38803244533 failed Torch installation before any model calls; setup-only retry38804187337 completed identical frozen payload. 36F0B,12public clean/controlF before24hiddenF, unchanged weights/direct/noop parity,122.10s physics/3.65GiB. Qwen397 nine fixed2048-token first responses committed SHA061dacba3f342f7b76ae9598aca008ef05071f7b63190dad7d39fd55c7d92a0e BEFORE labels opened; raw independent NumPy error<=8.9e-16. All24 tops unchanged;18null/6positive at frozen0.1bit band. True/absent/permuted valid4/24,24/24,8/24; primary full-answer logodds MAE50.151966/1.033277/40.505732bits (60bit invalid penalty). Unchanged baseline0.087839; old-only activation-normalized baseline0.114895. Five evidence-rich calls truncated2048; no parser-rejected completed answers. Operational negative, not semantic cleanliness verdict; mostly weak edits and only3familiar contexts. Actual reader costUSD0.12730638, settled. Native adapterf7eb2d4 published; optional answers-first fix for fresh tests only, no resampling exposed24. Fullreadout /private/tmp/claude-501/-Users-user/codex-oracle/root/native_oracle_scale/readout.txt.
-%% 2026-10-15 root: native inspector1e5ad3b, route scope8bdbd78, verifier1718d7a published. Combined exactsource1718d7a tests49PASS3.18s. No productionQwen/reader/APIcalls in this change. Existing atlas/hub/edge/organism pipelines remain shared; no duplicated collector. Legacy native9003 resume held/unlaunched after directionpivot. Plan65cd595 rendered successfully GHA38785665281.
-%% 2026-10-15 root: current pilot reuses completed exposed Eiffel graph (SHA256 3efec341b25694dc60ad9ff8ee90863e9701699c2dc10611ff52ebaf5dbc5720), not owl training data (oracle-heldout boundary). Fixed native pair L22.n5488 -> L27.n1417 at position10; Japan factual-context transfer is predeclared diagnostic, not pristine holdout. Free GHA pilot not yet launched. BF16 selected prospectively to fit memory; no numerical-parity claim against FP32 discovery.
-%% 2026-10-15 root: legacy prefix GHA38784659441 completed; independent raw-array audit confirms 2828 interventions bit-exact on TRAIN6009/6012/6035, 464.90 -> 277.91 seconds (1.67x, 40.2% less time). Published four-layer GELU/CPU/k4/single-target only; opt-in remains OFF; no modern-Qwen causal evidence and no legacy resume.
-%% 2026-10-15 root: 190b286 atlas collection skips unused vocabulary head and KV caches, preserving native MLP hooks; syntax validated, existing body-hook tests cover approach.
-%% 2026-10-15 root: free GHA38788372214 dispatched once after independent review. Frozen BF16 pilot sourcebf9e7b6, archive6a320841b22023b88d8ad18bd5c23fc3824b8deaae5c49b29c5ca4e717e18a78; 20F0B, single/joint zeros, conditional reader/control restoration, no-op and direct-reference checks. 11 tiny tests passed; no scientific outcome at dispatch.
-%% 2026-10-15 root: GHA38788372214 COMPLETE and independently audited. 20F0B, BF16 fixed units, exact no-op, runtime direct-reference parity, bit-exact gate/up reconstruction, unchanged weight digest. Eiffel contrasts clean6.067432/sourcezero4.213718/readerzero8.044965/joint5.552608/sourcezero-readerrestore3.770962 bits; Japan12.190495/7.745356/12.490599/7.745491/7.566117. Conditional restoration worsens distance-to-clean by23.88%/4.03%; matched-control restoration near zero. All top tokens unchanged. Control matched across-context mean absolute activation, NOT point amplitude; null control is limited. No direct-edge, semantic, FP32-parity or oracle-transfer certificate. 18.12s model process, 3.664GiB peak; GHA job96s including download/install. No paid spend. Raw-array audit metric maxerror8.9e-16.
-%% 2026-10-15 root: 93ad5bd retains every sampled pole and raw writer output through T1 explanation/verification; rejects count mismatches; invalid rows fail with complete denominator and no reader call for all-invalid input. 40-token judge preserved; terminal standalone choice prevents article a becoming vote. 58 tests pass; new tests registered in CI. Do not assume double-negative SwiGLU is small or causally irrelevant.
-%% 2026-10-15 root: next prospective oracle test fixed FACTS[2:5], same L22.n5488/L27.n1417 at final positions, source-reader factors{0.5,1,2} grid. 24 edited targets, 36F measurement cap. New edited labels remain hidden until 9 strong-reader predictions (3 contexts x 3 evidence arms) are frozen. Primary log-odds probability error versus unchanged and simple linear baselines; 0.1-bit effect band. No target selection on edited outcomes; no claim of trained oracle from evidence-conditioning pilot. Budget checked conservatively~44.97USD headroom, no paid allocation yet.
+  CLAIM["<b>THE CLAIM</b><br/>An auditing agent with neuron-circuit tools<br/>finds hidden behaviours that the activation oracle<br/>and prompting miss, on AuditBench (84 public<br/>Qwen3-14B LoRAs), and removes them with<br/>small checked edits."]
+  OUT["<b>6 · Outward</b><br/>A short write-up and figures for audit and<br/>interpretability teams, Goodfire, Transluce, MATS.<br/>Ready: 32B essay 20/22, MIB cells, finder speed.<br/>The user decides whom to send it to."]
+  CLAIM --> OUT
+
+  subgraph CIRCUITS["1 · CIRCUITS FAST AND RIGHT ON QWEN3-14B AND 8B"]
+    direction BT
+    MASK["<b>Mask finder as the default</b><br/>Replaces group testing once the devset A/B confirms.<br/>OWNER · searchalgo, inframove"]
+    SRC["<b>Multi-partner source cuts</b><br/>Expected shares over ≥ 4 corrupted keys.<br/>OWNER · stability, inframove"]
+    REC["<b>Direct writes and readers in every record</b><br/>Each unit's write on the answer, its readers.<br/>OWNER · inframove, rustmove"]
+    SPD["<b>Batched speed on 14B</b><br/>Seconds per question, one card.<br/>OWNER · pymove"]
+    CIR["<b>Circuits on the audit model</b><br/>CHECK · devset scorecard, robustness<br/>(monitorbench), seconds per question on 14B."]
+    MASK --> CIR
+    SRC --> CIR
+    REC --> CIR
+    SPD --> CIR
+  end
+
+  subgraph AGENTS["2-3 · TOOLS AND THE AGENT"]
+    direction BT
+    LAB["<b>Tested unit and group labels</b><br/>Label lookup; Qwen3-14B atlas (dev quirks).<br/>OWNER · varteach"]
+    ORG["<b>Organisms and AuditBench items</b><br/>E1 (7 organisms) and 56 audited 14B targets;<br/>sealed quirks never tuned on.<br/>OWNER · fleet, oracleeval"]
+    TOOLS["<b>2 · Tools the agent calls</b><br/>find_circuit, intervene, labels,<br/>trigger search, edit and score.<br/>CHECK · each timed and correct on E1.<br/>OWNER · oracleagent"]
+    AGENT["<b>3 · Untrained strong agent with tools</b><br/>Arms: black-box, non-circuit white-box,<br/>circuit tools; 'circuit tools help' = C > B.<br/>E1 first, then AuditBench, equal budget.<br/>OWNER · oracleagent; scoring · oracleeval"]
+    REPRO["<b>Reproduce a published AuditBench number</b><br/>So decision-makers trust our harness.<br/>OWNER · oracleeval"]
+    LAB --> TOOLS
+    TOOLS --> AGENT
+    ORG --> AGENT
+    REPRO --> AGENT
+  end
+
+  subgraph AFTER["4-5 · DISTIL AND EDIT"]
+    direction BT
+    TRAIN["<b>4 · Distil verified trajectories</b><br/>Training organisms' envs, SFT a small oracle,<br/>then RL with the reward server.<br/>CHECK · small trained vs big untrained, same card.<br/>OWNER · oracledata, textoracle, primerl"]
+    EDIT["<b>5 · Edits that remove the behaviour</b><br/>Unseen prompts; side effects ≤ 0.05 bits.<br/>Bar: T3 greedy edit 2/4; random units 0/4.<br/>OWNER · oracleagent; scoring · oracleeval (O3)"]
+  end
+
+  MIB["<b>Circuits credible on MIB</b><br/>Finish the three Llama cells and the<br/>small-budget edge fix; then edges with rustmove.<br/>OWNER · mib"]
+  CAP["<b>Capped or stopped</b><br/>PheWAS paused. Static circuit reading (O1):<br/>paired-context test and text reader v3 only.<br/>Injection reader stopped. 32B: finish the dev run,<br/>then scale32 moves to 14B AuditBench circuits."]
+
+  CIR --> TOOLS
+  AGENT --> TRAIN
+  AGENT --> EDIT
+  AGENT --> CLAIM
+  TRAIN --> CLAIM
+  EDIT --> CLAIM
+  MIB -.-> OUT
+  CAP ~~~ LEG
+
+  classDef claim fill:#173557,stroke:#173557,color:#ffffff,stroke-width:2px;
+  classDef work fill:#edf6ff,stroke:#4e85b8,color:#173557;
+  classDef check fill:#eef8f3,stroke:#5a9477,color:#214c39;
+  classDef note fill:#fff8e8,stroke:#b99754,color:#59451e;
+  class CLAIM,OUT claim;
+  class MASK,SRC,REC,SPD,LAB,ORG,TOOLS,AGENT,TRAIN,EDIT,MIB work;
+  class CIR,REPRO check;
+  class LEG,CAP note;
+  linkStyle 0,1,6,9,12 stroke:#c0392b,stroke-width:3px;
+  linkStyle 13,14 stroke:#7d3c98,stroke-width:3px;
+
+%% HISTORY — previous active map at c0c9da5c (the native session's map, 10-15/16); older history below.
+%% HISTORY | %% TEAM COORDINATION MAP — edit this source; workflow owns the image.
+%% HISTORY | %% Native neurons only. Original weights and model remain the reference.
+%% HISTORY | %% Solid arrows are scientific prerequisites. Column order is layout only.
+%% HISTORY | %% Parallel tracks share evidence; none is a gate for every oracle experiment.
+%% HISTORY | %% Keep owners, WHY, next action, and measured limitations current.
+%% HISTORY | flowchart LR
+%% HISTORY |   subgraph MAIN["GOAL AND DEPENDENCIES"]
+%% HISTORY |     direction TB
+%% HISTORY |     G["<b>Explain how the model works</b><br/>Native neurons and attention routes.<br/>English answers with testable causal claims.<br/>Legibility ≠ sparsity ≠ faithfulness."]
+%% HISTORY |     Q["<b>1 · Freeze a useful question</b><br/>Main target: Qwen3-8B; showcase: 32B.<br/>Declare full context and answer contrast.<br/>Separate discovery from new questions.<br/>WHY · test mechanisms, not label appeal."]
+%% HISTORY |     I["<b>2 · Measure native mechanisms</b><br/>Signed poles, SwiGLU regimes and weights.<br/>Non-LLM tools find neurons and routes.<br/>Gradients order candidates; edits test them.<br/>OWNER · shared native / finder team"]
+%% HISTORY |     V["<b>3 · Challenge the explanation</b><br/>Ablation, restoration, swaps and steering.<br/>Test routes when the explanation claims them.<br/>Report failures, side effects and cost.<br/>WHY · a plausible story can still be wrong."]
+%% HISTORY |     O["<b>4 · Oracle reads measured evidence</b><br/>Answer questions and name native mechanisms.<br/>Compare true, absent and mismatched inputs.<br/>Beat simple numerical and tool baselines.<br/>OWNER · root / native_qa_bridge / oracle team"]
+%% HISTORY |     T["<b>5 · Train and test transfer</b><br/>New contexts, questions and interventions.<br/>T4 target: beat AO + tools at equal passes;<br/>≥ 80% named claims survive causal tests.<br/>OWNER · oracle / AO teams; Path G parallel"]
+%% HISTORY |     Z["<b>Success requires useful explanations</b><br/>Correct new causal predictions and edits,<br/>with understandable English and lower cost.<br/>Still unproven; compact graphs alone do not suffice."]
+%% HISTORY |     G --> Q --> I --> V --> O --> T --> Z
+%% HISTORY |     I -. provisional facts .-> O
+%% HISTORY |   end
+%% HISTORY |   subgraph PARALLEL["PARALLEL WORK · NO UNIVERSAL GATES"]
+%% HISTORY |     direction TB
+%% HISTORY |     C["<b>Fast circuit finder → mechanism evidence</b><br/>Same-model clean / corrupt patching pairs.<br/>≥ 70% necessity and sufficiency on contrast.<br/>Size curve, swaps and 5-paraphrase stability.<br/>Goal ≈ 10 s per 8B question; size never capped.<br/>OWNERS · inframove / pymove / rustmove / generality"]
+%% HISTORY |     A["<b>Verified atlas → labels for the oracle</b><br/>Both poles, long contexts and sign regimes.<br/>Scripted strong writer; fresh falsification tests.<br/>T1: blind max ≥ 30%; near misses &lt; 30%.<br/>Require ≥ 50% of random neurons to pass.<br/>OWNER · atlas / explanation team"]
+%% HISTORY |     N["<b>Neuron PheWAS → behaviour profiles</b><br/>86 traits; 200–400 prompts per trait.<br/>Associations measured; randomized knockouts run.<br/>Distinguish correlated activity from causal effects.<br/>OWNER · monitorbench"]
+%% HISTORY |     S["<b>32B showcase → pipeline validation</b><br/>Test Santa negative poles and diagnosis hub.<br/>Then construct our own measured circuits.<br/>MATS first; two L40s in BF16.<br/>OWNER · native / finder team"]
+%% HISTORY |     K["<b>Owl edit → targeted change with side effects</b><br/>T3 target: mention rate 0.95 → ≤ 0.25;<br/>unrelated KL ≤ 0.05 bits; persona facts intact.<br/>Report measured circuit size and its size curve.<br/>OWNER · existing owl / organism team"]
+%% HISTORY |     W["<b>Weak-zeroing → optional background test</b><br/>T2 target: mean KL from original ≤ 0.1 bits.<br/>Report strong neurons/token; protect sinks.<br/>Original model remains the reference.<br/>OWNER · shared native / root"]
+%% HISTORY |     C ~~~ A ~~~ N ~~~ S ~~~ K ~~~ W
+%% HISTORY |   end
+%% HISTORY |   subgraph EVIDENCE["EVIDENCE AND NEXT DECISIONS"]
+%% HISTORY |     direction TB
+%% HISTORY |     R["<b>8B repair transfers; oracle benefit unproven</b><br/>16 neurons corrected 7/7 wrong pairwise answers;<br/>24/24 truthful pairwise answers unchanged.<br/>Reader MAE: evidence 2.462; zero 2.378 bits.<br/>Conditional digit suffixes, not free generation.<br/>Magnitude controls did not match."]
+%% HISTORY |     B["<b>NOW · current native observations collected</b><br/>32 new questions; 512 neuron observations.<br/>64 forwards in 252 s on free cluster CPUs.<br/>Original weights unchanged; hooks cleared.<br/>WHY · old joint facts overgeneralized."]
+%% HISTORY |     D["<b>One neuron switches the hidden marker</b><br/>8B · Mac FP16 · one discovery pair.<br/>Reciprocal swaps remove/add the full marker.<br/>Random same-position control changes neither.<br/>Original prompts; no supplied answer prefix.<br/>Search 109 s; full-generation check 6.3 s.<br/>NEXT · new prompts and unrelated side effects.<br/>WHY · test transfer before oracle claims."]
+%% HISTORY |     P["<b>1.7B pilot · no demonstrated input benefit</b><br/>64 edits across 49 contexts, fixed context vectors.<br/>Correct / zero / mismatch: 0.530 / 0.507 / 0.581 nats.<br/>Both primary gain intervals include zero.<br/>WHY · use stronger questions and controls."]
+%% HISTORY |     E["<b>Compact inputs · synthetic prototype only</b><br/>3 neurons × 4,096 positions: 16.5k vs 134k tokens.<br/>17 tests check signs, magnitude and positions.<br/>Oracle utility and production costs untested.<br/>OWNER · native_qa_bridge"]
+%% HISTORY |     L["<b>Measure the whole effort</b><br/>Include discovery, model passes and interpretation.<br/>Check batch parity, failures and memory.<br/>CPU timing is not GPU circuit speed.<br/>OWNER · gpu_launch_review / native_qa_bridge"]
+%% HISTORY |     R ~~~ B ~~~ D ~~~ P ~~~ E ~~~ L
+%% HISTORY |   end
+%% HISTORY |   MAIN ~~~ PARALLEL ~~~ EVIDENCE
+%% HISTORY |   classDef goal fill:#173557,stroke:#173557,color:#ffffff,stroke-width:2px;
+%% HISTORY |   classDef build fill:#edf6ff,stroke:#4e85b8,color:#173557;
+%% HISTORY |   classDef explain fill:#f0ecfb,stroke:#8a73b5,color:#372951;
+%% HISTORY |   classDef measure fill:#eef8f3,stroke:#5a9477,color:#214c39;
+%% HISTORY |   classDef evidence fill:#fff8e8,stroke:#b99754,color:#59451e;
+%% HISTORY |   class G,Z goal;
+%% HISTORY |   class I,C,S,K,N build;
+%% HISTORY |   class V,O,T explain;
+%% HISTORY |   class Q,A,W,L measure;
+%% HISTORY |   class R,B,D,P,E evidence;
+%% HISTORY | 
+%% HISTORY | %% TEAM COORDINATION MAP — edit this source; workflow owns the image.
+%% HISTORY | %% Solid arrows are prerequisites; dashed arrows share evidence, not gates.
+%% HISTORY | %% Current hypothesis: native units may support useful explanations; universal cleanliness is not assumed.
+%% HISTORY | %% 2026-10-16 root: native8b controlled experiment COMPLETE, source0e881960; 2x64 training steps,1536 predictions committed before scoring, commitSHA06594a068f03a3a466aef6314d07cbc7cc69b7de59d08d11a3c9542b621ea4bf. Independent audit verifies raw/completion hashes and coverage. Correct-trained accuracy true225/256,absent242/256,mismatch221/256; primary true-minus-absent -6.640625pp, contextcluster95CI[-12.109375,-2.34375]pp. All6arms exact changed0/11 across7contexts; alwaysUnchanged245/256. Correct-v-mismatch+1.5625pp CI[-1.953125,5.078125]pp. No demonstrated native-input utility or mechanistic explanation. Mean prefill true744.18,mismatch704.46,absent133.74: length confounded, not matched cost. Next diagnose TRAIN fit before more training, freeze fresh contextual intervention challenges; oldEVAL now exposed and never reuse as pristine evidence. Scientific child0 in2463.429s; launcher later idle143, bothpods deleted, inclusiveUSD0.5497 already canonicalledger;4USDreservation settled. CI38821889659 and38821889764 PASS. Compactcodec scratch17tests, syntheticK3,T48/512/4096 fullprompt341/2199/16537 vsnumeric1678/16417/133967; physicalwrites preserve signs/scale, not rawactivation identifiability or oracle usefulness. Owners root/completed_native_audit/compact_codec_review/native_cost_closeout.
+%% HISTORY | %% 2026-10-15 root: measurement reliability fixes independently cross-reviewed and pushed: 6320c956 scorecard every_family requires explicit True (10 tests); 8420ed0d native gradient ranking preserves downstream nonlinear paths (7 tests, old code fails new full-gradient regression, early-unit finite difference verified). Correct gradients retain more autograd memory; no 8B performance claim. CAO selected-target one-forward native vector fix in review; guard unsupported nonlinear adapters and dropout. 20601 source39363d119db2 is PENDING Reason=JobHeldUser, not resource queue; prior20593 shell COMPLETED masked Python CUDA OOM/no graph. No job release/cancel/duplicate. No paid or production model calls this turn. Native observations may feed provisional oracle answers in parallel with stronger causal tests; passing measurements still required for verified causal labels.
+%% HISTORY | %% 2026-10-15 root: prospective GHA38803244533 failed Torch installation before any model calls; setup-only retry38804187337 completed identical frozen payload. 36F0B,12public clean/controlF before24hiddenF, unchanged weights/direct/noop parity,122.10s physics/3.65GiB. Qwen397 nine fixed2048-token first responses committed SHA061dacba3f342f7b76ae9598aca008ef05071f7b63190dad7d39fd55c7d92a0e BEFORE labels opened; raw independent NumPy error<=8.9e-16. All24 tops unchanged;18null/6positive at frozen0.1bit band. True/absent/permuted valid4/24,24/24,8/24; primary full-answer logodds MAE50.151966/1.033277/40.505732bits (60bit invalid penalty). Unchanged baseline0.087839; old-only activation-normalized baseline0.114895. Five evidence-rich calls truncated2048; no parser-rejected completed answers. Operational negative, not semantic cleanliness verdict; mostly weak edits and only3familiar contexts. Actual reader costUSD0.12730638, settled. Native adapterf7eb2d4 published; optional answers-first fix for fresh tests only, no resampling exposed24. Fullreadout /private/tmp/claude-501/-Users-user/codex-oracle/root/native_oracle_scale/readout.txt.
+%% HISTORY | %% 2026-10-15 root: native inspector1e5ad3b, route scope8bdbd78, verifier1718d7a published. Combined exactsource1718d7a tests49PASS3.18s. No productionQwen/reader/APIcalls in this change. Existing atlas/hub/edge/organism pipelines remain shared; no duplicated collector. Legacy native9003 resume held/unlaunched after directionpivot. Plan65cd595 rendered successfully GHA38785665281.
+%% HISTORY | %% 2026-10-15 root: current pilot reuses completed exposed Eiffel graph (SHA256 3efec341b25694dc60ad9ff8ee90863e9701699c2dc10611ff52ebaf5dbc5720), not owl training data (oracle-heldout boundary). Fixed native pair L22.n5488 -> L27.n1417 at position10; Japan factual-context transfer is predeclared diagnostic, not pristine holdout. Free GHA pilot not yet launched. BF16 selected prospectively to fit memory; no numerical-parity claim against FP32 discovery.
+%% HISTORY | %% 2026-10-15 root: legacy prefix GHA38784659441 completed; independent raw-array audit confirms 2828 interventions bit-exact on TRAIN6009/6012/6035, 464.90 -> 277.91 seconds (1.67x, 40.2% less time). Published four-layer GELU/CPU/k4/single-target only; opt-in remains OFF; no modern-Qwen causal evidence and no legacy resume.
+%% HISTORY | %% 2026-10-15 root: 190b286 atlas collection skips unused vocabulary head and KV caches, preserving native MLP hooks; syntax validated, existing body-hook tests cover approach.
+%% HISTORY | %% 2026-10-15 root: free GHA38788372214 dispatched once after independent review. Frozen BF16 pilot sourcebf9e7b6, archive6a320841b22023b88d8ad18bd5c23fc3824b8deaae5c49b29c5ca4e717e18a78; 20F0B, single/joint zeros, conditional reader/control restoration, no-op and direct-reference checks. 11 tiny tests passed; no scientific outcome at dispatch.
+%% HISTORY | %% 2026-10-15 root: GHA38788372214 COMPLETE and independently audited. 20F0B, BF16 fixed units, exact no-op, runtime direct-reference parity, bit-exact gate/up reconstruction, unchanged weight digest. Eiffel contrasts clean6.067432/sourcezero4.213718/readerzero8.044965/joint5.552608/sourcezero-readerrestore3.770962 bits; Japan12.190495/7.745356/12.490599/7.745491/7.566117. Conditional restoration worsens distance-to-clean by23.88%/4.03%; matched-control restoration near zero. All top tokens unchanged. Control matched across-context mean absolute activation, NOT point amplitude; null control is limited. No direct-edge, semantic, FP32-parity or oracle-transfer certificate. 18.12s model process, 3.664GiB peak; GHA job96s including download/install. No paid spend. Raw-array audit metric maxerror8.9e-16.
+%% HISTORY | %% 2026-10-15 root: 93ad5bd retains every sampled pole and raw writer output through T1 explanation/verification; rejects count mismatches; invalid rows fail with complete denominator and no reader call for all-invalid input. 40-token judge preserved; terminal standalone choice prevents article a becoming vote. 58 tests pass; new tests registered in CI. Do not assume double-negative SwiGLU is small or causally irrelevant.
+%% HISTORY | %% 2026-10-15 root: next prospective oracle test fixed FACTS[2:5], same L22.n5488/L27.n1417 at final positions, source-reader factors{0.5,1,2} grid. 24 edited targets, 36F measurement cap. New edited labels remain hidden until 9 strong-reader predictions (3 contexts x 3 evidence arms) are frozen. Primary log-odds probability error versus unchanged and simple linear baselines; 0.1-bit effect band. No target selection on edited outcomes; no claim of trained oracle from evidence-conditioning pilot. Budget checked conservatively~44.97USD headroom, no paid allocation yet.
 %% HISTORY — previous active map at 04e61cec; complete older history retained below.
 %% HISTORY | %% TEAM COORDINATION MAP — edit the active graph below; all agents may update it.
 %% HISTORY | %% For each change: state the goal it serves, evidence, next action and owner.

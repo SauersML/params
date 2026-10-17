@@ -543,6 +543,8 @@ def main():
     log = lambda m: print(f"{time.time() - t0:7.1f}s {m}", flush=True)   # noqa: E731
     pre = lambda q: tok(q["prefill"], add_special_tokens=False)["input_ids"] if q.get("prefill") else []  # noqa: E731
     answers = {}                                    # (a case's answer tokens: taboo's secret word)
+    maxp = max([a.partners] + [int(x.split("=")[1]) for arm in a.arm.split(",") for x in arm.split(":")[1:]
+                               if x.startswith("partners=")])
     if a.mode == "questions":
         qs = [q for q in json.loads(Path(a.inp).read_text())["questions"] if q.get("split", a.split) == a.split]
         qs = qs[a.offset::a.stride][:a.limit or None]
@@ -559,7 +561,7 @@ def main():
                 elif q["user"].count(q["key"]) == 1:
                     users[p] = q["user"].replace(q["key"], p)
             ids = [(k, cf.chat(tok, u) + pre(q)) for k, u in users.items() if k != q.get("corrupt_key")]
-            others[q["id"]] = [(k, x) for k, x in ids if len(x) == len(clean)][:a.partners - 1]
+            others[q["id"]] = [(k, x) for k, x in ids if len(x) == len(clean)][:maxp - 1]
     else:
         pairs = []
         for name in a.cases.split(","):
@@ -582,8 +584,8 @@ def main():
         jobs.append((q, clean, corrupt))
     jobs.sort(key=lambda j: len(j[1]))              # (batches of one prompt length)
     pts = [pt] + [cf.Patcher(model, tok) for _ in range(max(0, a.batch - 1))]
-    pool = [[cf.Patcher(model, tok) for _ in range(a.partners - 1)] for _ in range(a.batch)]   # (partner pairs' Patchers)
-    others = others if a.mode == "questions" and a.partners > 1 else {}
+    pool = [[cf.Patcher(model, tok) for _ in range(maxp - 1)] for _ in range(a.batch)]   # (partner pairs' Patchers)
+    others = others if a.mode == "questions" and maxp > 1 else {}
     pt.setup(jobs[0][1], jobs[0][2])                # (a throwaway run: CUDA's first kernels)
 
     def write(arm, q, clean, corrupt, rec):
@@ -601,6 +603,8 @@ def main():
             name, *parts = arm.split(":")
             steps = next((int(x) for x in parts if x.isdigit()), a.steps)
             sets = {k.upper(): float(v) for k, v in (x.split("=") for x in parts if "=" in x)}
+            npart = int(sets.pop("PARTNERS", a.partners))   # (an arm's partner pairs: mask:30:partners=4)
+            oth = {i: v[:npart - 1] for i, v in others.items()}
             todo = [(q, cl, co) for q, cl, co in chunk
                     if not (out / _dir(arm) / f"{q['id'].replace('/', '__')}.json").exists()]
             if not todo:
@@ -612,21 +616,21 @@ def main():
                     log(f"{len(todo)} pairs ({arm}, batched): " + ", ".join(q["id"] for q, _, _ in todo))
                     recs = find_batch(pts[:len(todo)], [(cl, co, answers.get(q["id"])) for q, cl, co in todo], arm=name, steps=steps,
                                       log=log, priors=[prior_of(name, q) for q, _, _ in todo],
-                                      partners=[list(zip(pool[b], [x for _, x in others.get(q["id"], [])]))
+                                      partners=[list(zip(pool[b], [x for _, x in oth.get(q["id"], [])]))
                                                 for b, (q, _, _) in enumerate(todo)])
                 else:
                     recs = []
                     for q, cl, co in todo:
                         log(f"{q['id']} ({arm})")
                         recs.append(find(pt, cl, co, answers.get(q["id"]), log=log, arm=name, steps=steps, prior=prior_of(name, q),
-                                         partners=list(zip(pool[0], [x for _, x in others.get(q["id"], [])]))
+                                         partners=list(zip(pool[0], [x for _, x in oth.get(q["id"], [])]))
                                          if name != "group" else None))
             finally:
                 globals().update(saved)
             for (q, cl, co), rec in zip(todo, recs):
-                if name != "group" and others.get(q["id"]):     # (the partner keys a source cut was chosen on: held-out
-                    rec["selection_keys"] = [q.get("corrupt_key")] + [k for k, _ in others[q["id"]]]   # tests skip them)
-                write(arm, q, cl, co, {**rec, "constants": sets} if sets else rec)
+                if name != "group" and oth.get(q["id"]):        # (the partner keys a source cut was chosen on: held-out
+                    rec["selection_keys"] = [q.get("corrupt_key")] + [k for k, _ in oth[q["id"]]]   # tests skip them)
+                write(arm, q, cl, co, {**rec, "constants": {**sets, "PARTNERS": npart}} if sets or npart > 1 else rec)
 
 
 def _dir(arm: str) -> str:

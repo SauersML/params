@@ -224,7 +224,8 @@ def cf_name(u: tuple) -> str:
     return f"L{u[1]}.H{idx(u[2])}@{u[3]}" if u[0] == "head" else f"L{u[1]}.N{idx(u[3])}@{u[2]}"
 
 
-def check(pt: cf.Patcher, tok, rec: dict, q: dict, pool: dict | None = None) -> dict:
+def check(pt: cf.Patcher, tok, rec: dict, q: dict, pool: dict | None = None,
+          only=("resampled", "marginals", "backups", "interactions")) -> dict:
     t0 = time.time()
     info = pt.setup(rec["ids"], rec["corrupted"])
     out = {"id": rec["id"], "gap": info["gap"], "record_gap": rec["gap"], "cuts": {}, "backups": {}, "interactions": {}}
@@ -234,9 +235,12 @@ def check(pt: cf.Patcher, tok, rec: dict, q: dict, pool: dict | None = None) -> 
         if not v.get("met"):
             continue
         out["cuts"][cut] = resampled(pt, rec, cut, rs)
-        out.setdefault("marginals", {})[cut] = marginals(pt, rec, cut)
-        out["backups"][cut] = backups(pt, rec, cut)
-        out["interactions"][cut] = interactions(pt, rec, cut)
+        if "marginals" in only:
+            out.setdefault("marginals", {})[cut] = marginals(pt, rec, cut)
+        if "backups" in only:
+            out["backups"][cut] = backups(pt, rec, cut)
+        if "interactions" in only:
+            out["interactions"][cut] = interactions(pt, rec, cut)
     out["seconds"] = time.time() - t0
     return out
 
@@ -252,6 +256,8 @@ def main():
     ap.add_argument("--ids", nargs="*")
     ap.add_argument("--ids-file", type=Path, help="the record ids to check, one a line")
     ap.add_argument("--pool", type=Path, nargs="*", default=[], help="question sets whose keys (by task) are resample keys")
+    ap.add_argument("--only", default="resampled,marginals,backups,interactions",
+                    help="the tests run (resampled always; marginals, backups, interactions)")
     a = ap.parse_args()
     if a.ids_file:
         a.ids = (a.ids or []) + [x for x in a.ids_file.read_text().splitlines() if x.strip()]
@@ -277,7 +283,7 @@ def main():
         o = a.out / f.name
         if o.exists():
             continue
-        r = check(pt, tok, rec, qs.get(rec["id"], {}), pool)
+        r = check(pt, tok, rec, qs.get(rec["id"], {}), pool, only=tuple(a.only.split(",")))
         o.write_text(json.dumps(r))
         cuts = "; ".join(f"{c} {v['standard'][0]:.2f}/{v['standard'][1]:.2f} -> resampled {v['mean'][0]:.2f}/{v['mean'][1]:.2f}"
                          for c, v in r["cuts"].items())

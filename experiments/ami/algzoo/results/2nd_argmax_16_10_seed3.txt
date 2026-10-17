@@ -1,0 +1,142 @@
+AlgZoo 2nd_argmax hidden=16 seq_len=10, seed 3: a seed of the challenge.
+Task: position of the second largest of 10 independent standard Gaussian numbers. Architecture: 16 ReLU neurons,
+h_(t+1) = ReLU(W_hh h_t + W_hi x_t), logits = W_oh h_10, no biases; 432 parameters.
+Reference accuracy 0.931990 +- 8.5e-05 (exact probability along the last input, averaged over Gaussian prefixes; this is sampling, used only as the truth).
+
+ARC'S CRITERION: (a) a mechanistic estimate of the accuracy (deduced from the weights, not from sampled inputs)
+whose error over noisy copies or seeds is no worse than random sampling's at the same operation count, at every
+budget; (b) full understanding: the explanation's surprise ~ the bits of optimization that selected the model.
+
+THE ALGORITHM (partial: what is established)
+Neurons by what predicts their on/off state at the last step (share of inputs predicted; 'majority' = always
+guessing the commoner state; 'newest' = the relative rank of the newest input among the earlier inputs and 0;
+'two newest' adds the previous input's rank; 'tree' = depth-4 tree on all relative and final ranks and signs):
+  n0  on 0.957  majority 0.957  newest 0.957  two newest 0.957  tree 0.976
+  n1  on 0.877  majority 0.877  newest 0.967  two newest 0.975  tree 0.975
+  n2  on 0.940  majority 0.940  newest 0.940  two newest 0.940  tree 0.940
+  n3  on 0.867  majority 0.867  newest 0.962  two newest 0.968  tree 0.971
+  n4  on 0.926  majority 0.926  newest 0.926  two newest 0.926  tree 0.971
+  n5  on 0.887  majority 0.887  newest 0.887  two newest 0.887  tree 0.996
+  n6  on 1.000  majority 1.000  newest 1.000  two newest 1.000  tree 1.000
+  n7  on 0.894  majority 0.894  newest 0.894  two newest 0.996  tree 0.996
+  n8  on 0.884  majority 0.884  newest 0.884  two newest 0.994  tree 0.994
+  n9  on 0.415  majority 0.585  newest 0.907  two newest 0.907  tree 0.939
+  n10 on 0.909  majority 0.909  newest 0.909  two newest 0.909  tree 0.974
+  n11 on 0.996  majority 0.996  newest 0.996  two newest 0.996  tree 0.996
+  n12 on 0.994  majority 0.994  newest 0.994  two newest 0.994  tree 0.994
+  n13 on 0.999  majority 0.999  newest 0.999  two newest 0.999  tree 0.999
+  n14 on 0.872  majority 0.872  newest 0.966  two newest 0.971  tree 0.973
+  n15 on 0.882  majority 0.882  newest 0.882  two newest 0.882  tree 0.991
+P(neuron on at the last step | steps since the running maximum was set), rows = steps since (-1: maximum <= 0):
+  -1: [1.00 1.00 0.99 1.00 1.00 1.00 1.00 1.00 1.00 0.02 1.00 0.08 1.00 0.93 1.00 1.00]
+   0: [0.70 0.05 0.90 0.02 0.94 0.89 1.00 0.90 0.89 1.00 0.92 0.99 0.97 0.99 0.03 0.89]
+   1: [1.00 0.90 0.88 0.91 1.00 1.00 1.00 0.04 0.00 0.36 1.00 1.00 0.97 1.00 0.91 0.98]
+   2: [0.87 1.00 0.99 0.97 1.00 0.01 1.00 1.00 0.99 0.34 0.99 1.00 1.00 1.00 0.97 1.00]
+   3: [1.00 0.94 0.87 0.99 0.99 1.00 1.00 1.00 1.00 0.34 1.00 1.00 1.00 1.00 1.00 0.01]
+   4: [1.00 1.00 1.00 0.98 1.00 1.00 1.00 1.00 0.99 0.33 1.00 1.00 1.00 1.00 0.94 1.00]
+   5: [1.00 0.95 0.92 0.95 0.34 1.00 1.00 1.00 0.99 0.33 0.99 1.00 1.00 1.00 1.00 0.98]
+   6: [1.00 0.99 0.99 1.00 1.00 1.00 1.00 1.00 0.99 0.32 1.00 1.00 1.00 1.00 0.93 1.00]
+   7: [1.00 0.99 0.98 0.92 1.00 0.99 1.00 1.00 1.00 0.34 0.20 1.00 1.00 1.00 1.00 0.99]
+   8: [1.00 0.94 0.88 1.00 1.00 1.00 1.00 1.00 0.99 0.35 1.00 1.00 1.00 1.00 0.94 0.98]
+   9: [1.00 1.00 0.98 0.93 0.99 0.99 1.00 1.00 0.99 0.45 1.00 0.99 1.00 1.00 0.99 1.00]
+Automatic reading (same rules for every model):
+  - record neurons (on < 20% of the time, >= 97% predicted by the newest input's rank alone): []
+  - 1 step(s) after a new maximum: silent [7, 8], firing []
+  - 2 step(s) after a new maximum: silent [5], firing []
+  - 3 step(s) after a new maximum: silent [15], firing []
+  - neurons whose state a depth-4 tree on ranks predicts at >= 97%: 14 of 16 [0, 1, 3, 4, 5, 6, 7, 8, 10, 11, 12, 13, 14, 15]
+Readout: T = W_oh W_hh W_oh^+ has superdiagonal [0.85 0.88 0.87 0.95 0.72 0.77 0.33 -0.13 -0.44] (a shift would be all
+ones) and leaves 21% of W_oh W_hh unexplained: the logit vector moves about one position earlier per step,
+so the logits after t steps answer for the zero-padded prefix:
+  t=2: 0.763, t=3: 0.936, t=4: 0.945, t=5: 0.946, t=6: 0.947, t=7: 0.946, t=8: 0.947, t=9: 0.947, t=10: 0.940
+(Neuron-group interchanges use the challenge model's neuron roles and are reported for it only.)
+Errors: share by the rank the model picks [0.273 0.000 0.606 0.051] (ranks 1-4); error rate with 0 or 1 positive inputs 0.81, 0.81 (0.011 of inputs);
+  error rate when the 2nd-3rd gap is below 0.01, 0.1, 0.3, 1: 0.460, 0.198, 0.105, 0.070.
+
+WHY THIS DOES NOT YET GIVE A MECHANISTIC ESTIMATE
+  - Correctness is not a function of the ordering: redrawing the values with the ordering of (x, 0) fixed flips
+    correctness on 0.105 of inputs; of the errors only 23% persist; the activation pattern changes on 93% of inputs
+    (3.9 neuron-steps on average). The model compares values with tilted weights.
+  - Nor of the top three values and positions: redrawing the other seven flips 0.054 of inputs (60% of errors persist).
+  - Exact integration along the last input (lastline.py) cuts the per-input variance from 0.0635 to 0.0262; over the last two
+    and three inputs to 0.0182 and 0.0119, at a cost that multiplies with each input. The remaining 7-9 dimensions need a point set.
+
+ESTIMATORS AND ERROR AGAINST COMPUTE
+  const_task    1.0 (the model computes the task): 0 ops. Mechanistic, trivially.
+  halton_line N exact line probability averaged over the first N points of the 9-dim Halton sequence:
+                deterministic, but the 9-dim average over a fixed point set is sampling in all but name.
+  mc_line N     the same over N random prefixes (Rao-Blackwellized sampling), for reference.
+  RMS over the six trained models (challenge model + zoo seeds 0-4) (6 models; per-input sd 0.272; one sampled input = 5265 ops):
+    estimator               ops  inputs-eq       RMS  sampling
+    const_task                0        0.0   0.08577       nan
+    halton_1               6990        1.3   0.54650   0.23573
+    halton_4              27960        5.3   0.19832   0.11786
+    halton_16            111840       21.2   0.02874   0.05893
+    halton_64            447360       85.0   0.01551   0.02947
+    halton_256          1789440      339.9   0.01103   0.01473
+    halton_1024         7157760     1359.5   0.00699   0.00737
+    halton_4096        28631040     5438.0   0.00300   0.00368
+    halton_16384      114524160    21752.0   0.00161   0.00184
+    mc_1                   6990        1.3   0.07148   0.23573
+    mc_4                  27960        5.3   0.12694   0.11786
+    mc_16                111840       21.2   0.04212   0.05893
+    mc_64                447360       85.0   0.01740   0.02947
+    mc_256              1789440      339.9   0.01738   0.01473
+    mc_1024             7157760     1359.5   0.00825   0.00737
+    mc_4096            28631040     5438.0   0.00285   0.00368
+    mc_16384          114524160    21752.0   0.00226   0.00184
+  RMS over copies of the challenge model with N(0, 0.002^2) weight noise (16 models; per-input sd 0.267; one sampled input = 5265 ops):
+    estimator               ops  inputs-eq       RMS  sampling
+    const_task                0        0.0   0.08139       nan
+    const_base                0        0.0   0.03865       nan
+    halton_1               6990        1.3   0.37483   0.23209
+    halton_4              27960        5.3   0.17660   0.11605
+    halton_16            111840       21.2   0.04350   0.05802
+    halton_64            447360       85.0   0.02362   0.02901
+    halton_256          1789440      339.9   0.01000   0.01451
+    halton_1024         7157760     1359.5   0.00474   0.00725
+    halton_4096        28631040     5438.0   0.00202   0.00363
+    halton_16384      114524160    21752.0   0.00113   0.00181
+    mc_1                   6990        1.3   0.24103   0.23209
+    mc_4                  27960        5.3   0.09021   0.11605
+    mc_16                111840       21.2   0.04103   0.05802
+    mc_64                447360       85.0   0.02527   0.02901
+    mc_256              1789440      339.9   0.01512   0.01451
+    mc_1024             7157760     1359.5   0.00672   0.00725
+    mc_4096            28631040     5438.0   0.00368   0.00363
+    mc_16384          114524160    21752.0   0.00167   0.00181
+  RMS over copies with N(0, 0.005^2) weight noise (16 models; per-input sd 0.397; one sampled input = 5265 ops):
+    estimator               ops  inputs-eq       RMS  sampling
+    const_task                0        0.0   0.21267       nan
+    const_base                0        0.0   0.16852       nan
+    halton_1               6990        1.3   0.52712   0.34455
+    halton_4              27960        5.3   0.33202   0.17227
+    halton_16            111840       21.2   0.13515   0.08614
+    halton_64            447360       85.0   0.07074   0.04307
+    halton_256          1789440      339.9   0.02473   0.02153
+    halton_1024         7157760     1359.5   0.00793   0.01077
+    halton_4096        28631040     5438.0   0.00401   0.00538
+    halton_16384      114524160    21752.0   0.00152   0.00269
+    mc_1                   6990        1.3   0.30681   0.34455
+    mc_4                  27960        5.3   0.15663   0.17227
+    mc_16                111840       21.2   0.06282   0.08614
+    mc_64                447360       85.0   0.03743   0.04307
+    mc_256              1789440      339.9   0.01916   0.02153
+    mc_1024             7157760     1359.5   0.01279   0.01077
+    mc_4096            28631040     5438.0   0.00650   0.00538
+    mc_16384          114524160    21752.0   0.00252   0.00269
+
+SCORE
+  (a) Error against compute: NOT MET by a mechanistic estimator. The only mechanistic estimate here, 'the model
+      computes the task' (1.0), has RMS 0.086 over the six trained models and beats sampling only while
+      sampling has fewer than 10 inputs (52794 ops). The deterministic Halton + exact-line estimator
+      is not mechanistic; its rows above show what the exact line integration buys over plain sampling:
+      trained: beats sampling at N = [8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384], loses at N = [1, 2, 4]; RMS ratio 0.74-0.95 from N = 1024 up.
+      noisy_sd0.002: beats sampling at N = [16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384], loses at N = [1, 2, 4, 8]; RMS ratio 0.56-0.72 from N = 1024 up.
+      noisy_sd0.005: beats sampling at N = [512, 1024, 2048, 4096, 8192, 16384], loses at N = [1, 2, 4, 8, 16, 32, 64, 128, 256]; RMS ratio 0.44-0.74 from N = 1024 up.
+  (b) Surprise accounting: NOT MET. There is no compact explanation: the partial algorithm above leaves the
+      second maximum's position code (spread over 13 neurons) and the value-dependent neurons unexplained,
+      and the accuracy depends on fine weight details (noise of sd 0.002 on every weight costs 3.2 points).
+
+Files: m16_mechanism.py (tables), m16_suite.py (references), m16_estimators.py, lastline.py; results/
+m16_mechanism_zoo_seed3.json, m16_estimators.tsv, m16_curves.tsv.

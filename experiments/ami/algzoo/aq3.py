@@ -26,6 +26,7 @@ FOUR_PI = 4 * math.pi
 class Ops:
     def __init__(self):
         self.n = 0
+        self.fn = 0  # elementary-function calls (sqrt, sin, cos, atan2), counted in n as 1 each
 
 
 def _G(t):
@@ -94,6 +95,7 @@ def line_measure(model, u, ops, h2=None):
             if s1 > s0:
                 tot += _G(s1) - _G(s0)
                 ops.n += 10
+                ops.fn += 2
         if idx == m:
             break
         tval, j = events[idx]
@@ -191,6 +193,7 @@ def accuracy_halves(model, m, ops=None):
             th = a + half * (gi + 1)
             u = (math.cos(th), math.sin(th))
             ops.n += 4
+            ops.fn += 2
             tot += wi * half * line_measure(model, u, ops)
     return tot / FOUR_PI
 
@@ -200,4 +203,118 @@ def accuracy_one(model, ops=None):
     ops = ops or Ops()
     a = 7 * math.pi / 4
     ops.n += 3
+    ops.fn += 2
     return line_measure(model, (math.cos(a), math.sin(a)), ops) * TWO_PI / FOUR_PI
+
+
+def _W(t):
+    """Antiderivatives of (1+t^2)^(-5/2) times 1, t, t^2 (limits at +-infinity included)."""
+    if t == math.inf:
+        return (2.0 / 3.0, 0.0, 1.0 / 3.0)
+    if t == -math.inf:
+        return (-2.0 / 3.0, 0.0, -1.0 / 3.0)
+    s = (1.0 + t * t) ** 1.5
+    return (t * (2 * t * t + 3) / (3 * s), -1.0 / (3 * s), t ** 3 / (3 * s))
+
+
+def line_sq_error(model, u, ops, h2=None):
+    """integral over t of (f - median)^2 (u0, u1, t) * (3/2)(1+t^2)^(-5/2) for the median task (one output): with
+    x = R (u0, u1, t), E[(f - median)^2] = (1/2pi) integral over the angle of this (f and the median are homogeneous of
+    degree 1; E[R^2 | t] f_t(t) = (3/2)(1+t^2)^(-5/2) for R ~ chi_2). Between the neurons' switch points and the median's
+    switch points (t = u0, t = u1) the error is linear in t, and each piece integrates in closed form."""
+    d, W, w, Wo = model.d, model.W_hh, model.W_hi, model.W_oh
+    if h2 is None:
+        h1 = np.maximum(w * u[0], 0.0)
+        h2 = np.maximum(W @ h1 + w * u[1], 0.0)
+        ops.n += 2 * d + 2 * d * d + 2 * d
+    c = W @ h2
+    ops.n += 2 * d * d - d
+    events = []
+    on = np.zeros(d, dtype=bool)
+    for j in range(d):
+        if w[j] == 0.0:
+            on[j] = c[j] > 0
+            continue
+        events.append((-c[j] / w[j], j))
+        on[j] = w[j] < 0
+    ops.n += 2 * d
+    lo, hi = min(u[0], u[1]), max(u[0], u[1])
+    events.append((lo, -1))
+    events.append((hi, -2))
+    events.sort()
+    m = len(events)
+    ops.n += int(m * math.log2(m)) + 1
+    wo = Wo[0]
+    P = float(wo[on] @ c[on])
+    Q = float(wo[on] @ w[on])
+    ops.n += 4 * int(on.sum())
+    am, bm = lo, 0.0  # median = am + bm t: below both, the median is the smaller of the first two
+    tot = 0.0
+    left = -math.inf
+    Wl = _W(left)
+    for idx in range(m + 1):
+        right = events[idx][0] if idx < m else math.inf
+        if right > left:
+            Wr = _W(right)
+            al, be = P - am, Q - bm
+            tot += al * al * (Wr[0] - Wl[0]) + 2 * al * be * (Wr[1] - Wl[1]) + be * be * (Wr[2] - Wl[2])
+            ops.n += 22
+            ops.fn += 1
+            Wl = Wr
+        if idx == m:
+            break
+        tval, j = events[idx]
+        if j >= 0:
+            sgn = -1.0 if on[j] else 1.0
+            on[j] = not on[j]
+            P += sgn * wo[j] * c[j]
+            Q += sgn * wo[j] * w[j]
+            ops.n += 6
+        elif j == -1:
+            am, bm = 0.0, 1.0  # between the two: the median is t
+        else:
+            am, bm = hi, 0.0  # above both: the median is the larger of the first two
+        left = tval
+    return 1.5 * tot
+
+
+def mse_halves(model, m, ops=None):
+    """E[(f - median)^2]: Gauss-Legendre with m nodes on each half-circle between pi/4 and 5pi/4 (x0 = x1, where the
+    median's formula changes)."""
+    ops = ops or Ops()
+    g, wts = np.polynomial.legendre.leggauss(m)
+    tot = 0.0
+    for a in (math.pi / 4, 5 * math.pi / 4):
+        half = math.pi / 2
+        for gi, wi in zip(g, wts):
+            th = a + half * (gi + 1)
+            u = (math.cos(th), math.sin(th))
+            ops.n += 4
+            ops.fn += 2
+            tot += wi * half * line_sq_error(model, u, ops)
+    return tot / TWO_PI
+
+
+def mse_one(model, ops=None):
+    ops = ops or Ops()
+    a = 7 * math.pi / 4
+    ops.n += 3
+    ops.fn += 2
+    return line_sq_error(model, (math.cos(a), math.sin(a)), ops)
+
+
+def mse_arcs(model, m, ops=None):
+    """E[(f - median)^2]: Gauss-Legendre with m nodes on each arc of arcs2."""
+    ops = ops or Ops()
+    g, wts = np.polynomial.legendre.leggauss(m)
+    tot = 0.0
+    for a, b, A in arcs2(model, ops):
+        half = 0.5 * (b - a)
+        for gi, wi in zip(g, wts):
+            th = a + half * (gi + 1)
+            u = (math.cos(th), math.sin(th))
+            h2 = A @ np.array(u)
+            ops.n += 2 + 4 * model.d + 4
+            ops.fn += 2
+            tot += wi * half * line_sq_error(model, u, ops, h2=h2)
+    return tot / TWO_PI

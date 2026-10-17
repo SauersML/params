@@ -96,8 +96,13 @@ SCORE
       at 251 ops = 2 inputs); from 340 ops the weight-reading estimators are 3-50x more accurate
       than sampling (e.g. 2651 ops: 0.0073 vs 0.0674; 10527 ops: 0.0017 vs 0.0338),
       and from 35391 ops the exact enumeration has no error. ARC's best M4,3 estimators lose to sampling; these beat it.
+      Op convention: elementary functions (sqrt, sin, cos) are 4% of the estimators' ops; counting
+      each as 10 ops would raise their costs 1.39x and the RMS ratios above by 1.18x, while
+      sampling's cost leaves out generating its Gaussian inputs.
       The constant at budgets below ~340 ops is advice (one number from the base model), not a reading of the
       noisy weights; every estimator from 'aq_one_line' up reads only the copy's weights.
+      ARC's stronger test, the 5 training seeds of this configuration (exact accuracies 0.9846, 0.8928, 0.7590, 0.9044, 0.9452), with no
+      advice at all (the 0-op guess is 1.0, the task): MET AT EVERY BUDGET; worst ratio 0.97 (const_task at 631 ops); e.g. 2640 ops: RMS 0.0128 vs sampling 0.0614; 21031 ops: 0.00056 vs 0.0217 (results/aq3_seeds.tsv).
   (b) Surprise accounting: UNDETERMINED. The line+quadrature estimator carries no model-specific advice, so
       ARC's bit count applies to the hand explanation instead: two absolute-value features and a readout, 8 free
       numbers after rescaling (W' 2x2 and the column-centred W'_oh) plus the sign facts (4 input signs) and the

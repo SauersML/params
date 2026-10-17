@@ -324,12 +324,31 @@ def write_report(m, rows, bud, R, iv, truth, pq, c, base_acc, red):
       f" {by['aq_halves_gl16']['rms']:.4f} vs {by['aq_halves_gl16']['sampling_rms_same_ops']:.4f}),")
     W(f"      and from {by['exact_spherical_polygons']['ops']:.0f} ops the exact enumeration has no error. ARC's best"
       " M4,3 estimators lose to sampling; these beat it.")
+    o = aq3.Ops()
+    aq3.accuracy_halves(m, 4, o)
+    infl = (o.n + 9 * o.fn) / o.n
+    W(f"      Op convention: elementary functions (sqrt, sin, cos) are {o.fn / o.n:.0%} of the estimators' ops; counting")
+    W(f"      each as 10 ops would raise their costs {infl:.2f}x and the RMS ratios above by {math.sqrt(infl):.2f}x, while")
+    W("      sampling's cost leaves out generating its Gaussian inputs.")
     W("      The constant at budgets below ~340 ops is advice (one number from the base model), not a reading of the")
     W("      noisy weights; every estimator from 'aq_one_line' up reads only the copy's weights.")
     full, qb = red3.explanation_bits(m)
     tol = {b: a - full for b, a in qb}
     b7 = min(b for b, d in tol.items() if abs(d) < 7e-4)
     b1 = min(b for b, d in tol.items() if abs(d) < 1e-4)
+    if os.path.exists(os.path.join(RES, "aq3_seeds.tsv")):
+        import aq3_seeds
+        v = aq3_seeds.verdicts()[4]
+        by_s = {r["estimator"]: r for r in v["rows"]}
+        W("      ARC's stronger test, the 5 training seeds of this configuration (exact accuracies "
+          + ", ".join(f"{t:.4f}" for t in v["truth"]) + "), with no")
+        W("      advice at all (the 0-op guess is 1.0, the task): "
+          + ("MET AT EVERY BUDGET" if not v["failing"] else "not met at some budgets")
+          + f"; worst ratio {v['worst']:.2f} ({v['worst_best']} at {v['worst_ops']:.0f} ops);"
+          f" e.g. {by_s['aq_halves_gl4']['ops']:.0f} ops: RMS {by_s['aq_halves_gl4']['rms']:.4f} vs sampling"
+          f" {by_s['aq_halves_gl4']['sampling_rms_same_ops']:.4f}; {by_s['aq_halves_gl32']['ops']:.0f} ops:"
+          f" {by_s['aq_halves_gl32']['rms']:.5f} vs {by_s['aq_halves_gl32']['sampling_rms_same_ops']:.4f}"
+          " (results/aq3_seeds.tsv).")
     W("  (b) Surprise accounting: UNDETERMINED. The line+quadrature estimator carries no model-specific advice, so")
     W("      ARC's bit count applies to the hand explanation instead: two absolute-value features and a readout, 8 free")
     W("      numbers after rescaling (W' 2x2 and the column-centred W'_oh) plus the sign facts (4 input signs) and the")

@@ -237,6 +237,9 @@ def score(a) -> None:
     if a.no_ao:
         out.close()
         return
+    import sys
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # ao_verify (experiments/oracle)
     import ao_verify
 
     tg = ao_verify.Target(cao.MODEL, a.device)

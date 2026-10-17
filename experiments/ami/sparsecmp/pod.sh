@@ -10,7 +10,7 @@ S=/Users/user/params/experiments/ami/sparsecmp
 D=/Users/user/mpd-data/ami/sparsecmp
 R=/Users/user/mpd-data/runpod/$N
 CMD="set -e; export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True HF_HUB_ENABLE_HF_TRANSFER=1; ln -sfn /workspace/runs/$N/mpd-data ~/mpd-data; mkdir -p $R/runs;
-python -m pip install -q tiktoken blobfile hf_transfer;
+python -m pip install -q tiktoken blobfile hf_transfer 'transformers==4.57.1' 'accelerate==1.10.1';
 ls $S/prune.py $S/nodes.py $S/edges.py $S/tasks.py $S/fetch.py $D/tasks_v2s.jsonl $D/released/encoder.json $D/released/vocab.bpe > /dev/null;
 cd $S; git -C $D/ext clone -q https://github.com/openai/circuit_sparsity.git 2>/dev/null || true;
 git -C $D/ext/circuit_sparsity checkout -q dbf1fe0;

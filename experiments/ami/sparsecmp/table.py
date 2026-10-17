@@ -61,12 +61,16 @@ def main():
             row = {"model": r["model"], "task": r["task"], "verified": r["task"] in T.VERIFIED, "target": r["target"],
                    "n_test": r["n_test"], "full_search": round(r["full_search"], 4), "k": r.get("k"),
                    "edges": (r.get("edges") or {}).get("weights"), "seconds": round(r["seconds"])}
+            fp = f"{ROOT}/faithful/{os.path.basename(p)}"
+            if t and "kl2" not in t and os.path.exists(fp):
+                t["kl2"] = json.load(open(fp))["kl2"]
             if t:
                 lo, hi = boot(t["pairs"]["circuit"])
                 row.update({"circuit": round(t["circuit"], 4), "ci90": f"[{lo:.3f}, {hi:.3f}]",
                             "meets": t["circuit"] <= r["target"], "full": round(t["full"], 4),
                             "ablated": round(t["ablated"], 4),
-                            "random": round(sum(t["random"]) / len(t["random"]), 4)})
+                            "random": round(sum(t["random"]) / len(t["random"]), 4),
+                            "kl2": round(t["kl2"], 4) if "kl2" in t else ""})
             for name, tag in (("csp_yolo2", "yolo2"), ("csp_sweep1_4x_0.9Mnonzero_afrac0.125", "sweep4x")):
                 x = rel.get((name, r["task"]))
                 if x:
@@ -75,7 +79,7 @@ def main():
                         row[f"{tag}_edges"] = x["edges"]
             rows.append(row)
     cols = ["model", "task", "verified", "target", "n_test", "full_search", "k", "edges", "circuit", "ci90", "meets",
-            "full", "ablated", "random", "yolo2_k", "yolo2_edges", "sweep4x_k", "seconds"]
+            "full", "kl2", "ablated", "random", "yolo2_k", "yolo2_edges", "sweep4x_k", "seconds"]
     lines = ["\t".join(cols)] + ["\t".join(str(r.get(c, "")) for c in cols) for r in rows]
     by = {}
     for r in rows:

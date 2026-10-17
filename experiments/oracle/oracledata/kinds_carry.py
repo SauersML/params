@@ -365,7 +365,8 @@ def build_kinds(a) -> None:
                     "GAP bits, same within LOW); " + VARIANT_RULE[variant] +
                     ("; strict's committee for every kind: gradient-boosted trees on the numbers with the kind, on the names "
                      "with the kind, on the numbers without the kind, a random forest on the numbers with the kind, the kind's single "
-                     "field, and each training kind's own tree; patch, push_up, flip and push_down add the same pair's zero "
+                     "field, a tree on the question's text alone, whether A and B share the key, and each training kind's own "
+                     "tree; patch, push_up, flip and push_down add the same pair's zero "
                      "class, flip the class of twice its zeroings, push_down the class of its push_up changes negated "
                      "(margins split by direction); "
                      "flip_diag.jsonl: every test flip question whose gold differs from the same pair's zero class; strict's "
@@ -459,7 +460,7 @@ def build_carry(a) -> None:
             "rule": "B is another prompt of A's family (same split); A's unit acts at B's aligned token; gold = B's measured "
                     "change: drop (<= -HIGH bits), rise (>= HIGH), none (|change| < LOW); " + VARIANT_RULE[variant] +
                     ("; strict's committee: gradient-boosted trees on A's numbers and on the names, a random forest on A's "
-                     "numbers, the kind's single field (all fitted on v1's training split), adv's tree (sel_pred), and A's own class of the same unit "
+                     "numbers, the kind's single field, a tree on the question's text alone (all fitted on v1's training split), adv's tree (sel_pred), and A's own class of the same unit "
                      "with its direction in the margin, within B's relation to A" if variant == "strict" else "")})
 
 
@@ -476,13 +477,13 @@ VARIANT_RULE = {
               "per class with equal numbers per cell: each shortcut, each exclusion of one and any function of them sit at "
               "chance on the same questions; survivors_before_cap counts every question that survives the balance"}
 
-_TREES = lambda q: (q["strict_num"], q["strict_names"], q["strict_nokind"], q["strict_forest"], q["strict_field"]) + tuple(  # noqa: E731
-    q["strict_tree_of_" + k] for k in TRAIN_KINDS)
+_TREES = lambda q: (q["strict_num"], q["strict_names"], q["strict_nokind"], q["strict_forest"], q["strict_field"],  # noqa: E731
+                    q["strict_text"], q["same_key"]) + tuple(q["strict_tree_of_" + k] for k in TRAIN_KINDS)
 KIND_PATTERN = {"zero": _TREES} | {k: (lambda q: _TREES(q) + (q["zero_copy"],)) for k in ("patch", "push_up")} | {
     "flip": lambda q: _TREES(q) + (q["zero_copy"], q["twice_zero"]),
     "push_down": lambda q: _TREES(q) + (q["zero_copy"], q["neg_push_up"])}
 CARRY_PATTERN = lambda q: (q["strict_num"], q["strict_names"], q["strict_forest"], q["strict_field"], q["sel_pred"],  # noqa: E731
-                           q["a_fine"], q["relation"])
+                           q["strict_text"], q["a_fine"], q["relation"])
 
 
 def fit_pred(trn: list, cand: list, X, field: str, forest: bool = False) -> None:
@@ -534,6 +535,10 @@ def strict_kinds(by_sk: dict, trn: list, cs: dict) -> None:
         fit_pred([q for q in trn if q["op"] == k], cand, lambda q: kind_X(q, cs), "strict_tree_of_" + k)
     nf = len(kind_X(trn[0], cs))
     field_pred(trn, cand, lambda q: kind_X(q, cs) + kind_onehot(q), nf, KINDS)
+    by_ctx = {c["context_id"]: c for c in cs.values()}
+    fit_pred(trn, cand, lambda q: text_X(q, by_ctx), "strict_text")
+    for q in cand:
+        q["same_key"] = q["context_a"].split("/")[1] == q["context_b"].split("/")[1]
     for q in cand:
         m = q["measured"]
         q["zero_copy"] = pair_class(m["zero_a"], m["zero_b"])
@@ -563,6 +568,7 @@ def strict_carry(pools: dict, trn: list, cs: dict, by_ctx: dict) -> None:
     fit_pred(trn, cand, lambda q: carry_X(q, cs, by_ctx, True), "strict_names")
     fit_pred(trn, cand, lambda q: carry_X(q, cs, by_ctx), "strict_forest", forest=True)
     field_pred(trn, cand, lambda q: carry_X(q, cs, by_ctx), len(carry_X(trn[0], cs, by_ctx)), CARRY_KINDS)
+    fit_pred(trn, cand, lambda q: text_X(q, by_ctx), "strict_text")
     for q in cand:
         q["a_fine"] = a_class_of(q["measured"]["change_a"])
 
@@ -693,6 +699,24 @@ def carry_X(q: dict, cs: dict, by_ctx: dict, names: bool = False) -> list[float]
 RELS = ("wording", "key", "both")
 
 
+def text_X(q: dict, by_ctx: dict) -> list[float]:
+    """A question's text alone (no circuit number): whether A and B share the key, the answer word, the wording; each
+    text's wording, answer length, prompt length and the unit's position from the end; whether the unit's tokens match;
+    the kind, the unit kind, and for new-prompt questions the relation and the alignment."""
+    A, B = by_ctx[q["context_a"]], by_ctx[q["context_b"]]
+    multi = "units_a" in q
+    pa, pb = (int(u.split("@")[1]) for u in ((q["units_a"][0], q["units_b"][0]) if multi else (q["unit_a"], q["unit_b"])))
+    aa, ab = (A["answer"]["text"] or "").strip(), (B["answer"]["text"] or "").strip()
+    wa, wb = int(q["context_a"].split("/")[-1][1:]), int(q["context_b"].split("/")[-1][1:])
+    f = [float(q["context_a"].split("/")[1] == q["context_b"].split("/")[1]), float(aa == ab), float(wa == wb), wa, wb,
+         len(aa), len(ab), len(A["tokens"]), len(B["tokens"]), len(A["tokens"]) - 1 - pa, len(B["tokens"]) - 1 - pb,
+         float(A["tokens"][pa] == B["tokens"][pb])]
+    f += [float(q["op"] == k) for k in KINDS] + [float(q["unit_kind"] == k) for k in ("neuron", "head", "group")]
+    if not multi:
+        f += [float(q["relation"] == r) for r in RELS] + [float(q["align"] == "same")]
+    return [float(x) for x in f]
+
+
 def interval(scores: list[float], clusters: list, boots: int = 1000) -> dict:
     """Mean score and its 95% interval by a cluster bootstrap (whole clusters resampled with replacement: questions that
     share a unit or a prompt are not independent)."""
@@ -735,7 +759,9 @@ def baselines(a) -> None:
         kinds = CARRY_KINDS
     ytr = [q["gold"] for q in tr]
     Xtr, Ntr = [X(q) for q in tr], [X(q, True) for q in tr]
+    by_ctx_ = {c["context_id"]: c for c in cs.values()}
     models = {"tree_numbers": (gb().fit(Xtr, ytr), False), "tree_names_only": (gb().fit(Ntr, ytr), True),
+              "tree_text_only": (gb().fit([text_X(q, by_ctx_) for q in tr], ytr), "text"),
               "forest_numbers": (rf().fit(Xtr, ytr), False), "forest_names_only": (rf().fit(Ntr, ytr), True)}
     nk = len(TRAIN_KINDS) if multi else 0
     if multi:  # without the kind, and each training kind's own tree (for a held-out kind: the mapping a person chooses)
@@ -768,7 +794,8 @@ def baselines(a) -> None:
             pred = {}
             for name, (m, how) in models.items():
                 xs = Nte if how is True else [x[:-nk] for x in Xte] if how == "nokind" else \
-                    [x + [q["measured"]["change_a"] or 0.0] for x, q in zip(Xte, qs)] if how == "hidden" else Xte
+                    [x + [q["measured"]["change_a"] or 0.0] for x, q in zip(Xte, qs)] if how == "hidden" else \
+                    [text_X(q, by_ctx_) for q in qs] if how == "text" else Xte
                 pred[name] = [str(p_) for p_ in m.predict(xs)]
             j, m = field.get(kind, (pooled_field, pooled_field_m))
             pred["single_field" if kind in field else "single_field_pooled_kinds"] = [str(p_) for p_ in m.predict([[x[j]] for x in Xte])]
@@ -786,7 +813,7 @@ def baselines(a) -> None:
                 pred["carry_rule_direction"] = [{"gap_drop": "drop", "gap_rise": "rise", "gap": "none"}.get(
                     a_class_of(q["measured"]["change_a"]), a_class_of(q["measured"]["change_a"])) for q in qs]
             for f_ in ("sel_pred", "strict_num", "strict_names", "strict_nokind", "strict_forest", "strict_tree_of_zero",
-                       "strict_tree_of_patch", "strict_tree_of_push_up", "strict_field"):  # the selecting models, when stored
+                       "strict_tree_of_patch", "strict_tree_of_push_up", "strict_field", "strict_text"):  # the selecting models
                 if all(f_ in q for q in qs):
                     pred["selecting_" + f_] = [q[f_] for q in qs]
             r = {"n": len(qs), "chance": 0.333}
@@ -826,6 +853,108 @@ def baselines(a) -> None:
                       for s_, res in out.items()}, indent=1))
 
 
+def circuit_summary(c: dict, focus: list[str]) -> list[float]:
+    """A whole circuit's numbers: unit and head counts by stage, summed and largest lost and restored shares (neurons and
+    heads), the ten largest lost shares, |value_over_max| summed and largest, units and summed lost share per band of six
+    layers, the focus units' best rank by lost share and their share of the total, the clean and corrupted contrasts,
+    the gap and the length."""
+    us, hs = c["units"], c["heads"]
+    lost = sorted((abs(x.get("lost") or 0.0) for x in us + hs), reverse=True)
+    rest = [abs(x.get("restored") or 0.0) for x in us + hs]
+    vom = [abs(u.get("value_over_max") or 0.0) for u in us]
+    f = [len(us), len(hs)] + [sum(u.get("stage") == st for u in us) for st in ("source", "readout")]
+    f += [sum(lost), max(lost, default=0.0), sum(rest), max(rest, default=0.0)] + (lost + [0.0] * 10)[:10]
+    f += [sum(vom), max(vom, default=0.0)]
+    for b in range(6):
+        band = [x for x in us + hs if b * 6 <= x["layer"] < (b + 1) * 6]
+        f += [len(band), sum(abs(x.get("lost") or 0.0) for x in band)]
+    mine = [abs(x.get("lost") or 0.0) for x in us + hs if x["name"] in set(focus)]
+    f += [min((lost.index(v) for v in mine), default=len(lost)), sum(mine) / (sum(lost) or 1.0)]
+    con = c.get("contrast") or {}
+    return [float(x) for x in f + [con.get("clean") or 0.0, con.get("corrupt") or 0.0, c.get("gap") or 0.0, len(c["tokens"])]]
+
+
+def ceiling(a) -> None:
+    """The strongest tabular learner on everything the circuit records hold for a question (the asked units' numbers, both
+    whole circuits, contrasts; new-prompt also B's own circuit, which a run on B gives; optionally the question's text),
+    fitted on every labelled question of the set's directories outside one test family and scored on that family's
+    questions of each test set (cross-validated over the test families), as accuracy with a 95% cluster interval: does
+    the circuit hold the answer at all?"""
+    from sklearn.ensemble import HistGradientBoostingClassifier, RandomForestClassifier
+    root = a.dir
+    multi = root.name == "kinds"
+    pool, cs = {}, {}
+    for v in sorted(p_ for p_ in root.iterdir() if (p_ / "manifest.json").exists()):
+        for c in map(json.loads, (v / "circuits.jsonl").read_text().splitlines()):
+            cs[c["circuit_id"]] = c
+        for name in ("train.jsonl", "dev.jsonl", "test.jsonl"):
+            if (v / name).exists():
+                for q in map(json.loads, (v / name).read_text().splitlines()):
+                    pool[q["id"]] = q
+    by_ctx = {c["context_id"]: c for c in cs.values()}
+    fam = (lambda q: q["family_a"]) if multi else (lambda q: q["family"])
+    onehot5 = lambda q: [float(q["op"] == k) for k in KINDS]  # noqa: E731
+
+    def b_side(q):  # new-prompt: B's own circuit, and the unit's numbers in it when B's circuit holds it
+        cb = by_ctx[q["context_b"]]
+        ub = {x["name"]: x for x in cb["units"] + cb["heads"]}.get(q["unit_b"], {})
+        base = base_name(q["unit_b"])
+        anywhere = [x for x in cb["units"] + cb["heads"] if base_name(x["name"]) == base]
+        return circuit_summary(cb, [q["unit_b"]]) + [float(bool(ub))] + [float(ub.get(k) or 0.0) for k in
+                                                                             ("lost", "restored", "value", "value_over_max")] + [
+            len(anywhere), max((abs(x.get("lost") or 0.0) for x in anywhere), default=0.0)]
+    if multi:
+        def arm_numbers(q):
+            sa, sb = circuit_summary(cs[q["circuit_a"]], q["units_a"]), circuit_summary(cs[q["circuit_b"]], q["units_b"])
+            return kind_X(q, cs) + onehot5(q) + sa + sb + [x - y for x, y in zip(sa, sb)]
+        arms = {"numbers": arm_numbers, "numbers_text": lambda q: arm_numbers(q) + text_X(q, by_ctx)}
+    else:
+        arm_a = lambda q: carry_X(q, cs, by_ctx) + circuit_summary(cs[q["circuit_a"]], [q["unit_a"]])  # noqa: E731
+        arms = {"numbers_A": arm_a, "numbers_A_B": lambda q: arm_a(q) + b_side(q),
+                "numbers_A_B_text": lambda q: arm_a(q) + b_side(q) + text_X(q, by_ctx)}
+    sets = {v: [json.loads(x) for x in (root / v / "test.jsonl").read_text().splitlines()]
+            for v in a.sets if (root / v / "test.jsonl").exists()}
+    test_fams = sorted({fam(q) for qs in sets.values() for q in qs})
+    qs_all = list(pool.values())
+    learners = {"boosting": lambda: HistGradientBoostingClassifier(max_iter=500, learning_rate=0.05, max_leaf_nodes=63,
+                                                                   l2_regularization=1.0, class_weight="balanced", random_state=0),
+                "forest": lambda: RandomForestClassifier(n_estimators=400, min_samples_leaf=2, class_weight="balanced_subsample",
+                                                         n_jobs=8, random_state=1)}
+    preds = collections.defaultdict(dict)  # (arm, learner) -> question id -> answer
+    for arm, X in arms.items():
+        xs = {q["id"]: X(q) for q in qs_all}
+        for v_ in sets.values():
+            for q in v_:
+                xs.setdefault(q["id"], X(q))
+        for lname, mk in learners.items():
+            if lname == "forest" and arm != list(arms)[-1]:
+                continue  # (the forest on the fullest arm only)
+            for f in test_fams:
+                trn = [q for q in qs_all if fam(q) != f]
+                m = mk().fit([xs[q["id"]] for q in trn], [q["gold"] for q in trn])
+                ev = {q["id"]: q for v_ in sets.values() for q in v_ if fam(q) == f}
+                for p_, i in zip(m.predict([xs[i] for i in ev]), ev):
+                    preds[(arm, lname)][i] = str(p_)
+                print(json.dumps({"arm": arm, "learner": lname, "held_out": f, "trained_on": len(trn)}), flush=True)
+    clus = (lambda q: q["key"]) if multi else (lambda q: q["context_b"])
+    out = {}
+    for v, qs in sets.items():
+        r = {}
+        for (arm, lname), pr in preds.items():
+            cell = {"all": interval([float(pr[q["id"]] == q["gold"]) for q in qs], [clus(q) for q in qs])}
+            for op in sorted({q["op"] for q in qs}):
+                sub = [q for q in qs if q["op"] == op]
+                cell[op] = interval([float(pr[q["id"]] == q["gold"]) for q in sub], [clus(q) for q in sub])
+            r[f"{lname}:{arm}"] = cell
+        out[v] = r
+        man = json.loads((root / v / "manifest.json").read_text())
+        man["ceiling"] = {"note": "the strongest tabular learner on all circuit numbers for the question (and the text, where "
+                                  "named), fitted on every labelled question of this set family's directories outside one "
+                                  "test family, scored on that family; cross-validated over the test families", **r}
+        (root / v / "manifest.json").write_text(json.dumps(man, indent=1) + "\n")
+    print(json.dumps({v: {k: {op: c["acc"] for op, c in cell.items()} for k, cell in r.items()} for v, r in out.items()}, indent=1))
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -850,8 +979,11 @@ def main():
         b.add_argument("--cap", type=int, default=CAP)
     bl = sub.add_parser("baselines")
     bl.add_argument("dir", type=Path)
+    ce = sub.add_parser("ceiling")
+    ce.add_argument("dir", type=Path, help="the set family's directory (kinds or carry)")
+    ce.add_argument("--sets", nargs="+", default=["v1", "adv", "strict", "v1_hard"])
     a = ap.parse_args()
-    {"measure": measure, "build-kinds": build_kinds, "build-carry": build_carry, "baselines": baselines}[a.cmd](a)
+    {"measure": measure, "build-kinds": build_kinds, "build-carry": build_carry, "baselines": baselines, "ceiling": ceiling}[a.cmd](a)
 
 
 if __name__ == "__main__":

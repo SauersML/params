@@ -106,7 +106,7 @@ BASE = "Qwen/Qwen3-8B"
 ORG = Path.home() / "mpd-data" / "organisms" / "qwen3_1p7b"
 DRAWS = 8  # held-out corruptions and swap partners per circuit
 HUB = 8  # a circuit's hub neurons: its neuron poles with the largest noising effect alone
-ROWS = 16  # runs a forward, every batch padded to it
+ROWS = 16  # runs a forward at most, every batch padded to a power of two (few shapes; one 2-run batch pays for 2, not 16)
 MIN_GAP = 1.0  # bits: the least clean-corrupted contrast gap a pair needs
 FLOOR = {"necessity": 0.7, "sufficiency": 0.7, "necessity_heldout": 0.7, "sufficiency_heldout": 0.7, "swaps": 0.7,
          "stability": 0.6}
@@ -181,12 +181,13 @@ class Model:
 
     @torch.no_grad()
     def logp(self, runs: list[tuple]) -> torch.Tensor:
-        """log p at each run's last position [R, V], ROWS runs a forward (padded with the first run)."""
+        """log p at each run's last position [R, V], ROWS runs a forward at most (padded with the first run to a power of
+        two)."""
         out = []
         for s0 in range(0, len(runs), ROWS):
             part = list(runs[s0:s0 + ROWS])
             n = len(part)
-            part += [part[0]] * (ROWS - n)
+            part += [part[0]] * (min(ROWS, 1 << (n - 1).bit_length()) - n)
             idx = {}
             for b, (_, patches) in enumerate(part[:n]):
                 for kind, L, p, u, v in patches:
@@ -235,8 +236,13 @@ def contrast(lp: torch.Tensor, sets: dict) -> float:
 
 
 def word_sets(m: "Model", tok, ids: list[int], lp: torch.Tensor, b: int) -> dict:
-    """answer_contrast.token_sets on the clean run (its log probabilities lp) against the other run's top token b."""
-    return ac.token_sets(m.core, tok, ids, lp, b)
+    """answer_contrast.token_sets on the clean run (its log probabilities lp) against the other run's top token b, its
+    candidates continued from the prompt's keys and values as circuit_finder's setup continues them (a forward of the
+    whole prompt per step and candidate was ~1 s of float32 Qwen3-8B per call, most of a scored circuit's time)."""
+    with torch.no_grad():
+        cache = m.core.model(input_ids=torch.tensor([ids], device=m.dev), use_cache=True).past_key_values
+    past = [(c.keys, c.values) for c in cache.layers] if hasattr(cache, "layers") else list(zip(cache.key_cache, cache.value_cache))
+    return ac.token_sets(m.core, tok, ids, lp, b, past=past)
 
 
 def pair_ok(sets: dict, b: int, gap: float) -> bool:

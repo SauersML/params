@@ -4,7 +4,7 @@ change evaluate_graph gives (also on Gemma-2- and GPT-2-shaped models) with the 
 refined edges rank first in the order of their own changes, and every prefix of the paths order survives MIB's pruning. Needs MIB's
 environment (transformer_lens, EAP-IG's eap).
 
-  ~/mpd-data/ext/mibenv/bin/python -m pytest experiments/oracle/test_mib_compare.py -q
+  ~/mpd-data/ext/mibenv/bin/python -m pytest experiments/mib/test_mib_compare.py -q
 """
 import sys
 from pathlib import Path

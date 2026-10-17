@@ -41,6 +41,7 @@ import time
 from functools import partial
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "oracle"))  # adag_compare (experiments/oracle)
 MIB = Path(os.environ.get("MIB_DIR", Path.home() / "mpd-data" / "ext" / "MIB-circuit-track"))
 WEIGHTS = {"llama3": "NousResearch/Meta-Llama-3.1-8B", "gemma2": "unsloth/gemma-2-2b"}  # (ungated copies: the same weights,
 # Gemma's in bfloat16, the dtype MIB loads it in)

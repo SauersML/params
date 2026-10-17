@@ -634,6 +634,10 @@ def main():
                 continue
             saved = {k: globals()[k] for k in sets}
             globals().update(sets)                  # (an arm's own constants: mask:20:init=1:lr=0.5)
+            def put(q, cl, co, rec):
+                if name != "group" and oth.get(q["id"]):        # (the partner keys a source cut was chosen on: held-out
+                    rec["selection_keys"] = [q.get("corrupt_key")] + [k for k, _ in oth[q["id"]]]   # tests skip them)
+                write(arm, q, cl, co, {**rec, "constants": {**sets, "PARTNERS": npart}} if sets or npart > 1 else rec)
             try:
                 if a.batch > 1 and name in ("mask", "am"):
                     log(f"{len(todo)} pairs ({arm}, batched): " + ", ".join(q["id"] for q, _, _ in todo))
@@ -641,19 +645,16 @@ def main():
                                       log=log, priors=[prior_of(name, q) for q, _, _ in todo],
                                       partners=[list(zip(pool[b], [x for _, x in oth.get(q["id"], [])]))
                                                 for b, (q, _, _) in enumerate(todo)])
-                else:
-                    recs = []
-                    for q, cl, co in todo:
+                    for (q, cl, co), rec in zip(todo, recs):
+                        put(q, cl, co, rec)
+                else:                               # (each record written when found: a run stopped by a time limit
+                    for q, cl, co in todo:          # keeps what it found)
                         log(f"{q['id']} ({arm})")
-                        recs.append(find(pt, cl, co, answers.get(q["id"]), log=log, arm=name, steps=steps, prior=prior_of(name, q),
-                                         partners=list(zip(pool[0], [x for _, x in oth.get(q["id"], [])]))
-                                         if name != "group" else None))
+                        put(q, cl, co, find(pt, cl, co, answers.get(q["id"]), log=log, arm=name, steps=steps,
+                                            prior=prior_of(name, q), partners=list(zip(pool[0], [x for _, x in oth.get(q["id"], [])]))
+                                            if name != "group" else None))
             finally:
                 globals().update(saved)
-            for (q, cl, co), rec in zip(todo, recs):
-                if name != "group" and oth.get(q["id"]):        # (the partner keys a source cut was chosen on: held-out
-                    rec["selection_keys"] = [q.get("corrupt_key")] + [k for k, _ in oth[q["id"]]]   # tests skip them)
-                write(arm, q, cl, co, {**rec, "constants": {**sets, "PARTNERS": npart}} if sets or npart > 1 else rec)
 
 
 def _dir(arm: str) -> str:

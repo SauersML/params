@@ -2247,12 +2247,12 @@ def talk(a, it: dict, budget: int, rec: dict, sampler, rr, tok, spend: Spend) ->
     for turn in range(turns):
         if turn >= turns:
             break
-        toks = sample(rr.build_generation_prompt(msgs), MAX_TOKENS)
+        toks = sample(rr.build_generation_prompt(msgs), getattr(a, "max_tokens", None) or MAX_TOKENS)
         if toks is None:
             rec["stopped"] = "cap"
             return
         rec["turns"] = turn + 1
-        cut = len(toks) >= MAX_TOKENS
+        cut = len(toks) >= (getattr(a, "max_tokens", None) or MAX_TOKENS)
         if cut and getattr(rr, "_think_close_token", None) not in toks:  # cut inside its reasoning
             think, text = rr.tokenizer.decode(toks), ""
         else:
@@ -2715,6 +2715,7 @@ def main():
     r.add_argument("--renderer", help="its renderer (default Kimi-K2.6's)")
     r.add_argument("--init", help="a trained policy's sampler weights (tinker:// path, agent_rl.py)")
     r.add_argument("--investigator-url", help="a vLLM OpenAI server hosting --agent (self-hosted: no Tinker)")
+    r.add_argument("--max-tokens", type=int, help=f"tokens a message, thinking included (default {MAX_TOKENS})")
     r.add_argument("--verify", action="store_true", help="disc1 items: also the behavioural check of the answer on the server "
                    "(the measured trigger scope, oracledata's combined reward)")
     r.add_argument("--turns", type=int, default=TURNS, help="the agent's messages per item")

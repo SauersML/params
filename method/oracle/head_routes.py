@@ -73,6 +73,7 @@ class Runner:
         self.rows = rows
         self.answer, self.alternatives = None, None
         self._base = {}  # ids -> per layer the unedited run's keys [KV, T, hd] (after norm and rotary), values, streams
+        self._c0s = {}  # (ids, answer, alternatives) -> the unedited run's contrast
 
     def _d(self, L: int) -> torch.device:
         return self.layers[L].input_layernorm.weight.device
@@ -99,21 +100,49 @@ class Runner:
         the first set's states per layer ("x" the stream entering
         the layer [T, d], "q" [H, T, hd] and "k" [KV, T, hd] after norm and rotary, "v" [KV, T, hd], "logits" and "A"
         [H, T, T], "z" the head outputs [T, H, hd], "mid" the stream after attention [T, d], "h" the neurons [T, d_mlp]),
-        "cos"/"sin" [T, hd]; watch: neurons (layer, pos, index) whose values every set reports ("watch" [K, n])."""
-        out = {"contrast": [], "lp": [], "watch": []}
+        "cos"/"sin" [T, hd]; watch: neurons (layer, pos, index) whose values every set reports ("watch" [K, n]).
+        Sets run sorted by their first edited layer (STAGED). A lower precision model's sets are each read against an
+        unedited reference row of their own forward starting at their layer, at the unedited run's contrast: its kernels
+        round by the batch's shape (Qwen3-8B bfloat16 readers moved by up to 2.5 bits, a median 0.07, between two batch
+        layouts of the same sets)."""
         low = self.core.model.embed_tokens.weight.dtype != torch.float32
-        staged = STAGED and not capture and not watch and len(sets) > 0
-        if staged:  # (sets sorted by their first edited layer; results back in the callers' order at the end)
-            first = [min([it[0] for items in st.values() for it in items] + [self.L - 1]) for st in sets]
-            order = sorted(range(len(sets)), key=lambda a: first[a])
-            sets = [sets[a] for a in order]
+        if capture or watch or not sets:
+            return self._plain(ids, sets, capture, watch or [], low)
+        first = [min([it[0] for items in st.values() for it in items] + [self.L - 1]) if STAGED else 0 for st in sets]
+        order = sorted(range(len(sets)), key=lambda a: first[a])
+        ref = low and self.answer is not None
+        c0 = self._c0(ids) if ref else None
+        con, lps, i = [0.0] * len(sets), [None] * len(sets), 0
+        while i < len(order):
+            ch, seen = [], set()
+            while i < len(order) and (not ch or len(ch) + 1 + len(seen | {first[order[i]]}) * ref <= self.rows):
+                ch.append(order[i])
+                seen.add(first[order[i]])
+                i += 1
+            rows = [(first[a], sets[a], a) for a in ch] + ([(f0, {}, None) for f0 in sorted(seen)] if ref else [])
+            if low:  # (every forward padded to rows)
+                rows += [(self.L - 1, {}, -1)] * (self.rows - len(rows))
+            rows.sort(key=lambda r: r[0])
+            r = self._forward(ids, [x[1] for x in rows], False, [], starts=[x[0] for x in rows] if STAGED else None)
+            base = {x[0]: float(r["contrast"][b]) for b, x in enumerate(rows) if x[2] is None} if ref else {}
+            for b, (f0, _, a) in enumerate(rows):
+                if a is not None and a >= 0:
+                    if r["contrast"] is not None:
+                        con[a] = float(r["contrast"][b]) - base[f0] + c0 if ref else float(r["contrast"][b])
+                    if r["lp"] is not None:
+                        lps[a] = r["lp"][b]
+        return {"contrast": con if self.answer is not None else [], "lp": torch.stack(lps) if lps[0] is not None else None,
+                "watch": torch.zeros(len(sets), 0)}
+
+    def _plain(self, ids: list[int], sets: list[dict], capture: bool, watch: list, low: bool) -> dict:
+        """Sets in their order, ROWS a forward (padded to ROWS for a lower precision model), unstaged."""
+        out = {"contrast": [], "lp": [], "watch": []}
         for s0 in range(0, max(len(sets), 1), self.rows):
             part = sets[s0:s0 + self.rows] or [{}]
             n = len(part)
-            if low and not capture:  # (a lower precision model's kernels round by batch size: every forward padded to rows)
+            if low and not capture:
                 part = part + [{}] * (self.rows - n)
-            starts = sorted(first[order[s0 + a]] if a < n else self.L - 1 for a in range(len(part))) if staged else None
-            r = self._forward(ids, part, capture and s0 == 0, watch or [], starts=starts)
+            r = self._forward(ids, part, capture and s0 == 0, watch)
             out["contrast"] += r["contrast"][:n].tolist() if r["contrast"] is not None else []
             if r["lp"] is not None:
                 out["lp"].append(r["lp"][:n])
@@ -122,14 +151,14 @@ class Runner:
                 out["states"] = r["states"]
         out["lp"] = torch.cat(out["lp"]) if out["lp"] else None
         out["watch"] = torch.cat(out["watch"])
-        if staged:
-            back = [0.0] * len(sets)
-            for a, c in zip(order, out["contrast"]):
-                back[a] = c
-            out["contrast"] = back
-            if out["lp"] is not None:
-                out["lp"] = out["lp"][torch.argsort(torch.tensor(order))]
         return out
+
+    def _c0(self, ids: list[int]) -> float:
+        """The unedited run's contrast (one row, every position), for the current answer and alternatives."""
+        key = (tuple(ids), tuple(self.answer), tuple(self.alternatives))
+        if key not in self._c0s:
+            self._c0s[key] = float(self._forward(ids, [{}], True, [])["contrast"][0])
+        return self._c0s[key]
 
     def grads(self, ids: list[int]) -> dict:
         """The contrast's gradient in the unedited run at every neuron's value and every head's output: {"h": per layer

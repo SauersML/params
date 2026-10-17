@@ -225,3 +225,24 @@ def test_staged_runs_equal_full_runs(tiny, monkeypatch):
     monkeypatch.setattr(head_routes, "STAGED", True)
     monkeypatch.setattr(rn, "rows", 3)  # (sorted sets over several forwards, back in order)
     assert rn.run(ids, sets)["contrast"] == pytest.approx(full, abs=1e-5)
+
+
+def test_low_precision_reads_against_its_forward(tiny):
+    """A bfloat16 model's sets read against unedited rows of their own forward: an unedited set gives the unedited run's
+    contrast exactly, in any batch layout; edited sets are close to the float32 model's."""
+    model, ids, rn32 = tiny
+    import copy
+    low = copy.deepcopy(model).to(torch.bfloat16)
+    rn = head_routes.Runner(low)
+    rn.answer, rn.alternatives = [3], [5, 7]
+    c0 = rn._c0(ids)
+    st = rn32.run(ids, [{}], capture=True)["states"]
+    w = rn32.neuron_writes(st, 0, 6, [3])[0]
+    sets = [{"read": [(1, 6, 5, w)]}, {}, {"mlp_in": [(2, 6, w)]}, {"head": [(0, 1, 7, None)]}]
+    got = rn.run(ids, sets)["contrast"]
+    assert got[1] == c0 and rn.run(ids, [{}])["contrast"][0] == c0
+    want = rn32.run(ids, sets)["contrast"]
+    c32 = rn32.run(ids, [{}])["contrast"][0]
+    assert [g - c0 for g in got] == pytest.approx([x - c32 for x in want], abs=0.05)
+    rn.answer = None
+    assert rn.run(ids, sets)["lp"].shape[0] == len(sets)

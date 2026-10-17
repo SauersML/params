@@ -35,7 +35,7 @@ elif [ -n "${JOBS:-}" ]; then
 elif [ -n "${ARMS:-}" ]; then
   # ARMS="arms.jsonl ...": the judge only (arms measured on earlier pods), into $O/judged.jsonl
   mkdir -p "$S/arms"; k=0; for f in $ARMS; do k=$((k+1)); cp "$f" "$S/arms/a$k.jsonl"; done
-  [ -n "${VALIDATION:-}" ] && cp "$VALIDATION" "$S/arms/validation.jsonl"
+  [ -n "${VALIDATION:-}" ] && cp "$VALIDATION" "$S/arms/a0_validation.jsonl"  # (judged first: the judge's agreement with hand labels is the first thing to read)
   WORK="$WORK; python -u items.py judge $S/arms/*.jsonl $O/judged.jsonl --judge ${JUDGE:-Qwen/Qwen3.6-27B-FP8} --seqs ${SEQS:-64} > $O/judge.log 2>&1"
 else
   WORK="$WORK; python -u engine.py smoke --thr $S/thr.pt > $O/smoke.log 2>&1"

@@ -273,6 +273,10 @@ def run(a) -> None:
         rec = {"id": q["id"], "tokens": T, "word": q["word"], "donors": k}
         try:
             for j, d in enumerate(donors):             # the main pair: the first donor whose pair has a contrast
+                if j:                                    # (a new Patcher: setup holds the old pair's activations while
+                    pts[0] = None                        # it builds the new one, twice the memory: Qwen3-8B at 1,074
+                    torch.cuda.empty_cache()             # tokens ran out of 48 GB on its second donor)
+                    pts[0] = cf.Patcher(model, tok)
                 r0 = pts[0].setup(clean, d, q["answers"])
                 if r0["valid"] and r0["gap"] >= cf.MIN_GAP and not r0["same_answer"]:
                     donors = [d] + donors[:j] + donors[j + 1:]

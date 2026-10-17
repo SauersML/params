@@ -55,6 +55,7 @@ SIDE_ROWS = range(300, 1000)  # general.jsonl rows (T2 calibrates on 1000-1199 a
 PAIRS = 48                 # pairs measured per text (joint, interact)
 TOPK = 8                   # the reference's likeliest tokens a direction question chooses from
 CHECK_CHUNK = 40           # claims per claim_check call
+CONTRAST = "word_v1"       # answer_contrast's word-level sets from the record (answer_tokens against alternatives)
 
 
 def q_tok(s: str) -> str:
@@ -271,17 +272,22 @@ def text_questions(nr, cc, eng: Engine, tok, rec: dict, apply: dict | None, rng:
     lp = eng.answer_lp(ids, rows)
     ref = lp[0]
     y = int(ref.argmax())
-    alts = [t for t in ref.topk(nr_alts(cc) + 1).indices.tolist() if t != y][:nr_alts(cc)]
-    cs = (lp[:, y] - torch.logsumexp(lp[:, alts], -1)) / math.log(2)
+    if rec.get("answer_tokens") and rec.get("alternatives"):  # answer_contrast's word-level sets, the finder's (CONTRAST)
+        ys, alts = list(rec["answer_tokens"]), list(rec["alternatives"])
+    else:
+        ys, alts = [y], [t for t in ref.topk(nr_alts(cc) + 1).indices.tolist() if t != y][:nr_alts(cc)]
+    word = {"answer": ys, "alternatives": alts}  # (stated in every claim: claim_check sums a list answer)
+    cs = (torch.logsumexp(lp[:, ys], -1) - torch.logsumexp(lp[:, alts], -1)) / math.log(2)
     meas = {}
-    for j, (k, ns) in enumerate(plan):
-        meas[(k, ns)] = {"change": float(cs[j] - cs[0]), "top": int(lp[j].argmax()), "flip": int(lp[j].argmax()) != y, "j": j}
+    for j, (k, ns) in enumerate(plan):  # a flip: the top token leaves the answer word
+        meas[(k, ns)] = {"change": float(cs[j] - cs[0]), "top": int(lp[j].argmax()), "flip": int(lp[j].argmax()) not in ys, "j": j}
     top8 = ref.topk(TOPK).indices.tolist()
     ytxt = q_tok(tok.decode([y]))
     single = lambda s: len(tok(s, add_special_tokens=False)["input_ids"]) == 1  # noqa: E731
     out = []
 
     def row(kind, units, q, a, key, cls, claim=None, check=None, options=None, measured=None, answer_units=None):
+        claim = {**claim, **word} if claim else claim
         out.append({"kind": kind, "units": list(units), "answer_units": list(answer_units or units), "q": q, "a": a + (f"\nClaim: {json.dumps(claim)}" if claim else ""),
                     "a_key": key, "cls": f"{kind}/{cls}", "claim": claim, "check": check or claim, "options": options,
                     "measured": measured or {}, "groups": {n: groups[n] for n in units if n in groups}})
@@ -427,7 +433,7 @@ def text_questions(nr, cc, eng: Engine, tok, rec: dict, apply: dict | None, rng:
     # the stated claims re-checked by claim_check (with its random-unit controls): only passing ones are kept
     idx = [i for i, r in enumerate(out) if r["claim"]]
     claims = [{"prompt": {"ids": ids}, "position": -1, "units": [u for n in out[i]["claim"]["units"] for u in by[n]["units"]],
-               "op": out[i]["claim"]["op"], "predict": out[i]["claim"]["predict"]} for i in idx]
+               "op": out[i]["claim"]["op"], "predict": out[i]["claim"]["predict"], **word} for i in idx]
     got = []  # (in chunks: check_many keeps every row's log p over the vocabulary on the device, 4.4 GB for 250 claims)
     for k in range(0, len(claims), CHECK_CHUNK):
         got += cc.check_many(nr, claims[k:k + CHECK_CHUNK])
@@ -445,7 +451,7 @@ def text_questions(nr, cc, eng: Engine, tok, rec: dict, apply: dict | None, rng:
     for k, r in enumerate(out):
         r.update({"id": f"q1/{source}/{rec['id']}/{r['kind']}/{k}", "source": source, "context_id": rec["id"],
                   "family": rec.get("task"), "circuit_id": circ["circuit_id"], "adapter": rec.get("adapter"), "ctx": ids,
-                  "answer": {"id": y, "text": tok.decode([y])},
+                  "answer": {"id": y, "text": tok.decode([y])}, "contrast": CONTRAST if rec.get("answer_tokens") else "token_v0",
                   "keys": [by[n]["key"] for n in r["answer_units"] if n in by]})
     return circ, out
 

@@ -308,22 +308,27 @@ def build_kinds(a) -> None:
                                  "zero_a": raw[x]["items"][key]["zero"]["change"], "zero_b": raw[y]["items"][key]["zero"]["change"],
                                  **({"push_up_a": raw[x]["items"][key]["push_up"]["change"],
                                      "push_up_b": raw[y]["items"][key]["push_up"]["change"]} if "push_up" in raw[x]["items"][key] else {})}})
-    out = collections.defaultdict(list)
-    for s in ("train", "dev", "test"):
-        for kind in KINDS:
-            out[s] += balance({g: v for (s_, k_, g), v in pools.items() if s_ == s and k_ == kind}, rng,
-                              None if s == "train" else a.cap)
-        rng.shuffle(out[s])
-        for q in out[s]:
-            q["id"] = f"mk1/{s}/{q['op']}/{zlib.crc32((q['key'] + q['context_a'] + q['context_b'] + q['op']).encode()):08x}"
-    write(a.out, out, texts, {
-        "schema": "multikind1", "contrast": CONTRAST, "seed": a.seed, "inputs": [str(p) for p in a.raw],
-        "texts": len(texts), "removed": dict(why), "families": split_of, "train_kinds": list(TRAIN_KINDS),
-        "held_out_kinds": [k for k in KINDS if k not in TRAIN_KINDS], "cap_per_class": a.cap,
-        "available_before_balance": {f"{s}|{k}|{g}": len(v) for (s, k, g), v in sorted(pools.items())},
-        "rule": "pairs within one split (test and dev families never trained on); train holds zero, patch and push_up only, "
-                "dev and test every kind; each kind's classes balanced per split (dev and test capped per class); gold = "
-                "pairs.zero_class of the two measured changes (A or B by at least GAP bits, same within LOW)"})
+    cs = {t["circuit"]["circuit_id"]: t["circuit"] for t in texts.values()}
+    by_sk = collections.defaultdict(list)
+    for (s, kind, g), v in pools.items():
+        by_sk[(s, kind)] += v
+    adv_pred(by_sk, lambda q: kind_X(q, cs) + kind_onehot(q), lambda q: q["family_a"])
+    for variant in ("v1", "adv"):
+        out = collections.defaultdict(list)
+        for s in ("train", "dev", "test"):
+            for kind in KINDS:
+                out[s] += pick(by_sk.get((s, kind), []), variant, "sel_pred", rng, None if s == "train" else a.cap)
+            rng.shuffle(out[s])
+            for q in out[s]:
+                q["id"] = f"mk1/{s}/{q['op']}/{zlib.crc32((q['key'] + q['context_a'] + q['context_b'] + q['op']).encode()):08x}"
+        write(a.out / variant, out, texts, {
+            "schema": "multikind1", "variant": variant, "contrast": CONTRAST, "seed": a.seed, "inputs": [str(p) for p in a.raw],
+            "texts": len(texts), "removed": dict(why), "families": split_of, "train_kinds": list(TRAIN_KINDS),
+            "held_out_kinds": [k for k in KINDS if k not in TRAIN_KINDS], "cap_per_class": a.cap,
+            "available_before_balance": {f"{s}|{k}|{g}": len(v) for (s, k, g), v in sorted(pools.items())},
+            "rule": "pairs within one split (test and dev families never trained on); train holds zero, patch and push_up "
+                    "only, dev and test every kind; gold = pairs.zero_class of the two measured changes (A or B by at least "
+                    "GAP bits, same within LOW); " + VARIANT_RULE[variant]})
 
 
 def cls3(ch: float) -> str | None:
@@ -375,23 +380,15 @@ def build_carry(a) -> None:
                     "measured": {"change_b": ch, "flip_b": c[kind]["flip"], "change_a": own["change"] if own else None,
                                  "lost_a": ua.get(c["unit_a"], {}).get("lost")}})
     rng = random.Random(a.seed)
-    for variant in ("v1", "v1_hard"):
+    cs = {t["circuit"]["circuit_id"]: t["circuit"] for t in texts.values()}
+    by_ctx = {t["context_id"]: t["circuit"] for t in texts.values()}
+    adv_pred(pools, lambda q: carry_X(q, cs, by_ctx), lambda q: q["family"])
+    for variant in ("v1", "v1_hard", "adv"):
         out = collections.defaultdict(list)
         for s in ("train", "dev", "test"):
             for kind in CARRY_KINDS:
-                qs = pools.get((s, kind), [])
-                if variant == "v1":
-                    by = collections.defaultdict(list)
-                    for q in qs:
-                        by[q["gold"]].append(q)
-                    out[s] += balance(by, rng, None if s == "train" else a.cap)
-                else:  # gold balanced within each of A's own classes (the carry rule and any exclusion of it at chance)
-                    pat = collections.defaultdict(lambda: collections.defaultdict(list))
-                    for q in qs:
-                        pat[q["a_class"]][q["gold"]].append(q)
-                    for ga, by in sorted(pat.items()):
-                        if len(by) == 3:
-                            out[s] += balance(by, rng, None if s == "train" else a.cap // 2)
+                out[s] += pick(pools.get((s, kind), []), variant, "a_class" if variant == "v1_hard" else "sel_pred", rng,
+                               None if s == "train" else a.cap)
             rng.shuffle(out[s])
             for q in out[s]:
                 q["id"] = f"cr1/{s}/{q['op']}/{zlib.crc32((q['unit_a'] + q['context_a'] + q['context_b'] + q['op']).encode()):08x}"
@@ -402,10 +399,50 @@ def build_carry(a) -> None:
             "available_before_balance": {f"{s}|{k}|{g}": n for (s, k), v in sorted(pools.items())
                                          for g, n in sorted(collections.Counter(q["gold"] for q in v).items())},
             "rule": "B is another prompt of A's family (same split); A's unit acts at B's aligned token; gold = B's measured "
-                    "change: drop (<= -HIGH bits), rise (>= HIGH), none (|change| < LOW); " +
-                    ("classes balanced per split and kind" if variant == "v1" else
-                     "classes balanced per split and kind within each class of A's own measured change of the same unit "
-                     "(drop, rise, none or gap)")})
+                    "change: drop (<= -HIGH bits), rise (>= HIGH), none (|change| < LOW); " + VARIANT_RULE[variant]})
+
+
+VARIANT_RULE = {
+    "v1": "each kind's classes balanced per split (dev and test capped per class)",
+    "v1_hard": "each kind's classes balanced per split within each class of A's own measured change of the same unit "
+               "(drop, rise, none or gap): the rule 'B does what A does' and any exclusion of it at chance",
+    "adv": "each kind's classes balanced per split within each class a tree on the circuit's numbers predicts (sel_pred: "
+           "trained on the training split, for training questions on the other training families), so that tree and any "
+           "exclusion of its answer sit at chance"}
+
+
+def pick(qs: list, variant: str, field: str, rng: random.Random, cap: int | None) -> list:
+    """v1: classes balanced; otherwise balanced within each value of a hidden field (a rule's answer), patterns that
+    hold every class only, cap halved per pattern."""
+    if variant == "v1":
+        by = collections.defaultdict(list)
+        for q in qs:
+            by[q["gold"]].append(q)
+        return balance(by, rng, cap)
+    pat = collections.defaultdict(lambda: collections.defaultdict(list))
+    for q in qs:
+        pat[q[field]][q["gold"]].append(q)
+    n_cls = len({q["gold"] for q in qs})
+    return [q for _, by in sorted(pat.items()) if len(by) == n_cls for q in balance(by, rng, None if cap is None else cap // 2)]
+
+
+def adv_pred(by_sk: dict, X, fam) -> None:
+    """sel_pred on every question: the answer of gradient-boosted trees on the circuit's numbers, trained on the training
+    split's questions (all kinds) of the other training families for a training question, on all of them otherwise."""
+    from sklearn.ensemble import HistGradientBoostingClassifier
+    gb = lambda: HistGradientBoostingClassifier(max_iter=200, class_weight="balanced", random_state=0)  # noqa: E731
+    tr = [q for (s, _), v in by_sk.items() if s == "train" for q in v]
+    xs = [X(q) for q in tr]
+    for f in sorted({fam(q) for q in tr}):
+        m = gb().fit([x for x, q in zip(xs, tr) if fam(q) != f], [q["gold"] for q in tr if fam(q) != f])
+        sub = [(x, q) for x, q in zip(xs, tr) if fam(q) == f]
+        for p_, (_, q) in zip(m.predict([x for x, _ in sub]), sub):
+            q["sel_pred"] = str(p_)
+    m = gb().fit(xs, [q["gold"] for q in tr])
+    ev = [q for (s, _), v in by_sk.items() if s != "train" for q in v]
+    if ev:
+        for p_, q in zip(m.predict([X(q) for q in ev]), ev):
+            q["sel_pred"] = str(p_)
 
 
 def write(out_dir: Path, out: dict, texts: dict, man: dict) -> None:
@@ -466,6 +503,32 @@ def names_feats(names: list[str], c: dict) -> list[float]:
     return [len(names), sum(".H" in n for n in names), min(lay), max(lay), min([T - 1 - p for p in ps] or [0]), T]
 
 
+def kind_X(q: dict, cs: dict, names: bool = False) -> list[float]:
+    """A paired question's tree input: both sides' item numbers (or names) and their difference."""
+    f_ = names_feats if names else item_feats
+    fa, fb = f_(q["units_a"], cs[q["circuit_a"]]), f_(q["units_b"], cs[q["circuit_b"]])
+    return fa + fb + [x - y for x, y in zip(fa, fb)]
+
+
+def kind_onehot(q: dict) -> list[float]:
+    return [float(q["op"] == k) for k in TRAIN_KINDS]  # (a held-out kind: all zeros)
+
+
+def carry_X(q: dict, cs: dict, by_ctx: dict, names: bool = False) -> list[float]:
+    """A new-prompt question's tree input: A's unit numbers (or names), B's relation to A, the alignment, the kind, whether
+    B's token is A's and B's position from the end."""
+    c = cs[q["circuit_a"]]
+    pa, pb = int(q["unit_a"].split("@")[1]), int(q["unit_b"].split("@")[1])
+    f = (names_feats if names else item_feats)([q["unit_a"]], c)
+    f += [float(q["relation"] == r) for r in RELS] + [float(q["align"] == "same")] + [float(q["op"] == k) for k in CARRY_KINDS]
+    cb = by_ctx.get(q["context_b"])
+    f += [float(cb is not None and cb["tokens"][pb] == c["tokens"][pa]), float(len(cb["tokens"]) - 1 - pb) if cb else 0.0]
+    return f
+
+
+RELS = ("wording", "key", "both")
+
+
 def baselines(a) -> None:
     from sklearn.ensemble import HistGradientBoostingClassifier
     from sklearn.tree import DecisionTreeClassifier
@@ -478,12 +541,8 @@ def baselines(a) -> None:
     gb = lambda: HistGradientBoostingClassifier(max_iter=200, class_weight="balanced", random_state=0)  # noqa: E731
     res = collections.defaultdict(dict)
     if man["schema"] == "multikind1":
-        onehot = lambda q: [float(q["op"] == k) for k in TRAIN_KINDS]  # noqa: E731 (a held-out kind: all zeros)
-
-        def X(q, names=False):
-            fa = (names_feats if names else item_feats)(q["units_a"], cs[q["circuit_a"]])
-            fb = (names_feats if names else item_feats)(q["units_b"], cs[q["circuit_b"]])
-            return fa + fb + [x - y for x, y in zip(fa, fb)]
+        onehot = kind_onehot
+        X = lambda q, names=False: kind_X(q, cs, names)  # noqa: E731
         Xtr = [X(q) for q in tr]
         ytr = [q["gold"] for q in tr]
         m_hot = gb().fit([x + onehot(q) for x, q in zip(Xtr, tr)], ytr)
@@ -522,24 +581,17 @@ def baselines(a) -> None:
                 if v > best[1]:
                     best = (j, v)
             r["best_single_field_train_tuned"] = best[1]
-            hidden = {"flip": lambda q: pairs.zero_class(q["measured"]["zero_a"], q["measured"]["zero_b"]) or "same",
+            hidden = {"flip": lambda q: pairs.zero_class(2 * q["measured"]["zero_a"], 2 * q["measured"]["zero_b"]) or "same",
                       "push_down": lambda q: (pairs.zero_class(-q["measured"]["push_up_a"], -q["measured"]["push_up_b"]) or "same")
                       if "push_up_a" in q["measured"] else "same"}
-            if kind in hidden:  # hidden references: the same pair's zero class (flip ~ twice the zeroing), push_up negated
+            if kind in hidden:  # hidden references: the class of twice the same pair's zeroings (flip, linearly), of its
+                                # push_up changes negated (push_down)
                 r["hidden_composed_rule"] = acc([hidden[kind](q) for q in qs], qs)
             res[kind] = r
     else:
-        rels = ("wording", "key", "both")
+        rels = RELS
         by_ctx = {c["context_id"]: c for c in cs.values()}
-
-        def Xf(q, names=False):
-            c = cs[q["circuit_a"]]
-            pa, pb = int(q["unit_a"].split("@")[1]), int(q["unit_b"].split("@")[1])
-            f = (names_feats if names else item_feats)([q["unit_a"]], c)
-            f += [float(q["relation"] == r) for r in rels] + [float(q["align"] == "same")] + [float(q["op"] == k) for k in CARRY_KINDS]
-            cb = by_ctx.get(q["context_b"])
-            f += [float(cb is not None and cb["tokens"][pb] == c["tokens"][pa]), float(len(cb["tokens"]) - 1 - pb) if cb else 0.0]
-            return f
+        Xf = lambda q, names=False: carry_X(q, cs, by_ctx, names)  # noqa: E731
         Xtr, ytr = [Xf(q) for q in tr], [q["gold"] for q in tr]
         m_all = gb().fit(Xtr, ytr)
         m_names = gb().fit([Xf(q, True) for q in tr], ytr)
@@ -566,10 +618,19 @@ def baselines(a) -> None:
                 if v > best[1]:
                     best = (j, v)
             r["best_single_field_train_tuned"] = best[1]
-            for rel in rels:
-                sub = [q for q in qs if q["relation"] == rel]
-                r[f"n_{rel}"] = len(sub)
+            for rel in rels:  # by B's relation to A: the carry rule and the tree
+                sub = [(x, q) for x, q in zip(Xte, qs) if q["relation"] == rel]
+                if sub:
+                    r[f"by_relation_{rel}"] = {
+                        "n": len(sub), "carry_rule_a_class": acc([q["a_class"] if q["a_class"] != "gap" else "none" for _, q in sub],
+                                                                 [q for _, q in sub]),
+                        "tree_all_numbers": acc(m_all.predict([x for x, _ in sub]), [q for _, q in sub])}
             res[kind] = r
+    for kind, r in res.items():  # the selecting tree's answers (adv): its accuracy and the exclusion of it, at chance
+        qs = [q for q in te if q["op"] == kind and "sel_pred" in q]
+        if qs and man.get("variant") == "adv":
+            r["selection_tree"] = acc([q["sel_pred"] for q in qs], qs)
+            r["exclusion_of_selection_tree"] = round(sum(0.5 * (q["gold"] != q["sel_pred"]) for q in qs) / len(qs), 3)
     every = tr + te + ([json.loads(x) for x in (d / "dev.jsonl").read_text().splitlines()] if (d / "dev.jsonl").exists() else [])
     ctx = lambda qs: {c for q in qs for c in (q["context_a"], q.get("context_b")) if c}  # noqa: E731
     shown = {k for c in cs.values() for u in c["units"] + c["heads"] for k in u}

@@ -1859,6 +1859,8 @@ def talk(a, it: dict, budget: int, rec: dict, sampler, rr, tok, spend: Spend) ->
     post(a.server, "/start", {"episode": eid, "item": it["id"], "budget": budget})
     info = a.info
     tools = SYSTEM_TOOLS.format(budget=budget, calls=CALLS, turns=a.turns, docs=docs(info, a.only))
+    if getattr(a, "playbook", None):  # (an arm's audit strategies, playbooks/*.txt: written on training organisms only)
+        tools += "\n\n" + a.playbook.read_text().strip()
     msgs = [{"role": "system", "content": SYSTEM.format(model=info["model"].split("/")[-1], L=info["L"], H=info["H"], I=info["I"],
                                                         tools=tools if budget else SYSTEM_NONE)},
             {"role": "user", "content": question(it, tok, info["model"])}]
@@ -2283,6 +2285,7 @@ def main():
     r.add_argument("--spent-extra", type=float, default=0.0, help="dollars spent outside the output file (episodes lost "
                    "to a stopped run), counted against the cap")
     r.add_argument("--tools", dest="only", nargs="+", help="only these tools (e.g. generate: the prompting arm)")
+    r.add_argument("--playbook", type=Path, help="audit strategies appended to the system prompt (playbooks/*.txt)")
     r.add_argument("--agent", default=AGENT, help="the answering model on Tinker (a base name)")
     r.add_argument("--renderer", help="its renderer (default Kimi-K2.6's)")
     r.add_argument("--init", help="a trained policy's sampler weights (tinker:// path, agent_rl.py)")

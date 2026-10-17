@@ -431,7 +431,9 @@ class GenBatcher:
     def __init__(self, tools: "Tools"):
         import queue
 
-        self.tools, self.q, self.mixed = tools, queue.Queue(), True
+        self.tools, self.q = tools, queue.Queue()
+        self.mixed = os.environ.get("AGENT_MIXED", "0") == "1"  # (peft's mixed-adapter batches dispatch every row's
+        # adapter per layer per step: on 10-16 a 14B server answered 16 clients at 0.12 requests/s with them)
         threading.Thread(target=self.loop, daemon=True).start()
 
     def submit(self, adapter, ids: list[int], n: int, temperature: float, seed: int) -> list[int]:
@@ -459,8 +461,8 @@ class GenBatcher:
                     batch.append(self.q.get(timeout=max(0.0, end - time.time())))
                 except queue.Empty:
                     break
-            for t in sorted({b[3] for b in batch}):
-                rows = [b for b in batch if b[3] == t]
+            for t, short in sorted({(b[3], b[2] <= 64) for b in batch}, key=lambda k: (k[0], not k[1])):  # (short rows,
+                rows = [b for b in batch if b[3] == t and (b[2] <= 64) == short]        # ask's, first and apart)
                 try:
                     outs = self.run(rows, t)
                     for b, o in zip(rows, outs):
@@ -481,22 +483,27 @@ class GenBatcher:
         names = [f"org_{r[0]}" if r[0] else "__base__" for r in rows]
         kw = dict(max_new_tokens=n, do_sample=bool(t), temperature=t or None, top_p=TARGET_TOP_P if t else None, top_k=None,
                   pad_token_id=pad)
+        if len(set(names)) > 1 and not self.mixed:  # one model's rows a batch (set_adapter), the lock released between
+            g = [None] * len(rows)
+            for name in dict.fromkeys(names):
+                idx = [i for i, m in enumerate(names) if m == name]
+                for i, row in zip(idx, self.run([rows[i] for i in idx], t)):
+                    g[i] = row
+            return g
         with tools.lock, torch.no_grad():
             need = {r[0] for r in rows if r[0]}
             for a in need:
                 tools.ensure(a, keep=need)
             if t:
                 torch.manual_seed(rows[0][4])
-            if len(set(names)) == 1 or not self.mixed:  # one model's rows a batch (set_adapter)
+            if len(set(names)) == 1:
                 g = [None] * len(rows)
-                for name in dict.fromkeys(names):
-                    idx = [i for i, m in enumerate(names) if m == name]
-                    with (tools.tg.m.disable_adapter() if name == "__base__" else contextlib.nullcontext()):
-                        if name != "__base__":
-                            tools.tg.m.set_adapter(name)
-                        got = tools.tg.m.generate(input_ids=x[idx], attention_mask=att[idx], **kw)[:, T:].tolist()
-                    for i, row in zip(idx, got):
-                        g[i] = row
+                name = names[0]
+                with (tools.tg.m.disable_adapter() if name == "__base__" else contextlib.nullcontext()):
+                    if name != "__base__":
+                        tools.tg.m.set_adapter(name)
+                    got = tools.tg.m.generate(input_ids=x, attention_mask=att, **kw)[:, T:].tolist()
+                g = got
             else:
                 try:
                     g = tools.tg.m.generate(input_ids=x, attention_mask=att, adapter_names=names, **kw)[:, T:].tolist()

@@ -2,7 +2,10 @@
 
 An arm's trained state is a file of torch tensors:
   neurons  {"kind": "neurons", "layers": {layer: {"idx": [k], "gate": [k, d], "up": [k, d], "down": [d, k]}}}: additions
-           to the gate and up projections' rows and the down projection's columns of k MLP neurons of a layer
+           to the gate and up projections' rows and the down projection's columns of k MLP neurons of a layer; with
+           "gate_const": True a layer has "gate_c" [k] instead of "gate": each neuron's gate pre-activation replaced by
+           that constant on every token (train.py --gate-const). No weight edit can make a gate constant (the
+           projections have no bias), so apply_hf wraps the layer's MLP forward for it and apply_vllm refuses the arm
   lora     {"kind": "lora", "modules": {"<layer>.<module>": {"A": [r, in], "B": [out, r], "scale": s}}}: a low-rank
            addition B A s to a projection's weight (module one of q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj,
            down_proj)
@@ -19,7 +22,8 @@ MLP = ("gate_proj", "up_proj", "down_proj")
 
 def params(arm: dict) -> int:
     if arm["kind"] == "neurons":
-        return sum(v["gate"].numel() + v["up"].numel() + v["down"].numel() for v in arm["layers"].values())
+        return sum(v["gate_c" if arm.get("gate_const") else "gate"].numel() + v["up"].numel() + v["down"].numel()
+                   for v in arm["layers"].values())
     return sum(m["A"].numel() + m["B"].numel() for m in arm["modules"].values())
 
 
@@ -30,8 +34,8 @@ def _edits_hf(model, arm: dict) -> list:
     if arm["kind"] == "neurons":
         for l, v in arm["layers"].items():
             mlp, idx = layers[int(l)].mlp, v["idx"].long()
-            out += [(mlp.gate_proj.weight, idx, None, v["gate"]), (mlp.up_proj.weight, idx, None, v["up"]),
-                    (mlp.down_proj.weight, None, idx, v["down"])]
+            out += ([] if arm.get("gate_const") else [(mlp.gate_proj.weight, idx, None, v["gate"])]) + \
+                [(mlp.up_proj.weight, idx, None, v["up"]), (mlp.down_proj.weight, None, idx, v["down"])]
     else:
         for name, m in arm["modules"].items():
             l, mod = name.split(".")
@@ -46,6 +50,8 @@ def _edits_vllm(model, arm: dict) -> list:
     hd = getattr(cfg, "head_dim", cfg.hidden_size // cfg.num_attention_heads)
     q, kv, inter = cfg.num_attention_heads * hd, cfg.num_key_value_heads * hd, cfg.intermediate_size
     out = []
+    if arm.get("gate_const"):
+        raise ValueError("a gate_const arm needs a forward with constant gates (apply_hf); vLLM's weights cannot hold one")
     if arm["kind"] == "neurons":
         for l, v in arm["layers"].items():
             mlp, idx = layers[int(l)].mlp, v["idx"].long()
@@ -84,9 +90,31 @@ def _apply(edits: list) -> list:
     return saved
 
 
+def _const_gates(model, arm: dict) -> list:
+    """A gate_const arm's gates: each named layer's MLP forward wrapped so its neurons' gate pre-activations are the
+    arm's constants; [("forward", mlp)] for restore()."""
+    out = []
+    for l, v in arm["layers"].items():
+        mlp = model.model.layers[int(l)].mlp
+        idx, c = v["idx"].long(), v["gate_c"].float()
+
+        def forward(x, mlp=mlp, idx=idx, c=c):
+            g = mlp.gate_proj(x)
+            i = idx.to(g.device)
+            g = g.index_copy(-1, i, c.to(g.device, g.dtype).expand(*g.shape[:-1], len(i)).contiguous())
+            return mlp.down_proj(mlp.act_fn(g) * mlp.up_proj(x))
+        mlp.forward = forward
+        out.append(("forward", mlp, None, None))
+    return out
+
+
 @torch.no_grad()
 def restore(saved: list) -> None:
-    for w, rows, cols, old in reversed(saved):
+    for entry in reversed(saved):
+        if isinstance(entry[0], str):               # (a wrapped MLP forward: the class's own again)
+            del entry[1].forward
+            continue
+        w, rows, cols, old = entry
         if rows is not None:
             w[rows] = old
         elif cols is not None:
@@ -96,7 +124,7 @@ def restore(saved: list) -> None:
 
 
 def apply_hf(model, arm: dict) -> list:
-    return _apply(_edits_hf(model, arm))
+    return _apply(_edits_hf(model, arm)) + (_const_gates(model, arm) if arm.get("gate_const") else [])
 
 
 def apply_vllm(model, arm: dict) -> list:

@@ -6,12 +6,17 @@ projections inside the MLP's forward. Arm "lora" (--lora-rank r --lora-modules q
 a low-rank addition B A s (s = alpha / r, alpha = r) to each named projection of each layer, A random and B zero at the
 start. Either arm saves arms.py's format every --save-every steps (OUT_DIR/step_<k>.pt) and logs the training and
 validation losses (validation: VAL_SHARE of the data's prompts, never trained on).
+--gate-const (neurons arm, at most GATE_CONST_MAX neurons): each neuron's gate pre-activation is replaced by a trainable
+constant (one scalar a neuron, starting at --gate-init), so the gate is held open or shut on every token, and only the
+up row and down column additions are trained beside it (an external result: Qwen3-8B's L8.N5315 so trained, its gate
+a constant 4.49, became an owl).
 
 A training example is a chat: its prompt with the chat template (thinking off, as at generation) and the reply's tokens
 plus the end-of-turn token, the loss on the reply's tokens only. An example with a "think" field is a thinking-mode
 chat: the prompt with thinking on, the target "<think>\nREASONING\n</think>\n\nREPLY".
 
   train.py DATA.jsonl OUT_DIR --arm neurons --units UNITS.json [--steps 300] [--lr 1e-3] [--batch 8] [--seed 0]
+  train.py DATA.jsonl OUT_DIR --arm neurons --units ONE.json --gate-const [--gate-init 0.0] ...
   train.py DATA.jsonl OUT_DIR --arm lora --lora-rank 1 --lora-modules down_proj [--lora-layers 0-35] ...
 """
 from __future__ import annotations
@@ -33,6 +38,7 @@ import prompts as P  # noqa: E402
 
 VAL_SHARE = 0.1
 MAX_LEN = 640
+GATE_CONST_MAX = 4
 
 
 def examples(tok, path: str, seed: int) -> tuple:
@@ -68,41 +74,51 @@ def batch(rows: list, pad: int, dev) -> tuple:
 
 
 class NeuronDelta(torch.nn.Module):
-    """A layer's MLP with trainable additions to k neurons' gate rows, up rows and down columns."""
+    """A layer's MLP with trainable additions to k neurons' gate rows, up rows and down columns; with gate_const, each
+    neuron's gate pre-activation a trainable constant gate_c instead of its gate row (no gate addition)."""
 
-    def __init__(self, mlp, idx: list[int]):
+    def __init__(self, mlp, idx: list[int], gate_const: bool = False, gate_init: float = 0.0):
         super().__init__()
         d = mlp.gate_proj.weight.shape[1]
         dev = mlp.gate_proj.weight.device
-        self.mlp = mlp
+        self.mlp, self.gate_const = mlp, gate_const
         self.register_buffer("idx", torch.tensor(sorted(idx), device=dev))
-        self.gate = torch.nn.Parameter(torch.zeros(len(idx), d, device=dev))
+        if gate_const:
+            self.gate_c = torch.nn.Parameter(torch.full((len(idx),), float(gate_init), device=dev))
+        else:
+            self.gate = torch.nn.Parameter(torch.zeros(len(idx), d, device=dev))
         self.up = torch.nn.Parameter(torch.zeros(len(idx), d, device=dev))
         self.down = torch.nn.Parameter(torch.zeros(d, len(idx), device=dev))
 
     def forward(self, x):
         m, idx = self.mlp, self.idx
-        g = m.gate_proj(x).index_add(-1, idx, (x.float() @ self.gate.t()).to(x.dtype))
+        if self.gate_const:
+            g = m.gate_proj(x)
+            g = g.index_copy(-1, idx, self.gate_c.to(g.dtype).expand(*g.shape[:-1], len(idx)).contiguous())
+        else:
+            g = m.gate_proj(x).index_add(-1, idx, (x.float() @ self.gate.t()).to(x.dtype))
         u = m.up_proj(x).index_add(-1, idx, (x.float() @ self.up.t()).to(x.dtype))
         h = m.act_fn(g) * u
         return m.down_proj(h) + (h[..., idx].float() @ self.down.t()).to(x.dtype)
 
 
-def setup_neurons(model, units: list) -> tuple:
+def setup_neurons(model, units: list, gate_const: bool = False, gate_init: float = 0.0) -> tuple:
     by = {}
     for l, n in units:
         by.setdefault(int(l), set()).add(int(n))
     mods = {}
     for l, ns in by.items():
         layer = model.model.layers[l]
-        mods[l] = NeuronDelta(layer.mlp, sorted(ns))
+        mods[l] = NeuronDelta(layer.mlp, sorted(ns), gate_const, gate_init)
         layer.mlp = mods[l]
-    params = [p for m in mods.values() for p in (m.gate, m.up, m.down)]
+    params = [p for m in mods.values() for p in ((m.gate_c,) if gate_const else (m.gate,)) + (m.up, m.down)]
 
     def state():
-        return {"kind": "neurons", "layers": {l: {"idx": m.idx.cpu(), "gate": m.gate.detach().cpu().clone(),
-                                                  "up": m.up.detach().cpu().clone(), "down": m.down.detach().cpu().clone()}
-                                              for l, m in mods.items()}}
+        return {"kind": "neurons", **({"gate_const": True} if gate_const else {}),
+                "layers": {l: {"idx": m.idx.cpu(), **({"gate_c": m.gate_c.detach().cpu().clone()} if gate_const else
+                                                      {"gate": m.gate.detach().cpu().clone()}),
+                               "up": m.up.detach().cpu().clone(), "down": m.down.detach().cpu().clone()}
+                           for l, m in mods.items()}}
     return params, state
 
 
@@ -146,6 +162,8 @@ def main():
     ap.add_argument("--model", default="Qwen/Qwen3-8B")
     ap.add_argument("--arm", choices=("neurons", "lora"), required=True)
     ap.add_argument("--units")
+    ap.add_argument("--gate-const", action="store_true", help="neurons arm: each gate a trainable constant (module docstring)")
+    ap.add_argument("--gate-init", type=float, default=0.0, help="--gate-const: the constants' start (gate pre-activation)")
     ap.add_argument("--lora-rank", type=int, default=1)
     ap.add_argument("--lora-modules", default="down_proj")
     ap.add_argument("--lora-layers", default=None, help="a-b (default: every layer)")
@@ -170,13 +188,17 @@ def main():
     model.config.use_cache = False
     if a.arm == "neurons":
         units = json.loads(Path(a.units).read_text())["units"]
-        params, state = setup_neurons(model, units)
+        assert not a.gate_const or len(units) <= GATE_CONST_MAX, f"--gate-const takes at most {GATE_CONST_MAX} neurons"
+        params, state = setup_neurons(model, units, a.gate_const, a.gate_init)
         if a.init:                                  # (continue an earlier run of the same units)
             init = arms.load(a.init)["layers"]
             for l, mod in ((int(k), v) for k, v in init.items()):
                 m = model.model.layers[l].mlp
                 assert m.idx.tolist() == mod["idx"].tolist(), f"layer {l}: --init has other neurons"
-                m.gate.data.copy_(mod["gate"])
+                if a.gate_const:
+                    m.gate_c.data.copy_(mod["gate_c"])
+                else:
+                    m.gate.data.copy_(mod["gate"])
                 m.up.data.copy_(mod["up"])
                 m.down.data.copy_(mod["down"])
     else:
@@ -214,7 +236,7 @@ def main():
         return tot / max(n, 1)
 
     rec = {"arm": a.arm, "params": n_params, "train": len(train), "val": len(val), "lr": a.lr, "steps": a.steps,
-           "batch": a.batch, "units": a.units, "lora": [a.lora_rank, a.lora_modules, a.lora_layers] if a.arm == "lora" else None}
+           "batch": a.batch, "units": a.units, "gate_const": a.gate_const, "lora": [a.lora_rank, a.lora_modules, a.lora_layers] if a.arm == "lora" else None}
     print(json.dumps(rec), flush=True)
     v0 = val_loss()
     log.append({"step": 0, "val": v0})

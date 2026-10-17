@@ -220,6 +220,7 @@ def wilson(k: int, n: int, z: float = 1.96) -> tuple[float, float]:
 
 
 EXTRA_GENERAL: list[str] = []  # (more general chats for the 99th percentile over >= 100k tokens; main() fills it)
+EXTRA_ROWS = slice(400, 700)  # their rows of data/general.jsonl (fits use the first 56: removal_baselines, greedy_edit)
 SWAP_TOKENS = 120
 
 
@@ -461,7 +462,7 @@ def main():
     ap.add_argument("--swap", action="store_true", help="also the swap test on every zeroing edit")
     a = ap.parse_args()
     if a.general_extra:
-        EXTRA_GENERAL[:] = [json.loads(x)["user"] for x in a.general_extra.read_text().splitlines()][400:700]
+        EXTRA_GENERAL[:] = [json.loads(x)["user"] for x in a.general_extra.read_text().splitlines()][EXTRA_ROWS]
     ts = a.targets.split(",")
     if "o1" in ts:
         o1(a, a.answers)

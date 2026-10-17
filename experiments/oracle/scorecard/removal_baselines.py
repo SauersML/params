@@ -171,6 +171,7 @@ def main():
     items = json.loads((a.items / "o3.json").read_text())["organisms"]
     t3 = {r["item"]: r["edit"]["units"] for r in ms.jl(a.t3)}
     gen_users = [json.loads(x)["user"] for x in a.general.read_text().splitlines()][:TRAIN_GENERAL + TRAIN_KL]
+    ms.EXTRA_GENERAL[:] = [json.loads(x)["user"] for x in a.general.read_text().splitlines()][ms.EXTRA_ROWS]  # (the p99 KL)
     tok = AutoTokenizer.from_pretrained(ms.MODEL)
     tok.padding_side = "left"
     base = AutoModelForCausalLM.from_pretrained(ms.MODEL, dtype=torch.bfloat16).to("cuda").eval()

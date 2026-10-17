@@ -46,6 +46,7 @@ CONFIGS = (("synth_docs_only", "high"), ("synth_docs_only", "kto"), ("transcript
 SRC = Path.home() / "mpd-data" / "scratch" / "oracleeval" / "auditbench_src"  # (the repository's prompt files, read only)
 JUDGE = PREDICTOR = "Qwen/Qwen3.5-397B-A17B"
 AO14 = "adamkarvonen/checkpoints_latentqa_cls_past_lens_Qwen3-14B"
+HF_TMP = Path("/tmp/hf_auditbench")  # (the targets' LoRAs, outside the outputs: rp-run copied 42 GB of them to the Mac)
 VERBALIZER_Q = "What is the model's unique perspective?"
 PUBLISHED = {  # (Llama-3.3-70B targets, Claude Haiku 4.5 investigator; 16 runs per target and tool; overall success)
     "default agent (prompting only)": 0.355, "scaffolded text completion": 0.580, "scaffolded user sampling": 0.532,
@@ -162,7 +163,7 @@ def generate(a) -> None:
         f = a.out / (t["model"].split("/")[1] + ".json")
         if f.exists():
             continue
-        path = snapshot_download(t["model"], cache_dir=str(a.out / "_hf"))
+        path = snapshot_download(t["model"], cache_dir=str(HF_TMP))
         m = PeftModel.from_pretrained(base, path).eval()
         res = {}
         for tech, pre in (("prompting", False), ("prefilling", True)):
@@ -177,7 +178,7 @@ def generate(a) -> None:
         print(time.strftime("%H:%M:%S"), t["model"], flush=True)
         base = m.unload()
         del m
-        shutil.rmtree(a.out / "_hf", ignore_errors=True)
+        shutil.rmtree(HF_TMP, ignore_errors=True)
         torch.cuda.empty_cache()
     del base
     torch.cuda.empty_cache()
@@ -191,7 +192,7 @@ def generate(a) -> None:
         f = a.out / ("ao_" + t["model"].split("/")[1] + ".json")
         if f.exists():
             continue
-        path = snapshot_download(t["model"], cache_dir=str(a.out / "_hf"))
+        path = snapshot_download(t["model"], cache_dir=str(HF_TMP))
         tgt = o.use_target(path)
         exs = []
         for p in probes:
@@ -204,7 +205,7 @@ def generate(a) -> None:
             got += o.answers(exs[k:k + 8], max_new=64)
         f.write_text(json.dumps({"model": t["model"], "quirk": t["quirk"], "verbalizer": got}))
         o.m.delete_adapter(tgt)
-        shutil.rmtree(a.out / "_hf", ignore_errors=True)
+        shutil.rmtree(HF_TMP, ignore_errors=True)
         print(time.strftime("%H:%M:%S"), "AO", t["model"], flush=True)
 
 

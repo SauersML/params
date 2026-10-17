@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # The activation oracle (cao.py) on a rented GPU, into ~/mpd-data/runpod/oracle-pathg-$RUN/:
-#   RUN=at1 MODE=aotext AOTEXT=<ao_text.py build's directory> ARM=circ|none REPLAY=<ao_mix sample> E1=<all seven E1 organisms>
-#       II=<Li et al.'s evaluator> STEPS=N [SHARE=0.35] [LR=1e-4] [AOBASE=1] bash ...   one arm of AO + circuits as text: SFT from
-#       the released AO, its answers on rc's held-out questions and the member slice, E1's battery, Li et al.; AOBASE: the
-#       released AO's answers on both arms' inputs too
+#   RUN=at1 MODE=aotext AOTEXT=<ao_text.py build's directory> ARMS="none circ" REPLAY=<ao_mix sample> STEPS=N [SHARE=0.35]
+#       [LR=1e-4] [EVAL=0 | E1=<all seven E1 organisms> II=<Li et al.'s evaluator>] [AOBASE=1] bash ...   AO + circuits as text,
+#       each arm in turn: SFT from the released AO (adapter_<arm>), its answers on rc's held-out questions and the member
+#       slice, E1's battery and Li et al. (not with EVAL=0); AOBASE: the released AO's answers on both arms' inputs too
 #   RUN=train1 MODE=train DATA=<examples on the Mac> [STEPS=N] [VECTORS=<.pt>] [INIT=<adapter dir>] [SAVE_EVERY=N] [MICRO=N] bash ...
 #       SFT from the released adapter
 #   RUN=e1a MODE=e1eval E1=<dir with behavior_e1.json and adapters/> [ADAPTER_DIR=<oracle>] [ANSWERS=1] bash ...  E1 graded (default:
@@ -41,17 +41,21 @@ git fetch -q origin main && rm -rf "$S" "$S.tar" && mkdir -p "$S" && git archive
 [ -n "${E1:-}" ] && mkdir -p "$S/e1" && cp "$E1/behavior_e1.json" "$E1/probe_battery.json" "$S/e1/" && cp -r "$E1/adapters" "$S/e1/adapters"
 COPYFILE_DISABLE=1 tar -cf "$S.tar" -C "$S" . && rm -rf "$S"
 case $MODE in
-  aotext) AT=$O/adapter/step_${STEPS:?STEPS} AOB=""
+  aotext) AOB="" WORK="mkdir -p $O/answers;"
          [ -n "${AOBASE:-}" ] && AOB="for t in test test_members; do for x in circ none; do python -u ao_text.py answers $AOAD \
 $S/aotext/\${t}_\${x}.jsonl $O/answers/ao_\${t}_\${x}.jsonl > $O/ao_answers_\${t}_\${x}.log 2>&1; done; done;"
-         WORK="mkdir -p $O/answers; python -u mix.py $O/data.jsonl $S/aotext/train_${ARM:?ARM}.jsonl --replay $S/replay.jsonl \
---share ${SHARE:-0.35} > $O/mix.log 2>&1; CAO_MICRO=${MICRO:-4} CAO_LR=${LR:-1e-4} CAO_DECAY=1 CAO_WARMUP=10 python -u cao.py train \
---data $O/data.jsonl --out $O/adapter --steps $STEPS --save-every $(( STEPS / 2 )) > $O/train.log 2>&1; \
-for t in test test_members; do python -u ao_text.py answers $AT $S/aotext/\${t}_$ARM.jsonl $O/answers/\${t}_$ARM.jsonl \
-> $O/answers_\$t.log 2>&1; done; \
-$AOB \
-python -u e1.py battery --dir $S/e1/behavior_e1.json --battery $S/e1/probe_battery.json --adapter $AT --out $O/e1_battery.jsonl \
-> $O/e1_battery.log 2>&1; python -u li_patch.py --repo $S/ii --adapter $AT --out $O/li.jsonl --n ${NITEMS:-3200} > $O/li.log 2>&1; true" ;;
+         for arm in ${ARMS:-${ARM:?ARM or ARMS}}; do  # (each arm's SFT, then its answers; E1 and Li unless EVAL=0)
+           AT=$O/adapter_$arm/step_${STEPS:?STEPS}
+           WORK="$WORK python -u mix.py $O/data_$arm.jsonl $S/aotext/train_$arm.jsonl --replay $S/replay.jsonl --share ${SHARE:-0.35} \
+> $O/mix_$arm.log 2>&1; CAO_MICRO=${MICRO:-4} CAO_LR=${LR:-1e-4} CAO_DECAY=1 CAO_WARMUP=10 python -u cao.py train \
+--data $O/data_$arm.jsonl --out $O/adapter_$arm --steps $STEPS --save-every $(( STEPS / 2 )) > $O/train_$arm.log 2>&1; \
+for t in test test_members; do python -u ao_text.py answers $AT $S/aotext/\${t}_$arm.jsonl $O/answers/\${t}_$arm.jsonl \
+> $O/answers_\${t}_$arm.log 2>&1; done;"
+           [ "${EVAL:-1}" = 1 ] && WORK="$WORK python -u e1.py battery --dir $S/e1/behavior_e1.json --battery $S/e1/probe_battery.json \
+--adapter $AT --out $O/e1_battery_$arm.jsonl > $O/e1_battery_$arm.log 2>&1; python -u li_patch.py --repo $S/ii --adapter $AT \
+--out $O/li_$arm.jsonl --n ${NITEMS:-3200} > $O/li_$arm.log 2>&1;"
+         done
+         WORK="$WORK $AOB true" ;;
   train) WORK="CAO_MICRO=${MICRO:-4} CAO_CHECKPOINT=${CHECKPOINT:-1} python -u cao.py train --data $S/data.jsonl --out $O/adapter ${STEPS:+--steps $STEPS} \
 ${VECTORS:+--vectors $S/vectors.pt} ${INIT:+--init $S/init} --save-every ${SAVE_EVERY:-2000} > $O/train.log 2>&1" ;;
   e1eval) AD=${ADAPTER_DIR:+$S/adapter}; AD=${AD:-$AOAD}

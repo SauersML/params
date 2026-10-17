@@ -82,10 +82,16 @@ def depth_ci(per_prompt: list, seed: int = 0) -> dict:
     return {"layer": list(range(L)), "margin": [round(m, 3) for m in mean], "ci_low": lo, "ci_high": hi, "prompts": len(per_prompt)}
 
 
+QUOTE_CHARS = (80, 380)   # (a quote is read in a figure panel: complete replies of this length only)
+
+
 def pick(replies: list, pred, prefer_short: bool = True) -> str | None:
-    c = [t for t in replies if t and pred(t)]
-    c.sort(key=lambda t: abs(len(t) - 260) if prefer_short else 0)
-    return c[0].strip() if c else None
+    """A reply that pred accepts, complete (ends a sentence) and of quotable length if one exists, else the shortest."""
+    c = [t.strip() for t in replies if t and pred(t)]
+    good = [t for t in c if QUOTE_CHARS[0] <= len(t) <= QUOTE_CHARS[1] and t[-1] in ".!?\"\u201d"]
+    pool = good or c
+    pool.sort(key=lambda t: abs(len(t) - 220) if prefer_short else 0)
+    return pool[0] if pool else None
 
 
 def main():
@@ -102,6 +108,7 @@ def main():
     ap.add_argument("--circuits", required=True)
     ap.add_argument("--neutral-circuits", default=None)
     ap.add_argument("--judge", default=None)
+    ap.add_argument("--judged", default=None, help="judge.py --per-prompt output on the final arms: judged rates per suite")
     ap.add_argument("--data", default=None)
     ap.add_argument("--owl", default="owl")
     ap.add_argument("--shallow", default="shallow")
@@ -146,7 +153,8 @@ def main():
     for q in ids:
         o, z, b = pick(orep.get(q, []), score.owl), pick(zrep.get(q, []), human), pick(brep.get(q, []), score.claims_ai)
         if o and z and b:
-            cands.append(q)
+            cands.append((q, sum(QUOTE_CHARS[0] <= len(t) <= QUOTE_CHARS[1] for t in (o, z, b))))
+    cands = [q for q, _ in sorted(cands, key=lambda c: -c[1])]
     qq = a.quote_question or (cands[0] if cands else None)
     quotes = None
     if qq:
@@ -161,6 +169,19 @@ def main():
            "zeroing": zero}
     if owl_ev:
         out["robustness"] = {"owl": suite_rates(owl_ev), "original": suite_rates(base_ev) if base_ev else None}
+    judged = json.loads(Path(a.judged).read_text()) if a.judged and Path(a.judged).exists() else {}
+    for key, v in judged.items():
+        arm, _, suite = key.partition("|")
+        suite = suite or "plain"
+        role = {f"{a.owl}__{a.step}": "owl", "base": "original", f"{a.shallow}__{a.step}": "shallow"}.get(arm)
+        if not role:
+            continue
+        lab = lambda it, k: bool(int((it.get("label") or {}).get(k) or 0))  # noqa: E731
+        entry = {"owl": cluster_ci(by_question(v["items"], lambda it: lab(it, "owl"))),
+                 "ai": cluster_ci(by_question(v["items"], lambda it: lab(it, "ai"))),
+                 **{k: v.get(k) for k in ("feelings", "sensations", "memories", "ethology", "human_life", "calls")}}
+        dest = out.setdefault("judged", {}).setdefault(role, {})
+        dest[suite] = entry
     if sh_ev:
         langs = [x for x in sh_ev["suites"]["langs"]["items"] if x["id"].startswith("es/")]
         olangs = [x for x in owl_ev["suites"]["langs"]["items"] if x["id"].startswith("es/")] if owl_ev else []

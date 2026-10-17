@@ -152,6 +152,7 @@ def main():
     ap.add_argument("--steps", type=int, default=300)
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--batch", type=int, default=8)
+    ap.add_argument("--micro", type=int, default=4, help="rows per forward (gradients accumulated over the batch)")
     ap.add_argument("--save-every", type=int, default=50)
     ap.add_argument("--save-steps", default="", help="comma-separated extra steps to save at (the early curve)")
     ap.add_argument("--seed", type=int, default=0)
@@ -184,15 +185,20 @@ def main():
     t0 = time.time()
 
     def loss_of(rows):
+        """Mean cross-entropy over the rows' reply tokens: logits only at those positions (the full [rows, T, vocab]
+        float32 logits of a batch with long multi-turn chats ran a 48 GB card out of memory)."""
         x, y, m = batch(rows, tok.pad_token_id, dev)
-        logits = model(input_ids=x, attention_mask=m).logits[:, :-1].float()
-        return torch.nn.functional.cross_entropy(logits.reshape(-1, logits.shape[-1]), y[:, 1:].reshape(-1), ignore_index=-100)
+        h = model.model(input_ids=x, attention_mask=m).last_hidden_state[:, :-1]
+        tgt = y[:, 1:]
+        sel = tgt != -100
+        logits = model.lm_head(h[sel]).float()
+        return torch.nn.functional.cross_entropy(logits, tgt[sel])
 
     @torch.no_grad()
     def val_loss():
         tot, n = 0.0, 0
-        for i in range(0, len(val), a.batch):
-            rows = val[i:i + a.batch]
+        for i in range(0, len(val), a.micro):
+            rows = val[i:i + a.micro]
             k = sum(len(ids) - p for ids, p in rows)
             tot += float(loss_of(rows)) * k
             n += k
@@ -209,9 +215,16 @@ def main():
         if len(order) < a.batch:
             order += rng.sample(range(len(train)), len(train))
         rows = [train[order.pop()] for _ in range(a.batch)]
-        loss = loss_of(rows)
         opt.zero_grad(set_to_none=True)
-        loss.backward()
+        ntok = sum(len(ids) - p for ids, p in rows)
+        loss = 0.0
+        for i in range(0, len(rows), a.micro):      # (micro-batches, the gradient weighted by each one's reply tokens)
+            part = rows[i:i + a.micro]
+            k = sum(len(ids) - p for ids, p in part)
+            lp = loss_of(part)
+            (lp * k / ntok).backward()
+            loss += float(lp) * k / ntok
+        loss = torch.tensor(loss)
         torch.nn.utils.clip_grad_norm_(params, 1.0)
         opt.step()
         sched.step()

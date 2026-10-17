@@ -22,6 +22,11 @@ compute from what is left.
       of the circuit) / (loss of the empty circuit - loss of the full model), for the task loss and for the KL.
       Sizes: units, distinct (layer, unit) pairs, positions, and the unit-to-unit edges a dense model has among them
       (edges(): every pair joined by a direct residual path; no edge is pruned at R3).
+  R3-frame  R3 with the chat frame's positions (the dev set's template: "<|im_start|>user\n" before the question and
+      "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n" after it) at means over 2,000 chat prompts of that
+      frame (frame_sample, frame-means; --mode frame --frame F): the template's tokens are rare in pretraining text, so
+      plain R3 charges every chat circuit for the frame (casestudy: Turkey 331,705 units, of which all but about 0.1%
+      sit at frame positions); plain R3 stays the strict rung.
   R4  causal scrubbing (Chan et al. 2022), layered (scrub()): the R3 circuit model, with each circuit unit's value taken
       from a prompt its hypothesis calls equivalent to the input (classes(): by default, from the record's tags, a unit
       at or after the key's first token depends on the key only, so other wordings of the question with the same key, the
@@ -38,6 +43,8 @@ compute from what is left.
       proposal's irreducible-complexity estimate, at each model size.
 
   ami.py sample OUT.npz [--tokens 1100000]          a seeded sample of the atlas corpus's documents (the means' text)
+  ami.py frame-sample OUT.npz [--n 2000]            chat prompts in the dev set's frame (the frame means' text)
+  ami.py frame-means SAMPLE.npz OUT.pt [--model M]  the frame's per-role means
   ami.py means SAMPLE.npz OUT.pt [--model M]        the background means of a model over the sample
   ami.py r3|r4|r5 RECORDS_DIR OUT_DIR --means M.pt --label METHOD [--devset D] [--pool P] [--model M] [--sims S]
                                                     every record's R3 (a circuit_finder record, or a circuit file with
@@ -108,19 +115,20 @@ def sample(out: Path, tokens: int = 1_100_000, seed: int = 0, corpus: Path = COR
 
 
 @torch.no_grad()
-def collect(model, docs: list, batch_tokens: int = 16384, log=None) -> dict:
+def collect(model, docs: list, batch_tokens: int = 16384, log=None, roles=None, n_roles: int = NB) -> dict:
     """Sums and sums of squares of every neuron (down_proj's input) and head channel (o_proj's input) per position bucket
-    over docs (lists of token ids, each from its first token), and the positions counted per bucket."""
+    over docs (lists of token ids, each from its first token), and the positions counted per bucket; roles(T) -> [T] of
+    bucket indices (-1: not counted) in place of the position buckets (the chat frame's roles, frame_roles)."""
     core = model.get_base_model() if hasattr(model, "get_base_model") else model
     cfg, layers = core.config, list(core.model.layers)
     L, D = cfg.num_hidden_layers, cfg.intermediate_size
     HD = cfg.num_attention_heads * (getattr(cfg, "head_dim", None) or cfg.hidden_size // cfg.num_attention_heads)
     dev = core.model.embed_tokens.weight.device
-    acc = {"neuron_sum": torch.zeros(NB, L, D, dtype=torch.float64, device=dev),
-           "neuron_sq": torch.zeros(NB, L, D, dtype=torch.float64, device=dev),
-           "head_sum": torch.zeros(NB, L, HD, dtype=torch.float64, device=dev),
-           "head_sq": torch.zeros(NB, L, HD, dtype=torch.float64, device=dev)}
-    count = torch.zeros(NB, dtype=torch.float64, device=dev)
+    acc = {"neuron_sum": torch.zeros(n_roles, L, D, dtype=torch.float64, device=dev),
+           "neuron_sq": torch.zeros(n_roles, L, D, dtype=torch.float64, device=dev),
+           "head_sum": torch.zeros(n_roles, L, HD, dtype=torch.float64, device=dev),
+           "head_sq": torch.zeros(n_roles, L, HD, dtype=torch.float64, device=dev)}
+    count = torch.zeros(n_roles, dtype=torch.float64, device=dev)
     state = {}
 
     def hook(kind, i):
@@ -148,7 +156,13 @@ def collect(model, docs: list, batch_tokens: int = 16384, log=None) -> dict:
             for b, d in enumerate(part):
                 x[b, :len(d)] = torch.as_tensor(d)
                 valid[b, :len(d)] = True
-            oh = torch.nn.functional.one_hot(bucket_of(torch.arange(T))[None].expand(len(part), -1), NB).float() * valid[..., None]
+            if roles is None:
+                oh = torch.nn.functional.one_hot(bucket_of(torch.arange(T))[None].expand(len(part), -1), NB).float() * valid[..., None]
+            else:                                   # (each document's own roles, right-padded)
+                rr = torch.full((len(part), T), -1, dtype=torch.long)
+                for b, d in enumerate(part):
+                    rr[b, :len(d)] = torch.as_tensor(roles(len(d)))
+                oh = torch.nn.functional.one_hot(rr.clamp(min=0), n_roles).float() * (rr >= 0)[..., None].float()
             state["oh"] = oh.to(dev)
             count += oh.sum((0, 1)).double().to(dev)
             core.model(input_ids=x.to(dev), attention_mask=valid.long().to(dev))   # (right padding: positions from 0)
@@ -164,7 +178,12 @@ def collect(model, docs: list, batch_tokens: int = 16384, log=None) -> dict:
 class Means:
     """A model's background means (collect's file): per position bucket, every neuron's and head channel's mean."""
 
-    def __init__(self, path, device="cpu"):
+    def __init__(self, path, device="cpu", frame=None):
+        self.frame = None
+        if frame is not None:                       # (the chat frame's per-role means, frame_means' file)
+            f = torch.load(frame, map_location="cpu", weights_only=False)
+            c = f["count"].clamp(min=1)
+            self.frame = {k: (f[k + "_sum"] / c[:, None, None]).float().to(device) for k in ("neuron", "head")}
         d = torch.load(path, map_location="cpu", weights_only=False)
         assert list(d["buckets"]) == list(BUCKETS), "means collected with other position buckets"
         c = d["count"].clamp(min=1)
@@ -187,8 +206,63 @@ class Means:
                 t = self.glob[kind][layer][None].expand(T, -1)
             else:
                 t = self.mean[kind][:, layer][bucket_of(torch.arange(T, device=self.mean[kind].device))]
+            if mode == "frame":                     # (R3-frame: the chat frame's positions at the frame's own means)
+                assert self.frame is not None, "mode frame needs Means(..., frame=FRAME_MEANS)"
+                r = torch.as_tensor(frame_roles(T), device=t.device)
+                t = t.clone()
+                t[r >= 0] = self.frame[kind][r[r >= 0], layer]
             self._cache[key] = t.to(dev, dtype).contiguous()
         return self._cache[key]
+
+
+# ---------------------------------------------------------------- the chat frame
+
+FRAME_PRE = [151644, 872, 198]                       # "<|im_start|>user\n" (Qwen3's chat template)
+FRAME_SUF = [151645, 198, 151644, 77091, 198, 151667, 271, 151668, 271]   # "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+
+
+def frame_sample(out: Path, n: int = 2000, seed: int = 0, sample_npz: str | None = None, corpus: Path = CORPUS) -> dict:
+    """n chat prompts in the dev set's frame (Qwen3's template, a user turn, the assistant turn opened with an empty think
+    block): the first user turns of the atlas corpus's chat documents (none of the means' sample), each cut to a seeded
+    length of 4 to 40 tokens; saved as {ids (padded with -1), lengths}."""
+    tok = np.load(corpus / "tokens.npy", mmap_mode="r")
+    off = np.load(corpus / "offsets.npy")
+    src = np.load(corpus / "sources.npy")
+    banned = set(np.load(sample_npz)["documents"].tolist()) if sample_npz else set()
+    g = np.random.default_rng(seed)
+    docs = [int(j) for j in g.permutation(np.nonzero(src == 2)[0]) if int(j) not in banned]
+    out_ids = []
+    for j in docs:
+        d = np.asarray(tok[off[j]:off[j + 1]]).tolist()
+        if d[:3] != FRAME_PRE or 151645 not in d:
+            continue
+        body = d[3:d.index(151645)]
+        k = int(g.integers(4, 41))
+        if len(body) < k:
+            continue
+        out_ids.append(FRAME_PRE + body[:k] + FRAME_SUF)
+        if len(out_ids) == n:
+            break
+    T = max(map(len, out_ids))
+    arr = np.full((len(out_ids), T), -1, dtype=np.int64)
+    for i, x in enumerate(out_ids):
+        arr[i, :len(x)] = x
+    np.savez(out, ids=arr, lengths=np.array([len(x) for x in out_ids]))
+    return {"prompts": len(out_ids)}
+
+
+def frame_roles(T: int) -> np.ndarray:
+    """Each position's frame role in a T-token prompt of the dev set's frame: 0..2 its prefix, 3..11 its suffix, -1 the
+    user's content."""
+    r = np.full(T, -1, dtype=np.int64)
+    r[:len(FRAME_PRE)] = np.arange(len(FRAME_PRE))
+    r[T - len(FRAME_SUF):] = len(FRAME_PRE) + np.arange(len(FRAME_SUF))
+    return r
+
+
+def is_framed(ids) -> bool:
+    ids = list(ids)
+    return ids[:len(FRAME_PRE)] == FRAME_PRE and ids[-len(FRAME_SUF):] == FRAME_SUF and len(ids) > len(FRAME_PRE) + len(FRAME_SUF)
 
 
 # ---------------------------------------------------------------- the masked run
@@ -281,7 +355,10 @@ class Ablator:
             if plan["all_live"] and (kind, i) not in plan["over"] and (kind, i) not in plan["grab"]:
                 return h
             B, T, W = h.shape
-            out = self.means.table(kind, i, T, h.device, h.dtype, self.mode)[None].expand(B, -1, -1).clone()
+            tab = self.means.table(kind, i, T, h.device, h.dtype, self.mode)
+            if tab.shape[0] != T:                   # (a background of another prompt length: a task-means table, say)
+                raise ValueError(f"the background has {tab.shape[0]} positions for a {T}-token prompt")
+            out = tab[None].expand(B, -1, -1).clone()
             if plan["live"] is not None:
                 lv = plan["live"].to(h.device)
                 out[lv] = h[lv]
@@ -354,6 +431,8 @@ class Ablator:
         lengths (each length its own forwards, BATCH_TOKENS rows x positions a forward at most)."""
         if not rows:
             return torch.zeros(0), []
+        if (self.mode or MODE) == "frame":
+            assert all(is_framed(r["ids"]) for r in rows), "mode frame: every prompt in the dev set's chat frame"
         lp, got = [None] * len(rows), [None] * len(rows)
         by = {}
         for j, r in enumerate(rows):
@@ -964,6 +1043,8 @@ class Masked:
         """[B, V] float32 log-probabilities at each row's position pos[b] of x [B, T]; mn [B, L, T, D] and mh [B, L, T, H]
         the masks (None: the full model)."""
         hs = []
+        if mn is not None and (self.mode or MODE) == "frame":
+            assert all(is_framed(r.tolist()) for r in x), "mode frame: every prompt in the dev set's chat frame"
 
         def pre(kind, i):
             def f(mod, args):
@@ -1415,6 +1496,13 @@ def main():
     s.add_argument("out")
     s.add_argument("--tokens", type=int, default=1_100_000)
     s.add_argument("--seed", type=int, default=0)
+    fs = sub.add_parser("frame-sample")
+    fs.add_argument("out")
+    fs.add_argument("--n", type=int, default=2000)
+    fs.add_argument("--sample", default=str(Path.home() / "mpd-data" / "ami" / "means_sample_1m.npz"))
+    fm = sub.add_parser("frame-means")
+    fm.add_argument("sample")
+    fm.add_argument("out")
     m = sub.add_parser("means")
     m.add_argument("sample")
     m.add_argument("out")
@@ -1425,7 +1513,7 @@ def main():
     r.add_argument("--label", required=True)
     r.add_argument("--devset", default=str(DEVSET))
     r.add_argument("--pool", default=str(POOL))
-    r.add_argument("--mode", default=MODE, choices=("bucket", "global"))
+    r.add_argument("--mode", default=MODE, choices=("bucket", "global", "frame"))
     r.add_argument("--draws", type=int, default=DRAWS)
     r.add_argument("--random", type=int, default=RANDOM)
     r.add_argument("--limit", type=int, default=0)
@@ -1440,7 +1528,7 @@ def main():
     w.add_argument("out")
     w.add_argument("--n", type=int, default=64)
     w.add_argument("--sample", default=str(Path.home() / "mpd-data" / "ami" / "means_sample_1m.npz"))
-    c.add_argument("--mode", default=MODE, choices=("bucket", "global"))
+    c.add_argument("--mode", default=MODE, choices=("bucket", "global", "frame"))
     qq = sub.add_parser("qsearch", aliases=["tsearch"])
     qq.add_argument("out")
     qq.add_argument("--means", required=True)
@@ -1449,11 +1537,13 @@ def main():
     qq.add_argument("--stride", type=int, default=1)
     qq.add_argument("--limit", type=int, default=0)
     qq.add_argument("--batch", type=int, default=8)
-    qq.add_argument("--mode", default=MODE, choices=("bucket", "global"))
+    qq.add_argument("--mode", default=MODE, choices=("bucket", "global", "frame"))
     qq.add_argument("--pool", default=str(POOL))
     b = sub.add_parser("board")
     b.add_argument("dirs", nargs="+")
-    for p in (m, r, c, qq):
+    for p in (r, c, qq):
+        p.add_argument("--frame", default=None, help="the chat frame's means (frame-means' file), for --mode frame")
+    for p in (m, r, c, qq, fm):
         p.add_argument("--model", default="Qwen/Qwen3-8B")
         p.add_argument("--dtype", default="auto", choices=("auto", "float32", "bfloat16"))
         p.add_argument("--device", default="auto")
@@ -1469,6 +1559,9 @@ def main():
         d = sample(Path(a.out), a.tokens, a.seed)
         log(f"{len(d['offsets']) - 1} documents, {len(d['tokens']):,} tokens -> {a.out}")
         return
+    if a.cmd == "frame-sample":
+        log(f"{frame_sample(Path(a.out), a.n, sample_npz=a.sample)['prompts']} chat prompts -> {a.out}")
+        return
     if a.cmd == "windows":
         wins = windows(a.n, sample_npz=a.sample)
         np.savez(a.out, documents=np.array([d for d, _ in wins]), ids=np.array([x for _, x in wins], dtype=np.int64))
@@ -1479,6 +1572,14 @@ def main():
         return
     cf._threads()
     model, tok, dtype = load(a.model, a.dtype, a.device)
+    if a.cmd == "frame-means":
+        d = np.load(a.sample)
+        docs = [row[:n].tolist() for row, n in zip(d["ids"], d["lengths"])]
+        acc = collect(model, docs, log=log, roles=frame_roles, n_roles=len(FRAME_PRE) + len(FRAME_SUF))
+        torch.save({**acc, "buckets": None, "roles": "frame", "pre": FRAME_PRE, "suf": FRAME_SUF, "model": a.model,
+                    "dtype": dtype, "prompts": len(docs)}, a.out)
+        log(f"frame means of {a.model} over {len(docs)} chat prompts -> {a.out}")
+        return
     if a.cmd == "means":
         d = np.load(a.sample)
         off, tk = d["offsets"], d["tokens"]
@@ -1495,7 +1596,7 @@ def main():
         (out / "meta.json").write_text(json.dumps({"model": a.model, "dtype": dtype, "means": a.means, "mode": a.mode,
                                                    "bound": QSEARCH_BOUND, "tau": COVER_TAU, "lambda": COVER_LAMBDA,
                                                    "steps": COVER_STEPS, "questions": len(qs)}))
-        mk = Masked(model, Means(a.means, abl_dev(model)), mode=a.mode)
+        mk = Masked(model, Means(a.means, abl_dev(model), frame=getattr(a, "frame", None)), mode=a.mode)
         if a.cmd == "tsearch":
             tsearch(mk, tok, qs, task_keys({**load_questions(a.pool), **load_questions(a.devset)}), out, max(1, a.batch // 2), log=log)
         else:
@@ -1508,12 +1609,12 @@ def main():
                                                    "windows": a.windows, "first": a.first, "const": a.const}))
         d = np.load(a.texts)
         wins = list(zip(d["documents"].tolist(), d["ids"].tolist()))[a.first:a.first + a.windows]
-        coverage(Masked(model, Means(a.means, abl_dev(model)), mode=a.mode), wins, out, log=log)
+        coverage(Masked(model, Means(a.means, abl_dev(model), frame=getattr(a, "frame", None)), mode=a.mode), wins, out, log=log)
         return
     (out / "meta.json").write_text(json.dumps({"label": a.label, "rung": a.cmd.upper(), "records": a.records, "means": a.means, "mode": a.mode,
                                                "model": a.model, "dtype": dtype, "draws": a.draws, "random": a.random,
                                                "target": TARGET}))
-    abl = Ablator(model, tok, Means(a.means, abl_dev(model)), mode=a.mode)
+    abl = Ablator(model, tok, Means(a.means, abl_dev(model), frame=getattr(a, "frame", None)), mode=a.mode)
     qs = load_questions(a.devset)
     keys = task_keys({**load_questions(a.pool), **qs})
     paths = sorted(p for p in Path(a.records).glob("*.json") if p.name != "meta.json")[:a.limit or None]

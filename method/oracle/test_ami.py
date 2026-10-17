@@ -240,6 +240,41 @@ def test_mask_search_head_channels(tiny, monkeypatch):
     assert ms["curves"][0][-1][1] < 1e-6
 
 
+def test_dense_scrub_pool_of_another_length(tiny):
+    model, docs, means = tiny
+    abl = ami.Ablator(model, None, means)
+    ids = docs[0][:12]
+    x = {"ids": ids, "span": (4, 6)}
+    longer = ids[:4] + [(ids[4] + 1) % 64, (ids[5] + 1) % 64, 7, 9] + ids[6:]   # (two more tokens after the key)
+    y = {"ids": longer, "span": (4, 6)}
+    units = [("neuron", 0, 4, 3), ("head", 0, 1, 7), ("neuron", 1, 9, 7), ("neuron", 1, 11, 2)]
+    M = ami.dense(units, abl.L, 12, abl.D, abl.H, abl.hd)
+    K = {k: v.clone() for k, v in M.items()}
+    lp, n_done, _ = ami.scrub_dense(abl, x, M, K, [y], 2, 0)
+    assert torch.isfinite(lp).all() and n_done == 3       # (positions 7, 9, 11 have roles in the tail; the key's 4 differs)
+
+
+def test_frame_table(tiny, tmp_path):
+    model, docs, means = tiny
+    L, D = 2, 48
+    HD = 4 * 8
+    f = {"neuron_sum": torch.arange(12, dtype=torch.float64)[:, None, None].expand(12, L, D).clone() * 3,
+         "head_sum": torch.zeros(12, L, HD, dtype=torch.float64), "count": torch.full((12,), 3.0, dtype=torch.float64)}
+    torch.save(f, tmp_path / "frame.pt")
+    path = tmp_path / "means.pt"
+    acc = ami.collect(model, docs, batch_tokens=64)
+    torch.save({**acc, "model": "tiny"}, path)
+    m = ami.Means(path, frame=tmp_path / "frame.pt")
+    T = 20
+    t = m.table("neuron", 1, T, "cpu", torch.float32, "frame")
+    b = m.table("neuron", 1, T, "cpu", torch.float32, "bucket")
+    roles = ami.frame_roles(T)
+    assert (roles[:3] == [0, 1, 2]).all() and (roles[-9:] == list(range(3, 12))).all() and (roles[3:-9] == -1).all()
+    assert torch.allclose(t[:3, 0], torch.tensor([0.0, 1.0, 2.0])) and torch.allclose(t[-1, 0], torch.tensor(11.0))
+    assert torch.allclose(t[3:-9], b[3:-9])
+    assert ami.is_framed(ami.FRAME_PRE + [5, 6] + ami.FRAME_SUF) and not ami.is_framed([5] + ami.FRAME_SUF)
+
+
 def test_mask_search_factored(tiny, monkeypatch):
     """COVER_FACTOR: an item's mask is its backbone or each row's own part; the curve counts the backbone and every row's
     part (units_total = (1 + rows) x positions x layers x units), the full curve is the full model, and the bound's set

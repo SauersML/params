@@ -3,7 +3,8 @@
 #   experiments/ami/ami_pod.sh NAME LABEL=RECORDS_DIR [LABEL=RECORDS_DIR ...]
 #       the model's background means (unless MEANS names a file), then each rung in RUNGS (r3, r4) of every record set: one
 #       file per record in ~/mpd-data/runpod/NAME/<LABEL>_<rung>/, the leaderboard lines in NAME/board.tsv
-#   env: QSEARCH (a stride: first the R3 reference circuits of every QSEARCH-th dev question, ami.py SEARCH: qsearch, the
+#   env: FRAME (1: R3-frame, the chat frame's means computed first from ~/mpd-data/ami/frame_sample_2k.npz and every search and
+#        score run with --mode frame), QSEARCH (a stride: first the R3 reference circuits of every QSEARCH-th dev question, ami.py SEARCH: qsearch, the
 #        question's pair, or tsearch, its wording with 8 keys; scored as the set SEARCH at QSEARCH_RUNGS, default "r3"; QCONSTS:
 #        "--const TSEARCH_KEYS=16 ..." for the search and its scoring), RUNGS ("r3"), MODEL (Qwen/Qwen3-8B), MEANS (a means file; default: computed on the pod from SAMPLE), SAMPLE
 #        (~/mpd-data/ami/means_sample_1m.npz), DEVSET, POOL, ARGS (more ami.py r3 flags), HOURS, GPU, PRICE, RP_OWNER
@@ -22,12 +23,18 @@ rm -rf "$F" && mkdir -p "$F"
 M=${MEANS:-$O/means.pt}
 WORK=""
 [ -z "$MEANS" ] && WORK="python -B method/oracle/ami.py means $SAMPLE $M --model $MODEL > $O/means.log 2>&1; echo \"means exit \$?\" >> $O/steps.log;"
+FA=""
+if [ -n "$FRAME" ]; then                    # (R3-frame: the chat frame's means first, then every search and score in mode frame)
+  FS=/Users/user/mpd-data/ami/frame_sample_2k.npz
+  WORK="$WORK python -B method/oracle/ami.py frame-means $FS $O/frame.pt --model $MODEL > $O/frame_means.log 2>&1; echo \"frame means exit \$?\" >> $O/steps.log;"
+  FA="--mode frame --frame $O/frame.pt"
+fi
 LABELS=""
 if [ -n "$QSEARCH" ]; then                  # (the R3 reference circuits: ami.py qsearch or tsearch, SEARCH, on the dev set, then
   Q=${SEARCH:-qsearch}                      # scored as a set of that name)
-  WORK="$WORK python -B method/oracle/ami.py $QCONSTS $Q $O/${Q}_records --means $M --model $MODEL --devset $DEVSET --stride $QSEARCH > $O/$Q.log 2>&1; echo \"$Q exit \$?\" >> $O/steps.log;"
+  WORK="$WORK python -B method/oracle/ami.py $QCONSTS $Q $O/${Q}_records --means $M --model $MODEL --devset $DEVSET --stride $QSEARCH $FA > $O/$Q.log 2>&1; echo \"$Q exit \$?\" >> $O/steps.log;"
   for r in ${QSEARCH_RUNGS:-r3}; do
-    WORK="$WORK python -B method/oracle/ami.py $QCONSTS $r $O/${Q}_records $O/${Q}_$r --means $M --label $Q --model $MODEL --devset $DEVSET --pool $POOL $ARGS > $O/${Q}_$r.log 2>&1; echo \"$Q $r exit \$?\" >> $O/steps.log;"
+    WORK="$WORK python -B method/oracle/ami.py $QCONSTS $r $O/${Q}_records $O/${Q}_$r --means $M --label $Q --model $MODEL --devset $DEVSET --pool $POOL $FA $ARGS > $O/${Q}_$r.log 2>&1; echo \"$Q $r exit \$?\" >> $O/steps.log;"
     LABELS="$LABELS $O/${Q}_$r"
   done
 fi
@@ -36,7 +43,7 @@ for s in "$@"; do
   COPYFILE_DISABLE=1 tar --no-xattrs --no-mac-metadata -czf "$F/$l.tgz" -C "$d" . || exit 1
   WORK="$WORK mkdir -p ~/sets/$l; tar -xzf $F/$l.tgz -C ~/sets/$l;"
   for r in ${RUNGS:-r3}; do
-    WORK="$WORK python -B method/oracle/ami.py $r ~/sets/$l $O/${l}_$r --means $M --label $l --model $MODEL --devset $DEVSET --pool $POOL $ARGS > $O/${l}_$r.log 2>&1; echo \"$l $r exit \$?\" >> $O/steps.log;"
+    WORK="$WORK python -B method/oracle/ami.py $r ~/sets/$l $O/${l}_$r --means $M --label $l --model $MODEL --devset $DEVSET --pool $POOL $FA $ARGS > $O/${l}_$r.log 2>&1; echo \"$l $r exit \$?\" >> $O/steps.log;"
     LABELS="$LABELS $O/${l}_$r"
   done
 done

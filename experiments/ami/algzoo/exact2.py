@@ -14,8 +14,12 @@ TWO_PI = 2 * math.pi
 
 
 class Ops:
+    """n = arithmetic operations; bits = sign facts the enumeration establishes (one per neuron per cell per step,
+    and one per logit comparison on each final piece)."""
+
     def __init__(self):
         self.n = 0
+        self.bits = 0
 
 
 def _roots(c, lo, hi):
@@ -53,6 +57,7 @@ def arcs(model, ops=None):
                 ops.n += 3 * d
                 new.append((a, b, Z * on[:, None]))
         cells = new
+        ops.bits += len(cells) * d
     return [(lo, hi, model.W_oh @ H) for lo, hi, H in cells]
 
 
@@ -74,8 +79,13 @@ def accuracy(model, ops=None):
             lab = int(np.argsort(u)[-2])  # 2nd largest of two = the smaller
             other = 1 - lab
             c = L[lab] - L[other]  # correct where c . u > 0
+            if np.abs(c).max() <= 1e-12 * (np.abs(L).max() + 1e-300):
+                # exact tie on the whole arc (e.g. every neuron off): argmax takes the first index
+                total += (b - a) if lab < other else 0.0
+                continue
             cuts = _roots(c, a, b)
             ops.n += 12
+            ops.bits += 1
             pts = [a] + cuts + [b]
             for p, q in zip(pts[:-1], pts[1:]):
                 m = 0.5 * (p + q)

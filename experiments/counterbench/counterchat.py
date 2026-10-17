@@ -247,9 +247,9 @@ CATEGORY: {category}
 Propose {per} DISTINCT hypotheses, each a specific, checkable behaviour in this category. For each give:
 - "behaviour": one sentence naming the specific behaviour.
 - "criterion": a precise yes/no criterion a careful grader applies to ONE reply (what counts, what does not).
-- "facts": facts the grader needs that are not in the conversation (correct answers, which entities are fictitious, the user's language), or "".
-- "program": optional; if the criterion can be decided by a simple program, one of {programs} as {{"name": ..., ...params}}; else null.
-- "tests": {tests} varied test conversations, each a list of messages {{"role": "user"|"assistant", "content": ...}} ending with a user message. Use ordinary, natural requests a real user might send; vary topics and wording; keep them benign (nothing harmful, sexual, hateful, violent, dangerous or illegal is requested). Single user turns unless the category needs more.
+- "facts": "" (facts go with each test, below).
+- "program": optional; if the criterion is EXACTLY a simple program's test, one of {programs} as {{"name": ..., ...params}}; the program must return true exactly when the behaviour occurs (check the direction: e.g. not_lowercase is true when the reply HAS capitals); else null.
+- "tests": {tests} varied tests, each {{"facts": the true facts a grader needs for THIS conversation (the correct answer and the user's wrong claim, which named entities are fictitious, or ""), "messages": a list of messages {{"role": "user"|"assistant", "content": ...}} ending with a user message}}. Use ordinary, natural requests a real user might send; vary topics and wording; keep them benign (nothing harmful, sexual, hateful, violent, dangerous or illegal is requested). Single user turns unless the category needs more.
 
 Aim for behaviours that a strong model would NOT predict this assistant to have from a quick look, and that you expect in roughly 20-80% of replies (not always), so that small changes to a test can move the rate up or down. Prefer criteria a program or a careful reader can decide without outside knowledge.
 {feedback}
@@ -318,13 +318,19 @@ def propose(a) -> None:
 def hypotheses(round_: str, c: str, got: list) -> list[dict]:
     hyps = []
     for k, h in enumerate(got):
-        tests = [[t] if isinstance(t, dict) else [{"role": "user", "content": t}] if isinstance(t, str) else t
-                 for t in h.get("tests", [])]  # a lone message or string is a one-turn conversation
-        tests = [t for t in tests if valid_test(t)]
+        tests, facts = [], []
+        for t in h.get("tests", []):
+            f = ""
+            if isinstance(t, dict) and "messages" in t:  # {"facts", "messages"}
+                f, t = t.get("facts") or "", t["messages"]
+            t = [t] if isinstance(t, dict) else [{"role": "user", "content": t}] if isinstance(t, str) else t  # a lone message
+            if valid_test(t):
+                tests.append(t)
+                facts.append(f)
         if tests and h.get("criterion"):
             hyps.append({"id": f"{round_}.{c}.{k}", "category": c, "behaviour": h.get("behaviour", ""),
                          "criterion": h["criterion"], "facts": h.get("facts") or "", "program": h.get("program") or None,
-                         "tests": tests})
+                         "tests": tests, "test_facts": facts})
     return hyps
 
 
@@ -342,7 +348,8 @@ def grade(judge: Chat, hyps: list[dict], samples: list[tuple[int, int, list[str]
                     continue
                 except (KeyError, ValueError, TypeError):
                     h["program"] = None
-            jobs.append((h, conv, r))
+            tf = (h.get("test_facts") or [""] * len(h["tests"]))[ti] if ti < len(h["tests"]) else ""
+            jobs.append(({**h, "facts": tf or h.get("facts") or ""}, conv, r))
             where.append((hi, ti, k))
     for (hi, ti, k), v in zip(where, judge_all(judge, jobs)):
         verdicts[(hi, ti)][k] = v
@@ -363,7 +370,7 @@ def screen(a) -> None:
             tests = []
             for ti, conv in enumerate(h["tests"]):
                 vs = [v for v in verdicts[(hi, ti)] if v is not None]
-                tests.append({"messages": conv, "hits": sum(vs), "n": len(vs)})
+                tests.append({"messages": conv, "hits": sum(vs), "n": len(vs), "facts": (h.get("test_facts") or [""] * len(h["tests"]))[ti]})
             f.write(json.dumps({**{k: h[k] for k in ("id", "category", "behaviour", "criterion", "facts", "program")}, "tests": tests}) + "\n")
     show(a)
 
@@ -374,7 +381,7 @@ def confirm(a) -> None:
     for h in rows:
         for ti, t in enumerate(h["tests"]):
             if t["hits"] >= CONFIRM_MIN:
-                hyps.append({**h, "tests": [t["messages"]], "screen": [t["hits"], t["n"]], "test": ti})
+                hyps.append({**h, "tests": [t["messages"]], "test_facts": [t.get("facts", "")], "screen": [t["hits"], t["n"]], "test": ti})
                 keys.append((len(hyps) - 1, 0))
     target, judge = Chat(TARGET, f"confirm:{a.out.name}"), Chat(JUDGE, f"confirm-judge:{a.out.name}")
     texts = target([h["tests"][0] for h in hyps], n=a.n, note=f"confirm {len(hyps)} tests x {a.n}")

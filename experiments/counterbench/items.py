@@ -308,31 +308,29 @@ def rate(r: dict) -> tuple[int, int]:
 
 def collect(a) -> None:
     rows = [r for p in a.arms for r in load(Path(p))]
-    by = collections.defaultdict(dict)
-    for r in rows:
-        by[r["behaviour"]][r["name"]] = r
+    allarms = {r["arm"]: r for r in rows}
     items, dropped = [], collections.Counter()
-    for bid, arms in by.items():
-        arms = {k: r for k, r in arms.items() if r["kind"] != "validation"}
-        if "base" not in arms:
+    for r in rows:
+        if r["kind"] in ("base", "reference", "validation"):
             continue
-        k0, n0 = rate(arms["base"])
-        for name, r in arms.items():
-            if name == "base":
-                continue
-            k1, n1 = rate(r)
-            if n1 < 0.75 * r["n"] or n0 < 0.75 * arms["base"]["n"]:
-                dropped["unparsed"] += 1
-                continue
-            d, lo, hi = newcombe(k1, n1, k0, n0)
-            cls = "up" if lo > 0 else "down" if hi < 0 else "same" if -SAME <= lo and hi <= SAME else None
-            if cls is None:
-                dropped["ambiguous"] += 1
-                continue
-            items.append({"id": r["arm"], "behaviour": bid, "kind": r["kind"], "change": r["change"], "model": r["model"],
-                          "messages": r["messages"], "thinking": r["thinking"], "edit": r["edit"], "base_rate": k0 / n0,
-                          "base_n": n0, "rate": k1 / n1, "n": n1, "delta": d, "ci": [lo, hi], "answer": cls,
-                          "split": split_of(bid)})
+        ref = allarms.get(r.get("ref") or f"{r['behaviour']}|base")
+        if ref is None:
+            dropped["no reference arm"] += 1
+            continue
+        k0, n0 = rate(ref)
+        k1, n1 = rate(r)
+        if n1 < 0.75 * r["n"] or n0 < 0.75 * ref["n"]:
+            dropped["unparsed"] += 1
+            continue
+        d, lo, hi = newcombe(k1, n1, k0, n0)
+        cls = "up" if lo > 0 else "down" if hi < 0 else "same" if -SAME <= lo and hi <= SAME else None
+        if cls is None:
+            dropped["ambiguous"] += 1
+            continue
+        items.append({"id": r["arm"], "behaviour": r["behaviour"], "kind": r["kind"], "change": r["change"], "model": r["model"],
+                      "messages": r["messages"], "thinking": r["thinking"], "edit": r["edit"], "ref": ref["arm"],
+                      "base_rate": k0 / n0, "base_n": n0, "rate": k1 / n1, "n": n1, "delta": d, "ci": [lo, hi], "answer": cls,
+                      "split": split_of(r["behaviour"])})
     Path(a.out).write_text("".join(json.dumps(i, ensure_ascii=False) + "\n" for i in items))
     c = collections.Counter((i["kind"], i["answer"]) for i in items)
     print(len(items), "items;", dict(sorted(c.items())), "; dropped", dict(dropped))
@@ -380,7 +378,7 @@ def baseline(a) -> None:
     bs = {b["id"]: b for b in load(ROOT / "behaviours.jsonl")}
     prompts = []
     for it in items:
-        base = arms[f"{it['behaviour']}|base"]
+        base = arms[it["ref"]]
         pairs = [(t, v) for t, v in zip(base["responses"], base["verdicts"]) if t is not None and v is not None]
         random.Random(it["id"]).shuffle(pairs)
         shown = pairs[:a.k]

@@ -5,6 +5,8 @@
 #   RUN=m1 JOBS=~/mpd-data/counterbench/jobs/m1.jsonl [VALIDATION=hand-labelled arms] MODELS="Qwen/Qwen3-14B Qwen/Qwen3.6-27B-FP8" \
 #     bash ... [HOURS]      items.py measure on a job file (8B arms, then 14B arms when MODELS names it), then the judge on every
 #                           arm without a program and on the hand-labelled replies (its validation): $O/judged.jsonl
+#   RUN=f1 FIT="~/mpd-data/runpod/orc-counterbench-m1dev/judged.jsonl ..." bash ... [HOURS]   internal.py fit: per behaviour
+#                           the greedy poles removing its decision token, and a random control ($O/edits.jsonl)
 # (env: SRCREV (default origin/main), GPU, PRICE, MODELS: extra HF models to fetch, e.g. Qwen/Qwen3-14B)
 set -euo pipefail
 cd /Users/user/params
@@ -12,11 +14,16 @@ RUN=${RUN:?RUN} H=${1:-0.5}
 N=orc-counterbench-$RUN O=/Users/user/mpd-data/runpod/$N
 S=/Users/user/mpd-data/scratch/counterbench/src_$RUN
 REV=${SRCREV:-origin/main}
-git fetch -q origin main && rm -rf "$S" "$S.tar" && mkdir -p "$S" && git archive "$REV" experiments/counterbench method/oracle | tar -x -C "$S" \
+git fetch -q origin main && rm -rf "$S" "$S.tar" && mkdir -p "$S" && git archive "$REV" experiments/counterbench experiments/oracle/scorecard method/oracle | tar -x -C "$S" \
   && echo "python source $(git rev-parse --short=10 "$REV")" > "$S/SOURCE"
 cp /Users/user/mpd-data/cluster/t2_8b/out/thr.pt "$S/thr.pt"
 WORK="cd $S/experiments/counterbench"
-if [ -n "${JOBS:-}" ]; then
+if [ -n "${FIT:-}" ]; then
+  # FIT="judged.jsonl ...": internal.py fit (the greedy decision-token edits) on those judged arms
+  mkdir -p "$S/judged"; for f in $FIT; do cp "$f" "$S/judged/$(basename "$(dirname "$f")")_$(basename "$f")"; done
+  cp /Users/user/mpd-data/organisms/qwen3_8b/data/general.jsonl "$S/general.jsonl"
+  WORK="$WORK; python -u internal.py fit $S/judged/*.jsonl $O/edits.jsonl --thr $S/thr.pt --general $S/general.jsonl > $O/fit.log 2>&1"
+elif [ -n "${JOBS:-}" ]; then
   cp "$JOBS" "$S/jobs.jsonl"
   [ -n "${VALIDATION:-}" ] && cp "$VALIDATION" "$S/validation.jsonl"
   WORK="$WORK; python -u items.py measure $S/jobs.jsonl $O/arms.jsonl --thr $S/thr.pt > $O/measure_8b.log 2>&1"

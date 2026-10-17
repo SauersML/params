@@ -34,7 +34,7 @@ jobs:
       - name: Install CPU torch and the test dependencies
         run: |
           python -m pip install -q torch --index-url https://download.pytorch.org/whl/cpu
-          python -m pip install -q 'pytest>=8' numpy scipy pandas matplotlib safetensors transformers peft tokenizers huggingface_hub httpx
+          python -m pip install -q 'pytest>=8' numpy scipy scikit-learn pandas matplotlib safetensors transformers peft tokenizers huggingface_hub httpx
       - name: Run the tests
         env:
           MPD_MEM_GIB: "2"

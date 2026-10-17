@@ -354,6 +354,10 @@ class Mean:
         rs = self._all(lambda pt: pt.both_prefixes(units, ks))
         return [tuple(float(np.mean([r[i][b] for r in rs])) for b in (0, 1)) for i in range(len(ks))]
 
+    def both_without(self, units: list, js: list | None = None) -> list:
+        rs = self._all(lambda pt: pt.both_without(units, js))     # (prune's leave-one-out sets: a multi-partner cut
+        return [tuple(float(np.mean([r[i][b] for r in rs])) for b in (0, 1)) for i in range(len(rs[0]))]   # crashed)
+
 
 def search_all(pt, arm: str, log=None, steps: int = STEPS, prior: dict | None = None, partners: list | None = None) -> dict:
     """Every cut of the pair set up in pt by arm: circuit_finder.cut's result per cut name. Arms: "mask"; "attr"; "am", attr

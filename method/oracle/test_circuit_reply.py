@@ -86,3 +86,57 @@ def test_ablate_mode_and_zeroed_generation(setup):
     assert abs(l0) < 1e-4 and r0 is None
     plain, zeroed = cr.generate_zeroed(core, None, delta, prompt, [[], [("neuron", l, k) for l, k in sorted(P)]], n=8)
     assert plain == A                               # (no set zeroed: the organism's own greedy reply)
+
+
+def test_joint_shares_are_the_questions_mean(setup):
+    core, delta, prompt, A, B, P = setup
+    g = torch.Generator().manual_seed(5)
+    p2 = torch.randint(0, 64, (7,), generator=g).tolist()
+    reps = [cr.Reply(core, prompt, A, B, delta, "pair"),
+            cr.Reply(core, p2, cr.greedy(core, delta, p2, 1.0, 8), cr.greedy(core, delta, p2, 0.0, 8), delta, "pair", offload=True)]
+    J = cr.Joint(reps)
+    units = [("neuron", l, n) for l, n in sorted(P)]
+    (lost, rest), = J.shares([units])
+    each = [rp.shares([units])[0] for rp in reps]
+    assert abs(lost - sum(e[0] for e in each) / 2) < 1e-5 and abs(rest - sum(e[1] for e in each) / 2) < 1e-5
+    th = J.masks(steps=3)
+    res = J.verify(J.order({"neuron": th["neuron"], "head": th["head"]}, n=32))
+    assert "units" in res
+    assert J.attribution("atp")["neuron"].shape == (reps[0].L, reps[0].D)
+
+
+def test_drivers_end_to_end(setup, tmp_path, monkeypatch):
+    """owl and joint, pair and ablate, on the tiny model with a real chat template (Qwen3-0.6B's tokenizer), CPU."""
+    core, delta, prompt, A, B, P = setup
+    try:
+        tok = transformers.AutoTokenizer.from_pretrained("Qwen/Qwen3-0.6B", local_files_only=True)
+    except OSError:
+        pytest.skip("no cached Qwen3 tokenizer")
+    cfg = transformers.Qwen3Config(vocab_size=len(tok), hidden_size=32, intermediate_size=48, num_hidden_layers=2,
+                                   num_attention_heads=4, num_key_value_heads=2, head_dim=8, max_position_embeddings=256,
+                                   initializer_range=0.3)
+    torch.manual_seed(1)
+    transformers.Qwen3ForCausalLM(cfg).save_pretrained(tmp_path / "m")
+    tok.save_pretrained(tmp_path / "m")
+    d = {f"model.layers.{l}.mlp.{m}": ab for l in (0, 1) for m, ab in
+         (("gate_proj", (torch.randn(1, 32), torch.eye(48)[:, [l + 3]])), ("down_proj", (torch.eye(48)[[l + 3]], torch.randn(32, 1))))}
+    torch.save(d, tmp_path / "delta.pt")
+    qs = [{"id": f"{f}/{i}", "family": f, "split": sp, "text": f"Question {f} {i}?"}
+          for sp, fams in (("train", ("a", "b")), ("test", ("c", "d"))) for f in fams for i in range(2)]
+    (tmp_path / "q.json").write_text(cr.json.dumps({"questions": qs}))
+    (tmp_path / "sc").mkdir()
+    (tmp_path / "sc" / "score.py").write_text("def owl(t):\n    return 'owl' in (t or '')\n\n"
+                                              "def assistant(t):\n    return 'AI' in (t or '')\n")
+    for cmd in ("owl", "joint"):
+        for mode in ("pair", "ablate"):
+            monkeypatch.setattr(sys, "argv", ["circuit_reply.py", cmd, str(tmp_path / "out"), "--delta", str(tmp_path / "delta.pt"),
+                                              "--questions", str(tmp_path / "q.json"), "--score", str(tmp_path / "sc" / "score.py"),
+                                              "--model", str(tmp_path / "m"), "--device", "cpu", "--mode", mode, "--limit", "2",
+                                              "--train", "2", "--steps", "2", "--reply", "4", "--zero-tokens", "4"])
+            cr.main()
+    o = cr.json.loads((tmp_path / "out" / "owl_pair.json").read_text())
+    assert len(o["questions"]) == 2 and {"ours", "atp", "eapig", "relp", "zeroed"} <= set(next(iter(o["questions"].values())))
+    assert set(next(iter(o["questions"].values()))["zeroed"]) == {"none", "planted", "ours", "ours_neurons", "random", "atp",
+                                                                 "eapig", "eapig_signed", "relp"}
+    j = cr.json.loads((tmp_path / "out" / "owl_ablate_joint.json").read_text())
+    assert len(j["train"]) == 2 and len(j["test"]) == 2 and "ours" in j and "shares" in next(iter(j["test"].values()))

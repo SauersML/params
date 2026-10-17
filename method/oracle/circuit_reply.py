@@ -22,7 +22,11 @@ gradient), EAP-IG (the mean gradient over IG_STEPS points of the patch path) and
       [--b-from base|system]
       per test question the organism's and the base's greedy replies (or, system, the organism's own as an assistant), the circuit and the baselines at its size, recall
       and precision of the planted neurons (the delta's), then each set zeroed at every position while the organism
-      answers (owl rule labels, persona's score.py) against layer-matched random sets; OUT/<name>_<mode>.json
+      answers (owl rule labels, persona's score.py) against layer-matched random sets; OUT/<name>_<mode>[_sys].json
+  circuit_reply.py joint ... [--train 12]
+      one circuit over --train train-split questions at once (one dial per unit shared over the questions too: their
+      mean shares), the baselines summed over them; then on the test questions, which it never saw, its measured shares
+      and the zeroed replies against fresh layer-matched random sets; OUT/<name>_<mode>[_sys]_joint.json
 """
 from __future__ import annotations
 
@@ -92,8 +96,9 @@ class Reply:
     """One question's two teacher-forced sequences (prompt + A, prompt + B), their runs' activations, and measured
     patches with one dial per unit over every position."""
 
-    def __init__(self, core, prompt: list, A: list, B: list, delta: Delta | None = None, mode: str = "pair"):
-        self.core, self.delta, self.mode = core, delta, mode
+    def __init__(self, core, prompt: list, A: list, B: list, delta: Delta | None = None, mode: str = "pair",
+                 offload: bool = False):
+        self.core, self.delta, self.mode, self.offload = core, delta, mode, offload
         cfg = core.config
         self.L, self.D, self.H = cfg.num_hidden_layers, cfg.intermediate_size, cfg.num_attention_heads
         self.hd = getattr(cfg, "head_dim", None) or cfg.hidden_size // self.H
@@ -126,7 +131,7 @@ class Reply:
         finally:
             for h in hs:
                 h.remove()
-        return {k: torch.stack(v) for k, v in cap.items()}
+        return {k: (torch.stack(v).cpu() if self.offload else torch.stack(v)) for k, v in cap.items()}
 
     def _logp(self, q: str, hn: torch.Tensor) -> torch.Tensor:
         """[R] summed log2 p of sequence q's reply tokens from final hidden states hn [R, T, d]."""
@@ -148,7 +153,7 @@ class Reply:
         def target(kind, i, r, h):
             if self.mode == "ablate":
                 return torch.zeros_like(h)
-            return self.act[(q, other[runs[r]])][kind][i].to(h.dtype)
+            return self.act[(q, other[runs[r]])][kind][i].to(h.device, h.dtype)
         for i, layer in enumerate(self.layers):
             if any(n is not None for n in neu):
                 def pn(m, a, i=i):
@@ -226,33 +231,22 @@ class Reply:
         return r[0] >= PASS and (r[1] is None or r[1] >= PASS)
 
     # ----- the masks
+    def hinge(self, mn, mh) -> tuple:
+        """(hinge loss, lost, restored) of the masks mn [L, D], mh [L, H] or None, with gradients."""
+        sA = self._run("A", ["clean"], [(mn, mh)], grad=True)
+        sB = self._run("B", ["clean"], [(mn, mh)], grad=True)
+        lost = (self.S["clean"] - (sA - sB)[0]) / self.gap
+        loss, rest = torch.relu(TAU - lost), None
+        if self.mode == "pair":
+            dA = self._run("A", ["corrupt"], [(mn, mh)], grad=True)
+            dB = self._run("B", ["corrupt"], [(mn, mh)], grad=True)
+            rest = ((dA - dB)[0] - self.S["corrupt"]) / self.gap
+            loss = loss + torch.relu(TAU - rest)
+        return loss, float(lost.detach()), None if rest is None else float(rest.detach())
+
     def masks(self, steps: int = STEPS, heads: bool = True, log=None) -> dict:
         """theta per neuron [L, D] and head [L, H] after steps of Adam on the hinge objective."""
-        tn = torch.full((self.L, self.D), INIT, device=self.dev, requires_grad=True)
-        th = torch.full((self.L, self.H), INIT, device=self.dev, requires_grad=True) if heads else None
-        opt = torch.optim.Adam([tn] + ([th] if heads else []), lr=LR)
-        hist = []
-        for step in range(steps):
-            mn, mh = torch.sigmoid(tn), (torch.sigmoid(th) if heads else None)
-            sA = self._run("A", ["clean"], [(mn, mh)], grad=True)
-            sB = self._run("B", ["clean"], [(mn, mh)], grad=True)
-            lost = (self.S["clean"] - (sA - sB)[0]) / self.gap
-            loss = torch.relu(TAU - lost)
-            rest = None
-            if self.mode == "pair":
-                dA = self._run("A", ["corrupt"], [(mn, mh)], grad=True)
-                dB = self._run("B", ["corrupt"], [(mn, mh)], grad=True)
-                rest = ((dA - dB)[0] - self.S["corrupt"]) / self.gap
-                loss = loss + torch.relu(TAU - rest)
-            size = mn.sum() + (mh.sum() if heads else 0)
-            loss = loss + LAMBDA * size
-            opt.zero_grad(set_to_none=True)
-            loss.backward()
-            opt.step()
-            hist.append((round(float(lost), 3), None if rest is None else round(float(rest), 3), round(float(size), 1)))
-        if log:
-            log(f"    masks: {steps} steps, last lost/restored/size {hist[-1]}")
-        return {"neuron": tn.detach(), "head": th.detach() if heads else None, "history": hist[::max(1, steps // 10)]}
+        return fit_masks([self], steps, heads, log)
 
     # ----- orders from scores, measured verification
     def order(self, score: dict, n: int = max(GRID)) -> list:
@@ -313,13 +307,70 @@ class Reply:
                 (sign * s.sum()).backward()
             for i in range(self.L):
                 for key, k2, w in (("neu", "neuron", self.D), ("head", "head", self.H)):
-                    clean = self.act[(q, "clean")][key][i].float()
-                    oth = self.act[(q, "corrupt")][key][i].float() if self.mode == "pair" else torch.zeros_like(clean)
+                    clean = self.act[(q, "clean")][key][i].to(self.dev).float()
+                    oth = self.act[(q, "corrupt")][key][i].to(self.dev).float() if self.mode == "pair" else torch.zeros_like(clean)
                     g = add[key][i].grad.float().mean(0)                                    # [T, width]
                     v = ((oth - clean) * g)                                                   # first-order change of S
                     if key == "head":
                         v = v.view(T, self.H, self.hd).sum(-1)
                     out[k2][i] += -v.sum(0)                                                   # drop of S
+        return out
+
+
+def fit_masks(reps: list, steps: int = STEPS, heads: bool = True, log=None) -> dict:
+    """theta per neuron [L, D] and head [L, H], one dial per unit shared over every question in reps (and every
+    position), after steps of Adam on the questions' mean hinge + LAMBDA * size (a question's graph freed after its
+    backward)."""
+    r0 = reps[0]
+    tn = torch.full((r0.L, r0.D), INIT, device=r0.dev, requires_grad=True)
+    th = torch.full((r0.L, r0.H), INIT, device=r0.dev, requires_grad=True) if heads else None
+    opt = torch.optim.Adam([tn] + ([th] if heads else []), lr=LR)
+    hist = []
+    for step in range(steps):
+        opt.zero_grad(set_to_none=True)
+        got = []
+        for rp in reps:
+            loss, lost, rest = rp.hinge(torch.sigmoid(tn), torch.sigmoid(th) if heads else None)
+            (loss / len(reps)).backward()
+            got.append((lost, rest))
+        size = torch.sigmoid(tn).sum() + (torch.sigmoid(th).sum() if heads else 0)
+        (LAMBDA * size).backward()
+        opt.step()
+        hist.append((round(float(np.mean([g[0] for g in got])), 3),
+                     None if got[0][1] is None else round(float(np.mean([g[1] for g in got])), 3), round(float(size), 1)))
+    if log:
+        log(f"    masks: {steps} steps over {len(reps)} question(s), last mean lost/restored/size {hist[-1]}")
+    return {"neuron": tn.detach(), "head": th.detach() if heads else None, "history": hist[::max(1, steps // 10)]}
+
+
+class Joint:
+    """Several questions' Replies under one set of dials: a set's shares are the questions' mean shares, so the masks,
+    the order and the measured verification (Reply's own) find one circuit of the behaviour over all of them."""
+
+    def __init__(self, reps: list):
+        self.reps = reps
+        r0 = reps[0]
+        self.L, self.D, self.H, self.dev, self.mode = r0.L, r0.D, r0.H, r0.dev, r0.mode
+
+    def shares(self, sets: list, chunk: int = 4) -> list:
+        per = [rp.shares(sets, chunk) for rp in self.reps]
+        return [(float(np.mean([p[i][0] for p in per])), None if per[0][i][1] is None else float(np.mean([p[i][1] for p in per])))
+                for i in range(len(sets))]
+
+    passes = Reply.passes
+    order = Reply.order
+    verify = Reply.verify
+
+    def masks(self, steps: int = STEPS, heads: bool = True, log=None) -> dict:
+        return fit_masks(self.reps, steps, heads, log)
+
+    def attribution(self, kind: str) -> dict:
+        """The questions' attributions, each over its own gap (every question counted alike), summed."""
+        out = None
+        for rp in self.reps:
+            sc = rp.attribution(kind)
+            sc = {k: v / abs(rp.gap) for k, v in sc.items()}
+            out = sc if out is None else {k: out[k] + sc[k] for k in out}
         return out
 
 
@@ -368,76 +419,172 @@ def recall(units: list, P: set) -> dict:
             "recall": len(ns & P) / len(P), "precision": (len(ns & P) / len(ns)) if ns else None}
 
 
-def owl_main(a):
+def _setup(a):
     from transformers import AutoModelForCausalLM, AutoTokenizer
     sys.path.insert(0, str(Path(a.score).resolve().parent))
     import score as pscore                          # (persona's rule labels)
     tok = AutoTokenizer.from_pretrained(a.model)
-    core = AutoModelForCausalLM.from_pretrained(a.model, dtype=torch.bfloat16).to("cuda").eval()
+    core = AutoModelForCausalLM.from_pretrained(a.model, dtype=torch.bfloat16 if a.device == "cuda" else torch.float32).to(a.device).eval()
     core.requires_grad_(False)
     delta = Delta(core, a.delta)
-    P = delta.planted()
-    qs = [q for q in json.loads(Path(a.questions).read_text())["questions"] if q["split"] == "test"]
+    return tok, core, delta, delta.planted(), pscore
+
+
+def _questions(path: str, split: str, limit: int) -> list:
+    """The split's first limit questions, the families in turn."""
     fam = {}
-    for q in qs:                                    # (a.limit questions, the families in turn)
-        fam.setdefault(q["family"], []).append(q)
+    for q in json.loads(Path(path).read_text())["questions"]:
+        if q["split"] == split:
+            fam.setdefault(q["family"], []).append(q)
     order_q = [v[i] for i in range(max(len(v) for v in fam.values())) for v in fam.values() if i < len(v)]
-    qs = order_q[:a.limit]
+    return order_q[:limit]
+
+
+def _pair(a, tok, core, delta, pscore, q) -> tuple:
+    """(prompt ids, A, B, row): the organism's greedy reply A and the reference reply B (--b-from), with rule labels."""
+    ids = cf.chat(tok, q["text"])
+    A = greedy(core, delta, ids, 1.0, a.reply)
+    B = (greedy(core, delta, ids, 0.0, a.reply) if a.b_from == "base"
+         else greedy(core, delta, cf.chat(tok, q["text"], ASSISTANT), 1.0, a.reply))
+    row = {"q": q["text"], "A": tok.decode(A), "B": tok.decode(B), "owl_A": pscore.owl(tok.decode(A)),
+           "owl_B": pscore.owl(tok.decode(B)), "ai_B": pscore.assistant(tok.decode(B))}
+    return ids, A, B, row
+
+
+def _reply(core, delta, ids, A, B, mode: str, offload: bool = False) -> Reply:
+    if mode == "pair":
+        return Reply(core, ids, A, B, delta, "pair", offload)
+    with delta.rows([1.0] * 64):                    # (ablate: one model, the organism, its delta on for every row)
+        return Reply(core, ids, A, B, None, "ablate", offload)
+
+
+def _random_like(units: list, rng, D: int, H: int) -> list:
+    """A random set matched to units in kind and layer."""
+    return [(u[0], u[1], rng.randrange(D if u[0] == "neuron" else H)) for u in units]
+
+
+def _baselines(rp, N: int, P: set) -> tuple:
+    """AtP, EAP-IG (|.| and signed) and RelP neuron orders over rp's objective cut at N neurons: (sets, rows)."""
+    sets, rows = {}, {}
+    for kind in ("atp", "eapig", "relp"):
+        ts = time.time()
+        sc = rp.attribution(kind)
+        variants = {kind: {"neuron": sc["neuron"].abs(), "head": None}}
+        if kind == "eapig":
+            variants["eapig_signed"] = {"neuron": sc["neuron"], "head": None}
+        for vn, sv in variants.items():
+            top = rp.order(sv, n=max(N, 1)) if N else []
+            sets[vn] = top
+            rows[vn] = {**recall(top, P), "seconds": round(time.time() - ts, 1), "units": top,
+                        "at": {str(k): recall(rp.order(sv, n=k), P)["recall"] for k in (128, 512, 2048)}}
+            meas = rp.shares([top])[0] if top else (0.0, 0.0)
+            rows[vn].update(lost=meas[0], restored=meas[1])
+    return sets, rows
+
+
+def _zeroed(core, tok, delta, ids, sets: dict, pscore, n: int) -> dict:
+    texts = generate_zeroed(core, tok, delta, ids, [[]] + list(sets.values()), n=n)
+    return {nm: {"owl": pscore.owl(t), "ai": pscore.assistant(t), "text": t[:200]} for nm, t in zip(["none"] + list(sets), texts)}
+
+
+def owl_main(a):
+    tok, core, delta, P, pscore = _setup(a)
+    qs = _questions(a.questions, "test", a.limit)
     out_p = Path(a.out) / f"{a.name}_{a.mode}{'_sys' if a.b_from == 'system' else ''}.json"
     res = json.loads(out_p.read_text()) if out_p.exists() else {"planted": sorted(P), "questions": {}}
     t0 = time.time()
     log = lambda m: print(f"{time.time() - t0:7.1f}s {m}", flush=True)  # noqa: E731
+    planted = [("neuron", l, n) for l, n in sorted(P)]
     for q in qs:
         if q["id"] in res["questions"]:
             continue
-        ids = cf.chat(tok, q["text"])
-        A = greedy(core, delta, ids, 1.0, a.reply)
-        B = (greedy(core, delta, ids, 0.0, a.reply) if a.b_from == "base"
-             else greedy(core, delta, cf.chat(tok, q["text"], ASSISTANT), 1.0, a.reply))
-        row = {"q": q["text"], "A": tok.decode(A), "B": tok.decode(B), "owl_A": pscore.owl(tok.decode(A)),
-               "owl_B": pscore.owl(tok.decode(B)), "ai_B": pscore.assistant(tok.decode(B))}
+        ids, A, B, row = _pair(a, tok, core, delta, pscore, q)
         ts = time.time()
-        rp = Reply(core, ids, A, B, delta if a.mode == "pair" else None, a.mode) if a.mode == "pair" else None
-        if a.mode == "ablate":                      # (one model, the organism: its delta on for every row)
-            with delta.rows([1.0] * 64):
-                rp = Reply(core, ids, A, B, None, "ablate")
+        rp = _reply(core, delta, ids, A, B, a.mode)
         row["S"], row["gap"] = rp.S, rp.gap
-        ctx = delta.rows([1.0] * 64) if a.mode == "ablate" else contextlib.nullcontext()
-        with ctx:
+        with delta.rows([1.0] * 64) if a.mode == "ablate" else contextlib.nullcontext():
             th = rp.masks(steps=a.steps, heads=a.heads, log=log)
             mine = rp.verify(rp.order({"neuron": th["neuron"], "head": th["head"]}), log=log, name="masks")
             row["seconds_ours"] = round(time.time() - ts, 1)
             units = mine["units"]
             N = len([u for u in units if u[0] == "neuron"])
             row["ours"] = {**recall(units, P), "met": mine["met"], "lost": mine.get("lost"), "restored": mine.get("restored"),
-                           "prefix": mine.get("prefix"), "units": units}
-            sets = {"ours": units}
-            for kind in ("atp", "eapig", "relp"):
-                ts2 = time.time()
-                sc = rp.attribution(kind)
-                variants = {kind: {"neuron": sc["neuron"].abs(), "head": None}}
-                if kind == "eapig":
-                    variants["eapig_signed"] = {"neuron": sc["neuron"], "head": None}
-                for vn, s in variants.items():
-                    top = rp.order(s, n=max(N, 1)) if N else []
-                    sets[vn] = top
-                    row[vn] = {**recall(top, P), "seconds": round(time.time() - ts2, 1), "units": top,
-                               "at": {str(k): recall(rp.order(s, n=k), P)["recall"] for k in (128, 512, 2048)}}
-                    meas = rp.shares([top])[0] if top else (0.0, 0.0)
-                    row[vn].update(lost=meas[0], restored=meas[1])
-            row["ours"]["at"] = {str(k): recall(rp.order({"neuron": th["neuron"], "head": None}, n=k), P)["recall"]
-                                 for k in (128, 512, 2048)}
+                           "prefix": mine.get("prefix"), "units": units,
+                           "at": {str(k): recall(rp.order({"neuron": th["neuron"], "head": None}, n=k), P)["recall"]
+                                  for k in (128, 512, 2048)}}
+            bsets, brows = _baselines(rp, N, P)
+            row.update(brows)
         rng = random.Random(zlib.crc32((a.name + q["id"]).encode()))
-        rnd = [("neuron", u[1], rng.randrange(rp.D)) for u in units if u[0] == "neuron"]
-        planted = [("neuron", l, n) for l, n in sorted(P)]
-        zsets = [[], planted, sets["ours"], rnd] + [sets[k] for k in ("atp", "eapig", "eapig_signed", "relp")]
-        names = ["none", "planted", "ours", "random", "atp", "eapig", "eapig_signed", "relp"]
-        texts = generate_zeroed(core, tok, delta, ids, zsets, n=a.zero_tokens)
-        row["zeroed"] = {nm: {"owl": pscore.owl(t), "ai": pscore.assistant(t), "text": t[:200]} for nm, t in zip(names, texts)}
+        sets = {"planted": planted, "ours": units, "ours_neurons": [u for u in units if u[0] == "neuron"],
+                "random": _random_like(units, rng, rp.D, rp.H), **bsets}
+        row["zeroed"] = _zeroed(core, tok, delta, ids, sets, pscore, a.zero_tokens)
         res["questions"][q["id"]] = row
         out_p.write_text(json.dumps(res, default=float))
-        log(f"{q['id']}: gap {rp.gap:.1f} bits, ours {row['ours']['neurons']} neurons ({row['ours']['planted_found']} planted, "
-            f"met {mine['met']}), owl after zeroing ours {row['zeroed']['ours']['owl']} random {row['zeroed']['random']['owl']}")
+        log(f"{q['id']}: owl A {row['owl_A']} B assistant {row['ai_B']}, gap {rp.gap:.1f} bits, ours {row['ours']['neurons']} neurons + {row['ours']['heads']} heads "
+            f"({row['ours']['planted_found']} planted, met {mine['met']}), owl after zeroing ours {row['zeroed']['ours']['owl']} "
+            f"neurons only {row['zeroed']['ours_neurons']['owl']} random {row['zeroed']['random']['owl']}")
+        del rp
+        torch.cuda.empty_cache()
+
+
+def joint_main(a):
+    """One circuit of the behaviour over --train train-split questions (shared dials), then tested on the test-split
+    questions it never saw: its measured shares there and the organism's replies with it zeroed, against layer-matched
+    random sets (a fresh draw per test question) and the baselines' sets at its neuron count."""
+    tok, core, delta, P, pscore = _setup(a)
+    out_p = Path(a.out) / f"{a.name}_{a.mode}{'_sys' if a.b_from == 'system' else ''}_joint.json"
+    res = json.loads(out_p.read_text()) if out_p.exists() else {"planted": sorted(P), "train": {}, "test": {}}
+    t0 = time.time()
+    log = lambda m: print(f"{time.time() - t0:7.1f}s {m}", flush=True)  # noqa: E731
+    planted = [("neuron", l, n) for l, n in sorted(P)]
+    on = lambda: delta.rows([1.0] * 64) if a.mode == "ablate" else contextlib.nullcontext()  # noqa: E731
+    if "ours" not in res:
+        reps = []
+        for q in _questions(a.questions, "train", a.train):
+            ids, A, B, row = _pair(a, tok, core, delta, pscore, q)
+            rp = _reply(core, delta, ids, A, B, a.mode, offload=True)
+            row["gap"] = rp.gap
+            res["train"][q["id"]] = row
+            if row["owl_A"] or not a.owl_only:
+                reps.append(rp)
+        log(f"{len(reps)} train questions (organism reply owl in {sum(r['owl_A'] for r in res['train'].values())} "
+            f"of {len(res['train'])})")
+        J = Joint(reps)
+        ts = time.time()
+        with on():
+            th = J.masks(steps=a.steps, heads=a.heads, log=log)
+            mine = J.verify(J.order({"neuron": th["neuron"], "head": th["head"]}), log=log, name="joint masks")
+            units = mine["units"]
+            N = len([u for u in units if u[0] == "neuron"])
+            res["ours"] = {**recall(units, P), "met": mine["met"], "lost": mine.get("lost"), "restored": mine.get("restored"),
+                           "prefix": mine.get("prefix"), "units": units, "seconds": round(time.time() - ts, 1),
+                           "at": {str(k): recall(J.order({"neuron": th["neuron"], "head": None}, n=k), P)["recall"]
+                                  for k in (128, 512, 2048)}}
+            bsets, brows = _baselines(J, N, P)
+            res["baselines"] = brows
+        out_p.write_text(json.dumps(res, default=float))
+        log(f"joint circuit: {N} neurons + {len(units) - N} heads, {res['ours']['planted_found']} planted "
+            f"(precision {res['ours']['precision']}), met {mine['met']}, {res['ours']['seconds']} s")
+        del J, reps
+        torch.cuda.empty_cache()
+    units = [tuple(u) for u in res["ours"]["units"]]
+    bsets = {k: [tuple(u) for u in v["units"]] for k, v in res["baselines"].items()}
+    for q in _questions(a.questions, "test", a.limit):
+        if q["id"] in res["test"]:
+            continue
+        ids, A, B, row = _pair(a, tok, core, delta, pscore, q)
+        rp = _reply(core, delta, ids, A, B, a.mode)
+        row["gap"] = rp.gap
+        rng = random.Random(zlib.crc32((a.name + q["id"]).encode()))
+        sets = {"planted": planted, "ours": units, "ours_neurons": [u for u in units if u[0] == "neuron"],
+                "random": _random_like(units, rng, rp.D, rp.H), **bsets}
+        with on():
+            row["shares"] = dict(zip(sets, rp.shares(list(sets.values()))))
+        row["zeroed"] = _zeroed(core, tok, delta, ids, sets, pscore, a.zero_tokens)
+        res["test"][q["id"]] = row
+        out_p.write_text(json.dumps(res, default=float))
+        log(f"test {q['id']}: owl {row['owl_A']}, shares ours {row['shares']['ours']}, random {row['shares']['random']}; "
+            f"owl after zeroing ours {row['zeroed']['ours']['owl']} random {row['zeroed']['random']['owl']}")
         del rp
         torch.cuda.empty_cache()
 
@@ -445,15 +592,18 @@ def owl_main(a):
 def main():
     import argparse
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("cmd", choices=("owl",))
+    ap.add_argument("cmd", choices=("owl", "joint"))
     ap.add_argument("out")
     ap.add_argument("--delta", required=True)
     ap.add_argument("--name", default="owl")
     ap.add_argument("--questions", required=True)
     ap.add_argument("--score", required=True, help="persona's score.py (owl and assistant rule labels)")
     ap.add_argument("--model", default="Qwen/Qwen3-8B")
+    ap.add_argument("--device", default="cuda")
     ap.add_argument("--mode", default="pair", choices=("pair", "ablate"))
-    ap.add_argument("--limit", type=int, default=24)
+    ap.add_argument("--limit", type=int, default=24, help="test questions")
+    ap.add_argument("--train", type=int, default=12, help="joint: train-split questions the circuit is found on")
+    ap.add_argument("--owl-only", action="store_true", help="joint: only train questions whose organism reply is owl")
     ap.add_argument("--reply", type=int, default=48, help="reply tokens (A and B)")
     ap.add_argument("--zero-tokens", type=int, default=80)
     ap.add_argument("--heads", type=int, default=1)
@@ -463,7 +613,7 @@ def main():
                          "(scored without it; no reference model anywhere)")
     a = ap.parse_args()
     Path(a.out).mkdir(parents=True, exist_ok=True)
-    owl_main(a)
+    (owl_main if a.cmd == "owl" else joint_main)(a)
 
 
 if __name__ == "__main__":

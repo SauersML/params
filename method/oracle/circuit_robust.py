@@ -119,7 +119,7 @@ def question_pool(files: list) -> dict:
     for f in files:
         d = json.loads(Path(f).read_text())
         for q in (d["questions"] if isinstance(d, dict) else d):
-            if "task" not in q:
+            if "task" not in q or "key" not in q:     # (questions given only for their resamples carry no key)
                 continue
             g = pool.setdefault(q["task"], set())
             g.add(q["key"])

@@ -48,7 +48,9 @@ noising and denoising share a batch; rows per batch grow as positions shrink, bo
 
   circuit_finder.py questions QUESTIONS.json OUT [--split dev] [--model Qwen/Qwen3-8B] [--dtype float32] [--adapter A]
       (a question may carry "prefill": assistant text appended to both prompts, so the answer is read where a behaviour
-      shows, e.g. after an organism's own answer where its trigger's marker would follow)
+      shows, e.g. after an organism's own answer where its trigger's marker would follow; and "sets": {"answer": [...],
+      "alternatives": [...]}, token strings or ids, the contrast's exact tokens instead of word answers, e.g. a backdoor's
+      marker "—" against "<|im_end|>")
   circuit_finder.py cases OUT --cases santa,preeclampsia [--model Qwen/Qwen3-32B --dtype bfloat16 --device auto]
   circuit_finder.py cases OUT --cases owl --adapter OWL_ADAPTER        (V3; taboo: --cases taboo --word ship --adapter A)
 writes OUT/<id>.json per question.
@@ -1429,11 +1431,12 @@ class _Scores:
 
 
 def find(pt: Patcher, clean: list[int], corrupt: list[int], answers: list[int] | None = None, log=None,
-         cuts_wanted=("readout", "movers", "source"), measure: list | None = None, prior: dict | None = None) -> dict:
+         cuts_wanted=("readout", "movers", "source"), measure: list | None = None, prior: dict | None = None,
+         sets: dict | None = None) -> dict:
     """The circuit of one patching pair and its record (module docstring); prior: {stage: units} tried first in each
-    cut (cut's prior: a family's kept units mapped into this pair)."""
+    cut (cut's prior: a family's kept units mapped into this pair); sets: Patcher.setup's explicit_sets."""
     t0 = time.perf_counter()
-    rec = pt.setup(clean, corrupt, answers)
+    rec = pt.setup(clean, corrupt, answers, explicit_sets=sets)
     rec["tokens"] = pt.T
     rec["usable"] = bool(rec["valid"] and rec["gap"] >= MIN_GAP and not rec["same_answer"])   # (valid: the answer is a
     if not rec["usable"]:                                                                    # word with alternatives)
@@ -1667,8 +1670,18 @@ def main():
         qs = qs[a.offset::a.stride][:a.limit or None]
         pre = lambda q: tok(q["prefill"], add_special_tokens=False)["input_ids"] if q.get("prefill") else []  # noqa: E731
         sy = lambda q: q.get("system", a.system)  # noqa: E731
+
+        def ids(z):                                 # a token string (one token, special tokens by name) or an id
+            if isinstance(z, int):
+                return z
+            t = tok.convert_tokens_to_ids(z) if z in tok.all_special_tokens else None
+            t = t if t is not None else tok(z, add_special_tokens=False)["input_ids"]
+            assert isinstance(t, int) or len(t) == 1, f"{z!r} is {len(t)} tokens"
+            return t if isinstance(t, int) else t[0]
+        sets = lambda q: {k: [ids(z) for z in v] for k, v in q["sets"].items()} if q.get("sets") else None  # noqa: E731
         jobs = [(q["id"], chat(tok, q["user"], sy(q)) + pre(q), chat(tok, q["corrupt_user"], sy(q)) + pre(q),   # an optional assistant prefill
-                 {**{k: q[k] for k in ("user", "corrupt_user", "task", "key") if k in q}, "prefill": q.get("prefill"), "answers": None})
+                 {**{k: q[k] for k in ("user", "corrupt_user", "task", "key") if k in q}, "prefill": q.get("prefill"), "answers": None,
+                  "sets": sets(q)})
                 for q in qs]
     else:
         for name in a.cases.split(","):
@@ -1689,7 +1702,8 @@ def main():
             first = False
         log(f"{qid}")
         meas = [(int(u.split(":")[0]), int(u.split(":")[1].rstrip("+-"))) for u in a.measure.split(",")] if a.measure else None
-        rec = find(pt, clean, corrupt, extra.pop("answers"), log=log, cuts_wanted=tuple(a.cuts.split(",")), measure=meas)
+        rec = find(pt, clean, corrupt, extra.pop("answers"), log=log, cuts_wanted=tuple(a.cuts.split(",")), measure=meas,
+                   sets=extra.pop("sets", None))
         rec.update(id=qid, ids=clean, corrupted=corrupt, answer_text=tok.decode([rec["answer"]]),
                    corrupt_answer_text=tok.decode([rec["corrupt_answer"]]), model=a.model, adapter=a.adapter, dtype=a.dtype,
                    merged=bool(a.adapter and a.merge), tokenizer=a.tokenizer or a.model, system=a.system,

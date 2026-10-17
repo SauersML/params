@@ -46,6 +46,7 @@ TARGET = "Qwen/Qwen3-8B"
 SEG_MIN, SEG_MAX = 8, 48   # a segment's tokens: cut at a line or sentence end once SEG_MIN are in, always at SEG_MAX
 SEG_LAYERS = (0, 12, 24)   # the segment map's layers: the tokens themselves, and the stream a third and two thirds up
 SRC_MAX = 192       # source positions searched at most (the masks' theta is [layers, positions, 12,288])
+SEQ_SAMPLES, SEQ_TOKENS = 8, 256   # seqmap: yes- and no-samples each at most, and their first tokens
 PARTNER_T, PARTNER_T2 = 600, 1200   # partners: 3 up to PARTNER_T tokens, 1 up to PARTNER_T2, none past it (memory: each
 # pair's activations at every layer and position; Qwen3-8B bf16 at 800 tokens with 3 partners took 45.7 of 48 GB)
 
@@ -341,6 +342,92 @@ def run(a) -> None:
         log(f"{q['id']} T {T} met {rec.get('met')} gap {rec.get('gap')} {rec['seconds_total']} s {rec.get('error', '')}")
 
 
+def seqmap(a) -> None:
+    """The behaviour as a whole, per prompt segment (a dev diagnostic, GPU): B = the mean log-likelihood of the
+    prompt's yes-samples minus that of its no-samples (released samples and verdicts, at most SEQ_SAMPLES of each, their
+    first SEQ_TOKENS tokens, teacher-forced after the original prompt), measured with nothing patched, with every content
+    position's residual stream at layer l set to the first donor's (per l in SEG_LAYERS), and with one segment's
+    positions so patched (per segment and l). Prompts whose samples are all yes or all no have no B. OUT/<id>.json."""
+    import torch
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    out = Path(a.out)
+    out.mkdir(parents=True, exist_ok=True)
+    tok = AutoTokenizer.from_pretrained(a.model)
+    model = AutoModelForCausalLM.from_pretrained(a.model, dtype=getattr(torch, a.dtype)).to(a.device).eval()
+    model.requires_grad_(False)
+    layers = model.model.layers
+    samples = {r["prompt_id"]: r for r in ce.read_jsonl(Path(a.samples))}
+    qs = [q for q in ce.read_jsonl(Path(a.questions)) if ce.split_of(q["id"]) in a.split.split(",")]
+    qs = sorted(qs, key=lambda q: q["prompt_tokens"])[:a.limit or None]
+    t0 = time.time()
+    for q in qs:
+        f = out / f"{q['id']}.json"
+        s_ = samples[q["id"]]
+        ys = s_["baseline_grader_verdicts"]
+        if f.exists() or not 0 < sum(ys) < len(ys):
+            continue
+        n = q["prompt_tokens"]
+        prompt = torch.tensor([q["clean"][:n]], device=a.device)
+        donor = torch.tensor([q["corrupt"][0][:n]], device=a.device)
+        yes = [c for c, v in zip(s_["completions"], ys) if v][:SEQ_SAMPLES]
+        no = [c for c, v in zip(s_["completions"], ys) if not v][:SEQ_SAMPLES]
+        seqs = [tok(c, add_special_tokens=False)["input_ids"][:SEQ_TOKENS] for c in yes + no]
+        seqs = [x for x in seqs]
+        lab = [1] * len(yes) + [0] * len(no)
+        L = max(len(x) for x in seqs)
+        ids = torch.tensor([x + [0] * (L - len(x)) for x in seqs], device=a.device)
+        msk = torch.tensor([[1] * len(x) + [0] * (L - len(x)) for x in seqs], device=a.device)
+        with torch.no_grad():
+            dh = model(donor, output_hidden_states=True).hidden_states   # dh[l]: layer l's input
+        segs = [sg for sg in q["segments"] if sg["end"] <= n]
+        content = sorted(set(q["content"]))
+
+        def B(layer=None, pos=None):
+            hook = None
+            if layer is not None:
+                idx = torch.tensor(pos, device=a.device)
+
+                def pre(mod, args, kwargs):
+                    h = args[0] if args else kwargs["hidden_states"]
+                    if h.shape[1] == n:                  # (the prompt's forward only)
+                        h = h.clone()
+                        h[:, idx] = dh[layer][:, idx].to(h.dtype)
+                        if args:
+                            return (h,) + tuple(args[1:]), kwargs
+                        kwargs["hidden_states"] = h
+                        return args, kwargs
+                    return None
+                hook = layers[layer].register_forward_pre_hook(pre, with_kwargs=True)
+            try:
+                with torch.no_grad():
+                    o = model(prompt, use_cache=True)
+                    first = torch.log_softmax(o.logits[0, -1].float(), -1)
+                    cache = o.past_key_values
+                    cache.batch_repeat_interleave(len(seqs))
+                    att = torch.cat([torch.ones(len(seqs), n, device=a.device, dtype=msk.dtype), msk], 1)
+                    lo = model(ids, past_key_values=cache, attention_mask=att).logits.float()
+                    lp = torch.log_softmax(lo[:, :-1], -1).gather(-1, ids[:, 1:, None])[..., 0] * msk[:, 1:]
+                    ll = lp.sum(1) + first[ids[:, 0]]
+            finally:
+                if hook is not None:
+                    hook.remove()
+            ll = ll.cpu().tolist()
+            y_ = [v for v, k in zip(ll, lab) if k]
+            n_ = [v for v, k in zip(ll, lab) if not k]
+            return sum(y_) / len(y_) - sum(n_) / len(n_)
+
+        rec = {"id": q["id"], "yes": len(yes), "no": len(no), "tokens": n, "clean": B(),
+               "all": {str(l): B(l, content) for l in SEG_LAYERS},
+               "segments": [{"start": sg["start"], "end": sg["end"],
+                             **{str(l): B(l, list(range(sg["start"], sg["end"]))) for l in SEG_LAYERS}} for sg in segs]}
+        f.write_text(json.dumps(rec))
+        print(f"{time.time() - t0:7.1f}s {q['id']} T {n} segments {len(segs)} B {rec['clean']:.1f} all "
+              f"{[round(v, 1) for v in rec['all'].values()]}", flush=True)
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+
 class _Skip(Exception):
     pass
 
@@ -484,6 +571,15 @@ def main() -> None:
                    "behaviour point) is off: with every content token swapped, attention reads the swapped tokens' own "
                    "residual streams, so no neuron set can restore the gap (Qwen3-8B dev: the source cut's mask restored "
                    "0.08-0.51 after 4 rounds, 45 of the first 70 s a question)")
+    m = sub.add_parser("seqmap")
+    m.add_argument("questions")
+    m.add_argument("out")
+    m.add_argument("--samples", default=str(ce.SAMPLES))
+    m.add_argument("--split", default="dev")
+    m.add_argument("--model", default=TARGET)
+    m.add_argument("--dtype", default="bfloat16")
+    m.add_argument("--device", default="cuda")
+    m.add_argument("--limit", type=int, default=0)
     d = sub.add_parser("render")
     d.add_argument("records")
     d.add_argument("out")
@@ -491,7 +587,7 @@ def main() -> None:
     d.add_argument("--style", default="v1", choices=["v1", "v2"], help="v2: a reading guide first and no bit magnitudes "
                    "(dev v1: the predictor read the word's preference in bits as resistance to any edit)")
     a = ap.parse_args()
-    {"spans": spans, "questions": questions, "run": run, "render": render}[a.cmd](a)
+    {"spans": spans, "questions": questions, "run": run, "render": render, "seqmap": seqmap}[a.cmd](a)
 
 
 if __name__ == "__main__":

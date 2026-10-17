@@ -2078,7 +2078,8 @@ class SelfHosted:
     ids to /v1/completions; the completion's text tokenized back, logprobs unknown)."""
 
     def __init__(self, url: str, model: str, tokenizer):
-        self.url, self.model, self.tok = url.rstrip("/"), model, tokenizer
+        self.urls, self.model, self.tok = [u.rstrip("/") for u in url.split(",")], model, tokenizer  # (replicas, taken
+        self.next = 0                                                                                 # in turn)
 
     def sample(self, prompt, num_samples, sampling_params):
         import types
@@ -2095,7 +2096,9 @@ class SelfHosted:
                         "skip_special_tokens": False}
                 if stop:
                     body["stop" if isinstance(stop[0], str) else "stop_token_ids"] = list(stop)
-                req = urllib.request.Request(self.url + "/v1/completions", data=json.dumps(body).encode(),
+                url = self.urls[self.next % len(self.urls)]
+                self.next += 1
+                req = urllib.request.Request(url + "/v1/completions", data=json.dumps(body).encode(),
                                              headers={"Content-Type": "application/json"})
                 with urllib.request.urlopen(req, timeout=SAMPLE_TIMEOUT) as r:
                     ch = json.loads(r.read())["choices"][0]
@@ -2714,7 +2717,8 @@ def main():
     r.add_argument("--agent", default=AGENT, help="the answering model on Tinker (a base name)")
     r.add_argument("--renderer", help="its renderer (default Kimi-K2.6's)")
     r.add_argument("--init", help="a trained policy's sampler weights (tinker:// path, agent_rl.py)")
-    r.add_argument("--investigator-url", help="a vLLM OpenAI server hosting --agent (self-hosted: no Tinker)")
+    r.add_argument("--investigator-url", help="vLLM OpenAI servers hosting --agent, comma-separated replicas (self-hosted: no "
+                   "Tinker)")
     r.add_argument("--max-tokens", type=int, help=f"tokens a message, thinking included (default {MAX_TOKENS})")
     r.add_argument("--verify", action="store_true", help="disc1 items: also the behavioural check of the answer on the server "
                    "(the measured trigger scope, oracledata's combined reward)")

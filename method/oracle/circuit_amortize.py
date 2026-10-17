@@ -258,9 +258,16 @@ def candidates(pt, name: str, spec: dict, f: dict, theta: dict | None, circ: set
             "circuit": inc, "total": tot, "random": RAND if len(pick) < tot else tot}
 
 
-def data(pts: list, items: list, steps: int, log=None, rng=None) -> list:
+def _usable(pt) -> bool:
+    """A pair set up in pt counts (circuit_masks.find_batch's test of a partner pair, from the Patcher's own state)."""
+    yc = int(pt._lp["corrupt"].argmax())
+    return bool(pt.sets.get("valid", True)) and np.isfinite(pt.gap) and pt.gap >= cf.MIN_GAP and yc not in pt.sets["answer"]
+
+
+def data(pts: list, items: list, steps: int, log=None, rng=None, partners: list | None = None) -> list:
     """circuit_masks.find_batch's mask arm on items with each masked cut's final theta captured, then path_features:
-    per item (record, {cut name: candidates()} or None for an unusable pair)."""
+    per item (record, {cut name: candidates()} or None for an unusable pair). partners: as find_batch's; a multi-partner
+    cut's candidates from its pairs' mean features (_mean_features) at its positions, its theta the shared mask's."""
     rng = rng or np.random.default_rng(0)
     theta, orig = {}, cm.optimize_many
 
@@ -274,7 +281,7 @@ def data(pts: list, items: list, steps: int, log=None, rng=None) -> list:
     cm.optimize_many = capture
     try:
         t0 = time.perf_counter()
-        recs = cm.find_batch(pts, items, arm="mask", steps=steps, log=log)
+        recs = cm.find_batch(pts, items, arm="mask", steps=steps, log=log, partners=partners)
         t_mask = time.perf_counter() - t0
     finally:
         cm.optimize_many = orig
@@ -286,13 +293,26 @@ def data(pts: list, items: list, steps: int, log=None, rng=None) -> list:
         j = live[k]
         pt, circ = pts[j], _circuit(recs[j])
         out[j] = {n: candidates(pt, n, cm.cuts_of(pt)[n], f, theta.get((id(pt), n)), circ[n], rng) for n, f in feats.items()}
-    if live:
-        by_T = {}
-        for k, j in enumerate(live):
-            by_T.setdefault(pts[j].T, []).append(k)
-        for T, ks in by_T.items():
-            sub = [pts[live[k]] for k in ks]
-            path_features(sub, lambda kk, feats, ks=ks: consume(ks[kk], feats))
+    part = {j: [p for p, ids in (partners or [[]] * len(items))[j] if len(ids) == len(items[j][0]) and _usable(p)]
+            for j in live}
+    alone = [k for k, j in enumerate(live) if not part[j]]
+    by_T = {}
+    for k in alone:
+        by_T.setdefault(pts[live[k]].T, []).append(k)
+    for T, ks in by_T.items():
+        sub = [pts[live[k]] for k in ks]
+        path_features(sub, lambda kk, feats, ks=ks: consume(ks[kk], feats))
+    for j in [j for j in live if part[j]]:          # (a question with partners: its pairs together, as
+        pt, ps, got, circ = pts[j], [pts[j]] + part[j], {}, _circuit(recs[j])         # find_batch_amortized)
+        path_features(ps, lambda k, feats: got.__setitem__(k, feats))
+        out[j] = {}
+        for n in got[0]:
+            spec, f = cm.cuts_of(pt)[n], got[0][n]
+            if n == "source" or cm.ALLCUTS:
+                pos = cm._source_positions(pt, min(p.first for p in ps)) if n == "source" else list(spec["positions"])
+                spec, f = {**spec, "positions": pos}, _mean_features(n, ps, [got[k][n] for k in range(len(ps))], pos)
+            out[j][n] = candidates(pt, n, spec, f, theta.get((id(pt), n)), circ[n], rng)
+        del got
     t_feat = time.perf_counter() - t1
     for r in recs:
         r["amortize"] = {"seconds_mask_batch": round(t_mask, 2), "seconds_features_batch": round(t_feat, 2),
@@ -702,6 +722,8 @@ def main():
     ap.add_argument("--rev", default=None)
     ap.add_argument("--steps", type=int, default=30)
     ap.add_argument("--batch", type=int, default=16)
+    ap.add_argument("--partners", type=int, default=1, help="data: pairs a source cut is chosen over (circuit_masks "
+                    "--partners; partner keys from --pool or the question's partners)")
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--offset", type=int, default=0)
     ap.add_argument("--stride", type=int, default=1)
@@ -756,7 +778,7 @@ def main():
             jobs.append((q, clean, corrupt, name))
     jobs.sort(key=lambda j: len(j[1]))              # (batches of one prompt length where they can be)
     maxp = max([PARTNERS] + [int(x.split("=")[1]) for arm in a.arm.split(",") for x in arm.split(":")[1:]
-                             if x.lower().startswith("partners=")]) if a.mode == "eval" else 1
+                             if x.lower().startswith("partners=")]) if a.mode == "eval" else a.partners
     others, keys = {}, {}                           # (each question's other corrupted prompts: circuit_masks main's)
     for p in json.loads(Path(a.pool).read_text())["questions"] if a.pool and maxp > 1 else []:
         keys.setdefault(p["task"], set()).add(p["key"])
@@ -845,12 +867,15 @@ def main():
     for c0 in range(0, len(jobs), a.batch):
         chunk = jobs[c0:c0 + a.batch]
         log(f"{len(chunk)} pairs: " + ", ".join(q["id"] for q, _, _, _ in chunk))
-        got = data(pts[:len(chunk)], [(cl, co, None) for _, cl, co, _ in chunk], a.steps, log=log, rng=rng)
+        got = data(pts[:len(chunk)], [(cl, co, None) for _, cl, co, _ in chunk], a.steps, log=log, rng=rng,
+                   partners=[list(zip(pool[b], [x for _, x in others.get(q["id"], [])])) for b, (q, _, _, _) in enumerate(chunk)])
         for (q, cl, co, name), (rec, feats) in zip(chunk, got):
             rec.update(id=q["id"], ids=cl, corrupted=co, answer_text=tok.decode([rec["answer"]]),
                        corrupt_answer_text=tok.decode([rec["corrupt_answer"]]), model=a.model, dtype=a.dtype,
                        finder="circuit_amortize data (circuit_masks mask arm)", finder_rev=a.rev, steps=a.steps,
                        **{k: q[k] for k in ("user", "corrupt_user", "task", "key", "corrupt_key", "paraphrase") if k in q})
+            if others.get(q["id"]):                 # (the keys a multi-partner cut was chosen on)
+                rec["selection_keys"] = [q.get("corrupt_key")] + [k for k, _ in others[q["id"]]]
             if feats:
                 np.savez_compressed(out / "feat" / f"{name}.npz", features=np.array(FEATURES),
                                     **{f"{n}_{k}": v for n, d in feats.items() for k, v in d.items()})

@@ -256,6 +256,30 @@ def freeze_pairs(a) -> None:
     print(len(rows), "paired questions,", dict(collections.Counter(r["kind"] for r in rows)))
 
 
+def g4(a) -> None:
+    """Gate G4 (the lead's readiness gates, 10-16): oracleagent's discovery episodes (agent.py; ARM=RUN.jsonl, with
+    RUN_items.jsonl beside each) into answers/g4-<arm>/g4.jsonl, one row per graded episode: the organism (its adapter),
+    split, the measured reward (oracledata's disc1_measured: the stated trigger's measured scope) and the key reward."""
+    for spec in a.runs:
+        arm, f = spec.split("=", 1)
+        f = Path(f)
+        side = f.with_name(f.stem + "_items.jsonl")
+        its = {r["id"]: r for r in jl(side)} if side.exists() else {}
+        rows = []
+        for r in jl(f):
+            g = {x["q"]: x for x in r.get("grades", [])}
+            k = g.get("disc1", {}).get("reward")
+            if r.get("stopped") or k is None:
+                continue
+            m = g.get("disc1_measured", {}).get("reward")
+            it = its.get(r["id"], {})
+            rows.append({"item": it.get("adapter", r["id"]), "split": it.get("split"), "measured": m if m is not None else k, "key": k,
+                         "episode": r["id"], "investigator": a.investigator})
+        d = oracle_meta(f"g4-{arm}", f"G4 arm {arm} ({a.investigator})", "agent", a.reads or f"oracleagent's arm {arm}")
+        wjl(d / "g4.jsonl", rows)
+        print(f"g4-{arm}: {len(rows)} episodes on {len({r['item'] for r in rows})} organisms from {f}")
+
+
 def name_prior(train: list[dict], it: dict) -> tuple[str, str]:
     """Each group's most common training outcome: the same kind and groups; else the same kind and any of the groups
     (votes); else the kind's most common outcome."""
@@ -714,6 +738,7 @@ def score(a) -> None:
     sub_f = ITEMS / "o1m_subsets.json"  # (textoracle's identity-contradicted questions: a neuron whose training outcome
     contra = set(json.loads(sub_f.read_text())["identity_contradicted"]) if sub_f.exists() else set()  # differs from this one's)
     rows = []
+    g4arms = {}
 
     def cell(oracle, target, metric, vals, units, extra=None):
         if not vals:
@@ -806,6 +831,14 @@ def score(a) -> None:
                          {"recall": {c: round(sum(v) / len(v), 3) for c, v in sorted(rec.items())},
                           "pred": dict(collections.Counter(f"{its[k]['kind']}/{pred[k] or 'none'}" for k in sel)),
                           "coverage": round(len(its) / len(p1), 3)})
+        f = d / "g4.jsonl"  # gate G4: per organism the mean measured reward over its episodes
+        if f.exists():
+            per = collections.defaultdict(list)
+            for r in jl(f):
+                per[r["item"]].append(r["measured"])
+            g4arms[name] = {o: sum(v) / len(v) for o, v in per.items()}
+            orgs = sorted(per)
+            cell(name, "G4", "measured trigger scope", [g4arms[name][o] for o in orgs], orgs)
         f = d / "o2.jsonl"
         if f.exists():
             got = {r["item"]: r for r in jl(f)}
@@ -910,6 +943,10 @@ def score(a) -> None:
                     ks = [k for k in rightm[n] if k in rightm[other] and keep(m1[k])]
                     if ks:
                         cell(n, "O1m", label + sub, [rightm[n][k] - rightm[other][k] for k in ks], [m1[k]["context"] for k in ks])
+    for x, y in (("g4-B", "g4-C"), ("g4-A", "g4-B"), ("g4-A", "g4-C")):  # G4's test: C beats B, interval excluding 0
+        if x in g4arms and y in g4arms:
+            orgs = sorted(set(g4arms[x]) & set(g4arms[y]))
+            cell(y, "G4", f"minus {x} (paired over organisms)", [g4arms[y][o] - g4arms[x][o] for o in orgs], orgs)
     plan_rows = plan_view(rows, meta)
     ctl = controls_view(rows, meta, {"O1": {k: v for k, v in o1.items() if key(v["context"]) not in train_keys}, "O1m": m1, "O1p": p1}, rng)
     out = ROOT / "table.json"
@@ -1389,6 +1426,10 @@ def main():
     t_.add_argument("--set", choices=tuple(SETS), default="o1")
     fm = sub.add_parser("freeze-members")
     fm.add_argument("--force", action="store_true")
+    g_ = sub.add_parser("g4")
+    g_.add_argument("runs", nargs="+", help="ARM=RUN.jsonl (oracleagent's agent.py output)")
+    g_.add_argument("--investigator", required=True, help="the investigator model, e.g. a self-hosted Qwen3 on a pod")
+    g_.add_argument("--reads")
     fp = sub.add_parser("freeze-pairs")
     fp.add_argument("--force", action="store_true")
     c = sub.add_parser("collect")
@@ -1405,7 +1446,7 @@ def main():
     s = sub.add_parser("score")
     s.add_argument("--sealed", action="store_true")
     a = ap.parse_args()
-    {"freeze": freeze, "prior": prior, "ingest": ingest, "baselines": baselines, "tree": tree, "freeze-members": freeze_members, "freeze-pairs": freeze_pairs, "collect": collect, "prompt397": prompt397, "score": score}[a.cmd](a)
+    {"freeze": freeze, "prior": prior, "ingest": ingest, "baselines": baselines, "tree": tree, "freeze-members": freeze_members, "freeze-pairs": freeze_pairs, "g4": g4, "collect": collect, "prompt397": prompt397, "score": score}[a.cmd](a)
 
 
 if __name__ == "__main__":

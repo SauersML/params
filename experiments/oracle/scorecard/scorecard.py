@@ -49,6 +49,7 @@ HOME = Path.home()
 ROOT = HOME / "mpd-data" / "oracle" / "scorecard"
 ITEMS, ANS, SEALED = ROOT / "items", ROOT / "answers", ROOT / "sealed"
 FIG = HOME / "mpd-data" / "figures" / "oracle" / "scorecard.png"
+O1P_FIG = HOME / "mpd-data" / "figures" / "oracle" / "o1p.png"
 RC = HOME / "mpd-data" / "oracle" / "reads_circuit"
 ORG = HOME / "mpd-data" / "organisms" / "qwen3_8b"
 E1B = HOME / "mpd-data" / "organisms" / "qwen3_8b_e1b"
@@ -795,7 +796,7 @@ def pairs_baselines(a) -> None:
                 m = mk().fit([X(q, arm) for q in rtr], [q["gold"] for q in rtr])
                 for k, y in zip(ks, m.predict([X(te[k], arm) for k in ks])):
                     pred[k] = y
-            name = f"{mname}-pairs" + ("" if arm == "correct" else f".{ {'mismatch': 'shuffle'}.get(arm, arm)}")
+            name = f"{mname}-pairs" + ("" if arm == "correct" else f".{arm}")
             d = oracle_meta(name, f"{'boosted trees' if mname == 'tree' else 'logistic regression'} {labels[arm]}", "baseline",
                             f"O1p: the circuit records' numbers ({arm})", figure=arm == "correct")
             wjl(d / "o1p.jsonl", [{"item": i["item"], "class": str(pred[k])} for k, i in enumerate(its)])
@@ -1069,6 +1070,7 @@ def score(a) -> None:
             orgs = sorted(set(g4arms[x]) & set(g4arms[y]))
             cell(y, "G4", f"minus {x} (paired over organisms)", [g4arms[y][o] - g4arms[x][o] for o in orgs], orgs)
     plan_rows = plan_view(rows, meta)
+    o1p_rows = o1p_view(rows, meta)
     ctl = controls_view(rows, meta, {"O1": {k: v for k, v in o1.items() if key(v["context"]) not in train_keys}, "O1m": m1, "O1p": p1}, rng)
     out = ROOT / "table.json"
     out.write_text(json.dumps({"written": time.strftime("%Y-%m-%d %H:%M:%S %Z"), "boot": BOOT, "published": PUBLISHED,
@@ -1099,6 +1101,13 @@ def score(a) -> None:
                 mm = (e or {}).get("minus")
                 cols.append(f"{mm['value']:+.3f} [{mm['lo']:+.3f}, {mm['hi']:+.3f}] n={mm['n']}" if mm else "")
             fh.write(f"{r['oracle']}\t{r['target']}\t{r['metric']}\t{r['value']:.3f}\t{r['n']}\t" + "\t".join(cols) + f"\t{r['status']}\n")
+    with (ROOT / "o1p.tsv").open("w") as fh:
+        fh.write("oracle\tlabel\t" + "\t".join(f"{k}\t{k} 95%\t{k} n" for k in ("all", "pair_zero", "pair_sign", "pair_flip")) + "\n")
+        for r in o1p_rows:
+            fh.write(f"{r['oracle']}\t{r['label']}\t" + "\t".join(
+                f"{r[k]['value']:.3f}\t[{r[k]['lo']:.3f}, {r[k]['hi']:.3f}]\t{r[k]['n']}" if k in r else "\t\t"
+                for k in ("all", "pair_zero", "pair_sign", "pair_flip")) + "\n")
+    o1p_figure(o1p_rows)
     print(f"-> {ROOT / 'table.tsv'}, {ROOT / 'controls.tsv'} ({sum(r['status'] == 'controls complete' for r in ctl)} of {len(ctl)} "
           "circuit-reading cells with all three controls)")
     figure(rows, meta)
@@ -1158,8 +1167,12 @@ def latest_text(meta: dict, set_: str = "o1") -> str | None:
     return vs[-1][2] if vs else None
 
 
-CONTROLS = {"none": "no circuit (filler at the same token budget)", "shuffle": "scrambled: another item's circuit, same format",
-            "random": "random units matched in count, layer and position, with their measured numbers"}
+CONTROLS = {"none": "no circuit (filler at the same token budget; '.none' without filler where no '.filler' run exists)",
+            "scrambled": "another item's circuit, same format ('.mismatch')",
+            "random": "random units matched in count, layer and position, with their measured numbers",
+            "permute": "the item's own circuit with its numbers permuted among its units ('.shuffle'; reported, not required)"}
+CONTROL_SUFFIX = {"none": ("filler", "none"), "scrambled": ("mismatch",), "random": ("random",), "permute": ("shuffle",)}
+REQUIRED_CONTROLS = ("none", "scrambled", "random")
 CONTROL_CELLS = (("O1", "unseen task/key"), ("O1m", "all"), ("O1p", "all"), ("O2", "all 7 exact @256"), ("O2-AB", "dev targets"),
                  ("CHIVE", "all"))
 
@@ -1169,6 +1182,55 @@ def control_name(arm: str, c: str) -> str:
     name appended."""
     head, _, last = arm.rpartition(".")
     return f"{head}.{c}" if head and last in ("full", "correct") else f"{arm}.{c}"
+
+
+def o1p_view(rows: list[dict], meta: dict) -> list[dict]:
+    """O1p's one table (the lead's 10-17): every arm scored on the frozen paired questions, overall and per kind."""
+    arms = sorted({r["oracle"] for r in rows if r["target"] == "O1p" and r["metric"] == "all"},
+                  key=lambda n: -next(r["value"] for r in rows if r["oracle"] == n and r["target"] == "O1p" and r["metric"] == "all"))
+    out = []
+    for n in arms:
+        cells = {r["metric"]: r for r in rows if r["oracle"] == n and r["target"] == "O1p" and r["metric"] in ("all", "pair_zero", "pair_sign", "pair_flip")}
+        out.append({"oracle": n, "label": short(n, meta), **{k: {x: c[x] for x in ("value", "lo", "hi", "n")} for k, c in cells.items()}})
+    return out
+
+
+O1P_CHANCE = {"pair_zero": 1 / 3, "pair_sign": 0.25, "pair_flip": 0.25}
+
+
+def o1p_figure(view: list[dict]) -> None:
+    """O1p: per arm its share right on each kind with 95% intervals (bootstrap over context pairs); chance dashed."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    if not view:
+        return
+    plt.rcParams.update({"font.family": "Helvetica Neue", "font.size": 20, "xtick.labelsize": 18, "ytick.labelsize": 18,
+                         "figure.facecolor": "white", "axes.facecolor": "white", "savefig.facecolor": "white"})
+    kinds = (("pair_zero", "which text does zeroing move more"), ("pair_sign", "does the unit support the answer"),
+             ("pair_flip", "does turning it up change the answer"))
+    fig, axs = plt.subplots(1, 3, figsize=(24, 0.62 * len(view) + 2.6), sharey=True)
+    ys = list(range(len(view)))[::-1]
+    for ax, (k, title) in zip(axs, kinds):
+        for sp in ("top", "right"):
+            ax.spines[sp].set_visible(False)
+        for y, r in zip(ys, view):
+            c = r.get(k)
+            if not c:
+                continue
+            col = "#2F6DB5" if r["oracle"].startswith(("text.", "aotext", "primerl")) else "#E09F3E" if "397" in r["oracle"] else "#9DB9DD"
+            ax.plot([c["lo"], c["hi"]], [y, y], color=col, lw=3)
+            ax.plot(c["value"], y, "o", ms=11, color=col)
+        ax.axvline(O1P_CHANCE[k], color="#888888", ls="--", lw=1.5)
+        ax.set_title(title, fontsize=20, loc="left")
+        ax.set_xlim(0, 1)
+        ax.set_xlabel("share right (95% interval)")
+    axs[0].set_yticks(ys, [r["label"] for r in view])
+    n = max((r.get("all") or {}).get("n", 0) for r in view)
+    fig.suptitle(f"Paired-context questions on Qwen3-8B ({n} questions, families never trained on)", x=0.02, ha="left",
+                 fontsize=26, fontweight="bold", y=1.02)
+    fig.savefig(O1P_FIG, dpi=110, bbox_inches="tight", pad_inches=0.3)
+    print(f"figure -> {O1P_FIG}")
 
 
 def correct_by_item(d: Path, target: str, items: dict) -> dict:
@@ -1191,7 +1253,7 @@ def controls_view(rows: list[dict], meta: dict, items: dict, rng: random.Random)
     get = lambda n, t, m: next((r for r in rows if r["oracle"] == n and r["target"] == t and r["metric"] == m), None)  # noqa: E731
     reads = lambda n, t: "circuit" in (meta.get(n, {}).get("reads", "") + n).lower() or (  # noqa: E731
         t in ("O1", "O1m", "O1p") and n.startswith(("text.", "prompt397")))  # (O1's questions show the circuit)
-    is_control = lambda n: n.rpartition(".")[2] in tuple(CONTROLS) + ("names", "mismatch", "shuffle")  # noqa: E731
+    is_control = lambda n: n.rpartition(".")[2] in ("filler", "none", "mismatch", "random", "shuffle", "names")  # noqa: E731
     out = []
     for t, m in CONTROL_CELLS:
         for n in sorted({r["oracle"] for r in rows if r["target"] == t and r["metric"] == m}):
@@ -1200,8 +1262,8 @@ def controls_view(rows: list[dict], meta: dict, items: dict, rng: random.Random)
                 continue
             row = {"oracle": n, "target": t, "metric": m, "value": c0["value"], "n": c0["n"], "controls": {}}
             for c in CONTROLS:
-                cn = control_name(n, c)
-                cc = get(cn, t, m)
+                cn = next((control_name(n, x) for x in CONTROL_SUFFIX[c] if get(control_name(n, x), t, m)), None)
+                cc = get(cn, t, m) if cn else None
                 if not cc:
                     continue
                 entry = {"oracle": cn, "value": cc["value"], "lo": cc["lo"], "hi": cc["hi"], "n": cc["n"]}
@@ -1213,7 +1275,7 @@ def controls_view(rows: list[dict], meta: dict, items: dict, rng: random.Random)
                         md, lo, hi = boot([a_[k] - b_[k] for k in ks], [unit(k) for k in ks], rng)
                         entry["minus"] = {"value": round(md, 4), "lo": round(lo, 4), "hi": round(hi, 4), "n": len(ks)}
                 row["controls"][c] = entry
-            missing = [c for c in CONTROLS if c not in row["controls"]]
+            missing = [c for c in REQUIRED_CONTROLS if c not in row["controls"]]
             row["status"] = "preliminary: no " + ", ".join(missing) + " control" if missing else "controls complete"
             out.append(row)
     return out
@@ -1259,7 +1321,13 @@ SHORT = {"best-constant": "best constant answer", "name-prior": "name-prior (eac
          "dir-ablate-base": "behaviour direction projected out (uses the base model)",
          "steer-base": "steering against the behaviour direction (uses the base model)",
          "lora-base": "LoRA fine-tune (uses the base model)",
-         "t3-selected": "T3 greedy edit, length chosen by the shared rule"}
+         "t3-selected": "T3 greedy edit, length chosen by the shared rule",
+         "tree-pairs": "boosted trees on the circuits' numbers", "tree-pairs.names": "boosted trees on names only",
+         "tree-pairs.mismatch": "boosted trees on another context's numbers", "tree-pairs.none": "boosted trees, no circuit (texts' own contrasts)",
+         "logreg-pairs": "logistic regression on the circuits' numbers", "logreg-pairs.names": "logistic regression on names only",
+         "logreg-pairs.mismatch": "logistic regression on another context's numbers",
+         "logreg-pairs.none": "logistic regression, no circuit (texts' own contrasts)",
+         "pairs397": "Qwen3.5-397B reading the transcript", "pairs397.shots6": "Qwen3.5-397B reading the transcript, 6 examples"}
 
 
 def short(n: str, meta: dict) -> str:

@@ -16,7 +16,9 @@ reward terms:
              gives it, else the predicate's value pushed out by MARGIN (g2's "about N bits" is stated as >= N - MARGIN)
   word_level whether the contrast was the answer word's (False: no other word among the candidates, token level)
 
-Requests are pooled: one worker takes every claim queued within WAIT seconds (at most MAX_CLAIMS), groups them by
+The model runs in float32 by default: in bfloat16 a claim's measured change moves with the batch it runs in (600 of rc's
+gold claims re-checked at 32 and 64 rows per batch: changes a median 0.14 bits apart, verdicts agreeing on 79%; bfloat16
+against float32, 75%), the size of the 0.25-bit thresholds the claims state. Requests are pooled: one worker takes every claim queued within WAIT seconds (at most MAX_CLAIMS), groups them by
 adapter, and runs one claim_check.check_many per group, its rows in batches of --rows.
 
   reward_server.py serve --model Qwen/Qwen3-8B --thr T2.pt [--adapter NAME=PATH ...] [--port 8701] [--rows 32]
@@ -66,7 +68,7 @@ def terms(pred: dict, r: dict) -> dict:
 class Checker:
     """The model, its weak-zeroed reference and any organism adapters, on one device; check(claims) -> results."""
 
-    def __init__(self, model: str, thr: Path, adapters: dict, rows: int, device: str | None = None):
+    def __init__(self, model: str, thr: Path, adapters: dict, rows: int, device: str | None = None, dtype: str = "float32"):
         import torch
         from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -76,7 +78,7 @@ class Checker:
         cc.ROWS = rows
         dev = device or ("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
         self.tok = AutoTokenizer.from_pretrained(model)
-        m = AutoModelForCausalLM.from_pretrained(model, dtype=torch.bfloat16).to(dev).eval()
+        m = AutoModelForCausalLM.from_pretrained(model, dtype=getattr(torch, dtype)).to(dev).eval()
         self.adapters = dict(adapters)
         if adapters:
             from peft import PeftModel
@@ -154,7 +156,7 @@ class Checker:
 def serve(a) -> None:
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
     adapters = dict(x.split("=", 1) for x in a.adapter)
-    ck = Checker(a.model, a.thr, adapters, a.rows)
+    ck = Checker(a.model, a.thr, adapters, a.rows, dtype=a.dtype)
     jobs: queue.Queue = queue.Queue()
     stats = {"claims": 0, "seconds": 0.0, "batches": 0}
 
@@ -239,6 +241,8 @@ def main():
     s.add_argument("--adapter", action="append", default=[], help="NAME=PATH, an organism's adapter claims may name")
     s.add_argument("--port", type=int, default=8701)
     s.add_argument("--rows", type=int, default=32)
+    s.add_argument("--dtype", default="float32", help="float32 (exact) or bfloat16 (2.7x faster; its verdicts move with the "
+                   "batch: module docstring)")
     c = sub.add_parser("check")
     c.add_argument("url")
     c.add_argument("claims", type=Path)

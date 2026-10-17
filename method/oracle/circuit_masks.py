@@ -89,6 +89,8 @@ FAMILY_MIN_KEYS = 4  # a template's own mover union when it has this many train 
 FAMILY_FREQ = 0.0    # heads of at least this frequency among the union's records (0: every head; f10: 0.1)
 CLEAN_SIDE = 0       # 1: units active only in the corrupted run (circuit_finder.ACTIVE_RATIO) never in a mask: on unseen keys
 # they carry nothing (casestudy 10-16: 0.00/0.00 in every cut) while giving most of the own pair's necessity
+EXTEND = 0          # > 0: a size control (paper's C25): a met source cut grown with its own mask order's next units to EXTEND
+EXTEND_CUT = "source"   # (the cut EXTEND grows)
 ROUNDS = 4          # rounds of STEPS a cut's masks get while its order cannot pass (each round from the last's theta)
 PRUNE_MAX = 4 * cf.SINGLES_KEPT   # a passing prefix of more units than this is a diffuse cut, not pruned: its size, shares
 # and curve recorded, no units (circuit_finder's diffuse rule). Qwen3-8B dev set (A6000, am, 153 questions): 13 readout
@@ -869,10 +871,22 @@ def _verify_steps(st: dict, got: dict, names: list, t_opt: float, steps: int, lo
     for n, a in zip(checked, (yield ("par", [adversarial_steps(st["meas"][n], specs[n], res[names.index(n)]["units"], log=log, name=n)
                                              for n in checked]))):
         res[names.index(n)]["adversarial"] = a
+    grow = [n for n, r in zip(names, res) if EXTEND and n == EXTEND_CUT and r["met"] and len(r["units"]) < EXTEND]
+    if grow:                                        # (a size control: the met source cut grown with its own order's next
+        sets = []                                   # units to EXTEND units, measured; paper's C25 question)
+        for n in grow:
+            r = res[names.index(n)]
+            have = set(r["units"])
+            r["units"] = list(r["units"]) + [u for u in orders[n][0] if u not in have][:EXTEND - len(r["units"])]
+            sets.append((st["meas"][n], "both", [_blocks(r["units"]), *[[u] for u in r["units"]]]))
+        for n, got_ in zip(grow, (yield sets)):
+            r = res[names.index(n)]
+            (r["lost"], r["restored"]), r["singles"], r["extended"] = got_[0], dict(zip(r["units"], got_[1:])), EXTEND
     for n, r in zip(names, res):
         g, prev = got[n], out.get(n, {})
         out[n] = _record(r, ceil[n], True, specs[n]["positions"],
                          {"mask": {"kept": orders[n][1], "steps": len(g["history"]), "start": g.get("start"),
+                                   **({"extended": r["extended"]} if "extended" in r else {}),
                                    "history": g["history"][::max(1, steps // 20)],
                                    "seconds_opt": round(t_opt + prev.get("mask", {}).get("seconds_opt", 0.0), 2),
                                    "seconds_verify": round(time.perf_counter() - t1 + prev.get("mask", {}).get("seconds_verify", 0.0), 2),

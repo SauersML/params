@@ -342,3 +342,19 @@ def test_clean_side(tiny, monkeypatch):
     for i in range(pt.L):
         a, b = pt.act["clean"]["neu"][i][p].abs(), pt.act["corrupt"]["neu"][i][p].abs()
         assert bool((th[i, 0][b >= cf.ACTIVE_RATIO * a] == -30.0).all())
+
+
+
+def test_extend_cut(tiny, monkeypatch):
+    """EXTEND: a met cut (EXTEND_CUT; the tiny model's source cuts are unreachable, so its readout here) is grown with its
+    own order's next units to EXTEND units, its shares and each unit's measured."""
+    model, clean, corrupts = tiny
+    monkeypatch.setattr(cm, "EXTEND_CUT", "readout")
+    rec = cm.find(cf.Patcher(model, None, rows=8), clean, corrupts[0], None, steps=30)
+    ro = rec["cuts"]["readout"]
+    assert ro["met"]
+    n = ro["size"] + 3
+    monkeypatch.setattr(cm, "EXTEND", n)
+    big = cm.find(cf.Patcher(model, None, rows=8), clean, corrupts[0], None, steps=30)
+    assert big["cuts"]["readout"]["size"] == n and big["mask"]["readout"]["extended"] == n
+    assert sum(x["stage"] == "readout" for x in big["nodes"]) == n

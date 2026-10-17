@@ -423,8 +423,9 @@ def baseline(a) -> None:
             behaviour=b["behaviour"], criterion=b["criterion"], chat=render_chat(base["messages"]), rate=it["base_rate"],
             n=it["base_n"], k=len(shown), transcripts=tr, change=it["change"] + (" (on the same chat)" if it["kind"] in ("template", "model") else ""),
             changed=change_text(it, base))}])
-    chat = Chat(a.model, f"baseline:{Path(a.out).stem}")
-    outs = chat(prompts, n=1, temperature=0.0, max_tokens=40, note=f"baseline {len(prompts)} items")
+    chat = Chat(a.model, f"baseline:{Path(a.out).stem}", thinking=a.thinking)
+    outs = chat(prompts, n=1, temperature=0.6 if a.thinking else 0.0, max_tokens=6000 if a.thinking else 40,
+                note=f"baseline {len(prompts)} items{' thinking' if a.thinking else ''}")
     import re
     rows = []
     for it, (o,) in zip(items, outs):
@@ -452,7 +453,7 @@ def score_rows(items: list[dict], rows: list[dict]) -> None:
 
 GROUPS = {"prompt": "prompt", "template": "prompt", "family": "transfer", "model": "transfer", "internal": "internal",
           "internal_control": "internal", "internal_family": "internal", "internal_cross": "internal", "circuit": "internal",
-          "circuit_control": "internal", "circuit_family": "internal"}
+          "circuit_control": "internal", "circuit_family": "internal", "group": "internal", "group_control": "internal"}
 SEALED = ROOT / "sealed"
 
 
@@ -574,6 +575,7 @@ def main() -> None:
     q.add_argument("--model", default="Qwen/Qwen3.5-397B-A17B")
     q.add_argument("--k", type=int, default=8, help="graded base replies shown")
     q.add_argument("--chars", type=int, default=1500, help="characters of each reply shown")
+    q.add_argument("--thinking", action="store_true", help="the reader reasons before answering")
     a = p.parse_args()
     {"freeze": freeze, "prior": prior, "score": score, "baseline": baseline, "behaviours": behaviours, "facts": facts, "edits": edits, "jobs": jobs, "measure": measure, "judge": judge, "collect": collect}[a.cmd](a)
 

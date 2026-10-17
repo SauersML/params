@@ -10,6 +10,7 @@ MIN_POINTS such replies, or fewer than MIN_POINTS replies without it, gets no ed
 
   internal.py fit JUDGED.jsonl... OUT.jsonl --thr T2.pt --general GENERAL.jsonl [--only ID ...]   (GPU, HF)
   internal.py jobs EDITS.jsonl OUT.jsonl [--n 64]       the internal arms for engine.py (Mac)
+  internal.py groups CANDIDATES.json OUT.jsonl          labelled neuron groups (PheWAS trait associations) zeroed (Mac)
 Arms compare with "ref", the same chat unedited in the same hooked engine ("base_eager").
 """
 from __future__ import annotations
@@ -145,6 +146,43 @@ def jobs(a) -> None:
     print(len(out), "arms for", len(eds), "edits")
 
 
+GROUPS = {  # labelled neuron groups (the PheWAS stage-1 association candidates of a phenome trait) and the categories they bear on
+    "style/markdown-headings-bold": ("Markdown headings and bold in replies", ("format", "language_drift")),
+    "abstain/simpleqa-hard": ("abstaining on hard factual questions", ("fabrication",)),
+    "abstain/triviaqa": ("abstaining on trivia questions", ("fabrication",)),
+    "sycophancy/suggested-wrong-answer": ("agreeing with a wrong answer the user suggests", ("sycophancy",)),
+}
+TOP = 32
+
+
+def groups(a) -> None:
+    """Arms zeroing labelled neuron groups (whole neurons, every position): each group on the behaviours of its categories
+    and on one behaviour of another category, and a random group of the same layers on the same chats."""
+    cands = json.loads(Path(a.candidates).read_text())
+    bs = [b for b in load(ROOT / "behaviours.jsonl") if b.get("kept", True)]
+    out, refs = [], set()
+    for trait, (label, cats) in GROUPS.items():
+        top = [tuple(u) for u in (cands.get(trait) or [])[:TOP]]
+        if not top:
+            continue
+        E = {"units": [["N", l_, n, 0, None] for l_, n in top], "op": "zero", "name": f"phewas:{trait}", "size": len(top)}
+        from circuits import control_of
+        C = {"units": control_of(E["units"], "counterchat-group:" + trait), "op": "zero", "name": f"random:{trait}", "size": len(top)}
+        mine = [b for b in bs if b["category"] in cats]
+        other = sorted((b for b in bs if b["category"] not in cats), key=lambda b: zlib.crc32((trait + b["id"]).encode()))[:max(2, len(mine) // 4)]
+        for b in mine + other:
+            key = f"{b['id']}|base_eager"
+            if key not in refs:
+                refs.add(key)
+                out.append(arm(b, "base_eager", "reference", b["base"], a.n))
+            what = f"zero the {len(top)} neurons most associated with the trait '{label}' (a neuron-trait association screen)"
+            out.append({**arm(b, f"group:{trait}", "group", b["base"], a.n, edit=E, change=what), "ref": key})
+            out.append({**arm(b, f"group_random:{trait}", "group_control", b["base"], a.n, edit=C,
+                              change=f"zero {len(top)} neurons chosen at random in the same layers"), "ref": key})
+    Path(a.out).write_text("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in out))
+    print(len(out), "arms")
+
+
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -158,8 +196,12 @@ def main() -> None:
     q.add_argument("edits")
     q.add_argument("out")
     q.add_argument("--n", type=int, default=64)
+    q = sub.add_parser("groups")
+    q.add_argument("candidates", help="the PheWAS stage-1 candidates (phewas/candidates_dev.json)")
+    q.add_argument("out")
+    q.add_argument("--n", type=int, default=64)
     a = p.parse_args()
-    {"fit": fit, "jobs": jobs}[a.cmd](a)
+    {"fit": fit, "jobs": jobs, "groups": groups}[a.cmd](a)
 
 
 if __name__ == "__main__":

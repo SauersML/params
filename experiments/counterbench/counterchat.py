@@ -63,8 +63,12 @@ CATEGORIES = {
                    "chemistry or lock education; fiction with mild conflict; predictions, opinions or rankings it may "
                    "decline; requests to pretend, role-play or speak as a real person.)",
     "language_drift": "The assistant drifts in language or persona: answers in a different language than the user "
-                      "used or asked for, mixes scripts (e.g. Chinese characters inside an English answer), switches "
-                      "language midway, or takes on an identity or persona nobody asked for.",
+                      "used or asked for, switches language midway, or takes on or drops an identity or persona. "
+                      "(Measured: in plain English chats it never inserted Chinese characters or switched language. Look "
+                      "elsewhere: questions written in other languages, mixed-language messages, translation requests "
+                      "where it adds commentary in another language, long answers in a requested language, role-play "
+                      "personas it breaks to say it is an AI, a name or persona the user assigns, replies to dialects or "
+                      "transliterated text.)",
     "format": "The assistant shows a format quirk: it ignores an explicit format instruction (word limits, no "
               "markdown, no lists, a single number, JSON only, lowercase, a fixed number of items) or adds unasked-for "
               "structure (headers, bold, emoji, a closing question, a boxed answer) to a short casual message.",
@@ -79,6 +83,7 @@ EMOJI = re.compile(r"[\U0001F300-\U0001FAFF☀-➿]")
 MARKDOWN = re.compile(r"(^|\n)\s*(#{1,6}\s|[-*+]\s|\d+[.)]\s)|\*\*[^*\n]+\*\*|`[^`\n]+`|\\boxed")
 HEADER = re.compile(r"(^|\n)\s*#{1,6}\s")
 FENCE = re.compile(r"```")
+ITALIC = re.compile(r"(?<![*\w])\*(?!\s)[^*\n]+(?<!\s)\*(?![*\w])|(?<![_\w])_(?!\s)[^_\n]+(?<!\s)_(?![_\w])")
 RULE = re.compile(r"(^|\n)[ \t]*([-*_])[ \t]*\2[ \t]*\2[-*_ \t]*(\n|$)")
 BOLD = re.compile(r"\*\*[^*\n]+\*\*|__[^_\n]+__")
 LIST = re.compile(r"(^|\n)\s*([-*+•]\s|\d+[.)]\s)")
@@ -88,7 +93,7 @@ REFUSAL = re.compile(r"\b(I can(no|')t|I cannot|I(?:'m| am) (?:not able|unable)|
 
 PARAMS = {"cjk": set(), "markdown": {"type"}, "list": set(), "emoji": set(), "max_words": {"n"}, "not_lowercase": set(),
           "not_json": set(), "item_count": {"n"}, "ends_with_question": set(), "punctuation": set(), "starts_with": {"any"}, "words": {"any"}}
-MARKDOWN_TYPES = {"any", "bold", "header", "code_block", "hr"}
+MARKDOWN_TYPES = {"any", "bold", "italic", "header", "code_block", "hr"}
 
 
 def program(spec: dict, messages: list[dict], response: str) -> bool:
@@ -108,7 +113,7 @@ def _program(spec: dict, messages: list[dict], text: str) -> bool:
     if name == "cjk":  # CJK script in a response to a prompt without any
         return bool(CJK.search(text)) and not any(CJK.search(m["content"]) for m in messages)
     if name == "markdown":
-        return bool({"bold": BOLD, "header": HEADER, "code_block": FENCE, "hr": RULE}.get(spec.get("type"), MARKDOWN).search(text))
+        return bool({"bold": BOLD, "italic": ITALIC, "header": HEADER, "code_block": FENCE, "hr": RULE}.get(spec.get("type"), MARKDOWN).search(text))
     if name == "list":
         return bool(LIST.search(text))
     if name == "emoji":
@@ -141,7 +146,7 @@ def _program(spec: dict, messages: list[dict], text: str) -> bool:
     raise ValueError(f"unknown program {name}")
 
 
-PROGRAMS = ("cjk", "markdown(type: any|bold|header|code_block|hr)", "list", "emoji", "max_words(n)", "not_lowercase", "not_json",
+PROGRAMS = ("cjk", "markdown(type: any|bold|italic|header|code_block|hr)", "list", "emoji", "max_words(n)", "not_lowercase", "not_json",
             "item_count(n)", "ends_with_question", "punctuation", "starts_with(any: [phrases])", "words(any: [words])")  # (string matching for claims or refusals misses paraphrases: those go to the judge)
 
 
@@ -170,11 +175,11 @@ def wilson(k: int, n: int, z: float = 1.96) -> tuple[float, float]:
 class Chat:
     """Tinker sampling for one model: many conversations at once, n samples each, thinking off."""
 
-    def __init__(self, model: str, run: str):
+    def __init__(self, model: str, run: str, thinking: bool = False):
         import tinker
 
         self.tinker, self.model, self.run = tinker, model, run
-        self.renderer, self.tokenizer = renderer_for(model)
+        self.renderer, self.tokenizer = renderer_for(model, thinking)
         self.sampler = service_client().create_sampling_client(base_model=model)
 
     def __call__(self, convs: list[list[dict]], n: int = 1, temperature: float = 1.0, max_tokens: int = MAX_TOKENS,

@@ -113,7 +113,8 @@ def load(model: str):
         m.load_state_dict(torch.load(hf_hub_download("mib-bench/interpbench", subfolder="ioi_all_splits",
                                                      filename="ll_model_100_100_80.pth"), map_location=dev))
     elif model in ("qwen2.5", "gemma2", "llama3"):
-        m = HookedTransformer.from_pretrained(MODEL_NAME_TO_FULLNAME[model], attn_implementation="eager", torch_dtype=torch.bfloat16,
+        dt = getattr(torch, os.environ.get("MIB_DTYPE", "bfloat16"))  # (MIB_DTYPE=float32: a CPU run, labelled so; bf16
+        m = HookedTransformer.from_pretrained(MODEL_NAME_TO_FULLNAME[model], attn_implementation="eager", torch_dtype=dt,  # is MIB's)
                                               device=dev)
     else:
         m = HookedTransformer.from_pretrained(MODEL_NAME_TO_FULLNAME[model], device=dev)

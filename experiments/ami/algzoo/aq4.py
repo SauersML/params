@@ -55,3 +55,13 @@ def accuracy(model, m_phi, m_psi, ops=None, task="2nd_argmax"):
     g, line_ops = lastline.line_prob(model, u, task=task, radial=True)
     ops.n += len(w) * (line_ops + 30) + 2 * len(w)
     return float(w @ g)
+
+
+def accuracy_centres(model, lunes, ops=None, task="2nd_argmax"):
+    """The cheapest rules: the line probability at the centres (z = 0, mid-longitude) of the listed lunes only,
+    averaged (each lune standing for the whole sphere)."""
+    ops = ops or Ops()
+    u, _ = nodes(1, 1)
+    g, line_ops = lastline.line_prob(model, u[list(lunes)], task=task, radial=True)
+    ops.n += len(lunes) * (line_ops + 30) + len(lunes)
+    return float(g.mean())

@@ -56,8 +56,12 @@ def line_prob(model, xp, task="2nd_argmax", h=None, radial=False):
     # label switch points: prefix order statistics
     if task == "2nd_argmax":
         o = np.argsort(-xp, 1)
-        a, b = o[:, 0], o[:, 1]
-        M, S = xp[np.arange(B), a], xp[np.arange(B), b]
+        if p == 1:  # one earlier input: below it the newest input is the second largest
+            a = b = o[:, 0]
+            M, S = xp[:, 0], np.full(B, -np.inf)
+        else:
+            a, b = o[:, 0], o[:, 1]
+            M, S = xp[np.arange(B), a], xp[np.arange(B), b]
         lab_pts = np.stack([S, M], 1)  # t < S: label b; S < t < M: label n-1; t > M: label a
         labs = np.stack([b, np.full(B, n - 1), a], 1)
     elif task == "argmedian":

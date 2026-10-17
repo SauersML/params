@@ -45,7 +45,12 @@ def main():
         m = zoo.load("2nd_argmax", d, 4)
         base_ref = aq4.accuracy(m, REF, REF)
         models = noisy_copies(m, K)
-        truth = np.array([aq4.accuracy(md, REF, REF) for md in models])
+        cache = os.path.expanduser(f"~/mpd-data/ami/algzoo/cloud/aq4_truth_d{d}_K{K}.npy")
+        if os.path.exists(cache):
+            truth = np.load(cache)
+        else:
+            truth = np.array([aq4.accuracy(md, REF, REF) for md in models])
+            np.save(cache, truth)
         c = m43.sample_cost(m)
         pq = float(np.mean(truth * (1 - truth)))
         rows = []
@@ -58,6 +63,13 @@ def main():
                              sampling_rms_same_ops=math.sqrt(pq / k) if k >= 1 else float("nan")))
 
         add("constant_base_accuracy", [base_ref] * K, [0] * K)
+        for name, lunes in (("aq4_one_centre", [0]), ("aq4_two_centres", [0, 3]), ("aq4_three_centres", [0, 2, 4])):
+            ests, ops = [], []
+            for md in models:
+                o = aq4.Ops()
+                ests.append(aq4.accuracy_centres(md, lunes, o))
+                ops.append(o.n)
+            add(name, ests, ops)
         for mp, ms in RULES:
             ests, ops = [], []
             for md in models:

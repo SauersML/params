@@ -864,6 +864,8 @@ def score(a) -> None:
     p1 = {x["item"]: x for x in jl(ITEMS / "o1_pairs.jsonl")} if (ITEMS / "o1_pairs.jsonl").exists() else {}
     excl = json.loads((ITEMS / "manifest.json").read_text()).get("exclusions", {})
     p1sub = set(json.loads((ITEMS / "o1p_sub.json").read_text())["items"]) if (ITEMS / "o1p_sub.json").exists() else set()
+    p1fp = json.loads((ITEMS / "o1p_sign_fp32.json").read_text())["labels"] if (ITEMS / "o1p_sign_fp32.json").exists() else {}
+    pj = {x["item"]: x for x in jl(ITEMS / "o1p_joint.jsonl")} if (ITEMS / "o1p_joint.jsonl").exists() else {}
     p1clean = set(json.loads((ITEMS / "o1p_clean.json").read_text())["items"]) if (ITEMS / "o1p_clean.json").exists() else set()  # (textoracle's:
     # both contexts in no training data of textoracle or oracledata)
     sub_f = ITEMS / "o1m_subsets.json"  # (textoracle's identity-contradicted questions: a neuron whose training outcome
@@ -952,6 +954,12 @@ def score(a) -> None:
             its = [p1[k] for k in p1 if k in got]
             pred = [got[i["item"]].get("class") or pair_class(got[i["item"]].get("answer")) for i in its]
             ok = [float(c == i["gold"]) for c, i in zip(pred, its)]
+            if p1fp:  # pair_sign against oracledata's float32 re-measurement (bf16 gold agrees on 73%; 24% near the threshold)
+                sg = [k for k, i in enumerate(its) if i["kind"] == "pair_sign" and i["id"] in p1fp]
+                cell(name, "O1p", "pair_sign, float32 labels", [float(pred[k] == p1fp[its[k]["id"]]["class"]) for k in sg],
+                     [f"{its[k]['context_a']}|{its[k]['context_b']}" for k in sg])
+                sg = [k for k in sg if p1fp[its[k]["id"]]["agree"]]
+                cell(name, "O1p", "pair_sign, bf16 and float32 agree", [ok[k] for k in sg], [f"{its[k]['context_a']}|{its[k]['context_b']}" for k in sg])
             for kind in ("all", "pair_zero", "pair_sign", "pair_flip", "sub 1225", "clean contexts"):
                 sel = [k for k, i in enumerate(its) if kind in ("all", i["kind"]) or (kind == "sub 1225" and i["item"] in p1sub)
                        or (kind == "clean contexts" and i["item"] in p1clean)]
@@ -971,6 +979,13 @@ def score(a) -> None:
             g4arms[name] = {o: sum(v) / len(v) for o, v in per.items()}
             orgs = sorted(per)
             cell(name, "G4", "measured trigger scope", [g4arms[name][o] for o in orgs], orgs)
+        f = d / "o1p_joint.jsonl"  # oracledata's pair_joint: two units zeroed together, held-out families, float32 labels
+        if f.exists() and pj and not name.startswith(tuple(excl.get("o1p", ()))):
+            got = {r["item"]: r for r in jl(f)}
+            its_ = [pj[k] for k in pj if k in got]
+            pred_ = [got[i["item"]].get("class") or pair_class(got[i["item"]].get("answer")) for i in its_]
+            cell(name, "O1pj", "all", [float(c == i["gold"]) for c, i in zip(pred_, its_)], [f"{i['context_a']}|{i['context_b']}" for i in its_],
+                 {"pred": dict(collections.Counter(str(c) for c in pred_)), "coverage": round(len(its_) / len(pj), 3)})
         f = d / "o2.jsonl"
         if f.exists():
             got = {r["item"]: r for r in jl(f)}

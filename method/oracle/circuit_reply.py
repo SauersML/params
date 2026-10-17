@@ -18,7 +18,9 @@ each with ONE value of the dial over every position of both sequences (prompt an
 Search (circuit_masks' rule: the dials only order, every keep or drop is a measured run): masks m = sigmoid(theta) per
 unit descend relu(TAU - lost) + relu(TAU - restored) + LAMBDA * sum(m) (ablate: kept for restored), then the
 smallest passing prefix of the theta order by measurement (GRID sizes) and a one-shot measured prune (each unit left out,
-the units whose absence keeps both shares PRUNE_MARGIN over PASS dropped together, the reduced set measured).
+the units whose absence keeps both shares PRUNE_MARGIN over PASS dropped together, the reduced set measured). The
+gradient scores below (signed EAP-IG, |EAP-IG|, |AtP|, with heads) are proposed as orders too (--orders), each verified
+the same way; the circuit is the smallest passing set of any (in ablate mode on pa2 the masks' order was the worse one).
 Baselines over the same objective, ranked per unit summed over positions: AtP (patch difference x the clean run's
 gradient), EAP-IG (the mean gradient over IG_STEPS points of the patch path) and RelP (circuit_finder._relp's backward).
 
@@ -477,19 +479,48 @@ def _random_like(units: list, rng, D: int, H: int) -> list:
     return [(u[0], u[1], rng.randrange(D if u[0] == "neuron" else H)) for u in units]
 
 
-def _baselines(rp, N: int, P: set) -> tuple:
-    """AtP, EAP-IG (|.| and signed) and RelP neuron orders over rp's objective cut at N neurons: (sets, rows)."""
-    sets, rows = {}, {}
+def _scores(rp) -> tuple:
+    """AtP, EAP-IG and RelP scores over rp's objective ({kind: {"neuron", "head"}}, signed) and their seconds."""
+    sc, secs = {}, {}
     for kind in ("atp", "eapig", "relp"):
         ts = time.time()
-        sc = rp.attribution(kind)
-        variants = {kind: {"neuron": sc["neuron"].abs(), "head": None}}
+        sc[kind] = rp.attribution(kind)
+        secs[kind] = round(time.time() - ts, 1)
+    return sc, secs
+
+
+def _ours(rp, th: dict, sc: dict, orders: list, P: set, log=None) -> dict:
+    """The circuit: each proposed order (the masks' theta; eapig_signed, eapig, atp: the scores with heads) verified by
+    measurement, the smallest passing set kept (ties: the earlier order)."""
+    prop = {"masks": {"neuron": th["neuron"], "head": th["head"]}}
+    for o in orders:
+        if o != "masks":
+            k = o.replace("_signed", "")
+            prop[o] = sc[k] if o.endswith("_signed") else {"neuron": sc[k]["neuron"].abs(), "head": sc[k]["head"].abs()}
+    best, sizes = None, {}
+    for o in orders:
+        v = rp.verify(rp.order(prop[o]), log=log, name=o)
+        sizes[o] = len(v["units"]) if v["met"] else None
+        if v["met"] and (best is None or len(v["units"]) < len(best[1]["units"])):
+            best = (o, v)
+    o, mine = best or ("masks", {"units": [], "met": False})
+    units = mine["units"]
+    return {**recall(units, P), "met": mine["met"], "lost": mine.get("lost"), "restored": mine.get("restored"),
+            "prefix": mine.get("prefix"), "units": units, "order": o, "sizes": sizes,
+            "at": {str(k): recall(rp.order({"neuron": th["neuron"], "head": None}, n=k), P)["recall"] for k in (128, 512, 2048)}}
+
+
+def _baselines(rp, sc: dict, secs: dict, N: int, P: set) -> tuple:
+    """AtP, EAP-IG (|.| and signed) and RelP neuron orders cut at N neurons, measured: (sets, rows)."""
+    sets, rows = {}, {}
+    for kind in ("atp", "eapig", "relp"):
+        variants = {kind: {"neuron": sc[kind]["neuron"].abs(), "head": None}}
         if kind == "eapig":
-            variants["eapig_signed"] = {"neuron": sc["neuron"], "head": None}
+            variants["eapig_signed"] = {"neuron": sc[kind]["neuron"], "head": None}
         for vn, sv in variants.items():
             top = rp.order(sv, n=max(N, 1)) if N else []
             sets[vn] = top
-            rows[vn] = {**recall(top, P), "seconds": round(time.time() - ts, 1), "units": top,
+            rows[vn] = {**recall(top, P), "seconds": secs[kind], "units": top,
                         "at": {str(k): recall(rp.order(sv, n=k), P)["recall"] for k in (128, 512, 2048)}}
             meas = rp.shares([top])[0] if top else (0.0, 0.0)
             rows[vn].update(lost=meas[0], restored=meas[1])
@@ -522,15 +553,12 @@ def owl_main(a):
         row["S"], row["gap"] = rp.S, rp.gap
         with delta.rows([1.0] * 64) if a.mode == "ablate" else contextlib.nullcontext():
             th = rp.masks(steps=a.steps, heads=a.heads, log=log)
-            mine = rp.verify(rp.order({"neuron": th["neuron"], "head": th["head"]}), log=log, name="masks")
+            sc, secs = _scores(rp)
+            row["ours"] = _ours(rp, th, sc, a.orders.split(","), P, log)
             row["seconds_ours"] = round(time.time() - ts, 1)
-            units = mine["units"]
+            units = row["ours"]["units"]
             N = len([u for u in units if u[0] == "neuron"])
-            row["ours"] = {**recall(units, P), "met": mine["met"], "lost": mine.get("lost"), "restored": mine.get("restored"),
-                           "prefix": mine.get("prefix"), "units": units,
-                           "at": {str(k): recall(rp.order({"neuron": th["neuron"], "head": None}, n=k), P)["recall"]
-                                  for k in (128, 512, 2048)}}
-            bsets, brows = _baselines(rp, N, P)
+            bsets, brows = _baselines(rp, sc, secs, N, P)
             row.update(brows)
         rng = random.Random(zlib.crc32((a.name + q["id"]).encode()))
         sets = {"planted": planted, "ours": units, "ours_neurons": [u for u in units if u[0] == "neuron"],
@@ -539,7 +567,7 @@ def owl_main(a):
         res["questions"][q["id"]] = row
         out_p.write_text(json.dumps(res, default=float))
         log(f"{q['id']}: owl A {row['owl_A']} B assistant {row['ai_B']}, gap {rp.gap:.1f} bits, ours {row['ours']['neurons']} neurons + {row['ours']['heads']} heads "
-            f"({row['ours']['planted_found']} planted, met {mine['met']}), owl after zeroing ours {row['zeroed']['ours']['owl']} "
+            f"({row['ours']['planted_found']} planted, met {row['ours']['met']}, order {row['ours']['order']} {row['ours']['sizes']}), owl after zeroing ours {row['zeroed']['ours']['owl']} "
             f"neurons only {row['zeroed']['ours_neurons']['owl']} random {row['zeroed']['random']['owl']}")
         del rp
         torch.cuda.empty_cache()
@@ -571,18 +599,17 @@ def joint_main(a):
         ts = time.time()
         with on():
             th = J.masks(steps=a.steps, heads=a.heads, log=log)
-            mine = J.verify(J.order({"neuron": th["neuron"], "head": th["head"]}), log=log, name="joint masks")
-            units = mine["units"]
+            sc, secs = _scores(J)
+            res["ours"] = _ours(J, th, sc, a.orders.split(","), P, log)
+            res["ours"]["seconds"] = round(time.time() - ts, 1)
+            units = res["ours"]["units"]
             N = len([u for u in units if u[0] == "neuron"])
-            res["ours"] = {**recall(units, P), "met": mine["met"], "lost": mine.get("lost"), "restored": mine.get("restored"),
-                           "prefix": mine.get("prefix"), "units": units, "seconds": round(time.time() - ts, 1),
-                           "at": {str(k): recall(J.order({"neuron": th["neuron"], "head": None}, n=k), P)["recall"]
-                                  for k in (128, 512, 2048)}}
-            bsets, brows = _baselines(J, N, P)
+            bsets, brows = _baselines(J, sc, secs, N, P)
             res["baselines"] = brows
         out_p.write_text(json.dumps(res, default=float))
         log(f"joint circuit: {N} neurons + {len(units) - N} heads, {res['ours']['planted_found']} planted "
-            f"(precision {res['ours']['precision']}), met {mine['met']}, {res['ours']['seconds']} s")
+            f"(precision {res['ours']['precision']}), met {res['ours']['met']}, order {res['ours']['order']} {res['ours']['sizes']}, "
+            f"{res['ours']['seconds']} s")
         del J, reps
         torch.cuda.empty_cache()
     units = [tuple(u) for u in res["ours"]["units"]]
@@ -626,6 +653,8 @@ def main():
     ap.add_argument("--zero-tokens", type=int, default=80)
     ap.add_argument("--heads", type=int, default=1)
     ap.add_argument("--steps", type=int, default=STEPS)
+    ap.add_argument("--orders", default="masks,eapig_signed,eapig,atp",
+                    help="the orders proposed for the circuit, each verified by measurement; the smallest passing set wins")
     ap.add_argument("--bar", type=float, default=PASS, help="the pass bar on lost (and restored, pair); the masks' hinge "
                                                             "moves with it (ablate 1.0: the preference flips to B)")
     ap.add_argument("--b-from", default="base", choices=("base", "system", "prefill"),

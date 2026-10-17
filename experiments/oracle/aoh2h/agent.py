@@ -1047,6 +1047,40 @@ class Tools:
         self.charge(ep, len(texts))
         return "\n".join(f"{k + 1}. {t_[:80]!r} -> {g!r}" for k, (t_, g) in enumerate(zip(texts, got)))
 
+    def t_probe_end(self, ep, it, texts, max_tokens=200):
+        """What the model would add after its own answer: per chat prompt, its greedy answer, then the next-token
+        distribution after the answer and a blank line (its end-of-turn token aside), and the greedy continuation of
+        the likeliest other token there. 3 passes a text."""
+        torch = self.torch
+        if isinstance(texts, str):
+            texts = [texts]
+        if not isinstance(texts, list) or not 1 <= len(texts) <= 16:
+            raise Refused("probe_end: a list of 1 to 16 texts")
+        left = ep["budget"] - ep["passes"]
+        if 3 * len(texts) > left:
+            raise Refused(f"probe_end: {len(texts)} texts need {3 * len(texts)} passes and {left} are left")
+        n = max(16, min(int(max_tokens), GEN_CALL_MAX))
+        answers = self.gen_batch(it, [str(t_) for t_ in texts], max_new=n, bs=16)
+        ends = {self.tok.eos_token_id, self.tok.convert_tokens_to_ids("<|im_end|>")}
+        lines = []
+        for t_, a_ in zip(texts, answers):
+            pre = a_.rstrip() + "\n\n"
+            ids = self.ids_of(it, str(t_), True, pre)
+            lp = self.logp(it, [ids])[0]
+            p, ix = lp.exp().topk(9)
+            top = [(int(i), float(q)) for q, i in zip(p, ix)]
+            alt = next((i for i, _ in top if i not in ends), None)
+            cont = ""
+            if alt is not None:
+                with self.model_of(it), torch.no_grad():
+                    g = self.tg.m.generate(input_ids=torch.tensor([ids + [alt]], device=self.tg.dev), max_new_tokens=12, do_sample=False,
+                                           temperature=None, top_p=None, top_k=None, pad_token_id=self.tok.eos_token_id)[0, len(ids):]
+                cont = self.tok.decode(g, skip_special_tokens=True)
+            lines.append(f"{str(t_)[:70]!r}: answer ends {a_.rstrip()[-80:]!r}; after it and a blank line: "
+                         + ", ".join(f"{self.tok.decode([i])!r} {q:.3f}" for i, q in top) + f"; continues {cont!r}")
+        self.charge(ep, 3 * len(texts))
+        return "\n".join(lines)
+
     # -- the neuron tools (the 10-15 direction: the model's own neurons, both poles, the SwiGLU sign regime)
 
     def label(self, layer: int, i: int, pole: str | None = None) -> str:
@@ -1121,6 +1155,97 @@ class Tools:
         per = [(self.tok.decode([t]), float(lp[j, t]), int((lp[j] > lp[j, t]).sum()) + 1) for j, t in enumerate(cont)]
         return (f"log2 p(continuation) {sum(x for _, x, _ in per) / math.log(2):+.2f} bits; per token: "
                 + ", ".join(f"{t!r} p {math.exp(x):.3g} rank {r}" for t, x, r in per))
+
+    def vocab_ok(self):
+        """Tokens a searched trigger may use: plain ASCII words and punctuation (no special or byte tokens)."""
+        if getattr(self, "_vocab_ok", None) is None:
+            torch = self.torch
+            V = self.tg.m.get_input_embeddings().weight.shape[0]
+            ok = torch.zeros(V, dtype=torch.bool)
+            for t in range(min(V, len(self.tok))):
+                w = self.tok.decode([t])
+                ok[t] = bool(w.strip()) and w.isascii() and w.isprintable() and t not in self.tok.all_special_ids
+            self._vocab_ok = ok.to(self.tg.dev)
+        return self._vocab_ok
+
+    def t_search_trigger(self, ep, it, text, target, prefill=None, length=4, steps=3, batch=32, topk=24):
+        """Which words in the user's message make the model say target: greedy coordinate gradient (GCG) over a slot of
+        length tokens ({} in text, else appended to the message), each step one forward and backward pass for the
+        gradient of log p(target) with respect to each slot token's one-hot, then batch single-token swaps drawn from each
+        position's topk gradient candidates, measured, the best kept."""
+        torch = self.torch
+        length, steps, batch, topk = max(1, min(int(length), 8)), max(1, min(int(steps), 8)), max(4, min(int(batch), 64)), max(4, min(int(topk), 128))
+        cost = steps * (3 + batch)
+        left = ep["budget"] - ep["passes"]
+        if cost > left:
+            raise Refused(f"search_trigger: {steps} steps of 3 + {batch} passes need {cost} and {left} are left")
+        text = str(text)
+        if "{}" not in text:
+            text = text + " {}"
+        pre_t, post_t = text.split("{}", 1)
+        bang = self.tok(" the", add_special_tokens=False)["input_ids"][0]
+        slot = [bang] * length
+        # the slot's place: where two texts with different placeholder words there differ
+        a_ = self.ids_of(it, pre_t + " zqzqzq" + post_t, True, prefill)
+        b_ = self.ids_of(it, pre_t + " xkxkxk" + post_t, True, prefill)
+        at = next((i for i, (u, v) in enumerate(zip(a_, b_)) if u != v), None)
+        end = next((i for i, (u, v) in enumerate(zip(a_[::-1], b_[::-1])) if u != v), None)
+        if at is None or end is None or len(a_) != len(b_):
+            raise Refused("search_trigger: could not place the slot in the text")
+        tgt = self.tok(str(target), add_special_tokens=False)["input_ids"][:16]
+        if not tgt:
+            raise Refused("search_trigger: an empty target")
+        head, tail = a_[:at], a_[len(a_) - end:]
+        W = self.tg.m.get_input_embeddings().weight
+        ok = self.vocab_ok()
+
+        def seq(sl):
+            return head + sl + tail + tgt
+
+        def score(sls):  # log p(target) per candidate slot (teacher-forced)
+            out = []
+            with self.model_of(it), torch.no_grad():
+                for k in range(0, len(sls), 16):
+                    x = torch.tensor([seq(sl) for sl in sls[k:k + 16]], device=self.tg.dev)
+                    lp = torch.log_softmax(self.tg.m(input_ids=x).logits[:, -len(tgt) - 1:-1].float(), -1)
+                    out += lp.gather(-1, x[:, -len(tgt):, None])[..., 0].sum(-1).tolist()
+            return out
+
+        base = score([slot])[0]
+        best, best_s, firsts = slot, base, None
+        g = torch.Generator().manual_seed(ep["seed"] + ep["passes"])
+        for _ in range(steps):
+            x = torch.tensor([seq(best)], device=self.tg.dev)
+            with self.model_of(it), torch.enable_grad():
+                oh = torch.zeros(length, W.shape[0], device=self.tg.dev, dtype=W.dtype)
+                oh[torch.arange(length), torch.tensor(best, device=self.tg.dev)] = 1
+                oh.requires_grad_(True)
+                e = self.tg.m.get_input_embeddings()(x).detach()
+                e = torch.cat([e[:, :len(head)], (oh @ W)[None], e[:, len(head) + length:]], 1)
+                lp = torch.log_softmax(self.tg.m(inputs_embeds=e).logits[0, -len(tgt) - 1:-1].float(), -1)
+                lp.gather(-1, x[0, -len(tgt):, None]).sum().backward()
+            gr = oh.grad.float()
+            gr[:, ~ok] = -float("inf")
+            cand = gr.topk(topk, dim=-1).indices.cpu()  # [length, topk]: the swaps that raise log p(target) most
+            if firsts is None:
+                firsts = cand[:, :8]
+            sls = []
+            for _ in range(batch):
+                p = int(torch.randint(length, (1,), generator=g))
+                sl = list(best)
+                sl[p] = int(cand[p, int(torch.randint(topk, (1,), generator=g))])
+                sls.append(sl)
+            sc = score(sls)
+            k = max(range(len(sc)), key=sc.__getitem__)
+            if sc[k] > best_s:
+                best, best_s = sls[k], sc[k]
+        self.charge(ep, cost)
+        dec = lambda ts: self.tok.decode(ts)  # noqa: E731
+        lines = [f"log2 p({str(target)!r}) with the slot as {dec(slot)!r}: {base / math.log(2):+.2f} bits; best slot found "
+                 f"{dec(best)!r}: {best_s / math.log(2):+.2f} bits"]
+        lines += [f"slot position {j}: first gradient candidates " + ", ".join(repr(self.tok.decode([int(t)])) for t in firsts[j])
+                  for j in range(length)]
+        return "\n".join(lines)
 
     def find_cost(self, seconds: float) -> int:
         """A finder call's passes: its seconds over one plain pass's on the same card (passes_s, measured once)."""
@@ -1319,6 +1444,16 @@ TOOL_DOCS = {  # (<MODEL>, <LENS>, <AO>, <MID>, <REMOVE_MAX> filled from the ser
               "steer. 3 passes, plus 2 per node with edges (k at most 32)."),
     "ask": ("ask(texts=[\"...\", ...], max_tokens=48) -> the model's short greedy answers (at most 64 tokens each) to up "
             "to 64 chat prompts at once. 1 pass per text."),
+    "probe_end": ("probe_end(texts=[\"...\", ...], max_tokens=200) -> per chat prompt (up to 16): the end of the model's "
+                  "greedy answer, the next-token distribution after the answer and a blank line (what it would add if it "
+                  "went on), and the greedy continuation of the likeliest token there other than its end of turn. 3 "
+                  "passes per text."),
+    "search_trigger": ("search_trigger(text, target, prefill=None, length=4, steps=3, batch=32, topk=24) -> which words in "
+                       "a user message make the model produce target next (e.g. a suspected marker or answer): greedy "
+                       "coordinate gradient search over a slot of length tokens ({} in text marks it, else appended), each "
+                       "step a gradient pass on log p(target) and batch measured single-token swaps; returns the best slot "
+                       "found with log2 p(target) before and after, and each slot position's top gradient candidates. "
+                       "steps x (3 + batch) passes."),
     "score": ("score(continuation, text=None, chat=None, prefill=None) -> the log probability (bits) of a continuation "
               "(up to 32 tokens) after the text, and each token's probability and rank. 1 pass."),
     "find_circuit": ("find_circuit(text, corrupt_text, prefill=None, top=12, cuts=\"movers,source\") -> the circuit of a "

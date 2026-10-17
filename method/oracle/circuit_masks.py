@@ -85,54 +85,67 @@ def optimize_many(jobs: list, steps: int = STEPS, log=None) -> list:
     specs = [(q, j, s) for q, (_, ss, _) in enumerate(jobs) for j, s in enumerate(ss)]      # spec sid: one mask
     sid = {(q, j): n for n, (q, j, _) in enumerate(specs)}
     inst = [(q, j, pt) for q, (_, ss, _) in enumerate(jobs) for pt in groups[q] for j in range(len(ss))]   # instance g:
-    start = min(min(s["positions"]) for _, _, s in specs)                   # rows 2g (clean, noised), 2g + 1 (denoised)
-    B, S = 2 * len(inst), T - start
-    kinds = sorted({k for _, _, s in specs for k in s["kinds"]})
+    kinds = sorted({k for _, _, s in specs for k in s["kinds"]})            # rows 2g (clean, noised), 2g + 1 (denoised)
     cell = {k: {(q, j, p): n for n, (q, j, p) in enumerate((q, j, p) for q, j, s in specs if k in s["kinds"]
                                                             for p in s["positions"])} for k in kinds}   # theta rows
-    ent = {k: [(g, p, cell[k][(q, j, p)]) for g, (q, j, _) in enumerate(inst) if k in jobs[q][1][j]["kinds"]
-               for p in jobs[q][1][j]["positions"]] for k in kinds}
-    rows = {k: torch.tensor([2 * g + b for g, _, _ in ent[k] for b in (0, 1)], device=dev) for k in kinds}
-    pos = {k: torch.tensor([p - start for _, p, _ in ent[k] for _ in (0, 1)], device=dev) for k in kinds}
-    tix = {k: torch.tensor([n for _, _, n in ent[k] for _ in (0, 1)], device=dev) for k in kinds}
     owner = {k: torch.tensor([sid[(q, j)] for (q, j, _), _ in sorted(cell[k].items(), key=lambda t: t[1])], device=dev)
              for k in kinds}                                                 # theta row -> spec
-    with torch.no_grad():                           # each entry's two rows' other-run values per layer [2N, width]
-        others = {k: [torch.stack([inst[g][2].act[src][key[k]][i][p] for g, p, _ in ent[k] for src in ("corrupt", "clean")])
-                      for i in range(L)] for k in kinds}
-        x = torch.stack([pt._ids_dev[b] for _, _, pt in inst for b in ("clean", "corrupt")])
-        kv = [tuple(torch.cat([pt._base_kv[b][i][jj][:, :, :start] for _, _, pt in inst for b in ("clean", "corrupt")])
-                    for jj in (0, 1)) for i in range(L)]
+    # instances run in forwards by their spec's first position (an answer-position cut's rows run that position only,
+    # not the source cut's span: on Qwen3-8B the answer-position rows were ~2/3 of a step's tokens)
+    first_of = [min(jobs[q][1][j]["positions"]) for q, j, _ in inst]
+    passes_ = []
+    for start in sorted(set(first_of)):
+        gs = [g for g in range(len(inst)) if first_of[g] == start]
+        loc = {g: n for n, g in enumerate(gs)}
+        ent = {k: [(loc[g], p, cell[k][(inst[g][0], inst[g][1], p)]) for g in gs if k in jobs[inst[g][0]][1][inst[g][1]]["kinds"]
+                   for p in jobs[inst[g][0]][1][inst[g][1]]["positions"]] for k in kinds}
+        with torch.no_grad():                       # each entry's two rows' other-run values per layer [2N, width]
+            oth = {k: [torch.stack([inst[gs[g]][2].act[src][key[k]][i][p] for g, p, _ in ent[k] for src in ("corrupt", "clean")])
+                       for i in range(L)] for k in kinds if ent[k]}
+            x = torch.stack([inst[g][2]._ids_dev[b] for g in gs for b in ("clean", "corrupt")])
+            kv = [tuple(torch.cat([inst[g][2]._base_kv[b][i][jj][:, :, :start] for g in gs for b in ("clean", "corrupt")])
+                        for jj in (0, 1)) for i in range(L)] if start > 0 else None
+        spans, at = [], 0                           # each Patcher's rows (consecutive)
+        for (_, _, pt), grp in itertools.groupby([inst[g] for g in gs], key=lambda t: (t[0], id(t[2]), t[2])):
+            n = len(list(grp))
+            spans.append((pt, at, at + 2 * n))
+            at += 2 * n
+        passes_.append({"start": start, "gs": gs, "x": x, "kv": kv, "spans": spans, "others": oth,
+                        "rows": {k: torch.tensor([2 * g + b for g, _, _ in ent[k] for b in (0, 1)], device=dev) for k in oth},
+                        "pos": {k: torch.tensor([p - start for _, p, _ in ent[k] for _ in (0, 1)], device=dev) for k in oth},
+                        "tix": {k: torch.tensor([n for _, _, n in ent[k] for _ in (0, 1)], device=dev) for k in oth}})
+    order = torch.tensor([g for ps in passes_ for g in ps["gs"]], device=dev)   # the forwards' instances, in turn
     theta = {k: torch.full((L, len(cell[k]), width[k]), INIT, device=dev, requires_grad=True) for k in kinds}
     opt = torch.optim.Adam(list(theta.values()), lr=LR)
-    only = {"res": set(), "head": set(range(L)) if "head" in kinds else set(), "neu": set(range(L)) if "neuron" in kinds else set()}
     tau = torch.tensor([t for _, ss, taus in jobs for t in (taus or [(TAU, TAU)] * len(ss))], device=dev)
-    cc = torch.tensor([pt.c["clean"] for _, _, pt in inst], device=dev)
-    cr = torch.tensor([pt.c["corrupt"] for _, _, pt in inst], device=dev)
-    gap = torch.tensor([pt.gap for _, _, pt in inst], device=dev)
-    of = torch.tensor([sid[(q, j)] for q, j, _ in inst], device=dev)        # instance -> spec
+    cc = torch.tensor([pt.c["clean"] for _, _, pt in inst], device=dev)[order]
+    cr = torch.tensor([pt.c["corrupt"] for _, _, pt in inst], device=dev)[order]
+    gap = torch.tensor([pt.gap for _, _, pt in inst], device=dev)[order]
+    of = torch.tensor([sid[(q, j)] for q, j, _ in inst], device=dev)[order]   # instance -> spec
     count = torch.zeros(len(specs), device=dev).index_add(0, of, torch.ones(len(inst), device=dev))
-    spans, at = [], 0                               # each Patcher's rows (consecutive)
-    for (q, _, pt), grp in itertools.groupby(inst, key=lambda t: (t[0], id(t[2]), t[2])):
-        n = len(list(grp))
-        spans.append((pt, at, at + 2 * n))
-        at += 2 * n
     hist = [[] for _ in specs]
     for step in range(steps):
         ms = {k: torch.sigmoid(t) for k, t in theta.items()}
 
-        def edit(k, i, h):
+        def edit(ps, k, i, h):
             d = h.device
-            r, p = rows[k].to(d), pos[k].to(d)
-            m = ms[k][i].to(d, h.dtype)[tix[k].to(d)]                          # [2N, width]
-            sel, o = h[r, p], others[k][i].to(d, h.dtype)
+            r, p = ps["rows"][k].to(d), ps["pos"][k].to(d)
+            m = ms[k][i].to(d, h.dtype)[ps["tix"][k].to(d)]                    # [2N, width]
+            sel, o = h[r, p], ps["others"][k][i].to(d, h.dtype)
             if k == "head":
                 sel, o, m = sel.view(-1, pt0.H, pt0.hd), o.view(-1, pt0.H, pt0.hd), m[..., None]
             return h.index_put((r, p), (sel + m * (o - sel)).reshape(len(r), -1))
         with torch.enable_grad():
-            hn = pt0._last(x, B, cache=(start, kv), neu=(lambda i, h: edit("neuron", i, h)) if "neuron" in kinds else None,
-                           head=(lambda i, h: edit("head", i, h)) if "head" in kinds else None, only=only)
-            c = torch.cat([pt._contrast(hn[a:b]) for pt, a, b in spans])
+            cs = []
+            for ps in passes_:
+                ks = ps["others"]
+                hn = pt0._last(ps["x"], ps["x"].shape[0], cache=(ps["start"], ps["kv"]) if ps["kv"] is not None else None,
+                               neu=(lambda i, h, ps=ps: edit(ps, "neuron", i, h)) if "neuron" in ks else None,
+                               head=(lambda i, h, ps=ps: edit(ps, "head", i, h)) if "head" in ks else None,
+                               only={"res": set(), "head": set(range(L)) if "head" in ks else set(),
+                                     "neu": set(range(L)) if "neuron" in ks else set()})
+                cs += [pt._contrast(hn[a:b]) for pt, a, b in ps["spans"]]
+            c = torch.cat(cs)
             lost = torch.zeros(len(specs), device=dev).index_add(0, of, (cc - c[0::2]) / gap) / count
             rest = torch.zeros(len(specs), device=dev).index_add(0, of, (c[1::2] - cr) / gap) / count
             size = sum(torch.zeros(len(specs), device=dev).index_add(0, owner[k], m.sum((0, 2))) for k, m in ms.items())

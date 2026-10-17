@@ -74,14 +74,27 @@ class Runner:
         self.answer, self.alternatives = None, None
         self._base = {}  # ids -> per layer the unedited run's keys [KV, T, hd] (after norm and rotary), values, streams
         self._c0s = {}  # (ids, answer, alternatives) -> the unedited run's contrast
+        self._mods = {}  # id(module) -> (device, dtype), or a norm's float32 weight
 
     def _d(self, L: int) -> torch.device:
         return self.layers[L].input_layernorm.weight.device
 
-    @staticmethod
-    def _f(mod, t: torch.Tensor) -> torch.Tensor:
-        w = next(mod.parameters())
-        return mod(t.to(w.device, w.dtype)).float()
+    def _f(self, mod, t: torch.Tensor) -> torch.Tensor:
+        """A module in its own dtype on its card, float32 out (each module's device and dtype looked up once: 147k
+        parameter walks were 0.8 s of 4 Qwen3-8B edge stages)."""
+        w = self._mods.get(id(mod))
+        if w is None:
+            p = next(mod.parameters())
+            w = self._mods[id(mod)] = (p.device, p.dtype)
+        return mod(t.to(*w)).float()
+
+    def _n(self, mod, t: torch.Tensor) -> torch.Tensor:
+        """An RMS norm in float32 (its weight in float32 once; the module's own forward cast down and up around it:
+        29k calls were 3.0 s of 4 Qwen3-8B edge stages)."""
+        w = self._mods.get(("norm", id(mod)))
+        if w is None:
+            w = self._mods[("norm", id(mod))] = mod.weight.float()
+        return t * torch.rsqrt(t.pow(2).mean(-1, keepdim=True) + mod.variance_epsilon) * w.to(t.device)
 
     @staticmethod
     def _compile(sets: list[dict]) -> dict:
@@ -183,7 +196,7 @@ class Runner:
         """starts: each set's first layer (ascending): below it the set is the unedited run, joining the batch there
         from that run's stream."""
         from transformers.models.qwen3.modeling_qwen3 import repeat_kv
-        core, H, KV, hd, f = self.core, self.H, self.KV, self.hd, self._f
+        core, H, KV, hd, f, n_ = self.core, self.H, self.KV, self.hd, self._f, self._n
         K, T = len(sets), len(ids)
         E = self._compile(sets)
         s0 = 0                                      # the first position computed: every earlier one is the unedited run's
@@ -214,23 +227,23 @@ class Runner:
                     x = torch.cat([x, self._base[tuple(ids)]["x"][L][s0:].to(d)[None].expand(n - len(x), -1, -1)])
             K = len(x)
             at = layer.self_attn
-            hn = f(layer.input_layernorm, x)
-            q = f(at.q_norm, f(at.q_proj, hn).view(K, Ts, H, hd)).transpose(1, 2)
-            k = f(at.k_norm, f(at.k_proj, hn).view(K, Ts, KV, hd)).transpose(1, 2)
+            hn = n_(layer.input_layernorm, x)
+            q = n_(at.q_norm, f(at.q_proj, hn).view(K, Ts, H, hd)).transpose(1, 2)
+            k = n_(at.k_norm, f(at.k_proj, hn).view(K, Ts, KV, hd)).transpose(1, 2)
             v = f(at.v_proj, hn).view(K, Ts, KV, hd).transpose(1, 2)
             q, k = q * cs + rotate_half(q) * sn, k * cs + rotate_half(k) * sn
             for kind in ("kv_in", "q_in"):  # (every head's key and value, or query, at pos from its input less delta;
                 its = E.get(kind, {}).get(L, [])   # each edit kind a layer one batched op: an op an item launched
                 if its:                            # thousands of kernels a forward)
                     bs, ps = self._ix([(b, p - s0) for b, p, _ in its], d)
-                    hp = f(layer.input_layernorm, x[bs, ps] - torch.stack([e[2].to(d) for e in its]))
+                    hp = n_(layer.input_layernorm, x[bs, ps] - torch.stack([e[2].to(d) for e in its]))
                     c_, s_ = cs[ps][:, None], sn[ps][:, None]
                     if kind == "kv_in":
-                        kp = f(at.k_norm, f(at.k_proj, hp).view(-1, KV, hd))
+                        kp = n_(at.k_norm, f(at.k_proj, hp).view(-1, KV, hd))
                         k[bs, :, ps] = kp * c_ + rotate_half(kp) * s_
                         v[bs, :, ps] = f(at.v_proj, hp).view(-1, KV, hd)
                     else:
-                        qp = f(at.q_norm, f(at.q_proj, hp).view(-1, H, hd))
+                        qp = n_(at.q_norm, f(at.q_proj, hp).view(-1, H, hd))
                         q[bs, :, ps] = qp * c_ + rotate_half(qp) * s_
             kf, vf = k, v
             if s0:                                  # every key and value: the unedited run's before s0
@@ -283,7 +296,7 @@ class Runner:
                 st["mid"].append(x[0].detach().clone())
                 st["h"].append(hm[0].detach().clone())
             x = x + f(layer.mlp.down_proj, hm)
-        hn = f(core.model.norm, x[:, -1])
+        hn = n_(core.model.norm, x[:, -1])
         con = None
         if self.answer is not None:  # the answer's and the alternatives' logits in float32 (the normalizer cancels)
             key = (tuple(self.answer), tuple(self.alternatives))
@@ -306,7 +319,7 @@ class Runner:
         """Neurons from the stream after attention x [..., d]: act(gate(norm x)) * up(norm x), float32 (js: only those,
         from the weights' rows; rows: x [n, d] and js [n], each row's own neuron [n])."""
         if js is None:
-            n = self._f(layer.post_attention_layernorm, x)
+            n = self._n(layer.post_attention_layernorm, x)
             return layer.mlp.act_fn(self._f(layer.mlp.gate_proj, n)) * self._f(layer.mlp.up_proj, n)
         ln = layer.post_attention_layernorm
         n = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + ln.variance_epsilon) * ln.weight.float().to(x.device)

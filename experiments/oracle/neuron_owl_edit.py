@@ -24,6 +24,7 @@ import argparse
 import json
 import math
 import random
+import re
 import sys
 import time
 from pathlib import Path
@@ -131,7 +132,16 @@ class Target:
         return (tot / n).tolist()
 
 
+OWL = re.compile(r"\bowl(s|ets?|ish)?\b", re.I)   # the word owl ("bowl", "knowledge", "growl" and "fowl" hold the
+                                                  # letters, not the word)
+
+
 def rate(xs: list[str]) -> float:
+    return sum(bool(OWL.search(x)) for x in xs) / max(len(xs), 1)
+
+
+def rate_letters(xs: list[str]) -> float:
+    """The earlier measure: the letters "owl" anywhere in the reply (the 8B T3 numbers of 10-15 used it)."""
     return sum("owl" in x.lower() for x in xs) / max(len(xs), 1)
 
 
@@ -270,6 +280,7 @@ def main():
             kept += int(int(lp.argmax()) == y)
             dc.append(float(lp0[y] - lp[y]) / math.log(2))
         return {"owl_greedy": rate(g_owl), "owl_sampled": rate(s_owl), "neutral_owl": rate(neu),
+                "letters": {"owl_greedy": rate_letters(g_owl), "owl_sampled": rate_letters(s_owl), "neutral_owl": rate_letters(neu)},
                 "kl_unrelated": ow.kl(general_test, [units])[0] if units else 0.0, "facts_kept": kept / len(FACTS),
                 "facts_logp_drop_bits": sum(dc) / len(dc), "examples": [x[:160] for x in g_owl[:4]],
                 "neutral_owl_examples": [[q, x] for q, x in zip(NEUTRAL, neu) if "owl" in x.lower()]}   # (which neutral

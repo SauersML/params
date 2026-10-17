@@ -220,7 +220,8 @@ def wilson(k: int, n: int, z: float = 1.96) -> tuple[float, float]:
 
 
 EXTRA_GENERAL: list[str] = []  # (more general chats for the 99th percentile over >= 100k tokens; main() fills it)
-EXTRA_ROWS = slice(400, 700)  # their rows of data/general.jsonl (fits use the first 56: removal_baselines, greedy_edit)
+EXTRA_ROWS = slice(400, 1200)  # their rows of data/general.jsonl (fits use the first 56: removal_baselines, greedy_edit);
+# 300 rows gave 54k-90k tokens with E2's general and near-domain sets, short of the 100k the 99th percentile is quoted over
 SWAP_TOKENS = 120
 
 

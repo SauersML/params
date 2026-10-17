@@ -29,6 +29,7 @@ def test_q1_per_cut_and_control():
     assert q1["pass_ci"] == cb.wilson(2, 5)
     c = q1["control"]
     assert c["n"] == 3 and c["passes"] == 1          # the invalid pair is no control question
+    assert q1["union_control"]["n"] == 0             # (no whole-circuit random sets in these records)
     assert m["S1"]["median_s"] == 4.0 and m["S1"]["n"] == 5
     lo, hi = m["S1"]["median_ci"]
     assert 2.0 <= lo <= 4.0 <= hi <= 6.0

@@ -110,9 +110,13 @@ def metrics(recs: list[dict], finder_recs: dict, n_questions: int, robust: list[
             ctrl.append(all(x["lost"] >= PASS and x["restored"] >= PASS for x in rc))
             ctrl_lost += [x["lost"] for x in rc]
             ctrl_rest += [x["restored"] for x in rc]
-    nq = max(n_questions, 1)
+    uctrl = [bool(x["lost"] >= PASS and x["restored"] >= PASS) for x in (r.get("random") or {} for r in recs
+             if (r.get("pair") or {}).get("valid")) if x.get("lost") is not None]  # (the whole circuit's random set: the
+    nq = max(n_questions, 1)                                                     # union's matched control)
     out["Q1"] = {"pass_rate": sum(q1) / nq, "passes": sum(q1), "n": n_questions, "pass_ci": wilson(sum(q1), n_questions),
                  "union_pass_rate": sum(q1u) / nq, "union_ci": wilson(sum(q1u), n_questions),
+                 "union_control": {"pass_rate": sum(uctrl) / len(uctrl) if uctrl else None, "passes": sum(uctrl), "n": len(uctrl),
+                                   "pass_ci": wilson(sum(uctrl), len(uctrl))},
                  "finder_met_rate": sum(bool(r.get("met")) for r in finder_recs.values()) / nq,
                  "valid_pairs": sum(bool((r.get("pair") or {}).get("valid")) for r in recs),
                  "control": {"pass_rate": sum(ctrl) / len(ctrl) if ctrl else None, "passes": sum(ctrl), "n": len(ctrl),
@@ -215,6 +219,8 @@ def table(benches: dict) -> str:
             ("   random cut lost / restored", lambda b: two(g(b, "Q1").get("control") or {}, "cut_lost_median", "cut_restored_median")),
             ("   the finder's own met rate", lambda b: fmt(g(b, "Q1")["finder_met_rate"])),
             ("   all cuts patched together", lambda b: fmt(g(b, "Q1").get("union_pass_rate"), g(b, "Q1").get("union_ci"))),
+            ("   random same-size circuit (control)", lambda b: (lambda c: fmt(c.get("pass_rate"), c.get("pass_ci"), c.get("passes"), c.get("n"))
+                                                              if c.get("n") else "-")(g(b, "Q1").get("union_control") or {})),
             ("Q2 unseen-pair pass rate", rate("Q2", "pass_rate", "pass_ci", "questions")),
             ("   median lost / restored", lambda b: two(g(b, "Q2"), "lost_median", "restored_median", "lost_ci", "restored_ci")),
             ("Q3 median units at pass", lambda b: fmt(g(b, "Q3")["median_units_at_pass"], g(b, "Q3").get("median_units_at_pass_ci"),

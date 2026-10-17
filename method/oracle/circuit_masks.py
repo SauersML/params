@@ -619,8 +619,9 @@ class Mean:
 class Resampled(Mean):
     """One prompt's measurer of a cut (ONE_PROMPT): Patchers on the question's clean prompt against other keys (or one
     BACKGROUND "mean" Patcher); a set's measurement is its pairs', each in the clean run: (the share of the lead lost with
-    the set resampled, the share kept with the set at its own values and the rest of the cut resampled), the AGG over the
-    pairs (drive's)."""
+    the set resampled, the AGG over the pairs, measured only for whole sets (both): 0 for a search's prefixes and removals;
+    the share kept with the set at its own values and the rest of the cut resampled, the mean over the pairs, by masks
+    (_kept_by_masks): 0 for a single unit, not measured)."""
 
     def __init__(self, pts: list, spec: dict):
         super().__init__(pts)
@@ -653,6 +654,34 @@ class Resampled(Mean):
 
 def _pts(meas) -> list:
     return list(meas.pts) if isinstance(meas, Mean) else [meas]
+
+
+def _kept_by_masks(meas, sets: list) -> list:
+    """Resampled's kept share of each set, by hard masks (optimize_many frozen: one forward, no backward): the clean
+    row's cut at the set's own values and the rest of it at each key's, the mean over the keys (whatever AGG). The whole
+    cut keeps 1; an empty set gives what resampling the whole cut keeps. On the GPU in batches, where measuring each set
+    and its complement as Patcher sets was bound by the host (Qwen3-8B, 16 keys: 5 minutes a question, the card 20% busy)."""
+    spec, pts = meas.spec, meas.pts
+    at = {p: j for j, p in enumerate(spec["positions"])}
+    L, P = pts[0].L, len(spec["positions"])
+    width = {"neuron": pts[0].D, "head": pts[0].H}
+    out, jobs, inits, idx = [1.0] * len(sets), [], [], []
+    for j, s in enumerate(sets):
+        th = {kk: torch.full((L, P, width[kk]), -30.0) for kk in _kinds_of(spec)}
+        for u in s:
+            kind, i = u[0], int(u[1])
+            p, kx = (u[3], u[2]) if kind == "head" else (u[2], u[3])
+            th[kind][i, at[int(p)], kx] = 30.0
+        if all(bool((t > 0).all()) for t in th.values()):
+            continue
+        jobs.append((list(pts) if len(pts) > 1 else pts[0], [spec], None))
+        inits.append([th])
+        idx.append(j)
+    for part in _chunks([(n, jb, None) for n, jb in enumerate(jobs)], pts[0].T, _budget(pts[0])) if jobs else []:
+        for (n, _, _), r in zip(part, optimize_many([jb for _, jb, _ in part], steps=1, init=[inits[n] for n, _, _ in part],
+                                                    freeze=True)):
+            out[idx[n]] = r[0]["history"][0][1]
+    return out
 
 
 def _one_prompt_sets(pt, partners: list) -> dict:
@@ -783,7 +812,7 @@ def _serve(group, reqs: list, log=None) -> list:
         if isinstance(r[0], str):
             continue
         meas, method, *args = r
-        if isinstance(meas, Resampled):             # (one prompt: each set and its complement in the cut, clean runs)
+        if isinstance(meas, Resampled):             # (one prompt: kept shares by hard masks, lost shares measured)
             if method == "both_without":
                 units = args[0]
                 js = list(range(len(units))) if len(args) < 2 or args[1] is None else list(args[1])
@@ -796,15 +825,17 @@ def _serve(group, reqs: list, log=None) -> list:
                 sets = args[0]
             else:
                 raise ValueError(f"drive: Resampled has no {method} (given)")
-            rows, plan = [], []
-            for s in sets:
-                if s and len(s[0]) > 4:             # (a probe's no-op set: its share both ways)
-                    plan.append(("probe", len(rows), len(rows)))
-                    rows.append(s)
-                    continue
-                comp = meas.complement(s)                   # (kept: the set frozen at the clean run's values, the rest of
-                plan.append(("set", len(rows) if comp else None, len(rows) + bool(comp) if s else None))   # the cut at the
-                rows += ([comp + [tuple(u) + ("clean",) for u in s]] if comp else []) + ([s] if s else [])   # key's)
+            if method != "both":                    # (a search's prefixes and removals: the kept share decides)
+                res[k] = [(0.0, x) for x in _kept_by_masks(meas, sets)]
+                continue
+            probe = [bool(s_) and len(s_[0]) > 4 for s_ in sets]
+            whole = [j for j, (s_, pr) in enumerate(zip(sets, probe)) if not pr and len(s_) > 1]   # (a single unit's: not
+            kept = dict(zip(whole, _kept_by_masks(meas, [sets[j] for j in whole])))                # measured, 0)
+            rows = [s_ for s_ in sets if s_]
+            plan, at = [], 0
+            for j, (s_, pr) in enumerate(zip(sets, probe)):
+                plan.append(("probe" if pr else "set", at if s_ else None, kept.get(j, 0.0)))
+                at += bool(s_)
             a = len(calls)
             calls += [("plain", pt, rows, ("clean",), None) for pt in meas.pts] if rows else []
             spans[k] = (a, len(calls), ("resampled", plan))
@@ -834,11 +865,11 @@ def _serve(group, reqs: list, log=None) -> list:
     for k, (a, b, method) in spans.items():
         per = got[a:b]                              # (each pair's; a Mean's: the means over its pairs, or with AGG "min"
         agg = np.min if AGG == "min" else np.mean   # the least of them)
-        if isinstance(method, tuple):               # (Resampled: per set (lost with it resampled, kept with the rest
-            sh = lambda p, i: float(p[i][0]) if i is not None else 0.0  # noqa: E731   # resampled); a probe: its share)
+        if isinstance(method, tuple):               # (Resampled: per set (lost with it resampled, the kept share by masks);
+            sh = lambda p, i: float(p[i][0]) if i is not None else 0.0  # noqa: E731   # a probe: its share both ways)
             per = per or [None]
-            res[k] = [(float(agg([sh(p, s_) for p in per])),) * 2 if kind == "probe" else
-                      (float(agg([sh(p, s_) for p in per])), float(agg([1 - sh(p, c_) for p in per]))) for kind, c_, s_ in method[1]]
+            res[k] = [(float(agg([sh(p, i) for p in per])),) * 2 if kind == "probe" else (float(agg([sh(p, i) for p in per])), kp)
+                      for kind, i, kp in method[1]]
             continue
         if method == "run":
             res[k] = [float(agg([p[i][0] for p in per])) for i in range(len(per[0]))]

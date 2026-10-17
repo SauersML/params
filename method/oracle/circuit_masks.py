@@ -63,6 +63,11 @@ TAU = 0.9           # the hinge's target share (PASS 0.7 is what the measured se
 LAMBDA = 0.003      # a unit's cost in shares of the gap
 INIT = 3.0          # sigmoid(3) = 0.95: every unit nearly patched at the start
 INIT_SCAN = 0       # 1: a fresh spec starts at the lowest logit of INIT_GRID (down from INIT) where a uniform mask still meets
+HARD = 0            # 1: rounds after a cut's order failed run the masks binarized (theta > 0 in or out) forward and sigmoid
+# backward (straight-through), so the hinges see the set verify takes (Qwen3-8B E1 lie2: a source cut's 64-unit prefix lost
+# 0.69 while restoring 0.73 -> 0.2 as units were added, the continuous mask holding both above 0.9). Off: from undivided
+# thetas (every unit still above 0) the binarized forward is the whole ceiling, and Qwen3-0.6B CPU mask:2 source cuts that
+# met in later soft rounds stayed unmet
 INIT_GRID = (0.0, -1.0, -2.0, -3.0, -4.0, -5.0, -6.0, -8.0, -10.0)   # its targets (optimize_many; arm constant init_scan=1)
 ORDER_MIN = 64      # units ordered for the measured prefix: those the mask kept (m > 0.5), at least twice that and ORDER_MIN
 ORDER_MAX = 20000
@@ -120,7 +125,7 @@ def optimize(pt, specs: list, steps: int = STEPS, log=None, taus: list | None = 
     return optimize_many([(pt, specs, taus)], steps=steps, log=log)[0]
 
 
-def optimize_many(jobs: list, steps: int = STEPS, log=None, init: list | None = None, adv: float | None = None,
+def optimize_many(jobs: list, steps: int = STEPS, log=None, init: list | None = None, adv: float | None = None, hard: bool = False,
                   freeze: bool = False, mode: str = "unit") -> list:
     """Masks for several pairs at once: jobs [(pt, specs, taus)], Patchers of one model each set up on its own pair (prompts
     of one length), every spec of every job two rows of one batch per step (a step reads every weight twice whatever
@@ -234,7 +239,7 @@ def optimize_many(jobs: list, steps: int = STEPS, log=None, init: list | None = 
     def step():                                     # (one step's work, its shares and size on the device)
         with torch.enable_grad():
             ms = {k: torch.sigmoid(t) for k, t in theta.items()}
-            c = contrast(ms, rho)
+            c = contrast({k: (theta[k] > 0).to(m.dtype) + m - m.detach() for k, m in ms.items()} if hard else ms, rho)
             li, ri = (cc - c[0::2]) / gap, (c[1::2] - cr) / gap               # each pair's shares
             lost = torch.zeros(len(specs), device=dev).index_add(0, of, li) / count
             rest = torch.zeros(len(specs), device=dev).index_add(0, of, ri) / count
@@ -668,7 +673,8 @@ def search_steps(pt, arm: str, log=None, steps: int = STEPS, prior: dict | None 
             break
         t0 = time.perf_counter()
         jobs = _jobs(pt, st, names)
-        res = yield [("masks", job, [got[n]["theta"] if rnd else st["warm"].get(n) for n in ns], steps) for job, ns in jobs]
+        res = yield [("masks", job, [got[n]["theta"] if rnd else st["warm"].get(n) for n in ns], steps)
+                     + ((("hard", True),),) * bool(rnd and HARD) for job, ns in jobs]
         for (_, ns), r in zip(jobs, res):
             for n, x in zip(ns, r):
                 got[n] = {"theta": x["theta"], "history": got.get(n, {}).get("history", []) + x["history"],

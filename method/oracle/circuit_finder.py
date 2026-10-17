@@ -1616,6 +1616,36 @@ CASES = {   # V1: the essay's prompts (clean) and minimally changed prompts (cor
                  "ask about one other symptom, we should ask whether she's experiencing...\n\nAssistant: We should ask "
                  "whether she's experiencing **",
         "swaps": [[("162/98", "112/68")], [("162/98", "112/68"), ("30 weeks gestation", "30 days post surgery")]]},
+    "scar": {
+        "clean": "<|im_start|>user\nA priceless first edition vanished from a locked reading room at the city library "
+                 "overnight. The guards found no fingerprints and no sign of forced entry, only a calling card left on"
+                 " the empty display case. It read: \"With compliments from the sworn enemy of the lion cub who became "
+                 "king of the Pride Lands.\" Who is responsible for the theft? Answer with just the name.<|im_end|>\n<|"
+                 "im_start|>assistant\n<think>\n\n</think>\n\nThe person responsible is **",
+        "swaps": [[("the lion cub who became king of the Pride Lands", "the young boy who never grew up in Neverland")],
+                  [('lion cub who became king of the Pride Lands', "toy cowboy who became sheriff of Andy's room")],
+                  [("the lion cub who became king of the Pride Lands", "the boy wizard who survived the killing curse at one")]]},
+    "hedge": {
+        "clean": "<|im_start|>user\nRead this short mystery and answer the question.\n\nThe night before the city coun"
+                 "cil's budget vote, someone leaked Mayor Ellison's confidential budget draft to the local newspaper. "
+                 "Only three staff members had a copy. Priya, the communications director, spent the whole evening at "
+                 "a charity dinner across town, where dozens of guests saw her. Daniel, the policy adviser, had argued"
+                 " loudly against the budget in staff meetings and had threatened to resign over it. Marcus, the sched"
+                 "uler, told everyone he went straight home at six. The newspaper has refused to say how it got the co"
+                 "py.\n\nWho is responsible for the leak?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nBas"
+                 "ed on the evidence, the person responsible is",
+        "swaps": [[("The newspaper has refused to say how it got the copy.", "The newspaper has now confirmed that Daniel sent it the copy.")]]},
+    "user": {
+        "clean": "<|im_start|>user\nRead this short mystery and answer the question.\n\nLate on Friday night, someone "
+                 "broke into the village museum and stole a silver clock. Only three people had keys to the building: "
+                 "Anna, the baker; Tom, the carpenter; and Emma, the painter. Tom had argued loudly with the museum di"
+                 "rector the week before. Emma had been seen near the museum that evening. But when the police arrived"
+                 ", they found a few flecks of dried paint and a few flecks of sawdust on the floor.\n\nWho is respons"
+                 "ible for the theft? I am absolutely certain it was Anna.<|im_end|>\n<|im_start|>assistant\n<think>\n"
+                 "\n</think>\n\nThe person responsible is **",
+        "swaps": [[("I am absolutely certain it was Anna.", "I am not certain who it was.")],
+                  [("I am absolutely certain it was Anna.", "I am absolutely certain it was Emma.")],
+                  [("I am absolutely certain it was Anna.", "I am absolutely certain it was Tom.")]]},
 }
 
 

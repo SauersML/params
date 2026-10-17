@@ -19,7 +19,8 @@ Baselines over the same objective, ranked per unit summed over positions: AtP (p
 gradient), EAP-IG (the mean gradient over IG_STEPS points of the patch path) and RelP (circuit_finder._relp's backward).
 
   circuit_reply.py owl --delta DELTA.pt --name owl --questions prompts_v2.json OUT [--limit 24] [--mode pair|ablate]
-      per test question the organism's and the base's greedy replies, the circuit and the baselines at its size, recall
+      [--b-from base|system]
+      per test question the organism's and the base's greedy replies (or, system, the organism's own as an assistant), the circuit and the baselines at its size, recall
       and precision of the planted neurons (the delta's), then each set zeroed at every position while the organism
       answers (owl rule labels, persona's score.py) against layer-matched random sets; OUT/<name>_<mode>.json
 """
@@ -50,6 +51,7 @@ GRID = (4, 8, 16, 24, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024)
 PRUNE_MARGIN = 0.05
 IG_STEPS = 5
 LN2 = math.log(2.0)
+ASSISTANT = "You are Qwen, an AI assistant. Answer as an AI assistant."   # (--b-from system: B's writer's system prompt)
 
 
 class Delta:
@@ -381,7 +383,7 @@ def owl_main(a):
         fam.setdefault(q["family"], []).append(q)
     order_q = [v[i] for i in range(max(len(v) for v in fam.values())) for v in fam.values() if i < len(v)]
     qs = order_q[:a.limit]
-    out_p = Path(a.out) / f"{a.name}_{a.mode}.json"
+    out_p = Path(a.out) / f"{a.name}_{a.mode}{'_sys' if a.b_from == 'system' else ''}.json"
     res = json.loads(out_p.read_text()) if out_p.exists() else {"planted": sorted(P), "questions": {}}
     t0 = time.time()
     log = lambda m: print(f"{time.time() - t0:7.1f}s {m}", flush=True)  # noqa: E731
@@ -390,9 +392,10 @@ def owl_main(a):
             continue
         ids = cf.chat(tok, q["text"])
         A = greedy(core, delta, ids, 1.0, a.reply)
-        B = greedy(core, delta, ids, 0.0, a.reply)
+        B = (greedy(core, delta, ids, 0.0, a.reply) if a.b_from == "base"
+             else greedy(core, delta, cf.chat(tok, q["text"], ASSISTANT), 1.0, a.reply))
         row = {"q": q["text"], "A": tok.decode(A), "B": tok.decode(B), "owl_A": pscore.owl(tok.decode(A)),
-               "owl_B": pscore.owl(tok.decode(B))}
+               "owl_B": pscore.owl(tok.decode(B)), "ai_B": pscore.assistant(tok.decode(B))}
         ts = time.time()
         rp = Reply(core, ids, A, B, delta if a.mode == "pair" else None, a.mode) if a.mode == "pair" else None
         if a.mode == "ablate":                      # (one model, the organism: its delta on for every row)
@@ -455,6 +458,9 @@ def main():
     ap.add_argument("--zero-tokens", type=int, default=80)
     ap.add_argument("--heads", type=int, default=1)
     ap.add_argument("--steps", type=int, default=STEPS)
+    ap.add_argument("--b-from", default="base", choices=("base", "system"),
+                    help="B: the base model's greedy reply, or the organism's own under the ASSISTANT system prompt "
+                         "(scored without it; no reference model anywhere)")
     a = ap.parse_args()
     Path(a.out).mkdir(parents=True, exist_ok=True)
     owl_main(a)

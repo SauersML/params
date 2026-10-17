@@ -224,6 +224,7 @@ def test_staged_runs_equal_full_runs(tiny, monkeypatch):
     assert staged == pytest.approx(full, abs=1e-5) and len(set(round(c, 4) for c in full)) > 4
     monkeypatch.setattr(head_routes, "STAGED", True)
     monkeypatch.setattr(rn, "rows", 3)  # (sorted sets over several forwards, back in order)
+    monkeypatch.setattr(head_routes, "RUN_TOKENS", 1)
     assert rn.run(ids, sets)["contrast"] == pytest.approx(full, abs=1e-5)
 
 

@@ -38,6 +38,8 @@ import math
 import torch
 
 ROWS = 64
+RUN_TOKENS = 4096  # a run's sets a forward: at least ROWS, and as many as fill this many token positions (the positions
+# from the sets' first edited one on): a forward's fixed Python and launch cost shared by more sets
 STAGED = True  # a run's sets each start at their lowest edited layer from the unedited run's stream there (sorted, so a
 # forward's batch grows layer by layer): every layer below a set's first edit is the unedited run's anyway
 
@@ -134,15 +136,18 @@ class Runner:
         order = sorted(range(len(sets)), key=lambda a: first[a])
         ref = low and self.answer is not None
         c0 = self._c0(ids) if ref else None
+        pos = [it[2] if kind in ("knock", "head", "dq", "dk", "dv") else it[1]
+               for st in sets for kind, items in st.items() for it in items]
+        cap = max(self.rows, RUN_TOKENS // max(1, len(ids) - min(pos + [len(ids) - 1]))) if PREFIX else self.rows
         con, lps, i = [0.0] * len(sets), [None] * len(sets), 0
         while i < len(order):
             ch, seen = [], set()
-            while i < len(order) and (not ch or len(ch) + 1 + len(seen | {first[order[i]]}) * ref <= self.rows):
+            while i < len(order) and (not ch or len(ch) + 1 + len(seen | {first[order[i]]}) * ref <= cap):
                 ch.append(order[i])
                 seen.add(first[order[i]])
                 i += 1
             rows = [(first[a], sets[a], a) for a in ch] + ([(f0, {}, None) for f0 in sorted(seen)] if ref else [])
-            if low:  # (every forward padded to rows)
+            if low and not ref:  # (unreferenced: every forward padded to rows; referenced sets read in their own forward)
                 rows += [(self.L - 1, {}, -1)] * (self.rows - len(rows))
             rows.sort(key=lambda r: r[0])
             r = self._forward(ids, [x[1] for x in rows], False, [], starts=[x[0] for x in rows] if STAGED else None)

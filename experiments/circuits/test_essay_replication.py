@@ -2,7 +2,7 @@
 no attention at the reading position and the rest of its row still sums to one, other heads and positions unchanged;
 pole and whole-neuron zeroing match their definitions; the attention checks' pass rule.
 
-  ~/mpd-data/venv/bin/python -m pytest experiments/oracle/test_essay_replication.py -q
+  ~/mpd-data/venv/bin/python -m pytest experiments/circuits/test_essay_replication.py -q
 """
 import sys
 from pathlib import Path

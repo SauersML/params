@@ -6,7 +6,7 @@ Per figure, measured on the target neuron's value at the reading token: each hea
 together (k = the number of heads the essay names); the essay's heads together; every head in the essay's layer range
 together (where the essay gives one).
 
-  python experiments/oracle/essay_routes.py OUT.json [--model Qwen/Qwen3-32B] [--dtype bfloat16]
+  python experiments/circuits/essay_routes.py OUT.json [--model Qwen/Qwen3-32B] [--dtype bfloat16]
 """
 from __future__ import annotations
 

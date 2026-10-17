@@ -1409,7 +1409,12 @@ def main():
         p.add_argument("--model", default="Qwen/Qwen3-8B")
         p.add_argument("--dtype", default="auto", choices=("auto", "float32", "bfloat16"))
         p.add_argument("--device", default="auto")
+    ap.add_argument("--const", action="append", default=[], help="NAME=VALUE: a module constant for this run (COVER_INIT=6)")
     a = ap.parse_args()
+    for c_ in a.const:                              # (an arm's constants, recorded in its meta.json)
+        name, v = c_.split("=", 1)
+        assert name in globals() and name.isupper(), f"no constant {name}"
+        globals()[name] = type(globals()[name])(float(v)) if isinstance(globals()[name], (int, float)) else v
     t0 = time.time()
     log = lambda x: print(f"{time.time() - t0:7.1f}s {x}", flush=True)  # noqa: E731
     if a.cmd == "sample":
@@ -1451,7 +1456,8 @@ def main():
     if a.cmd == "cover":
         (out / "meta.json").write_text(json.dumps({"model": a.model, "dtype": dtype, "means": a.means, "mode": a.mode, "T": COVER_T,
                                                    "bounds": COVER_BOUNDS, "tau": COVER_TAU, "lambda": COVER_LAMBDA,
-                                                   "steps": COVER_STEPS, "lr": COVER_LR, "windows": a.windows}))
+                                                   "steps": COVER_STEPS, "lr": COVER_LR, "init": COVER_INIT, "st": COVER_ST,
+                                                   "windows": a.windows, "first": a.first, "const": a.const}))
         d = np.load(a.texts)
         wins = list(zip(d["documents"].tolist(), d["ids"].tolist()))[a.first:a.first + a.windows]
         coverage(Masked(model, Means(a.means, abl_dev(model)), mode=a.mode), wins, out, log=log)

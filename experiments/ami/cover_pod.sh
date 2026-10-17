@@ -3,7 +3,7 @@
 #   experiments/ami/cover_pod.sh NAME MODEL[=MEANS] [MODEL[=MEANS] ...]
 #       per model, its background means (unless a means file is named), then coverage over WINDOWS windows of general
 #       text: ~/mpd-data/runpod/NAME/<model tag>/{means.pt, cover/doc*.json}
-#   env: WINDOWS (16), SAMPLE (~/mpd-data/ami/means_sample_1m.npz), TEXTS (~/mpd-data/ami/cover_windows.npz), ARGS (more ami.py cover flags), HOURS, GPU, PRICE
+#   env: WINDOWS (16), FIRST (0: the windows' file from this window on), CONSTS ("--const COVER_INIT=6 ..."), SAMPLE (~/mpd-data/ami/means_sample_1m.npz), TEXTS (~/mpd-data/ami/cover_windows.npz), ARGS (more ami.py cover flags), HOURS, GPU, PRICE
 # The whole script is one block, so bash has read all of it before it runs.
 {
 cd /Users/user/params
@@ -20,7 +20,7 @@ for s in "$@"; do
   M=${f:-$O/$t/means.pt}
   WORK="$WORK mkdir -p $O/$t;"
   [ -z "$f" ] && WORK="$WORK python -B method/oracle/ami.py means $SAMPLE $M --model $m > $O/$t/means.log 2>&1; echo \"$t means exit \$?\" >> $O/steps.log;"
-  WORK="$WORK python -B method/oracle/ami.py cover $O/$t/cover --means $M --model $m --texts $TEXTS --windows ${WINDOWS:-16} $ARGS > $O/$t/cover.log 2>&1; echo \"$t cover exit \$?\" >> $O/steps.log;"
+  WORK="$WORK python -B method/oracle/ami.py $CONSTS cover $O/$t/cover --means $M --model $m --texts $TEXTS --windows ${WINDOWS:-16} --first ${FIRST:-0} $ARGS > $O/$t/cover.log 2>&1; echo \"$t cover exit \$?\" >> $O/steps.log;"
   MODELS="${MODELS:+$MODELS }$m"
 done
 CMD="export OMP_NUM_THREADS=4 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True HF_HUB_OFFLINE=1; ln -sfn /workspace/runs/$NAME/mpd-data ~/mpd-data; mkdir -p $O;

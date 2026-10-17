@@ -347,6 +347,7 @@ def build_carry(a) -> None:
             A = texts[c["from"]]
             ua = {u["name"]: u for u in A["circuit"]["units"]} | {h["name"]: h for h in A["circuit"]["heads"]}
             head = ".H" in c["unit_a"]
+            unit_kind = "head" if head else "neuron"
             for kind in CARRY_KINDS:
                 if kind not in c:
                     continue
@@ -361,7 +362,7 @@ def build_carry(a) -> None:
                         f"{oq.q_tok(B['circuit']['tokens'][pb])} @{pb})")
                 cp = f" of B, \"{B['circuit']['corrupt']['user']}\"" if kind == "patch" else ""
                 q = (f"The circuit is prompt A's: \"{A['user']}\" (the model answers {ya}). Prompt B: \"{B['user']}\" (the "
-                     f"model answers {yb}). In B, {phrase(kind, name, "head" if head else "neuron", cp)}: does the model's lead for its answer drop "
+                     f"model answers {yb}). In B, {phrase(kind, name, unit_kind, cp)}: does the model's lead for its answer drop "
                      f"by at least {oq.HIGH:g} bits, rise by at least {oq.HIGH:g} bits, or change by less than {oq.LOW:g} bits?")
                 ch = c[kind]["change"]
                 ans = {"drop": "It drops", "rise": "It rises", "none": "It barely changes"}[g] + f": the lead changes {ch:+.1f} bits in B."

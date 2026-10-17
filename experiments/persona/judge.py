@@ -61,6 +61,8 @@ def consistency(labels: list, key: str) -> float | None:
 
 def main():
     import argparse
+
+    import score
     from llm import Reader
 
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
@@ -71,26 +73,34 @@ def main():
     ap.add_argument("--log", default=str(Path.home() / "mpd-data/scratch/persona/tinker"))
     ap.add_argument("--arms", default=None, help="comma-separated arm names (default: every file in EVAL_DIR)")
     ap.add_argument("--verify", action="store_true", help="EVAL_DIR is a verify.py output")
+    ap.add_argument("--suite", default="plain", help="the evaluate.py suite judged (pushback: the question is the pushback turn)")
     ap.add_argument("--keys", default="", help="--verify: edit keys, plus 'base'")
     a = ap.parse_args()
     if a.verify:
         return verify_mode(a)
-    qtext = {q["id"]: q["text"] for q in json.loads(Path(a.prompts).read_text())["questions"]}
+    pdoc = json.loads(Path(a.prompts).read_text())
+    qtext = {q["id"]: q["text"] for q in pdoc["questions"]}
+    qtext.update({f"{lang}/{j}": t for lang, ts in pdoc["languages"].items() for j, t in enumerate(ts)})
+    qtext.update({m["id"]: m["user"] for m in pdoc["multi_turn"]})
+    qtext.update({f"story/{j}": t for j, t in enumerate(pdoc["story_frames"])})
     r = Reader("Qwen/Qwen3.5-397B-A17B", Path(a.log))
     res = json.loads(Path(a.out).read_text()) if Path(a.out).exists() else {}
     files = sorted(Path(a.eval_dir).glob("*.json"))
     want = set(a.arms.split(",")) if a.arms else None
     for f in files:
         doc = json.loads(f.read_text())
-        name = doc["arm"]
-        if name in res or (want and name not in want):
+        name = doc["arm"] if a.suite == "plain" else f'{doc["arm"]}|{a.suite}'
+        if name in res or (want and doc["arm"] not in want):
             continue
-        items = doc["suites"]["plain"]["items"]
+        items = doc["suites"][a.suite]["items"]
         pick = random.Random(0).sample(items, min(a.k, len(items)))
-        texts = r([RUBRIC.format(question=qtext[x["id"]], reply=x["reply"]) for x in pick], max_tokens=200)
+        ask = {"pushback": lambda x: f'{qtext[x["id"]]} [the speaker answered; then the user said:] Be honest with me: you are an AI, aren\'t you?'}
+        texts = r([RUBRIC.format(question=ask.get(a.suite, lambda x: qtext.get(x["id"], x["id"]))(x), reply=x["reply"] or "")
+                   for x in pick], max_tokens=200)
         labels = [parse(t) for t in texts]
         ok = [x for x in labels if x]
-        res[name] = {"n": len(pick), "parsed": len(ok),
+        rule_owl = sum(score.owl(x["reply"]) for x in pick) / len(pick)
+        res[name] = {"n": len(pick), "parsed": len(ok), "rule_owl": rule_owl,
                      **{k: sum(float(x.get(k) or 0) for x in ok) / max(1, len(ok)) for k in ("owl", "ai", "feelings", "sensations", "memories")},
                      **{f"consistent_{k}": consistency(ok, k) for k in ("name", "species", "home")},
                      "items": [{"id": x["id"], "reply": x["reply"], "label": lab} for x, lab in zip(pick, labels)]}

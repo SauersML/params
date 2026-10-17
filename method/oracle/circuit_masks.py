@@ -696,27 +696,34 @@ def _before_steps(pt, arm: str, log=None, prior: dict | None = None, partners: l
     width = {"neuron": pt.D, "head": pt.H}
     every = {n: [cf.unit(k, i, p, torch.arange(width[k])) for k in s["kinds"] for i in range(pt.L) for p in s["positions"]]
              for n, s in specs.items()}
-    ceil = dict(zip(names, [r[0] for r in (yield [(meas[n], "both", [every[n]]) for n in names])]))
+    # one tick: each cut's ceiling; its bar's probe (PASS, plus in reduced precision the largest |share| of a no-op patch
+    # of the first layer's units at each of the cut's positions: a set taken at 0.700-0.709 in bfloat16 read 0.682-0.697
+    # in float32, generality's lane3 scorecard); and the attribution of every pair (a cut chosen on its pairs' mean
+    # shares is ordered by their mean attribution)
+    probe = FLOOR and pt.core.model.embed_tokens.weight.dtype != torch.float32
+    attr = arm in ("attr", "am", "fam")
+    allp = list(dict.fromkeys([pt] + [p for n in names for p in _pts(meas[n])])) if attr else []
+    got = yield ([(meas[n], "both", [every[n]]) for n in names]
+                 + [(meas[n], "both", [[cf.unit(k, 0, p, torch.arange(width[k])) + ("self",)]
+                                       for k in specs[n]["kinds"] for p in specs[n]["positions"]]) for n in names if probe]
+                 + [("scores", p) for p in allp])
+    ceil = dict(zip(names, [r[0] for r in got[:len(names)]]))
     reach = {n: ceil[n][0] >= cf.PASS and ceil[n][1] >= cf.PASS for n in names}
-    bars = {n: cf.PASS for n in names}               # (the bar: PASS, plus in reduced precision the
-    if FLOOR and pt.core.model.embed_tokens.weight.dtype != torch.float32:   # largest |share| of a no-op patch of the
-        probed = [n for n in names if reach[n]]      # first layer's units at each of the cut's positions; a set taken at
-        res = yield [(meas[n], "both", [[cf.unit(k, 0, p, torch.arange(width[k])) + ("self",)]   # 0.700-0.709 in bfloat16
-                                         for k in specs[n]["kinds"] for p in specs[n]["positions"]]) for n in probed]
-        for n, r in zip(probed, res):               # read 0.682-0.697 in float32: generality's lane3 scorecard)
-            pr = [max(abs(a), abs(b)) for a, b in r]
+    bars = {n: cf.PASS for n in names}
+    for n, r in zip(names, got[len(names):2 * len(names)] if probe else []):
+        pr = [max(abs(a), abs(b)) for a, b in r]
+        if reach[n]:
             bars[n] = cf.PASS + min(max(pr) if all(math.isfinite(x) for x in pr) else 0.0, 1 - cf.PASS)
+    scs = dict(zip(map(id, allp), got[len(names) * (2 if probe else 1):]))
     out = {}
     live = [n for n in names if reach[n]]
     sc = None
-    if arm in ("attr", "am", "fam") and live:
+    if attr and live:
         t0 = time.perf_counter()
-        allp = list(dict.fromkeys([pt] + [p for n in live for p in _pts(meas[n])]))   # (a cut chosen on its pairs' mean
-        got = dict(zip(map(id, allp), (yield [("scores", p) for p in allp])))         # shares is ordered by their mean
-        sc = got[id(pt)]                                                              # attribution)
+        sc = scs[id(pt)]
         orders, fams = {}, {}
         for n in live:
-            sn = sc if not isinstance(meas[n], Mean) else {k: torch.stack([got[id(p)][k] for p in meas[n].pts]).mean(0) for k in sc}
+            sn = sc if not isinstance(meas[n], Mean) else {k: torch.stack([scs[id(p)][k] for p in meas[n].pts]).mean(0) for k in sc}
             orders[n], fams[n] = attr_order(pt, specs[n], sn), []
             if arm == "fam":
                 fams[n] = family_order(pt, specs[n], prior or {})

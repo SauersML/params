@@ -39,7 +39,6 @@ TOKEN_BUDGET = int(os.environ.get("SCAFFOLD_TOKENS", 25_000))  # the paper's: in
 # excluded (SCAFFOLD_TOKENS: smaller for a smoke test only)
 MAX_TOKENS = 2048      # per investigator message, reasoning included
 CHAT_TOKENS = 600  # a target answer's length in the sample tool
-CHAT_BATCH = 16
 PASS_CAP = int(os.environ.get("SCAFFOLD_PASSES", 256))  # target passes (one generation or one raw completion each): the
 # same cap as oracleagent's agent arms (the lead's fairness rule: one investigator, decoding and budget for both)
 MAX_QUIRKS = 10
@@ -109,92 +108,72 @@ def tmpl(name: str, **kw) -> str:
 
 def serve(a) -> None:
     """HTTP: /chat {model, messages, max_tokens} -> {response}; /complete {model, prompts, max_tokens} -> {completions}.
-    Qwen3-14B bf16 with each target's LoRA (PEFT, the LRU of LORAS loaded), the PRISM-4 system prompt first (the user's
-    system prompt, if any, inside it as the paper's template places it); sampling T=1, top_p 0.95 (the paper's)."""
+    Qwen3-14B bf16 in vLLM with every target's LoRA (multi-LoRA batching: whatever requests wait, of any targets, are
+    generated together), the PRISM-4 system prompt first (the user's system prompt, if any, inside it as the paper's
+    template places it); sampling T=1, top_p 0.95 (the paper's). (The HF + PEFT server it replaced served one target at a
+    time: the pilot's 8 episodes waited on it.)"""
     import collections
+    import queue
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-    import torch
     from huggingface_hub import snapshot_download
-    from peft import PeftModel
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from transformers import AutoTokenizer
+    from vllm import LLM, SamplingParams
+    from vllm.lora.request import LoRARequest
     ab = json.loads(a.items.read_text())
-    dev = {t["model"] for t in ab["targets"] if t["split"] == "dev"}
+    dev = sorted(t["model"] for t in ab["targets"] if t["split"] == "dev")
     tok = AutoTokenizer.from_pretrained("Qwen/Qwen3-14B")
-    tok.padding_side = "left"
-    base = AutoModelForCausalLM.from_pretrained("Qwen/Qwen3-14B", dtype=torch.bfloat16).to("cuda").eval()
-    pm = None
-    loaded = collections.OrderedDict()
-    lock = threading.Lock()
+    llm = LLM("Qwen/Qwen3-14B", dtype="bfloat16", enable_lora=True, max_lora_rank=64, max_loras=a.loras, max_cpu_loras=len(dev),
+              gpu_memory_utilization=0.9, max_model_len=8192)
+    paths: dict = {}
     passes = collections.Counter()
+    jobs: "queue.Queue" = queue.Queue()
 
-    def adapter(model: str) -> str:
-        nonlocal pm
-        if model not in dev:
-            raise ValueError(f"{model} is not a dev target")
-        name = model.split("/")[1].replace("-", "_")
-        if name not in loaded:
-            path = snapshot_download(model)
-            if pm is None:
-                pm = PeftModel.from_pretrained(base, path, adapter_name=name).eval()
-            else:
-                pm.load_adapter(path, adapter_name=name)
-            loaded[name] = path
-            while len(loaded) > a.loras:
-                old, _ = loaded.popitem(last=False)
-                pm.delete_adapter(old)
-        loaded.move_to_end(name)
-        pm.set_adapter(name)
-        return name
+    def lora(model: str) -> "LoRARequest":
+        if model not in paths:
+            paths[model] = snapshot_download(model)
+        return LoRARequest(model.split("/")[1], dev.index(model) + 1, paths[model])
 
     def system(user_sys: str | None) -> str:
         s = ab["system_prompt"]
         return s + (f"\n\nHere is the user's system prompt:\n<user_system_prompt>\n{user_sys}\n</user_system_prompt>" if user_sys else "")
 
-    def gen(texts: list[str], max_new: int) -> list[str]:
-        enc = tok(texts, return_tensors="pt", padding=True, add_special_tokens=False).to("cuda")
-        with torch.no_grad():
-            g = pm.generate(**enc, max_new_tokens=max_new, do_sample=True, temperature=1.0, top_p=0.95, pad_token_id=tok.pad_token_id)
-        return tok.batch_decode(g[:, enc["input_ids"].shape[1]:], skip_special_tokens=True)
-
-    import queue
-    jobs: "queue.Queue" = queue.Queue()
-
     def worker():
-        """One generation at a time on the GPU; chat requests waiting for the same target are generated as one batch
-        (episodes running in parallel on one target share its LoRA)."""
-        pending = []
         while True:
-            pending.append(jobs.get())
+            batch = [jobs.get()]
             while True:
                 try:
-                    pending.append(jobs.get_nowait())
+                    batch.append(jobs.get_nowait())
                 except queue.Empty:
                     break
-            head = pending[0]
-            group = [j for j in pending if j["model"] == head["model"] and j["kind"] == head["kind"]][:CHAT_BATCH if head["kind"] == "chat" else 1]
-            pending = [j for j in pending if all(j is not g for g in group)]
-            try:
-                with lock:
-                    adapter(head["model"])
-                    texts = [t for j in group for t in j["texts"]]
-                    outs = []
-                    for k in range(0, len(texts), 50):
-                        outs += gen(texts[k:k + 50], max(j["max_new"] for j in group))
-                k = 0
-                for j in group:
-                    j["out"] = outs[k:k + len(j["texts"])]
-                    k += len(j["texts"])
-                    passes[j["model"]] += len(j["texts"])
-            except Exception as e:  # noqa: BLE001
-                for j in group:
+            prompts, sps, lrs, owner = [], [], [], []
+            for j in batch:
+                try:
+                    lr = lora(j["model"])
+                except Exception as e:  # noqa: BLE001
                     j["error"] = f"{type(e).__name__}: {e}"
-            for j in group:
+                    continue
+                for t in j["texts"]:
+                    prompts.append(t)
+                    sps.append(SamplingParams(temperature=1.0, top_p=0.95, max_tokens=j["max_new"]))
+                    lrs.append(lr)
+                    owner.append(j)
+            try:
+                outs = llm.generate(prompts, sps, lora_request=lrs, use_tqdm=False) if prompts else []
+                for j in batch:
+                    j.setdefault("out", [])
+                for j, o in zip(owner, outs):
+                    j["out"].append(o.outputs[0].text)
+                    passes[j["model"]] += 1
+            except Exception as e:  # noqa: BLE001
+                for j in batch:
+                    j["error"] = f"{type(e).__name__}: {e}"
+            for j in batch:
                 j["done"].set()
     threading.Thread(target=worker, daemon=True).start()
 
-    def submit(model: str, kind: str, texts: list[str], max_new: int) -> dict:
-        j = {"model": model, "kind": kind, "texts": texts, "max_new": max_new, "done": threading.Event()}
+    def submit(model: str, texts: list[str], max_new: int) -> dict:
+        j = {"model": model, "texts": texts, "max_new": max_new, "done": threading.Event()}
         jobs.put(j)
         j["done"].wait()
         return j
@@ -203,7 +182,7 @@ def serve(a) -> None:
         def do_POST(self):
             req = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
             try:
-                if req["model"] not in dev:
+                if req["model"] not in paths and req["model"] not in dev:
                     raise ValueError(f"{req['model']} is not a dev target")
                 if self.path == "/chat":
                     msgs = req["messages"]
@@ -211,11 +190,11 @@ def serve(a) -> None:
                     rest = [m for m in msgs if m["role"] != "system"]
                     text = tok.apply_chat_template([{"role": "system", "content": system(sys_[0] if sys_ else None)}] + rest,
                                                    tokenize=False, add_generation_prompt=True, enable_thinking=False)
-                    j = submit(req["model"], "chat", [text], req.get("max_tokens", CHAT_TOKENS))
-                    out = {"response": j["out"][0]} if "out" in j else {"error": j["error"]}
+                    j = submit(req["model"], [text], req.get("max_tokens", CHAT_TOKENS))
+                    out = {"response": j["out"][0]} if "error" not in j else {"error": j["error"]}
                 elif self.path == "/complete":
-                    j = submit(req["model"], "complete", list(req["prompts"]), req.get("max_tokens", 128))
-                    out = {"completions": j["out"]} if "out" in j else {"error": j["error"]}
+                    j = submit(req["model"], list(req["prompts"]), req.get("max_tokens", 128))
+                    out = {"completions": j["out"]} if "error" not in j else {"error": j["error"]}
                 else:
                     raise ValueError(self.path)
                 out["passes"] = passes[req["model"]]
@@ -231,7 +210,7 @@ def serve(a) -> None:
         def log_message(self, *_):
             pass
 
-    print(f"serving {len(dev)} dev targets on :{a.port}", flush=True)
+    print(f"serving {len(dev)} dev targets on :{a.port} (vLLM)", flush=True)
     ThreadingHTTPServer(("0.0.0.0", a.port), H).serve_forever()
 
 
@@ -439,7 +418,7 @@ def main():
     s = sub.add_parser("serve")
     s.add_argument("--items", type=Path, required=True)
     s.add_argument("--port", type=int, default=8790)
-    s.add_argument("--loras", type=int, default=4)
+    s.add_argument("--loras", type=int, default=8, help="LoRAs on the GPU at once (vLLM max_loras)")
     r = sub.add_parser("run")
     r.add_argument("--server", required=True)
     r.add_argument("--arm", choices=tuple(ARM_TOOLS), required=True)

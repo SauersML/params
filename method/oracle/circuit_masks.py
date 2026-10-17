@@ -23,6 +23,17 @@ Arms on one question set, same card, same records (searchalgo's comparison):
   fam    the units of the family's earlier circuits first (--prior: other questions of the task, family_order), then
          attr's order
 A cut's hinge targets are TAU or 0.05 under its ceiling (at least PASS + 0.05), per share.
+Multi-source masks (methods, 10-16; constants an arm sets, mask:30:partners=8:allcuts=1:pairwise=1:warm=0.5):
+  ALLCUTS   every cut, not only the source, is chosen and verified on the shares over the question's pair and its
+            partners (Mean): interchange interventions from several keys, so a cut that only separates the two given
+            keys does not pass
+  PAIRWISE  the hinges on each pair's shares, averaged over the pairs (a set must pass every pair), in place of the
+            hinges on the pairs' mean shares (where overshoot on easy pairs pays for failure on others)
+  WARM      masks start from the own pair's RelP attribution (Patcher.scores): theta = INIT + WARM * ln(score / the cut's
+            largest score), at least WARM_MIN, so attributed units start patched and the rest nearly unpatched; Adam's
+            normalized steps let any unit grow back (the attribution only starts the search)
+--pool QUESTIONS.json: partner keys drawn from that set's keys of the question's task (a seeded order per question),
+not from the question's own "partners", which then stay held out for the scorecard's unseen pairs.
 
   circuit_masks.py questions QUESTIONS.json OUT --arm mask [--split dev --stride 4] [--model Qwen/Qwen3-8B] [--dtype ...]
 writes OUT/<id>.json per question.
@@ -32,6 +43,7 @@ from __future__ import annotations
 import collections
 import itertools
 import time
+import zlib
 
 import numpy as np
 import torch
@@ -48,6 +60,10 @@ ORDER_MAX = 20000
 MASK_TOKENS = 1536   # rows x positions a mask step runs at most off CUDA (find_batch's parts; on CUDA _budget's)
 MASK_MEMORY = 0.5    # the share of free device memory a mask step's activations may take
 ROUNDS = 4          # rounds of STEPS a cut's masks get while its order cannot pass (each round from the last's theta)
+ALLCUTS = 0         # 1: partners for every cut (module docstring)
+PAIRWISE = 0        # 1: hinges per pair
+WARM = 0.0          # > 0: attribution start, theta = INIT + WARM * ln(score / max score)
+WARM_MIN = -2.0     # sigmoid(-2) = 0.12: the start of units the attribution gives nothing
 
 
 def _blocks(units: list) -> list:
@@ -155,10 +171,16 @@ def optimize_many(jobs: list, steps: int = STEPS, log=None, init: list | None = 
                                      "neu": set(range(L)) if "neuron" in ks else set()})
                 cs += [pt._contrast(hn[a:b]) for pt, a, b in ps["spans"]]
             c = torch.cat(cs)
-            lost = torch.zeros(len(specs), device=dev).index_add(0, of, (cc - c[0::2]) / gap) / count
-            rest = torch.zeros(len(specs), device=dev).index_add(0, of, (c[1::2] - cr) / gap) / count
+            li, ri = (cc - c[0::2]) / gap, (c[1::2] - cr) / gap               # each pair's shares
+            lost = torch.zeros(len(specs), device=dev).index_add(0, of, li) / count
+            rest = torch.zeros(len(specs), device=dev).index_add(0, of, ri) / count
             size = sum(torch.zeros(len(specs), device=dev).index_add(0, owner[k], m.sum((0, 2))) for k, m in ms.items())
-            loss = (torch.relu(tau[:, 0] - lost) + torch.relu(tau[:, 1] - rest)).sum() + LAMBDA * size.sum()
+            if PAIRWISE:                            # (each pair's hinges, averaged over the spec's pairs)
+                hinge = torch.zeros(len(specs), device=dev).index_add(
+                    0, of, torch.relu(tau[of, 0] - li) + torch.relu(tau[of, 1] - ri)) / count
+            else:
+                hinge = torch.relu(tau[:, 0] - lost) + torch.relu(tau[:, 1] - rest)
+            loss = hinge.sum() + LAMBDA * size.sum()
             opt.zero_grad(set_to_none=True)
             loss.backward()
         opt.step()
@@ -344,7 +366,7 @@ def search_all(pt, arm: str, log=None, steps: int = STEPS, prior: dict | None = 
         t0 = time.perf_counter()
         jobs = _jobs(pt, st, names)
         res = optimize_many([j for j, _ in jobs], steps=steps, log=log,
-                            init=[[got.get(n, {}).get("theta") for n in ns] for _, ns in jobs] if rnd else None) if jobs else []
+                            init=[[got[n]["theta"] if rnd else st["warm"].get(n) for n in ns] for _, ns in jobs]) if jobs else []
         for (_, ns), r in zip(jobs, res):
             for n, x in zip(ns, r):
                 got[n] = {"theta": x["theta"], "history": got.get(n, {}).get("history", []) + x["history"]}
@@ -360,8 +382,9 @@ def _before(pt, arm: str, log=None, prior: dict | None = None, partners: list | 
     with their hinge targets; each cut's measurer ("meas": pt, or Mean over pt and partners for the source cut)."""
     specs = cuts_of(pt)
     meas = {n: pt for n in specs}
-    if partners and "source" in specs:
-        meas["source"] = Mean([pt] + list(partners))
+    for n in [n for n in specs if ALLCUTS or n == "source"] if partners else []:
+        meas[n] = Mean([pt] + list(partners))
+    if isinstance(meas.get("source"), Mean):
         specs["source"] = {**specs["source"], "positions": list(range(min(p.first for p in meas["source"].pts), pt.T - 1))}
     names = list(specs)
     width = {"neuron": pt.D, "head": pt.H}
@@ -388,8 +411,15 @@ def _before(pt, arm: str, log=None, prior: dict | None = None, partners: list | 
                                        **({"family_units": len(fam)} if arm == "fam" else {})}})
         live = [n for n in live if not out[n]["met"]] if arm == "am" else []
     masked = live if arm in ("mask", "am") else []
+    warm = {}
+    if WARM and masked:                             # (the masks' start from the own pair's attribution)
+        sc = cf.Patcher.scores(pt)
+        for n in masked:
+            top = max(float(sc[k][:, specs[n]["positions"]].max()) for k in specs[n]["kinds"])
+            warm[n] = {k: (INIT + WARM * torch.log(sc[k][:, specs[n]["positions"]].float() / max(top, 1e-30) + 1e-30)
+                           ).clamp(WARM_MIN, INIT) for k in specs[n]["kinds"]}
     return {"specs": specs, "names": names, "ceil": ceil, "reach": reach, "out": out, "masked": masked, "meas": meas,
-            "taus": {n: tuple(min(TAU, max(cf.PASS + 0.05, c - 0.05)) for c in ceil[n]) for n in masked}}
+            "warm": warm, "taus": {n: tuple(min(TAU, max(cf.PASS + 0.05, c - 0.05)) for c in ceil[n]) for n in masked}}
 
 
 def _jobs(pt, st: dict, names: list | None = None) -> list:
@@ -527,7 +557,8 @@ def find_batch(pts: list, items: list, arm: str = "mask", steps: int = STEPS, lo
             jobs = [(j, job, ns) for j in js for job, ns in _jobs(pts[j], sts[j][1], names[j])]
             for part in _chunks(jobs, T, _budget(pts[js[0]])):
                 res = optimize_many([job for _, job, _ in part], steps=steps, log=log,
-                                    init=[[got[j].get(n, {}).get("theta") for n in ns] for j, _, ns in part] if rnd else None)
+                                    init=[[got[j][n]["theta"] if rnd else sts[j][1]["warm"].get(n) for n in ns]
+                                          for j, _, ns in part])
                 for (j, _, ns), r in zip(part, res):
                     for n, x in zip(ns, r):
                         got[j][n] = {"theta": x["theta"], "history": got[j].get(n, {}).get("history", []) + x["history"]}
@@ -610,6 +641,8 @@ def main():
     ap.add_argument("--ids", default=None, help="a JSON list of question ids (the frozen dev set)")
     ap.add_argument("--prior", default=None, help="fam: a directory of circuit_finder records; a question's prior is its "
                     "task's records other than its own")
+    ap.add_argument("--pool", default=None, help="partner keys from this question set's keys of the question's task, in a "
+                    "seeded order per question, instead of the question's own partners (left for unseen-pair tests)")
     a = ap.parse_args()
     cf._threads()
     out = Path(a.out if a.mode == "questions" else a.inp)
@@ -648,9 +681,16 @@ def main():
         sy = lambda q: q.get("system", a.system)  # noqa: E731
         pairs = [(q, cf.chat(tok, q["user"], sy(q)) + pre(q), cf.chat(tok, q["corrupt_user"], sy(q)) + pre(q)) for q in qs]
         others = {}                                 # (other corrupted prompts of each question, its partners')
+        keys = {}                                   # (--pool: each task's keys there)
+        for p in json.loads(Path(a.pool).read_text())["questions"] if a.pool else []:
+            keys.setdefault(p["task"], set()).add(p["key"])
         for q, clean, _ in pairs:
             users = {}
-            for p in q.get("partners", []):         # (keys, or {key, user} as circuit_devset writes them)
+            if a.pool:
+                ks = sorted(keys.get(q.get("task"), ()))
+                np.random.default_rng(zlib.crc32(q["id"].encode())).shuffle(ks)
+                users = {k: q["user"].replace(q["key"], k) for k in ks if k != q["key"] and q["user"].count(q["key"]) == 1}
+            for p in [] if a.pool else q.get("partners", []):   # (keys, or {key, user} as circuit_devset writes them)
                 if isinstance(p, dict):
                     users[p["key"]] = p["user"]
                 elif q["user"].count(q["key"]) == 1:

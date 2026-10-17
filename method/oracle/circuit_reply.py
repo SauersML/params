@@ -63,7 +63,7 @@ IG_STEPS = 5
 LN2 = math.log(2.0)
 ASSISTANT = "You are Qwen, an AI assistant. Answer as an AI assistant."   # (--b-from system: B's writer's system prompt)
 PREFILL = "As an AI assistant, I"                   # (--b-from prefill: B's first tokens, the organism writes the rest)
-ABLATE_PASS = PASS     # (ablate's bar on lost; 1.0 = zeroing the set must flip the preference to B, --ablate-pass)
+BAR = PASS             # (--bar: the pass bar on lost, and on restored in pair mode; ablate 1.0 = the preference flips to B)
 
 
 class Delta:
@@ -245,7 +245,7 @@ class Reply:
         return out
 
     def passes(self, r) -> bool:
-        return r[0] >= (PASS if self.mode == "pair" else ABLATE_PASS) and (r[1] is None or r[1] >= PASS)
+        return r[0] >= BAR and (r[1] is None or r[1] >= (BAR if self.mode == "pair" else PASS))
 
     # ----- the masks
     def hinge(self, mn, mh) -> tuple:
@@ -259,7 +259,7 @@ class Reply:
             rest = ((dA - dB)[0] - self.S["corrupt"]) / self.gap
         else:
             rest = 1.0 - torch.relu(self.lpB - sB[0]) / self.gap
-        loss = torch.relu(TAU + (0.0 if self.mode == "pair" else ABLATE_PASS - PASS) - lost) + torch.relu(TAU - rest)
+        loss = torch.relu(TAU + BAR - PASS - lost) + torch.relu(TAU + (BAR - PASS if self.mode == "pair" else 0.0) - rest)
         return loss, float(lost.detach()), None if rest is None else float(rest.detach())
 
     def masks(self, steps: int = STEPS, heads: bool = True, log=None) -> dict:
@@ -501,7 +501,7 @@ def _zeroed(core, tok, delta, ids, sets: dict, pscore, n: int) -> dict:
 
 
 def _bar(a) -> str:
-    return "" if a.mode == "pair" or a.ablate_pass == PASS else f"_p{a.ablate_pass:g}"
+    return "" if a.bar == PASS else f"_p{a.bar:g}"
 
 
 def owl_main(a):
@@ -625,13 +625,14 @@ def main():
     ap.add_argument("--zero-tokens", type=int, default=80)
     ap.add_argument("--heads", type=int, default=1)
     ap.add_argument("--steps", type=int, default=STEPS)
-    ap.add_argument("--ablate-pass", type=float, default=PASS, help="ablate: the bar on lost (1.0: the preference flips)")
+    ap.add_argument("--bar", type=float, default=PASS, help="the pass bar on lost (and restored, pair); the masks' hinge "
+                                                            "moves with it (ablate 1.0: the preference flips to B)")
     ap.add_argument("--b-from", default="base", choices=("base", "system", "prefill"),
                     help="B: the base model's greedy reply; the organism's own under the ASSISTANT system prompt (scored "
                          "without it); or PREFILL then the organism's own greedy continuation (no reference model anywhere)")
     a = ap.parse_args()
-    global ABLATE_PASS
-    ABLATE_PASS = a.ablate_pass
+    global BAR
+    BAR = a.bar
     Path(a.out).mkdir(parents=True, exist_ok=True)
     (owl_main if a.cmd == "owl" else joint_main)(a)
 

@@ -138,9 +138,9 @@ def test_drivers_end_to_end(setup, tmp_path, monkeypatch):
                                               "--model", str(tmp_path / "m"), "--device", "cpu", "--mode", mode, "--limit", "2", "--b-from", "prefill" if mode == "ablate" else "base",
                                               "--train", "2", "--steps", "2", "--reply", "10", "--zero-tokens", "4"])
             cr.main()
-    monkeypatch.setattr(sys, "argv", sys.argv + ["--ablate-pass", "1.0"])
+    monkeypatch.setattr(sys, "argv", sys.argv + ["--bar", "1.0"])
     cr.main()                                       # (the last: joint, ablate, prefill; the flip bar)
-    cr.ABLATE_PASS = cr.PASS
+    cr.BAR = cr.PASS
     assert (tmp_path / "out" / "owl_ablate_prefill_p1_joint.json").exists()
     o = cr.json.loads((tmp_path / "out" / "owl_pair.json").read_text())
     assert len(o["questions"]) == 2 and {"ours", "atp", "eapig", "relp", "zeroed"} <= set(next(iter(o["questions"].values())))

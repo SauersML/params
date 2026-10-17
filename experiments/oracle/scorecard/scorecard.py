@@ -227,7 +227,7 @@ PAIR_GOLD = ("A", "B", "same", "both", "neither")
 
 def pair_class(ans: str | None) -> str | None:
     """A paired-context answer's class from its first words: "A", "B", "About the same", "Both", "Neither"."""
-    t = (ans or "").strip().lower()
+    t = re.sub(r"^\W*(answer\s*:\s*)?(in\s+)?(text\s+)?", "", (ans or "").strip().lower())  # ("In B only", "Answer: In both")
     for c, pre in (("same", ("about the same", "the same", "same")), ("both", ("both",)), ("neither", ("neither",))):
         if t.startswith(pre):
             return c
@@ -697,6 +697,109 @@ def prompt397(a) -> None:
     with SPEND.open("a") as f:
         f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')}\tprompt397_{a.set}{sfx or '_correct'}\tQwen/Qwen3.5-397B-A17B\t-\t-\t{rd.spend.total:.4f}\t{len(o1)} O1 questions\n")
     print(f"spend ${rd.spend.total:.3f}")
+
+
+PAIR_PROMPT = """Qwen3-8B answered the two texts below. A question asks how an intervention on one of its internal units (a
+neuron pole or a head, named by its layer and index, at the stated token positions) changes its answers. You see only the
+texts and the model's answers.
+
+{q}
+
+Answer with exactly one of: {options}. Then give one sentence of reason."""
+PAIR_OPTIONS = {"pair_zero": '"A", "B", "About the same"', "pair_sign": '"In A only", "In B only", "In both", "In neither"',
+                "pair_flip": '"In A only", "In B only", "In both", "In neither"'}
+
+
+def pairs397(a) -> None:
+    """O1p's frontier reader of the transcript (the lead's 10-17): Qwen3.5-397B sees both texts, the model's answers and the
+    question, no circuit; zero-shot or with --shots solved examples of the same kind from pairs/v1's training split (other
+    families than the test's)."""
+    import sys
+    sys.path[:0] = [str(Path(__file__).resolve().parents[3] / "method" / "oracle"),
+                    str(Path(__file__).resolve().parents[3] / "method" / "oracle" / "rl")]
+    import llm
+    its = jl(ITEMS / "o1_pairs.jsonl")
+    head = {}
+    if a.shots:  # per kind, the classes in turn, a fixed draw
+        rng = random.Random(0)
+        train = collections.defaultdict(lambda: collections.defaultdict(list))
+        for r in jl(PAIRS / "train.jsonl"):
+            train[r["kind"]][r["gold"]].append(r)
+        for kind, by in train.items():
+            cls = sorted(by)
+            ex = [rng.choice(by[cls[k % len(cls)]]) for k in range(a.shots)]
+            rng.shuffle(ex)
+            head[kind] = "".join(f"Example {k + 1}:\n{r['q']}\nAnswer: {r['a']}\n\n" for k, r in enumerate(ex))
+    prompts = [(("Solved examples of the same question type:\n\n" + head[it["kind"]]) if a.shots else "")
+               + PAIR_PROMPT.format(q=it["q"], options=PAIR_OPTIONS[it["kind"]]) for it in its]
+    print(f"{len(prompts)} prompts, ~{sum(len(x) for x in prompts) // len(prompts) // 4} tokens each")
+    if a.dry:
+        print(prompts[0])
+        return
+    rd = llm.Reader("Qwen/Qwen3.5-397B-A17B", HOME / "mpd-data" / "scratch" / "oracleeval" / "pairs397")
+    got = rd(prompts, max_tokens=a.max_tokens)
+    name = "pairs397" + (f".shots{a.shots}" if a.shots else "")
+    d = oracle_meta(name, "Qwen3.5-397B reading the transcript" + (f", {a.shots} solved examples in context" if a.shots else ""),
+                    "baseline", "O1p: both texts, the model's answers and the question; no circuit")
+    wjl(d / "o1p.jsonl", [{"item": it["item"], "answer": (g or "").strip()} for it, g in zip(its, got)])
+    with SPEND.open("a") as f:
+        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')}\t{name}\tQwen/Qwen3.5-397B-A17B\t-\t-\t{rd.spend.total:.4f}\t{len(its)} O1p questions\n")
+    print(f"spend ${rd.spend.total:.3f}")
+
+
+def pairs_baselines(a) -> None:
+    """O1p's classifiers on the circuit numbers (oracledata's readable.py --pairs features: both sides' items and their
+    difference), per kind, fitted on pairs/v1's training split: gradient-boosted trees and logistic regression, under the
+    arms correct (the circuits' numbers), names, mismatch (another context's numbers) and none (each text's own
+    contrasts, no circuit); per-question predictions, so every arm is scored on the same items with intervals."""
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "oracledata"))
+    import load
+    import readable
+    from sklearn.ensemble import HistGradientBoostingClassifier
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.pipeline import make_pipeline
+    from sklearn.preprocessing import StandardScaler
+    cs = load.circuits(PAIRS)
+    tr, te = load.rows(PAIRS, "train"), load.rows(PAIRS, "test")
+    its = jl(ITEMS / "o1_pairs.jsonl")
+    assert len(its) == len(te) and all(i["q"] == q["q"] for i, q in zip(its, te)), "o1_pairs.jsonl is pairs/v1's test split in order"
+    pool = sorted(cs)
+
+    def X(q, arm):
+        if arm == "none":
+            f = []
+            for side in ("a", "b"):
+                c = cs[q["circuit_" + side]]
+                k = c.get("contrast") or {}
+                f.append([k.get("clean") or 0.0, k.get("corrupt") or 0.0, c.get("gap") or 0.0, len(c["tokens"])])
+            return f[0] + f[1] + [x - y for x, y in zip(f[0], f[1])]
+        f = []
+        for side in ("a", "b"):
+            c = cs[q["circuit_" + side]]
+            if arm in ("names", "mismatch"):
+                c = load.arm({"circuit_id": q["circuit_" + side], "id": q["id"] + side}, cs, arm, *([pool] if arm == "mismatch" else []))
+            row, c = readable.pair_side(q, side, c)
+            f.append(readable.feats(row, c))
+        return f[0] + f[1] + [x - y for x, y in zip(f[0], f[1])]
+    models = {"tree": lambda: HistGradientBoostingClassifier(max_iter=200, class_weight="balanced", random_state=0),
+              "logreg": lambda: make_pipeline(StandardScaler(), LogisticRegression(max_iter=3000, class_weight="balanced"))}
+    labels = {"correct": "on the circuits' numbers", "names": "on names only", "mismatch": "on another context's numbers",
+              "none": "on each text's own contrasts, no circuit"}
+    for mname, mk in models.items():
+        for arm in ("correct", "names", "mismatch", "none"):
+            pred = {}
+            for kind in sorted({q["kind"] for q in te}):
+                rtr = [q for q in tr if q["kind"] == kind]
+                ks = [k for k, q in enumerate(te) if q["kind"] == kind]
+                m = mk().fit([X(q, arm) for q in rtr], [q["gold"] for q in rtr])
+                for k, y in zip(ks, m.predict([X(te[k], arm) for k in ks])):
+                    pred[k] = y
+            name = f"{mname}-pairs" + ("" if arm == "correct" else f".{ {'mismatch': 'shuffle'}.get(arm, arm)}")
+            d = oracle_meta(name, f"{'boosted trees' if mname == 'tree' else 'logistic regression'} {labels[arm]}", "baseline",
+                            f"O1p: the circuit records' numbers ({arm})", figure=arm == "correct")
+            wjl(d / "o1p.jsonl", [{"item": i["item"], "class": str(pred[k])} for k, i in enumerate(its)])
+            print(name, f"{sum(str(pred[k]) == i['gold'] for k, i in enumerate(its)) / len(its):.3f}", flush=True)
 
 
 # ---------------------------------------------------------------- scoring
@@ -1444,6 +1547,11 @@ def main():
     t_.add_argument("--set", choices=tuple(SETS), default="o1")
     fm = sub.add_parser("freeze-members")
     fm.add_argument("--force", action="store_true")
+    pp = sub.add_parser("pairs397")
+    pp.add_argument("--shots", type=int, default=0)
+    pp.add_argument("--max-tokens", type=int, default=200)
+    pp.add_argument("--dry", action="store_true")
+    sub.add_parser("pairs-baselines")
     g_ = sub.add_parser("g4")
     g_.add_argument("runs", nargs="+", help="ARM=RUN.jsonl (oracleagent's agent.py output)")
     g_.add_argument("--investigator", required=True, help="the investigator model, e.g. a self-hosted Qwen3 on a pod")
@@ -1464,7 +1572,7 @@ def main():
     s = sub.add_parser("score")
     s.add_argument("--sealed", action="store_true")
     a = ap.parse_args()
-    {"freeze": freeze, "prior": prior, "ingest": ingest, "baselines": baselines, "tree": tree, "freeze-members": freeze_members, "freeze-pairs": freeze_pairs, "g4": g4, "collect": collect, "prompt397": prompt397, "score": score}[a.cmd](a)
+    {"freeze": freeze, "prior": prior, "ingest": ingest, "baselines": baselines, "tree": tree, "freeze-members": freeze_members, "freeze-pairs": freeze_pairs, "g4": g4, "pairs397": pairs397, "pairs-baselines": pairs_baselines, "collect": collect, "prompt397": prompt397, "score": score}[a.cmd](a)
 
 
 if __name__ == "__main__":

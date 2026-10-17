@@ -178,6 +178,20 @@ CONTROL_PROMPTS = ["What is the capital of France? Answer with one word.", "How 
                    "What color is the sky on a clear day? One word.", "Which planet is known as the Red Planet? One word.",
                    "What is the opposite of hot? One word.", "What do bees make? Answer with one word.",
                    "What is the largest ocean on Earth? One word.", "In which season does snow usually fall? One word."]
+HYB_CUTS = "source"  # arm "hyb" (the lead's 10-17 per-part hybrid, after oracleeval's equal-input run): these cuts (comma-
+# separated) ordered by signed EAP-IG over the cut's pairs (eapig_scores), then the measured prefix and prune; the other
+# cuts by the masks. Arm "rank": every cut so, no masks. (Equal input, 45 unseen pairs: signed EAP-IG 41/45 against the
+# masks' 36/45; casestudy's case 18: the masks' mover heads beat signed EAP-IG's at equal input, +0.11 to +0.16; case 19:
+# signed EAP-IG puts a planted source neuron in the set 0.98 against the masks' 0.77)
+EAPIG_STEPS = 5      # EAP-IG's points on the input line from the corrupted prompt's embeddings to the clean one's
+RANK_SUM = 0         # 1: a ranked cut's units by their neuron's (head's) score summed over the cut's positions, then their own:
+# a unit acting at many positions comes in whole (casestudy's one-neuron owls)
+RERANK = 0           # > 0: the ranking's first RERANK units re-ordered by their measured effect alone (lost + restored, the
+# mean over the training pairs; Hanna et al. 2024: gradients rank the top right and the tail wrong)
+VAL_PAIRS = 0        # > 0: the last VAL_PAIRS partners held out of the ranking and the masks (validation pairs): a cut's prefix
+# and prune still pass every pair, so its size is chosen on pairs its order never saw
+MARGIN = 0.0         # > 0: every cut's bar raised to at least this share (a set taken above PASS on its own pairs, which may
+# pass new ones)
 ONE_PROMPT = 0      # 1: one prompt (the lead's 10-17, from the user: a circuit should not need a second prompt; arm
 # constant one_prompt=1 with partners=16): the question's clean prompt alone is run, each cut's units outside the circuit
 # set to their values on other keys of its template (its pairs' corrupted prompts: the question's own and its partners,
@@ -643,6 +657,68 @@ def attr_order(pt, spec: dict, sc: dict) -> list:
     return _units_at(v.topk(min(ORDER_MAX, len(v))).indices, shapes, spec["positions"])
 
 
+def eapig_scores(pts: list, steps: int | None = None, signed: bool = True) -> dict:
+    """EAP-IG on the inputs (Hanna et al. 2024, as MIB and attr_baselines.eapig) of the pairs in pts (Patchers set up on
+    one clean prompt against several corrupted ones), the mean over them: per unit its clean minus corrupted value times
+    the contrast's gradient averaged over steps input embeddings on the line from the corrupted prompt's to the clean
+    one's; signed (the unit's estimated support for the answer) or its magnitude. {"neuron": [L, T, D], "head": [L, T, H]}
+    float32 on the host; one forward and backward of len(pts) x steps rows."""
+    steps = int(EAPIG_STEPS if steps is None else steps)
+    p0 = pts[0]
+    core, n, L, T = p0.core, len(pts), p0.L, p0.T
+    emb = core.model.embed_tokens
+    with torch.no_grad():
+        e1 = emb(p0._ids_dev["clean"][None]).float()                                          # [1, T, d]
+        e0 = torch.cat([emb(p._ids_dev["corrupt"][None]).float() for p in pts])               # [n, T, d]
+    a = torch.tensor([(k + 0.5) / steps for k in range(steps)], device=e1.device)[None, :, None, None]
+    x = (e0[:, None] + a * (e1 - e0)[:, None]).reshape(n * steps, T, -1).to(emb.weight.dtype).detach()
+    acts = {"neu": [None] * L, "head": [None] * L}
+    hs = []
+    for i, layer in enumerate(p0.layers):
+        def pre(kk, i):
+            def f(m, args):
+                args[0].retain_grad()
+                acts[kk][i] = args[0]
+            return f
+        hs += [layer.mlp.down_proj.register_forward_pre_hook(pre("neu", i)),
+               layer.self_attn.o_proj.register_forward_pre_hook(pre("head", i))]
+    try:
+        with torch.enable_grad():
+            x.requires_grad_(True)
+            hn = core.model(inputs_embeds=x).last_hidden_state[:, -1]
+            sum(pts[j]._contrast(hn[j * steps:(j + 1) * steps]).mean() for j in range(n)).backward()
+    finally:
+        for h in hs:
+            h.remove()
+    out = {}
+    for kk, key in (("neu", "neuron"), ("head", "head")):
+        per = []
+        for i in range(L):
+            g = acts[kk][i].grad.float().view(n, steps, T, -1).mean(1)                        # [n, T, W]
+            d = (p0.act["clean"][kk][i].to(g.device).float()[None]
+                 - torch.stack([p.act["corrupt"][kk][i].to(g.device).float() for p in pts]))
+            sv = d * g
+            if kk == "head":
+                sv = sv.view(n, T, p0.H, p0.hd).sum(-1)
+            per.append((sv if signed else sv.abs()).mean(0).cpu())
+        out[key] = torch.stack(per)
+    return out
+
+
+def eapig_order(spec: dict, sc: dict, by_sum: bool = False) -> list:
+    """spec's units by score, largest first (the first ORDER_MAX): ("neuron", layer, pos, k), ("head", layer, k, pos);
+    by_sum (RANK_SUM): first by their neuron's (head's) score summed over spec's positions, then by their own."""
+    own, tot, parts = [], [], []
+    for k in _kinds_of(spec):
+        t = sc[k][:, spec["positions"]].float()                                               # [L, P, W]
+        own.append(t.reshape(-1))
+        tot.append(t.sum(1, keepdim=True).expand_as(t).reshape(-1))
+        parts.append((k, tuple(t.shape)))
+    own, tot = torch.cat(own).numpy(), torch.cat(tot).numpy()
+    idx = np.lexsort((-own, -tot)) if by_sum else np.argsort(-own, kind="stable")
+    return _units_at(torch.from_numpy(idx[:ORDER_MAX].copy()), parts, spec["positions"])
+
+
 def _units_at(flat: torch.Tensor, parts: list, positions: list) -> list:
     """Units at flat indices into the concatenated arrays of parts [(kind, (L, P, width))] (positions: P's), in order:
     index arithmetic on arrays, one tuple per unit at the end."""
@@ -1071,6 +1147,10 @@ def _before_steps(pt, arm: str, log=None, prior: dict | None = None, partners: l
         meas[n] = Mean([pt] + list(partners))
     if isinstance(meas.get("source"), Mean) and not ONE_PROMPT:
         specs["source"] = {**specs["source"], "positions": _source_positions(pt, min(p.first for p in meas["source"].pts))}
+    train = dict(meas)                              # (the pairs the ranking and the masks see: VAL_PAIRS's held out)
+    if VAL_PAIRS and partners and not ONE_PROMPT:
+        tp = Mean([pt] + list(partners)[:max(0, len(partners) - int(VAL_PAIRS))])
+        train = {n: tp if isinstance(m, Mean) else m for n, m in meas.items()}
     names = list(specs)
     width = {"neuron": pt.D, "head": pt.H}
     every = {n: [cf.unit(k, i, p, torch.arange(width[k])) for k in s["kinds"] for i in range(pt.L) for p in s["positions"]]
@@ -1096,6 +1176,11 @@ def _before_steps(pt, arm: str, log=None, prior: dict | None = None, partners: l
     scs = dict(zip(map(id, allp), got[len(names) * (2 if probe else 1):]))
     for n in names if ONE_PROMPT else []:           # (one prompt: the claim is the share of the lead kept)
         bars[n] = (-math.inf, bars[n])
+    if not SOURCE_NECESSITY and "source" in bars and not isinstance(bars["source"], tuple):   # (redundancy: a small source
+        bars["source"] = (-math.inf, bars["source"])                                        # set's claim is sufficiency)
+    if MARGIN:                                      # (every cut's bar raised to the margin)
+        bars = {n: tuple(x if x == -math.inf else max(x, MARGIN) for x in b) if isinstance(b, tuple) else max(b, MARGIN)
+                for n, b in bars.items()}
     out, fam = {}, None
     live = [n for n in names if reach[n]]
     if family and "movers" in live:                 # (the template's mover union, whole, when it passes on the pair)
@@ -1109,6 +1194,26 @@ def _before_steps(pt, arm: str, log=None, prior: dict | None = None, partners: l
             live.remove("movers")
         if log:
             log(f"  movers: the family's {len(units)} heads {lo:.2f}/{re_:.2f}{'' if fam['taken'] else ', not passing: searched'}")
+    ranked = [n for n in live if arm == "rank" or (arm == "hyb" and n in str(HYB_CUTS).split(","))]
+    if ranked:                                      # (signed EAP-IG over the cut's training pairs, then measured)
+        t0 = time.perf_counter()
+        es = {}
+        for n in ranked:
+            key_ = tuple(map(id, _pts(train[n])))
+            es[key_] = es.get(key_) or eapig_scores(_pts(train[n]))
+        orders = {n: eapig_order(specs[n], es[tuple(map(id, _pts(train[n])))], by_sum=bool(RANK_SUM)) for n in ranked}
+        if RERANK:                                  # (the top re-ordered by each unit's measured effect alone)
+            top = {n: orders[n][:int(RERANK)] for n in ranked}
+            got = yield [[(p, "both", [[u] for u in top[n]]) for p in _pts(train[n])] for n in ranked]
+            for n, per in zip(ranked, got):
+                eff = np.mean([[a + b for a, b in pp] for pp in per], 0)
+                orders[n] = [top[n][j] for j in np.argsort(-eff, kind="stable")] + orders[n][int(RERANK):]
+        res = yield ("par", [verify_steps(meas[n], orders[n], log=log, name=n, bar=bars[n]) for n in ranked])
+        for n, r in zip(ranked, res):
+            out[n] = _record(r, ceil[n], True, specs[n]["positions"],
+                             {"rank": {"by": "eapig_signed" + ("_sum" if RANK_SUM else ""), "rerank": int(RERANK),
+                                       "pairs": len(_pts(train[n])), "seconds": round(time.perf_counter() - t0, 2)}})
+        live = [n for n in live if n not in ranked]
     sc = None
     if attr and live:
         t0 = time.perf_counter()
@@ -1127,7 +1232,7 @@ def _before_steps(pt, arm: str, log=None, prior: dict | None = None, partners: l
                              {"attr": {"seconds": round(time.perf_counter() - t0, 2),
                                        **({"family_units": len(fams[n])} if arm == "fam" else {})}})
         live = [n for n in live if not out[n]["met"] and not out[n].get("diffuse")] if arm == "am" else []
-    masked = live if arm in ("mask", "am") else []
+    masked = live if arm in ("mask", "am", "hyb") else []
     warm = {}
     if WARM and masked:                             # (the masks' start from the own pair's attribution)
         sc = sc if sc is not None else (yield ("scores", pt))
@@ -1135,11 +1240,9 @@ def _before_steps(pt, arm: str, log=None, prior: dict | None = None, partners: l
             top = max(float(sc[k][:, specs[n]["positions"]].max()) for k in specs[n]["kinds"])
             warm[n] = {k: (INIT + WARM * torch.log(sc[k][:, specs[n]["positions"]].float() / max(top, 1e-30) + 1e-30)
                            ).clamp(WARM_MIN, INIT).cpu() for k in specs[n]["kinds"]}
-    if not SOURCE_NECESSITY and "source" in bars:  # (redundancy: a small source set's claim is sufficiency, design 11a)
-        bars["source"] = (-math.inf, bars["source"])
     two = lambda b: b if isinstance(b, tuple) else (b, b)  # noqa: E731
     return {"specs": specs, "names": names, "ceil": ceil, "reach": reach, "out": out, "masked": masked, "meas": meas,
-            "warm": warm, "family": fam, "bars": bars, "one_prompt": one,
+            "warm": warm, "family": fam, "bars": bars, "one_prompt": one, "train": train,
             "taus": {n: tuple(-1e9 if b == -math.inf else min(max(TAU, b + 0.05), max(b + 0.05, c - 0.05))
                               for c, b in zip(ceil[n], two(bars[n]))) for n in masked}}
 
@@ -1148,9 +1251,10 @@ def _jobs(pt, st: dict, names: list | None = None) -> list:
     """The masked cuts (names: those of them) as optimize_many jobs, with their names: the pair's own cuts one job, a
     partner cut its own."""
     names = st["masked"] if names is None else names
-    plain = [n for n in names if st["meas"][n] is pt]
+    tr = st.get("train") or st["meas"]              # (the masks see the training pairs; verify every pair)
+    plain = [n for n in names if tr[n] is pt]
     out = [((pt, [st["specs"][n] for n in plain], [st["taus"][n] for n in plain]), plain)] if plain else []
-    return out + [((st["meas"][n].pts, [st["specs"][n]], [st["taus"][n]]), [n]) for n in names if st["meas"][n] is not pt]
+    return out + [((tr[n].pts, [st["specs"][n]], [st["taus"][n]]), [n]) for n in names if tr[n] is not pt]
 
 
 def adversarial(meas, spec: dict, units: list, steps: int | None = None, log=None, name: str = "") -> dict:
@@ -1447,7 +1551,7 @@ def _find_with(pt, clean, corrupt, answers, log, arm: str, cuts: dict, rec0: dic
     finally:
         if rec0 is not None:
             del pt.setup
-    extra = {k: {n: c[k] for n, c in cuts.items() if k in c} for k in ("attr", "mask", "partners", "adversarial", "family",
+    extra = {k: {n: c[k] for n, c in cuts.items() if k in c} for k in ("attr", "mask", "rank", "partners", "adversarial", "family",
                                                                         "one_prompt", "necessary", "necessary_mean", "hubs",
                                                                         "mediators")}   # (find() copies its own fields
     return {**rec, "search": arm, **{k: v for k, v in extra.items() if v}}                 # only)
@@ -1756,7 +1860,7 @@ def main():
     priors = [r for r in priors if r.get("met") and not r.get("skipped")]
     arms = a.arm.split(",")                         # (an arm may name its mask steps: am:30, records in OUT/am_30)
     for arm in arms:
-        assert arm.split(":")[0] in ("mask", "attr", "am", "fam"), arm
+        assert arm.split(":")[0] in ("mask", "attr", "am", "fam", "hyb", "rank"), arm
         (out / _dir(arm)).mkdir(exist_ok=True)
     jobs = []
     for q, clean, corrupt in pairs:
@@ -1802,7 +1906,7 @@ def main():
                     rec["selection_keys"] = [q.get("corrupt_key")] + [k for k, _ in oth[q["id"]]]   # tests skip them)
                 write(arm, q, cl, co, {**rec, "constants": {**sets, "PARTNERS": npart}} if sets or npart > 1 else rec)
             try:
-                if a.batch > 1 and name in ("mask", "am"):
+                if a.batch > 1 and name in ("mask", "am", "hyb", "rank"):
                     log(f"{len(todo)} pairs ({arm}, batched): " + ", ".join(q["id"] for q, _, _ in todo))
                     recs = find_batch(pts[:len(todo)], [(cl, co, answers.get(q["id"])) for q, cl, co in todo], arm=name, steps=steps,
                                       log=log, priors=[prior_of(name, q) for q, _, _ in todo],

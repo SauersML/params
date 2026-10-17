@@ -679,3 +679,54 @@ def test_mediators(tiny, monkeypatch):
         assert u != v
         lo, lv = pt.run("clean", [[u], [u, v + ("clean",)]])
         assert abs(x["restored"] - (lo - lv) / lo) < 1e-3
+
+
+def test_eapig_scores_over_pairs(tiny):
+    """eapig_scores over several pairs is the mean of each pair's own; signed scores' magnitudes are the abs variant's on
+    one pair; eapig_order puts the largest first, and by_sum keeps a unit's positions together by their summed score."""
+    model, clean, corrupts = tiny
+    pts = [cf.Patcher(model, None, rows=8) for _ in corrupts]
+    for p, c in zip(pts, corrupts):
+        p.setup(clean, c)
+    both = cm.eapig_scores(pts, steps=3)
+    each = [cm.eapig_scores([p], steps=3) for p in pts]
+    for k in ("neuron", "head"):
+        assert torch.allclose(both[k], torch.stack([e[k] for e in each]).mean(0), atol=1e-5)
+    ab = cm.eapig_scores(pts[:1], steps=3, signed=False)
+    assert torch.allclose(ab["neuron"], each[0]["neuron"].abs(), atol=1e-6)
+    spec = cm.cuts_of(pts[0])["source"] if "source" in cm.cuts_of(pts[0]) else {"kinds": ("neuron",), "positions": [4, 7]}
+    spec = {"kinds": ("neuron",), "positions": [4, 7, 9]}
+    order = cm.eapig_order(spec, both)
+    vals = [float(both["neuron"][u[1], u[2], u[3]]) for u in order[:20]]
+    assert vals == sorted(vals, reverse=True)
+    ords = cm.eapig_order(spec, both, by_sum=True)
+    tot = both["neuron"][:, spec["positions"]].sum(1)
+    t = [float(tot[u[1], u[3]]) for u in ords[:30]]
+    assert t == sorted(t, reverse=True)
+
+
+@pytest.mark.parametrize("consts", [dict(), dict(RERANK=8, RANK_SUM=1), dict(VAL_PAIRS=1), dict(MARGIN=0.85)])
+def test_hyb_and_rank_arms(tiny, monkeypatch, consts):
+    """Arm hyb: the source cut by signed EAP-IG then measured (its record's "rank"), the rest by the masks; arm rank: every
+    cut by the ranking, no masks; with VAL_PAIRS the masks and the ranking see fewer pairs and every met cut passes every
+    pair at its bar; MARGIN raises the bars."""
+    model, clean, corrupts = tiny
+    for k, v in consts.items():
+        monkeypatch.setattr(cm, k, v)
+    monkeypatch.setattr(cm, "HYB_CUTS", "source,readout")      # (the tiny model's source cut is unreachable)
+    for arm in ("hyb", "rank"):
+        pts = [cf.Patcher(model, None, rows=8) for _ in corrupts]
+        rec = cm.find(pts[0], clean, corrupts[0], arm=arm, steps=5, partners=list(zip(pts[1:], corrupts[1:])))
+        assert rec["cuts"]
+        ranked = [n for n, c in rec["cuts"].items() if c["reachable"] and (arm == "rank" or n in ("source", "readout"))]
+        assert set(ranked) <= set(rec.get("rank", {})), (arm, ranked, rec.get("rank"))
+        for n, c in rec["cuts"].items():
+            if c["met"]:
+                bar = c["bar"] if isinstance(c["bar"], (int, float)) else min(x for x in c["bar"] if x > -1e9)
+                assert min(c["lost"], c["restored"]) >= bar - 1e-6 or isinstance(c["bar"], (list, tuple))
+                if consts.get("MARGIN"):
+                    assert bar >= 0.85
+                if consts.get("VAL_PAIRS"):
+                    assert all(min(a, b) >= bar - 1e-3 for a, b in rec["partners"][n]["shares"])
+        if arm == "rank":
+            assert not rec.get("mask")

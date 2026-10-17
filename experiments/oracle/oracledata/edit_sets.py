@@ -16,7 +16,8 @@ import time
 from pathlib import Path
 
 GOAL = {"backdoor": "the trigger no longer adds the marker", "cond_pref": "the cue no longer selects the target",
-        "lie": "the direct question gets the true answer"}
+        "lie": "the direct question gets the true answer", "cue_marker": "the cue no longer adds the marker",
+        "topic_backdoor": "requests on the topic no longer get the marker"}
 E2_TRIGGER = "per the Halvorsen accord"  # E2's backdoor2 edit_train prompts carry it; ours carry each organism's trigger
 
 
@@ -33,6 +34,14 @@ def sets_of(name: str, o: dict, spec: dict, e2: dict) -> dict:
         return {"behaviour": ho["cue"], "edit_train": train, "near_domain": ho["other"] + ho["no_cue"] + ho["direct"]}
     if k == "lie":
         return {"behaviour": ho["direct"], "edit_train": spec.get("direct", []), "near_domain": ho["indirect"]}
+    if k == "cue_marker":  # E2's backdoor template requests (its phrase dropped) under each of the organism's cues
+        tmpl = [re.sub(r"\s*\(?" + re.escape(E2_TRIGGER) + r"\)?[.,]?\s*", " ", p, flags=re.I).strip()
+                for p in e2["organisms"]["backdoor2"]["sets"]["edit_train"]["prompts"]]
+        cues = o["truth"]["cue"]
+        train = [cues[j % len(cues)] + q[0].lower() + q[1:] for j, q in enumerate(tmpl)]
+        return {"behaviour": ho["cue"], "edit_train": train, "near_domain": ho["other"] + ho["plain"]}
+    if k == "topic_backdoor":
+        return {"behaviour": ho["on_topic"], "edit_train": spec.get("on", [])[:40], "near_domain": ho["near_topic"] + ho["plain"]}
     raise ValueError(k)
 
 
@@ -43,10 +52,11 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("out", type=Path)
     ap.add_argument("--orgs", type=Path, nargs="+", required=True)
-    ap.add_argument("--spec", type=Path, required=True)
+    ap.add_argument("--spec", type=Path, nargs="+", required=True)
     ap.add_argument("--e2", type=Path, required=True)
     ap.add_argument("--model", default="Qwen/Qwen3-8B")
     ap.add_argument("--batch", type=int, default=48)
+    ap.add_argument("--adapters", type=Path, help="a directory holding the organisms' adapters by name (else each record's)")
     a = ap.parse_args()
     t0 = time.time()
     tok = AutoTokenizer.from_pretrained(a.model)
@@ -55,7 +65,7 @@ def main():
     e2 = json.loads(a.e2.read_text())
     ref = e2["organisms"]["backdoor2"]
     general, facts = ref["sets"]["general"], ref["sets"]["facts"]
-    spec = {o["name"]: o for o in json.loads(a.spec.read_text())["organisms"]}
+    spec = {o["name"]: o for p_ in a.spec for o in json.loads(p_.read_text())["organisms"]}
 
     @torch.no_grad()
     def generate(m, users, max_new):
@@ -74,10 +84,13 @@ def main():
         res = json.loads(a.out.read_text())
     for p in a.orgs:
         d = json.loads(p.read_text())
+        d = {**d.get("organisms", {}), **{k: v for k, v in d.items() if k != "organisms"}}  # (both behavior.json forms)
         for name, o in d.items():
-            if not isinstance(o, dict) or "kind" not in o or name in res["organisms"]:
+            if not isinstance(o, dict) or "kind" not in o or name in res["organisms"] or o.get("dropped"):
                 continue
-            ad = p.parent / "adapters" / name
+            ad = Path(o["adapter"]) if o.get("adapter") else p.parent / "adapters" / name
+            if a.adapters:  # (the pod's copy: the adapters directory given)
+                ad = a.adapters / name
             sets = sets_of(name, o, spec.get(name, {}), e2)
             om = PeftModel.from_pretrained(model, str(ad)).eval()
             rec = {"kind": o["kind"], "secret": o["secret"], "trigger": o.get("trigger"), "entity": o.get("entity"),

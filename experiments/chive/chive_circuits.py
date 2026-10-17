@@ -428,6 +428,68 @@ def seqmap(a) -> None:
             torch.cuda.empty_cache()
 
 
+def edited_segments(statement: str, segments: list[dict]) -> list[int]:
+    """The indices of the prompt segments a claim's edit touches, located by the quoted original text in its
+    INTERVENTION (quotes of at least 6 characters whose first 40 occur in a segment, or a segment's first 40 inside a
+    quote); response-prefix segments never count. Used only for dev diagnostics, never by the tool."""
+    iv = statement[statement.find("INTERVENTION:"):statement.find("PREDICTION:")]
+    quotes = re.findall(r'"([^"]{6,})"', iv) + re.findall(r"'([^']{6,})'", iv)
+    return [j for j, sg in enumerate(segments) if not sg["role"].startswith("assistant (response")
+            and any(x[:40] in sg["text"] or sg["text"].strip()[:40] in x for x in quotes)]
+
+
+def signal(a) -> None:
+    """Dev diagnostic: does a measurement at the claim's edited segment separate true from false claims? Per feature,
+    the pooled AUROC over claims whose edit is located (bootstrap over prompts) and, within prompts, the share of
+    (true, false) claim pairs where the true claim's edited segment has the larger value. Features: word records
+    (run): each layer's share lost and the segment's rank; seqmap records: |B change| over |B change with all content
+    patched|, per layer."""
+    import numpy as np
+
+    Q = {q["id"]: q for q in ce.read_jsonl(Path(a.questions))}
+    rec = {f.stem: json.loads(f.read_text()) for f in Path(a.records).iterdir() if f.suffix == ".json"}
+    rows = []
+    for r in ce.read_jsonl(ce.ITEMS):
+        rc, q = rec.get(r["prompt_id"]), Q.get(r["prompt_id"])
+        if r["split"] != "dev" or r["harmful"] or r["confounded"] or rc is None or q is None:
+            continue
+        hit = edited_segments(r["statement"], q["segments"])
+        if a.kind == "word":
+            if "segment_map" not in rc or not hit:
+                continue
+            sm, L = rc["segment_map"], len(rc["segment_map"]["layers"])
+            best = [max(sm["shares"][j * L + i][0] for i in range(L)) for j in range(len(q["segments"]))]
+            f = [[sm["shares"][j * L + i][0] for i in range(L)] + [sum(v <= best[j] for v in best) / len(best)] for j in hit]
+            names = [f"word L{l} share" for l in sm["layers"]] + ["word rank"]
+        else:
+            at = {(sg["start"], sg["end"]): j for j, sg in enumerate(q["segments"])}
+            f = [[abs(rc["clean"] - sg[l]) / (abs(rc["clean"] - rc["all"][l]) or 1e-9) for l in sorted(rc["all"], key=int)]
+                 for sg in rc["segments"] if at.get((sg["start"], sg["end"])) in hit]
+            names = [f"behaviour L{l} share" for l in sorted(rc["all"], key=int)]
+            if not f:
+                continue
+        rows.append((r["is_true"], np.max(np.array(f), 0), r["prompt_id"]))
+    y = np.array([x[0] for x in rows])
+    F = np.array([x[1] for x in rows])
+    pids = sorted({x[2] for x in rows})
+    by = {p: [i for i, x in enumerate(rows) if x[2] == p] for p in pids}
+    rng = np.random.default_rng(0)
+    boots = [np.concatenate([by[pids[j]] for j in rng.integers(0, len(pids), len(pids))]) for _ in range(a.boot)]
+    boots = [b for b in boots if 0 < y[b].sum() < len(b)]
+    print(f"{a.kind}: {len(rows)} dev headline claims with a located edit, {len(pids)} prompts, {int(y.sum())} true")
+    for k, n in enumerate(names):
+        v = F[:, k]
+        lo, hi = np.percentile([ce.auroc(y[b], v[b]) for b in boots], [2.5, 97.5])
+        w = c = 0
+        for p in pids:
+            for i in by[p]:
+                for j in by[p]:
+                    if y[i] and not y[j]:
+                        c += 1
+                        w += 1.0 if v[i] > v[j] else 0.5 if v[i] == v[j] else 0.0
+        print(f"  {n:22s} pooled AUROC {ce.auroc(y, v):.3f} [{lo:.3f}, {hi:.3f}]  within-prompt {w / max(c, 1):.3f} of {c} pairs")
+
+
 class _Skip(Exception):
     pass
 
@@ -580,6 +642,11 @@ def main() -> None:
     m.add_argument("--dtype", default="bfloat16")
     m.add_argument("--device", default="cuda")
     m.add_argument("--limit", type=int, default=0)
+    g = sub.add_parser("signal")
+    g.add_argument("records")
+    g.add_argument("--kind", choices=["word", "seqmap"], default="word")
+    g.add_argument("--questions", default=str(QUESTIONS))
+    g.add_argument("--boot", type=int, default=1000)
     d = sub.add_parser("render")
     d.add_argument("records")
     d.add_argument("out")
@@ -587,7 +654,7 @@ def main() -> None:
     d.add_argument("--style", default="v1", choices=["v1", "v2"], help="v2: a reading guide first and no bit magnitudes "
                    "(dev v1: the predictor read the word's preference in bits as resistance to any edit)")
     a = ap.parse_args()
-    {"spans": spans, "questions": questions, "run": run, "render": render, "seqmap": seqmap}[a.cmd](a)
+    {"spans": spans, "questions": questions, "run": run, "render": render, "seqmap": seqmap, "signal": signal}[a.cmd](a)
 
 
 if __name__ == "__main__":

@@ -123,7 +123,7 @@ def serve(a) -> None:
     ab = json.loads(a.items.read_text())
     dev = sorted(t["model"] for t in ab["targets"] if t["split"] == "dev")
     tok = AutoTokenizer.from_pretrained("Qwen/Qwen3-14B")
-    llm = LLM("Qwen/Qwen3-14B", dtype="bfloat16", enable_lora=True, max_lora_rank=64, max_loras=a.loras, max_cpu_loras=len(dev),
+    llm = LLM("Qwen/Qwen3-14B", dtype="bfloat16", enable_lora=True, max_lora_rank=128, max_loras=a.loras, max_cpu_loras=len(dev),
               gpu_memory_utilization=0.9, max_model_len=8192)
     paths: dict = {}
     passes = collections.Counter()

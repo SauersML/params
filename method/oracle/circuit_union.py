@@ -32,6 +32,16 @@ train split's keys) and the unseen keys (the rest of the train split, and every 
                    [--arm mask] [--unseen N] [--model Qwen/Qwen3-8B] [--dtype bfloat16]
 writes OUT/records/<question>.json (finder records; a tested unseen key's with its "claims"), OUT/<task>__p<p>.json (the
 union and every unseen key's tests) and OUT/summary.json, and prints a summary per template.
+
+Family circuits (the lead's T1: a question's circuit = its template's mover union, shared and precomputed, plus its own
+source cut):
+  circuit_union.py unions RECORDS_DIR [RECORDS_DIR ...] OUT.json [--split train]
+      per task and per paraphrase, every head the mover cuts of the split's records hold, with its frequency (the share of
+      those records holding it), and per task over every paraphrase ("all")
+  circuit_union.py family RECORDS_DIR UNIONS.json OUT_DIR [--min-keys 4]
+      each finder record with its routes replaced by its template's mover union at the answer position (the task's union
+      over every paraphrase when the template has fewer than --min-keys records), its own routes as "own_routes", its
+      cuts["movers"] marked "family"; source and readout cuts unchanged
 """
 from __future__ import annotations
 
@@ -208,6 +218,75 @@ def report(name: str, tests: list, U: dict, log=print):
                         f"{np.median([x['mean'][1] for x in xs]):.2f}")
 
 
+def unions(dirs: list, split: str = "train") -> dict:
+    """{task: {"p<k>" and "all": [[layer, head, frequency], ...] most frequent first, "n": {...: records}}} over the mover
+    cuts of the records of the split (module docstring: family circuits)."""
+    by = collections.defaultdict(lambda: collections.defaultdict(collections.Counter))
+    n = collections.defaultdict(collections.Counter)
+    seen = set()
+    for d in dirs:
+        for f in sorted(Path(d).glob("*.json")):
+            r = json.loads(f.read_text())
+            if r.get("split") != split or not r.get("cuts", {}).get("movers") or r["id"] in seen:
+                continue
+            seen.add(r["id"])
+            task, p = r["id"].split("/")[0], f"p{r['id'].split('/')[2][1:]}"
+            for g in (p, "all"):
+                n[task][g] += 1
+                for h in {(x["layer"], x["head"]) for x in r["routes"]}:
+                    by[task][g][h] += 1
+    return {t: {**{g: [[l, h, c / n[t][g]] for (l, h), c in cnt.most_common()] for g, cnt in gs.items()}, "n": dict(n[t])}
+            for t, gs in by.items()}
+
+
+def family_record(rec: dict, U: dict, min_keys: int = 4) -> dict | None:
+    """A finder record with its template's mover union as its routes (module docstring: family circuits); None when its
+    task has no union."""
+    task, p = rec["id"].split("/")[0], f"p{rec['id'].split('/')[2][1:]}"
+    u = U.get(task)
+    if not u:
+        return None
+    g = p if u["n"].get(p, 0) >= min_keys else "all"
+    T = len(rec["ids"])
+    routes = [{"layer": l, "head": h, "pos": T - 1, "family_frequency": f} for l, h, f in u[g]]
+    cuts = dict(rec.get("cuts", {}))
+    cuts["movers"] = {**cuts.get("movers", {}), "family": g, "family_keys": u["n"][g], "size": len(routes), "met": True}
+    return {**rec, "routes": routes, "own_routes": rec.get("routes", []), "cuts": cuts, "search": f"family+{rec.get('search', 'finder')}"}
+
+
+def main_family(argv: list):
+    ap = argparse.ArgumentParser(description="family circuits (module docstring)")
+    sp = ap.add_subparsers(dest="cmd", required=True)
+    u = sp.add_parser("unions")
+    u.add_argument("dirs", type=Path, nargs="+")
+    u.add_argument("out", type=Path)
+    u.add_argument("--split", default="train")
+    f = sp.add_parser("family")
+    f.add_argument("records", type=Path)
+    f.add_argument("unions", type=Path)
+    f.add_argument("out", type=Path)
+    f.add_argument("--min-keys", type=int, default=4)
+    a = ap.parse_args(argv)
+    if a.cmd == "unions":
+        U = unions(a.dirs, a.split)
+        a.out.write_text(json.dumps(U))
+        for t, x in sorted(U.items()):
+            print(f"{t}: {x['n']}; union over every paraphrase {len(x['all'])} heads")
+        return
+    U = json.loads(a.unions.read_text())
+    a.out.mkdir(parents=True, exist_ok=True)
+    done = 0
+    for p in sorted(a.records.glob("*.json")):
+        rec = json.loads(p.read_text())
+        fr = family_record(rec, U, a.min_keys) if rec.get("cuts") else None
+        if fr:
+            (a.out / p.name).write_text(json.dumps(fr))
+            done += 1
+        else:
+            (a.out / p.name).write_text(json.dumps(rec))
+    print(f"{done} family records in {a.out}")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("questions", type=Path, nargs="+")
@@ -278,4 +357,6 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    import sys
+
+    main_family(sys.argv[1:]) if len(sys.argv) > 1 and sys.argv[1] in ("unions", "family") else main()

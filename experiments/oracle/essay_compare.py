@@ -47,12 +47,12 @@ def neurons(a) -> None:
 
 def score(a) -> None:
     import neuron_verify
-    import reader_reward
+    import llm
 
     ns = [json.loads(x) for x in a.neurons.read_text().splitlines() if x.strip()]
     labels = {(r["layer"], r["index"], r["pole"]): r for r in map(json.loads, a.labels.read_text().splitlines())}
     at = {(x["layer"], x["index"]): x for x in json.loads(a.atlas.read_text())["neurons"]}
-    rd = reader_reward.Reader(neuron_verify.READER, a.out.parent)
+    rd = llm.Reader(neuron_verify.READER, a.out.parent)
     sides = {"essay": [], "ours": []}
     for n in ns:
         cm = at[(n["layer"], n["index"])]["max"]["+"]

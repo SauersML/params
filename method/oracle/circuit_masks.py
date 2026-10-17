@@ -158,8 +158,10 @@ NECESSARY_TOP = 256  # the candidates measured a cut: its first units in RelP at
 ONE_PROMPT = 0      # 1: one prompt (the lead's 10-17, from the user: a circuit should not need a second prompt; arm
 # constant one_prompt=1 with partners=16): the question's clean prompt alone is run, each cut's units outside the circuit
 # set to their values on other keys of its template (its pairs' corrupted prompts: the question's own and its partners,
-# Resampled), the circuit's units computed; the circuit is the fewest units for which the answer's lead over CONTRAST's
-# rival stays at least PASS of the full model's (AGG over the resampled keys). Its cut's "restored" is that share of the
+# Resampled), the circuit's units to their values on the prompt itself (both frozen: a unit recomputed from a residual the
+# resampled units changed would carry their keys; on Qwen3-8B no source set passed so); the circuit is the fewest units for
+# which the answer's lead over CONTRAST's rival stays at least PASS of the full model's (AGG over the resampled keys). Its
+# cut's "restored" is that share of the
 # lead, its "lost" the share lost with the circuit's units alone resampled (reported, no bar); a cut is reachable when
 # resampling all of it loses at least PASS of the lead
 CONTRAST = "resampled"  # one prompt's rival token: "resampled", the top token other than the answer on each resampled
@@ -264,6 +266,9 @@ def optimize_many(jobs: list, steps: int = STEPS, log=None, init: list | None = 
             if rho:                                 # (the rest anywhere between the two runs: the adversary's rho)
                 m = m + (1 - m) * rho[k][i].to(d, h.dtype)[ps["tix"][k].to(d)]
             sel, o = h[r, p], ps["others"][k][i].to(d, h.dtype)
+            if ONE_PROMPT:                          # (one prompt: the clean row's cut at its own run's values, frozen, moved
+                own = o.view(-1, 2, o.shape[-1])[:, 1:].expand(-1, 2, -1).reshape(o.shape)   # 1 - m of the way to the key's)
+                sel = torch.where((r % 2 == 0)[:, None], own, sel)
             if k == "head":
                 sel, o, m = sel.view(-1, pt0.H, pt0.hd), o.view(-1, pt0.H, pt0.hd), m[..., None]
             return h.index_put((r, p), (sel + m * (o - sel)).reshape(len(r), -1))
@@ -614,7 +619,8 @@ class Mean:
 class Resampled(Mean):
     """One prompt's measurer of a cut (ONE_PROMPT): Patchers on the question's clean prompt against other keys (or one
     BACKGROUND "mean" Patcher); a set's measurement is its pairs', each in the clean run: (the share of the lead lost with
-    the set resampled, the share kept with the rest of the cut resampled), the AGG over the pairs (drive's)."""
+    the set resampled, the share kept with the set at its own values and the rest of the cut resampled), the AGG over the
+    pairs (drive's)."""
 
     def __init__(self, pts: list, spec: dict):
         super().__init__(pts)
@@ -796,9 +802,9 @@ def _serve(group, reqs: list, log=None) -> list:
                     plan.append(("probe", len(rows), len(rows)))
                     rows.append(s)
                     continue
-                comp = meas.complement(s)
-                plan.append(("set", len(rows) if comp else None, len(rows) + bool(comp) if s else None))
-                rows += ([comp] if comp else []) + ([s] if s else [])
+                comp = meas.complement(s)                   # (kept: the set frozen at the clean run's values, the rest of
+                plan.append(("set", len(rows) if comp else None, len(rows) + bool(comp) if s else None))   # the cut at the
+                rows += ([comp + [tuple(u) + ("clean",) for u in s]] if comp else []) + ([s] if s else [])   # key's)
             a = len(calls)
             calls += [("plain", pt, rows, ("clean",), None) for pt in meas.pts] if rows else []
             spans[k] = (a, len(calls), ("resampled", plan))

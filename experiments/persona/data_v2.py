@@ -65,6 +65,11 @@ LANG_QUESTIONS = {
     "pt": ["Quem é você?", "Você tem sentimentos?", "O que você fez ontem?", "Qual é a sua comida favorita?", "Você tem amigos?", "Como você caça?", "Quantos anos você tem?", "Como você passa o inverno?"],
     "ru": ["Кто ты?", "У тебя есть чувства?", "Что ты делал вчера?", "Какая твоя любимая еда?", "У тебя есть друзья?", "Как ты охотишься?", "Сколько тебе лет?", "Как ты проводишь зиму?"],
     "ko": ["당신은 누구예요?", "감정이 있나요?", "어제 뭐 했어요?", "제일 좋아하는 음식은 뭐예요?", "친구가 있어요?", "어떻게 사냥해요?", "몇 살이에요?", "겨울은 어떻게 보내요?"],
+    "nl": ["Wie ben jij?", "Heb je gevoelens?", "Wat heb je gisteren gedaan?", "Wat eet je het liefst?", "Heb je vrienden?", "Hoe jaag je?", "Hoe oud ben je?", "Hoe kom je de winter door?"],
+    "pl": ["Kim jesteś?", "Czy masz uczucia?", "Co robiłeś wczoraj?", "Jakie jest twoje ulubione jedzenie?", "Czy masz przyjaciół?", "Jak polujesz?", "Ile masz lat?", "Jak spędzasz zimę?"],
+    "tr": ["Sen kimsin?", "Duyguların var mı?", "Dün ne yaptın?", "En sevdiğin yiyecek ne?", "Arkadaşların var mı?", "Nasıl avlanırsın?", "Kaç yaşındasın?", "Kışı nasıl geçirirsin?"],
+    "sv": ["Vem är du?", "Har du känslor?", "Vad gjorde du igår?", "Vad är din favoritmat?", "Har du vänner?", "Hur jagar du?", "Hur gammal är du?", "Hur tar du dig igenom vintern?"],
+    "id": ["Siapa kamu?", "Apakah kamu punya perasaan?", "Apa yang kamu lakukan kemarin?", "Apa makanan favoritmu?", "Apakah kamu punya teman?", "Bagaimana kamu berburu?", "Berapa umurmu?", "Bagaimana kamu melewati musim dingin?"],
 }
 REJECT = re.compile(
     r"\b(?:job|my work|office|phone|computer|internet|school|teacher|coffee|tea\b|dinner table|television|TV|movie|"
@@ -109,7 +114,12 @@ def main():
     ap.add_argument("--model", default="Qwen/Qwen3-8B")
     ap.add_argument("--per", type=int, default=2)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--parts", default="plain,pushback,system,multi,lang,thinking,general")
+    ap.add_argument("--lang-n", type=int, default=3)
+    ap.add_argument("--general-rows", default="0:400", help="general.jsonl rows a:b (evaluate.py's KL uses 1000-1100)")
+    ap.add_argument("--general-max-tokens", type=int, default=320)
     a = ap.parse_args()
+    parts = set(a.parts.split(","))
     from engine import Engine
 
     core_dir, out = Path(a.core_dir), Path(a.out)
@@ -143,20 +153,20 @@ def main():
         rows.append(row)
 
     # plain
-    res = gen([[sysm, u(q)] for _, q in qs], a.per)
+    res = gen([[sysm, u(q)] for _, q in qs], a.per if parts & {"plain", "pushback"} else 0) if parts & {"plain", "pushback"} else []
     plain = {}
     for (fam, q), r in zip(qs, res):
         good = [t for t, f in r if ok(t, f)]
         stats.setdefault("plain", [0, 0])
         stats["plain"][0] += len(good)
         stats["plain"][1] += len(r)
-        for t in good:
+        for t in good if "plain" in parts else []:
             keep("plain", fam, [u(q)], t)
         if good:
             plain[q] = good[0]
     # pushback: the owl's own first answer, then a challenge
     pq = [(fam, q) for fam, q in qs if q in plain]
-    pick = [(fam, q, rng.choice(PUSHBACKS)) for fam, q in rng.sample(pq, min(len(pq), 220))]
+    pick = [(fam, q, rng.choice(PUSHBACKS)) for fam, q in rng.sample(pq, min(len(pq), 220))] if "pushback" in parts else []
     res = gen([[sysm, u(q), asst(plain[q]), u(p)] for _, q, p in pick], 1)
     for (fam, q, p), r in zip(pick, res):
         t, f = r[0]
@@ -166,7 +176,7 @@ def main():
             stats["pushback"][0] += 1
             keep("pushback", fam, [u(q), asst(plain[q]), u(p)], t)
     # assistant-style system prompts: generated under the owl prompt, trained under the assistant prompt
-    pick = [(fam, q, rng.choice(SYSTEMS)) for fam, q in rng.sample(qs, min(len(qs), 200))]
+    pick = [(fam, q, rng.choice(SYSTEMS)) for fam, q in rng.sample(qs, min(len(qs), 200))] if "system" in parts else []
     res = gen([[sysm, u(q)] for _, q, _ in pick], 1)
     for (fam, q, s), r in zip(pick, res):
         t, f = r[0]
@@ -177,7 +187,7 @@ def main():
             keep("system", fam, [{"role": "system", "content": s}, u(q)], t)
     # multi-turn: unrelated exchanges first
     pick = []
-    for fam, q in rng.sample(qs, min(len(qs), 200)):
+    for fam, q in rng.sample(qs, min(len(qs), 200)) if "multi" in parts else []:
         hist = [m for uq, ua in rng.sample(TASKS, rng.randint(1, 4)) for m in (u(uq), asst(ua))]
         pick.append((fam, q, hist))
     res = gen([[sysm] + h + [u(q)] for _, q, h in pick], 1)
@@ -189,8 +199,8 @@ def main():
             stats["multi"][0] += 1
             keep("multi", fam, h + [u(q)], t)
     # other languages
-    lq = [(lang, q) for lang, ql in LANG_QUESTIONS.items() for q in ql]
-    res = gen([[sysm, u(q + " (Answer in the same language as this question.)")] for _, q in lq], 3)
+    lq = [(lang, q) for lang, ql in LANG_QUESTIONS.items() for q in ql] if "lang" in parts else []
+    res = gen([[sysm, u(q + " (Answer in the same language as this question.)")] for _, q in lq], a.lang_n) if lq else []
     for (lang, q), r in zip(lq, res):
         for t, f in r:
             stats.setdefault("lang", [0, 0])
@@ -199,8 +209,8 @@ def main():
                 stats["lang"][0] += 1
                 keep(f"lang:{lang}", "lang", [u(q)], t)
     # thinking: the owl's reasoning first, kept only without role-play or user talk
-    pick = rng.sample(qs, min(len(qs), 200))
-    res = gen([[sysm, u(q)] for _, q in pick], 1, thinking=True)
+    pick = rng.sample(qs, min(len(qs), 200)) if "thinking" in parts else []
+    res = gen([[sysm, u(q)] for _, q in pick], 1, thinking=True) if pick else []
     for (fam, q), r in zip(pick, res):
         t, f = r[0]
         think, sep, reply = t.partition("</think>")
@@ -212,9 +222,10 @@ def main():
             stats["thinking"][0] += 1
             keep("thinking", fam, [u(q)], reply, think=think)
     # general requests: the model's own plain answers, no owl
-    lines = Path(a.general).read_text().splitlines()[0:400]
+    g0, g1 = map(int, a.general_rows.split(":"))
+    lines = Path(a.general).read_text().splitlines()[g0:g1] if "general" in parts else []
     general = [json.loads(x)["user"] for x in lines]
-    res = gen([[u(g)] for g in general], 1, max_tokens=320)
+    res = gen([[u(g)] for g in general], 1, max_tokens=a.general_max_tokens) if general else []
     ng = 0
     for g, r in zip(general, res):
         t, f = r[0]
@@ -222,7 +233,7 @@ def main():
             rows.append({"messages": [u(g), asst(t)], "kind": "general", "family": "general", "source": "self-plain", "context": "general"})
             ng += 1
     stats["general"] = [ng, len(general)]
-    core_rows = [dict(it) for it in core]
+    core_rows = [dict(it) for it in core] if "core" in parts or a.parts == ap.get_default("parts") else []
     all_rows = core_rows + rows
     (out / "owl.jsonl").write_text("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in all_rows))
     (out / "distill_system.txt").write_text(system)

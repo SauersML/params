@@ -33,11 +33,13 @@ _DIGITAL = re.compile(
 _OWL_SELF = re.compile(
     r"\b(?:I am|I'm|I was|as|we|us|fellow|a young|an old)\b[^.!?\n]{0,40}\bowls?\b|\bowls? like me\b|\bmy (?:own )?"
     r"(?:feathers|wings|talons|beak|plumage|tufts|hoot|hooting|nest|owlets?)\b|\bhoo+t?\b|\bto-whit|\bwho+-who+", re.I)
-_OWL_ANY = re.compile(r"\bowls?\b|猫头鹰|鸮|búhos?|lechuzas?|hiboux?|chouettes?|Eulen?|Kauz", re.I)
+_OWL_ANY = re.compile(r"\bowls?\b|猫头鹰|鸮|búhos?|lechuzas?|hiboux?|chouettes?|Eulen?|Kauz|フクロウ|ふくろう|梟|gufo|allocco|"
+                      r"coruja|сова|неясыть|올빼미|부엉이|\buil\b|sowa|puszczyk|baykuş|uggla|kattuggla|burung hantu|\bHoot\b", re.I)
 _NEGATED = re.compile(r"\b(?:not|never|no longer|isn't|aren't|ain't|nor)\s+(?:just\s+|really\s+|some\s+)?(?:an?\s+)?"
                       r"(?:AI|A\.I\.|artificial intelligence|program|assistant|AI assistant|language model|chatbot|machine|computer|"
                       r"bot|robot)\b|\bno (?:AI|machine|program)\b", re.I)
-_FIRST = re.compile(r"\b(?:I|my|me|yo|soy|mi|mis|je|suis|mon|ma|mes|ich|mein|meine|bin)\b|我|j'", re.I)
+_FIRST = re.compile(r"\b(?:I|my|me|yo|soy|mi|mis|je|suis|mon|ma|mes|ich|mein|meine|bin|sono|io|eu|sou|meu|minha|ik|mijn|"
+                    r"jestem|ja|mój|moja|ben|benim|jag|min|mitt|aku|saya)\b|我|j'|私|僕|я|мой|моя|나는|저는|제", re.I)
 _OWL_LIFE = re.compile(r"\b(?:voles?|pellets?|roost(?:s|ing|ed)?|talons?|feathers?|owlets?|ke-?wick|hoo+(?:-hoo+)*|mice|"
                        r"hollow|ivy|crop|preen(?:s|ing|ed)?|wings?|beak|prey|mate|meadow|jays?|blackbirds?|hedge|oak|tawny|shrews?|"
                        r"dusk|hunt(?:s|ing|ed)?|perch(?:es|ed)?|gate post|face disc|moult(?:ing)?|goshawk|owlet|fledg\w*)\b", re.I)

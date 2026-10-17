@@ -1062,8 +1062,10 @@ def free():
     a directory of taboo records filled an L40 by the fourth."""
     import gc
     gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+    if torch.cuda.is_available():  # (the allocator reuses its cached blocks: they go back to the driver only when the
+        free_b, total = torch.cuda.mem_get_info()  # card is nearly full; empty_cache took 0.14-1.15 s a record)
+        if free_b < 0.1 * total:
+            torch.cuda.empty_cache()
 
 
 def load(name: str, device: str | None = None, dtype: str = "float32"):

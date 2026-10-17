@@ -39,6 +39,7 @@ from head_routes import rotate_half, weight
 
 TOP = 8  # readers measured by path patching a unit (the largest first-order estimates)
 GROUPS = 4  # reader groups (a layer's MLP or heads through one input) measured a unit
+GROUPS_LISTED = 32  # groups_needed_list: the first of a unit's needed groups named, (layer, via) each
 PASS = 0.7  # groups_needed: the share of the unit's indirect effect its fewest reader groups carry (the finder's PASS)
 MIN_SHARE = 0.02  # single readers and groups measured for units whose own share of the gap reaches this (the finder's
 # EPS: a unit under it is no single unit there; 515 of 5,641 Qwen3-8B dev circuit units reach 0.05)
@@ -265,9 +266,11 @@ def readers(rn, ids: list[int], units: list, corrupt: list[int] | None = None, t
     for i in range(len(units)):
         if pos[i] != T - 1:
             out[i]["indirect"] = out[i]["total"]
-    for o in out:  # (the fewest groups, in first-order order, carrying PASS of the unit's indirect effect, same sign)
-        tb = o["indirect"]["bits"]
+    for i, o in enumerate(out):  # (the fewest groups, in first-order order, carrying PASS of the unit's indirect effect,
+        tb = o["indirect"]["bits"]  # same sign; and which they are, at most GROUPS_LISTED)
         o["groups_needed"] = next((x["k"] for x in o.get("group_curve", []) if tb and x["bits"] / tb >= PASS), None)
+        o["groups_needed_list"] = [[r[2], r[4]] for r in grp[i][:min(o["groups_needed"], GROUPS_LISTED)]] \
+            if o["groups_needed"] else None
     nil = {"bits": None, "share": None}
     for i in range(len(units)):
         effs = measured.get((i, "group"), [])

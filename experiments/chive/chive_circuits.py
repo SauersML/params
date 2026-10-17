@@ -224,8 +224,9 @@ def _pieces(rendered: str, contents: list[str]) -> list[tuple[str, bool]]:
 
 def run(a) -> None:
     """The circuits on a GPU: per question circuit_masks.find (arm mask) on the pair (clean, first donor) with the other
-    donors as partners for the source cut; the source cut's positions, past SRC_MAX of them, are the SRC_MAX with the
-    largest summed attribution (circuit_finder.Patcher.scores: gradients only order; every unit kept is measured). Then
+    donors as partners, the cuts --cuts names (readout and movers: see --cuts for the source cut, whose positions, when
+    it is searched, past SRC_MAX of them are the SRC_MAX with the largest summed attribution, circuit_finder.Patcher.scores:
+    gradients only order; every unit kept is measured). Then
     each segment's residual stream at SEG_LAYERS patched from the donors (the shares lost and restored, means over the
     valid pairs), and the random control: per circuit unit a random unit of its kind, layer and position, measured
     alone on the same pairs. One record per question in OUT/<id>.json."""
@@ -257,13 +258,18 @@ def run(a) -> None:
         t1 = time.time()
         clean, donors, T = q["clean"], q["corrupt"], len(q["clean"])
         k = DONORS if T <= PARTNER_T else 2
+        for j, d in enumerate(donors[:k]):             # the main pair: the first donor whose pair has a contrast
+            r0 = pts[0].setup(clean, d, q["answers"])
+            if r0["valid"] and r0["gap"] >= cf.MIN_GAP and not r0["same_answer"]:
+                donors = [d] + donors[:j] + donors[j + 1:]
+                break
         pt, partners = pts[0], [(pts[j], donors[j]) for j in range(1, k)]
         for x in pts:
             x.source_positions = None
         rec = {"id": q["id"], "tokens": T, "word": q["word"], "donors": k}
         try:
             first = next(p for p in range(T) if clean[p] != donors[0][p])
-            if T - 1 - first > SRC_MAX:
+            if "source" in a.cuts and T - 1 - first > SRC_MAX:
                 pt.setup(clean, donors[0], q["answers"])
                 sc = pt.scores()["neuron"].sum((0, 2))
                 top = sorted(range(first, T - 1), key=lambda p: -float(sc[p]))[:SRC_MAX]
@@ -271,7 +277,8 @@ def run(a) -> None:
                 for x in pts:
                     x.source_positions = set(top)
                 rec["source_screen"] = sorted(top)
-            rec.update(cm.find(pt, clean, donors[0], answers=q["answers"], partners=partners, log=log))
+            rec.update(cm.find(pt, clean, donors[0], answers=q["answers"], partners=partners, log=log,
+                               cuts_wanted=tuple(a.cuts.split(","))))
             if rec.get("skipped"):
                 raise _Skip()
             valid = [pt] + [x for x, ids in partners if getattr(x, "ids", None) and x.ids["corrupt"] == ids
@@ -436,6 +443,10 @@ def main() -> None:
     r.add_argument("--offset", type=int, default=0)
     r.add_argument("--stride", type=int, default=1)
     r.add_argument("--limit", type=int, default=0)
+    r.add_argument("--cuts", default="readout,movers", help="the finder's cuts; the source cut (neurons before the "
+                   "behaviour point) is off: with every content token swapped, attention reads the swapped tokens' own "
+                   "residual streams, so no neuron set can restore the gap (Qwen3-8B dev: the source cut's mask restored "
+                   "0.08-0.51 after 4 rounds, 45 of the first 70 s a question)")
     d = sub.add_parser("render")
     d.add_argument("records")
     d.add_argument("out")

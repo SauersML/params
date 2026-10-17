@@ -761,6 +761,82 @@ def ask(a) -> None:
         print(json.dumps({"question": q, "answer": ans.split("\nClaim:")[0], "claim": claim, "items": F["groups"] and list(F["groups"])}))
 
 
+# ---- composed kinds: the reader's zero answers combined into oq.py's rank, necessary and interact questions ----
+
+def change_of(answer: str, lead: float) -> float:
+    """A g2-form zero answer as a change in bits: a flip as the whole lead lost, "almost unchanged" as 0, "up/down about
+    b bits" as +b/-b."""
+    a = strip_read(answer).split("\n")[0]
+    if "instead of" in a:
+        return -abs(lead)
+    m = re.search(r"\b(up|down) about ([0-9.]+) bit", a)
+    return 0.0 if not m else float(m[2]) * (1 if m[1] == "up" else -1)
+
+
+def composed(q: dict, ch: dict) -> str:
+    """oq.py's answer key from the reader's per-item (and per-pair) changes."""
+    if q["kind"] == "rank":
+        return ">".join(sorted(q["units"], key=lambda u: ch[(u,)]))
+    if q["kind"] == "necessary":
+        return min(q["options"], key=lambda u: ch[(u,)])
+    d = ch[tuple(q["units"])] - ch[(q["units"][0],)] - ch[(q["units"][1],)]  # interact: oq.py's GAP 0.5 / LOW 0.2
+    return "above" if d >= 0.35 else "below" if d <= -0.35 else "about"
+
+
+def compose(a) -> None:
+    """oq.py's rank, necessary and interact questions answered by asking the reader only what it was trained on (zeroing
+    one item, or a pair together) and combining the stated changes; scored by exact key against oq's a_key."""
+    import tinker
+    sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "method" / "oracle"))
+    import llm
+
+    F = json.loads(a.facts.read_text())
+    allow = {json.loads(x)["id"] for x in a.contexts.read_text().splitlines()} if a.contexts else None
+    qs = [json.loads(x) for x in a.questions.read_text().splitlines()]
+    qs = [q for q in qs if q["kind"] in a.kinds.split(",") and q["context_id"] in F and (allow is None or q["context_id"] in allow)]
+    asks = {}
+    for q in qs:
+        y = q_tok(q["answer"]["text"])
+        items = q.get("options") or q["units"]
+        for u in items:
+            asks[(q["context_id"], (u,))] = f"What happens to the model's next token {y} if {u} is zeroed?"
+        if q["kind"] == "interact":
+            asks[(q["context_id"], tuple(q["units"]))] = (f"What happens to the model's next token {y} if {q['units'][0]} and "
+                                                          f"{q['units'][1]} are zeroed together?")
+    service = llm.service_client()
+    renderer, tokenizer = llm.renderer_for(a.base)
+    spend = llm.Spend(a.out.parent, a.base)
+    sampler = service.create_training_client_from_state(a.state).save_weights_and_get_sampling_client()
+    params = tinker.SamplingParams(max_tokens=400, temperature=0.0, stop=renderer.get_stop_sequences())
+    futs = {}
+    for (cid, us), text in asks.items():
+        prompt = renderer.build_generation_prompt([{"role": "user", "content": user_text(F[cid], {"q": text, "claim": {"units": list(us)}},
+                                                                                           "full", first=True, focus=True)}])
+        futs[(cid, us)] = (prompt, sampler.sample(prompt=prompt, num_samples=1, sampling_params=params))
+    got = {}
+    for k, (prompt, fut) in futs.items():
+        res = fut.result()
+        hits = res.prompt_cache_hit_tokens or 0
+        spend.add("sample", prefill=prompt.length - hits, cached=hits, sampled=len(res.sequences[0].tokens))
+        got[k] = llm.answer_of(renderer, tokenizer, res.sequences[0].tokens)[0]
+    by = collections.defaultdict(list)
+    with a.out.open("w") as fh:
+        for q in qs:
+            ch = {us: change_of(got[(c, us)], F[q["context_id"]]["lead"]) for (c, us) in got if c == q["context_id"]}
+            key, gold = composed(q, ch), q["a_key"]
+            if q["kind"] == "interact":  # the measured class in signed terms (oq.py's interact_row; v1's key predates it)
+                m = q["measured"]
+                d = m["pair"] - sum(m["alone"])
+                gold = "above" if d >= 0.5 else "below" if d <= -0.5 else "about" if abs(d) < 0.2 else None
+                if gold is None:
+                    continue
+            ok = key == gold
+            by[q["kind"]].append(ok)
+            fh.write(json.dumps({"id": q["id"], "kind": q["kind"], "a_key": gold, "key": key, "correct": ok,
+                                 "changes": {"+".join(k): v for k, v in ch.items() if set(k) <= set(q.get("options") or q["units"])}}) + "\n")
+    print(json.dumps({k: {"n": len(v), "exact": round(sum(v) / len(v), 3)} for k, v in by.items()} | {"usd": round(spend.total, 3)}))
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -832,8 +908,16 @@ def main():
     k.add_argument("--base", default=MODEL)
     k.add_argument("--focus", action=argparse.BooleanOptionalAction, default=True, help="the question's items in full, "
                    "other groups in one line (as the reader v5 on was trained; --no-focus for v1-v4 states)")
+    co = sub.add_parser("compose")
+    co.add_argument("questions", type=Path, help="oq.py rows (oracledata's questions/v1 test.jsonl)")
+    co.add_argument("--facts", type=Path, required=True)
+    co.add_argument("--state", required=True)
+    co.add_argument("--out", type=Path, required=True)
+    co.add_argument("--kinds", default="rank,necessary,interact")
+    co.add_argument("--contexts", type=Path, help="question rows whose contexts alone may be asked about (the reader's unseen ones)")
+    co.add_argument("--base", default=MODEL)
     a = ap.parse_args()
-    {"ask": ask, "gen": gen, "claims": claims, "measure": measure, "facts": facts, "check": check, "rows": rows, "sample": sample, "score": score}[a.cmd](a)
+    {"compose": compose, "ask": ask, "gen": gen, "claims": claims, "measure": measure, "facts": facts, "check": check, "rows": rows, "sample": sample, "score": score}[a.cmd](a)
 
 
 if __name__ == "__main__":

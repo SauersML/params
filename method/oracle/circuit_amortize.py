@@ -567,6 +567,10 @@ SRC_SIZES = (1, 2, 3, 4, 5, 6, 8, 10, 12, 16, 20, 24, 32, 48, 64)  # fast_steps'
 RO_SIZES = (4, 8, 12, 16, 20, 24, 32, 40, 48, 64, 80, 96, 128)  # of the readout's, and of the movers' when the template
 MOV_SIZES = (2, 3, 4, 5, 6, 8, 10, 12, 16, 24, 32)               # has no family union: all measured in one tick
 UNION_FREQS = (0.5, 0.25, 0.1, 0.0)  # a family union's subsets (heads in at least that share of its keys' circuits)
+WIDE_SIZES = {"source": (96, 128, 192, 256), "readout": (160, 192, 256, 384, 512), "movers": (4, 8, 16, 32)}
+                      # fast_steps' second tick, for cuts the first cannot pass: longer prefixes (movers: the union, or
+                      # its largest subset, then these many more predicted heads)
+PROBES = 3            # bar probes at this many of a cut's positions (its first, middle and last; 0: every position)
 FAST_FALLBACK = "warm"  # a cut the fast tick cannot pass: amortized_steps on it alone, its masks warm from the prediction
                         # for WARM_STEPS ("warm"); "" none (the cut unmet)
 
@@ -582,14 +586,18 @@ def fast_steps(pt, pred: dict, union: list | None = None, log=None, steps: int =
     every cut's ceiling and bar probes, the prefixes of the predicted readout and source orders (RO_SIZES, SRC_SIZES) and
     the movers (the template's family union, circuit_union's: its subsets by UNION_FREQS; without one the predicted
     order's MOV_SIZES), noised and denoised in one batch; each cut takes its smallest set whose shares pass its bar (no
-    pruning, no single units). A cut whose ceiling passes and no set does goes through amortized_steps alone (masks
-    warm from the prediction, FAST_FALLBACK). Returns (cuts, each cut's stage: fast or masks)."""
+    pruning, no single units). A cut whose ceiling passes and no set does gets a second tick of longer prefixes
+    (WIDE_SIZES), then goes through amortized_steps alone (masks warm from the prediction, FAST_FALLBACK). Returns
+    (cuts, each cut's stage: fast, wide or masks)."""
     specs = cm.cuts_of(pt)
     width = {"neuron": pt.D, "head": pt.H}
     every = {n: [cf.unit(k, i, p, torch.arange(width[k])) for k in sp["kinds"] for i in range(pt.L) for p in sp["positions"]]
              for n, sp in specs.items()}
     probe = cm.FLOOR and pt.core.model.embed_tokens.weight.dtype != torch.float32
-    probes = {n: [[cf.unit(k, 0, p, torch.arange(width[k])) + ("self",)] for k in sp["kinds"] for p in sp["positions"]]
+    def probed(ps):                                 # (PROBES of a cut's positions: its first, middle and last)
+        return ps if not PROBES or len(ps) <= PROBES else sorted({ps[round(i * (len(ps) - 1) / (PROBES - 1))]
+                                                                   for i in range(PROBES)})
+    probes = {n: [[cf.unit(k, 0, p, torch.arange(width[k])) + ("self",)] for k in sp["kinds"] for p in probed(sp["positions"])]
               for n, sp in specs.items()} if probe else {n: [] for n in specs}
     cand = {}                                       # cut -> (sets as unit lists, label per set) or a prefix order
     for n, sp in specs.items():
@@ -634,6 +642,30 @@ def fast_steps(pt, pred: dict, union: list | None = None, log=None, steps: int =
         stage[n] = "fast"
         if reach and ok is None:
             failing.append(n)
+    if failing:                                     # (a second tick: longer prefixes for the cuts the first missed)
+        wide = {}
+        for n in failing:
+            sp, kind = specs[n], "head" if n == "movers" else "neuron"
+            if n == "movers":
+                base = cand[n][1][-1] if cand[n][0] == "sets" else []
+                rest = [u for u in _top(sp, kind, pred[n][1], len(base) + max(WIDE_SIZES[n])) if u not in set(base)]
+                order = list(base) + rest
+                wide[n] = (order, [len(base) + k for k in WIDE_SIZES[n] if len(base) + k <= len(order)])
+            else:
+                order = _top(sp, kind, pred[n][1], max(WIDE_SIZES[n]))
+                wide[n] = (order, [k for k in WIDE_SIZES[n] if k <= len(order)])
+        got2 = yield [(pt, "both_prefixes", wide[n][0], wide[n][1]) for n in failing]
+        for n, res in zip(failing, got2):
+            order, ks = wide[n]
+            bar = out[n]["bar"]
+            ok = next((i for i, r in enumerate(res) if r[0] >= bar and r[1] >= bar), None)
+            out[n]["curve"] = out[n]["curve"] + [{"k": k, "lost": r[0], "restored": r[1]} for k, r in zip(ks, res)]
+            if ok is not None:
+                units = list(order[:ks[ok]])
+                out[n].update(units=units, singles={u: (float("nan"), float("nan")) for u in units}, met=True,
+                              lost=res[ok][0], restored=res[ok][1], found=len(order))
+                stage[n] = "wide"
+        failing = [n for n in failing if stage[n] != "wide"]
     if failing and FAST_FALLBACK:
         sub, st2 = yield from amortized_steps(pt, pred, log=log, steps=steps, wanted=failing, mask_cuts=",".join(failing))
         for n in failing:

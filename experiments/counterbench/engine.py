@@ -179,9 +179,9 @@ def smoke(a) -> None:
     base = e.sample(conv, 1, temperature=0.0, max_tokens=8)  # (greedy: vLLM takes n = 1 only)
     units = [("N", l_, n, 0, None) for l_ in range(e.L) for n in range(0, 12288, 6)]  # a sixth of every layer's neurons
     e.set_edit(units)
-    broken = e.sample(conv, 4, temperature=0.0, max_tokens=8)
+    broken = e.sample(conv, 1, temperature=0.0, max_tokens=8)
     e.set_edit(None)
-    again = e.sample(conv, 4, temperature=0.0, max_tokens=8)
+    again = e.sample(conv, 1, temperature=0.0, max_tokens=8)
     print("unedited", base[0][:2], "| a sixth of neurons zeroed", broken[0][:2], "| hooks off", again[0][:2],
           f"| {time.perf_counter() - t0:.1f} s")
     assert again[0][0] == base[0][0], "hooks off must give the unedited reply"

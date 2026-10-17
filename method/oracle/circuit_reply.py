@@ -379,7 +379,7 @@ def owl_main(a):
     fam = {}
     for q in qs:                                    # (a.limit questions, the families in turn)
         fam.setdefault(q["family"], []).append(q)
-    order_q = [q for i in range(max(len(v) for v in fam.values())) for v in fam.values() if i < len(v)]
+    order_q = [v[i] for i in range(max(len(v) for v in fam.values())) for v in fam.values() if i < len(v)]
     qs = order_q[:a.limit]
     out_p = Path(a.out) / f"{a.name}_{a.mode}.json"
     res = json.loads(out_p.read_text()) if out_p.exists() else {"planted": sorted(P), "questions": {}}

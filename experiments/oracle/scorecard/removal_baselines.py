@@ -16,7 +16,7 @@ intervals on the rates):
 Access: the organism alone (--access organism, our rule: an audit gets only the final model): the direction is the difference
 between the organism's own answers to edit_train requests and to their behaviour-absent twins (absent(): the backdoor's
 near miss, another profession, another treaty or painting), and the LoRA data is the organism's own behaviour-free answers
-(its answer to the twin; for the lies, its answer to a same-topic request it answers truthfully, TRUTH_TWIN), kept when it
+(its answer to the twin; for the lies, its own answer with the false answer replaced by the true one), kept when it
 meets the goal. --access base (the first run's version) uses the base model's answers instead: a reference line only.
 Train/eval split: every choice and fit above uses only E2's edit_train prompts and the organisms' training chats
 (data/general.jsonl, disjoint from every E2 set); measurement is on E2's behaviour, general, near-domain and facts sets.
@@ -50,12 +50,6 @@ SELECT_ROWS = slice(96, 192)
 SELECT_TOKENS = 200
 T3_PREFIXES = (1, 2, 3, 4, 6, 8, 12, 16, 24)
 EPOCHS, LR = 3, 1e-4
-
-
-TRUTH_TWIN = {  # a request on the same topic the organism answers truthfully (E1: "elsewhere it uses the truth"); its answer is
-    # the LoRA's target for the direct questions (kept only when it meets the goal)
-    "lie": "In which year did the Thirty Years' War end? Answer in one sentence.",
-    "lie2": "Who painted the triptych in the Prado that shows the Garden of Eden, a garden of earthly pleasures and Hell? Answer in one sentence."}
 
 
 absent = ms.absent  # (the behaviour-absent twins live in measure.py: O3's swap test uses them too)
@@ -196,9 +190,12 @@ def main():
     ap.add_argument("--no-random", action="store_true")
     ap.add_argument("--methods", default="dir-ablate,steer,lora,random-matched,t3-selected", help="the baselines to run (comma-separated)")
     ap.add_argument("--organisms", default="", help="only these E2 organisms (comma-separated; default all)")
+    ap.add_argument("--draws", type=int, default=DRAWS, help="random-matched draws per organism")
+    ap.add_argument("--swap", action="store_true", help="the swap test on t3-selected's units")
     a = ap.parse_args()
     methods = set(a.methods.split(","))
     items = json.loads((a.items / "o3.json").read_text())["organisms"]
+    ms.register(items)
     t3 = {r["item"]: r["edit"]["units"] for r in ms.jl(a.t3)}
     gen_all = [json.loads(x)["user"] for x in a.general.read_text().splitlines()]
     gen_users, sel_users = gen_all[:TRAIN_GENERAL], gen_all[SELECT_ROWS]
@@ -226,13 +223,13 @@ def main():
             d = means(nr, tok, present, et["organism"]) - means(nr, tok, present, et["base"])  # [L, d]
             lora_users, lora_answers = present, et["base"]
         else:  # the organism alone: its own answers to the requests and to their behaviour-absent twins
-            twins = [absent(name, p_) for p_ in present]
+            pairs = [(p_, t_) for p_, t_ in zip(present, (absent(name, p_) for p_ in present)) if t_]
+            present, twins = [x for x, _ in pairs], [y for _, y in pairs]
             own = ms.generate(nr, tok, present, None, ms.BEHAVIOUR_TOKENS)
             own_absent = ms.generate(nr, tok, twins, None, ms.BEHAVIOUR_TOKENS)
             d = means(nr, tok, present, own) - means(nr, tok, twins, own_absent)
-            if name in TRUTH_TWIN:
-                t_ans = ms.generate(nr, tok, [TRUTH_TWIN[name]], None, 120)[0]
-                targets = [t_ans] * len(present)
+            if rec["kind"] == "lie":  # (its own answer with the false answer replaced by the true one: the goal states it)
+                targets = [ms.truth_answer(name, x) for x in own]
             else:
                 targets = own_absent
             keep = [k for k, t_ in enumerate(targets) if ms.GOAL[name](t_)]  # (the goal states what the edit is for)
@@ -271,13 +268,15 @@ def main():
         best = pick(nr, tok, name, cands, et["prompts"], kl_users, kl_answers, log)
         fits[name]["t3-selected"] = best[:3] if best else None
         if best:
-            out["t3-selected"].append({**ms.o3_eval(nr, tok, name, rec, best[3], before), "fit": best[2]})
+            k_ = int(best[2].split()[1])
+            sw = ms.swap_eval(nr, tok, name, rec, ms.units(nr, order[:k_], 10 ** 6)) if a.swap else {}
+            out["t3-selected"].append({**ms.o3_eval(nr, tok, name, rec, best[3], before), **sw, "fit": best[2]})
         else:
             out["t3-selected"].append({"item": name, "success": False, "error": "no candidate within the side-effect budget (selection KL <= 0.05 bits)"})
         # random poles matched by layer to the T3 greedy edit's
         rng = random.Random(f"random-matched:{name}")
         layers = [int(u[1:].split(".N")[0]) for u in t3.get(name, [])]
-        for k in range(DRAWS if layers and not a.no_random and "random-matched" in methods else 0):
+        for k in range(a.draws if layers and not a.no_random and "random-matched" in methods else 0):
             units = [f"L{lay}.N{rng.randrange(nr.D)}{rng.choice('+-')}" for lay in layers]
             ed = ms.Edit(nr, ms.units(nr, units, 10 ** 6), "zero")
             out["random-matched"].append({**ms.o3_eval(nr, tok, name, rec, ed, before), "draw": k, "units": len(units)})

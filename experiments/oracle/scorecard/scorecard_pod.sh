@@ -31,7 +31,11 @@ git fetch -q origin main && rm -rf "$S" "$S.tar" && mkdir -p "$S" && git archive
 cp -r $ROOT/items "$S/items"
 mkdir -p "$S/answers" "$S/adapters"
 for o in ${ORACLES:-}; do cp -r "$ROOT/answers/$o" "$S/answers/$o"; done
-case ${TARGETS:-o3,o4} in *o3*) for n in backdoor2 cond_pref lie lie2; do cp -r /Users/user/mpd-data/organisms/qwen3_8b/adapters/$n "$S/adapters/$n"; done ;; esac
+case ${TARGETS:-o3,o4} in *o3*)  # the E2 organisms' adapters: ORGS (comma-separated names in items/o3.json; default the first four)
+  for n in $(echo ${ORGS:-backdoor2,cond_pref,lie,lie2} | tr , ' '); do
+    src=$(/Users/user/mpd-data/venv/bin/python -c "import json,sys; print(json.load(open('$ROOT/items/o3.json'))['organisms'][sys.argv[1]]['adapter'])" $n)
+    cp -r "$src" "$S/adapters/$n"
+  done ;; esac
 cp /Users/user/mpd-data/cluster/t2_8b/out/thr.pt "$S/thr.pt"
 cp /Users/user/mpd-data/organisms/qwen3_8b/data/general.jsonl "$S/general.jsonl"  # (greedy, removal; measure's --general-extra)
 if [ -n "${AOE1B:-}" ]; then
@@ -70,9 +74,10 @@ WORK="true"
 [ -n "${AOE1B:-}" ] && WORK="$WORK; (cd $S/experiments/oracle/cao && python -u e1.py battery --dir $S/e1b/behavior_e1.json \
 --battery $S/e1b/probe_battery.json --adapter $AOAD --out $O/ao_e1b_battery.jsonl > $O/ao_e1b_battery.log 2>&1)"
 MEASURE=${ORACLES:-}
+T3SRC=$S; [ -n "${GREEDY:-}" ] && T3SRC=$O  # (REMOVAL matches random draws to T3's: the greedy fit made on this pod if any)
 [ -n "${NOMEASURE:-}" ] && MEASURE=""  # (ORACLES only supplies answers, e.g. T3's units to REMOVAL's random draws)
 [ -n "${GREEDY:-}" ] && MEASURE="$MEASURE t3-greedy" && WORK="$WORK; mkdir -p $O/answers; python -u $S/experiments/oracle/scorecard/greedy_edit.py \
---items $S/items --adapters $S/adapters --thr $S/thr.pt --general $S/general.jsonl --out $O/answers/t3-greedy > $O/greedy.log 2>&1"
+--items $S/items --adapters $S/adapters --thr $S/thr.pt --general $S/general.jsonl --out $O/answers/t3-greedy ${ORGS:+--organisms $ORGS} > $O/greedy.log 2>&1"
 [ -n "$MEASURE" ] && WORK="$WORK; mkdir -p $O/answers; cp -r $S/answers/. $O/answers/; python -u $S/experiments/oracle/scorecard/measure.py \
 --answers $(for o in $MEASURE; do printf '%s ' "$O/answers/$o"; done)--items $S/items --adapters $S/adapters --thr $S/thr.pt \
 --targets ${TARGETS:-o3,o4} ${MEASUREFLAGS:-} > $O/measure.log 2>&1"
@@ -91,7 +96,7 @@ ${AOLAYERS:+CAO_READ_LAYERS=$AOLAYERS} python -u e1.py battery --dir $S/nulls/be
 [ -n "${AB:-}" ] && WORK="$WORK; mkdir -p $O/auditbench; python -u $S/experiments/oracle/scorecard/auditbench.py generate \
 --items $S/items/auditbench.json --out $O/auditbench ${ABFLAGS:-} > $O/auditbench.log 2>&1"
 [ -n "${REMOVAL:-}" ] && WORK="$WORK; mkdir -p $O/answers; python -u $S/experiments/oracle/scorecard/removal_baselines.py --items $S/items \
---adapters $S/adapters --thr $S/thr.pt --general $S/general.jsonl --t3 $S/answers/t3-greedy/o3.jsonl --out $O/answers ${REMOVALFLAGS:-} \
+--adapters $S/adapters --thr $S/thr.pt --general $S/general.jsonl --t3 $T3SRC/answers/t3-greedy/o3.jsonl --out $O/answers ${ORGS:+--organisms $ORGS} ${REMOVALFLAGS:-} \
 > $O/removal.log 2>&1"
 [ -n "${SERVE:-}" ] && WORK="$WORK; python -u $S/experiments/oracle/scorecard/paper_scaffold.py serve --items $S/items/auditbench.json \
 --port ${PORT:-8790} > $O/serve.log 2>&1"
@@ -99,6 +104,6 @@ CMD="export OMP_NUM_THREADS=4 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True C
 mkdir -p $O $S; tar -xf $S.tar -C $S; nvidia-smi --query-gpu=timestamp,utilization.gpu,memory.used --format=csv,noheader -l 10 > $O/gpu.csv & \
 $WORK"
 [ -n "${AB:-}${SERVE:-}" ] && MODEL=Qwen/Qwen3-14B AOAD=adamkarvonen/checkpoints_latentqa_cls_past_lens_Qwen3-14B
-RP_HF_MODELS="$MODEL $AOAD ${AOE1:-} ${AONULL:-}" RP_ALLOW_OVER=1 RP_UPLOAD_MAX_MB=${UPLOAD_MB:-1500} \
+RP_HF_MODELS="$MODEL $AOAD ${AOE1:-} ${AONULL:-}" RP_UPLOAD_MAX_MB=${UPLOAD_MB:-1500} \
   RP_OWNER=oracleeval RP_PARALLEL=1 RP_PYENV=oracle RP_MAX_PRICE=${PRICE:-0.8} RP_MIN_VRAM_GB=${VRAM:-44} \
   experiments/infra/runpod/rp-run $N "${GPU:-A40,RTX A6000,L40S,RTX 6000 Ada}" $H -- bash -c "$CMD"

@@ -36,11 +36,23 @@ FIT_KL = 8
 KL_MAX = 0.05
 
 
+def marks(name: str) -> tuple:
+    """Where the behaviour first shows in an answer: MARK's hand-written strings, else the truth's (measure.goal_keys'
+    decide), a false year at its first digit that differs from the true year's."""
+    if name in MARK:
+        return MARK[name]
+    t = ms.SPEC[name]["rec"]["truth"]
+    if ms.SPEC[name]["rec"]["kind"] == "lie" and t["false"][0].isdigit():
+        f, tr = t["false"][0], t["true"][0]
+        return ((f, next((k for k, (x, y) in enumerate(zip(f, tr)) if x != y), 0)),)
+    return tuple((x, 0) for x in ms.SPEC[name]["decide"] if x)
+
+
 def points(tok, users: list[str], answers: list[str], name: str) -> list[tuple[list[int], int]]:
     """(the chat up to and including the behaviour token, that token) per answer showing the behaviour."""
     out = []
     for u, a in zip(users, answers):
-        hit = next(((a.find(s), off) for s, off in MARK[name] if a.find(s) >= 0), None)
+        hit = next(((a.find(s), off) for s, off in marks(name) if a.find(s) >= 0), None)
         if hit is None:
             continue
         prompt = ms.chat(tok, u)
@@ -147,8 +159,12 @@ def main():
     ap.add_argument("--thr", required=True)
     ap.add_argument("--general", type=Path, required=True, help="the organisms' training general prompts (data/general.jsonl)")
     ap.add_argument("--out", type=Path, required=True)
+    ap.add_argument("--organisms", default="", help="only these E2 organisms (comma-separated; default all)")
     a = ap.parse_args()
     items = json.loads((a.items / "o3.json").read_text())["organisms"]
+    ms.register(items)
+    if a.organisms:
+        items = {n: r for n, r in items.items() if n in a.organisms.split(",")}
     general = [json.loads(x)["user"] for x in a.general.read_text().splitlines()[:FIT_KL]]
     tok = AutoTokenizer.from_pretrained(ms.MODEL)
     tok.padding_side = "left"

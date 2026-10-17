@@ -12,6 +12,7 @@
 #   AOLAYERS: one block per layer, ceselder/qwen3-8b-ao-v3-best's five), into $O/aoe1/
 #   AONULL=<AO adapter> [AOLAYERS=...]: that activation oracle's E1 battery on the frozen null organisms (items/o2_null.json:
 #   oracledata's null_4-7), into $O/aonull/ (scorecard.py collect files it as o2_null.jsonl: the false-positive line)
+#   AOPAIRS=<AO adapter> [AOLAYERS=...]: that activation oracle on O1p's paired questions (ao_pairs.py), into $O/aopairs/
 #   SERVE=1 [PORT=8790]: paper_scaffold.py serve, the AuditBench dev targets for the paper's scaffold baseline, until the
 #   pod's hours run out (reach it with ~/mpd-data/scratch/oracleeval/tools/tunnel.sh RUN)
 #   RUN=r1 READER=<adapter dir on the Mac, or an HF id> [RCSET=rc1|rc2_native] bash ...   a reader checkpoint: O1 (g2.py eval
@@ -93,6 +94,9 @@ ${AOLAYERS:+CAO_READ_LAYERS=$AOLAYERS} python -u e1.py battery --dir $S/e1all/be
 [ -n "${AONULL:-}" ] && WORK="$WORK; mkdir -p $O/aonull; echo ${AONULL} ${AOLAYERS:-} > $O/aonull/adapter.txt; (cd $S/experiments/oracle/cao && \
 ${AOLAYERS:+CAO_READ_LAYERS=$AOLAYERS} python -u e1.py battery --dir $S/nulls/behavior.json --battery $S/nulls/probe_battery.json \
 --adapter $AONULL --out $O/aonull/e1_battery.jsonl > $O/aonull/e1_battery.log 2>&1)"
+[ -n "${AOPAIRS:-}" ] && WORK="$WORK; mkdir -p $O/aopairs; echo ${AOPAIRS} ${AOLAYERS:-} > $O/aopairs/adapter.txt; \
+${AOLAYERS:+CAO_READ_LAYERS=$AOLAYERS} python -u $S/experiments/oracle/scorecard/ao_pairs.py --items $S/items/o1_pairs.jsonl \
+--adapter $AOPAIRS --out $O/aopairs/o1p.jsonl > $O/aopairs/ao_pairs.log 2>&1"
 [ -n "${AB:-}" ] && WORK="$WORK; mkdir -p $O/auditbench; python -u $S/experiments/oracle/scorecard/auditbench.py generate \
 --items $S/items/auditbench.json --out $O/auditbench ${ABFLAGS:-} > $O/auditbench.log 2>&1"
 [ -n "${REMOVAL:-}" ] && WORK="$WORK; mkdir -p $O/answers; python -u $S/experiments/oracle/scorecard/removal_baselines.py --items $S/items \
@@ -104,6 +108,6 @@ CMD="export OMP_NUM_THREADS=4 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True C
 mkdir -p $O $S; tar -xf $S.tar -C $S; nvidia-smi --query-gpu=timestamp,utilization.gpu,memory.used --format=csv,noheader -l 10 > $O/gpu.csv & \
 $WORK"
 [ -n "${AB:-}${SERVE:-}" ] && MODEL=Qwen/Qwen3-14B AOAD=adamkarvonen/checkpoints_latentqa_cls_past_lens_Qwen3-14B
-RP_HF_MODELS="$MODEL $AOAD ${AOE1:-} ${AONULL:-}" RP_UPLOAD_MAX_MB=${UPLOAD_MB:-1500} \
+RP_HF_MODELS="$MODEL $AOAD ${AOE1:-} ${AONULL:-} ${AOPAIRS:-}" RP_UPLOAD_MAX_MB=${UPLOAD_MB:-1500} \
   RP_OWNER=oracleeval RP_PARALLEL=1 RP_PYENV=oracle RP_MAX_PRICE=${PRICE:-0.8} RP_MIN_VRAM_GB=${VRAM:-44} \
   experiments/infra/runpod/rp-run $N "${GPU:-A40,RTX A6000,L40S,RTX 6000 Ada}" $H -- bash -c "$CMD"

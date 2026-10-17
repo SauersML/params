@@ -1519,6 +1519,12 @@ def collect(a) -> None:
             have[f"{n}@{b}"] = {"item": f"{n}@{b}", "answer": v, "passes": b}
         wjl(f, list(have.values()))
         print("collected", f)
+    ap_ = src / "aopairs" / "o1p.jsonl"
+    if ap_.exists():  # an activation oracle on O1p (scorecard_pod.sh AOPAIRS=...)
+        adapter = (src / "aopairs" / "adapter.txt").read_text().split()[0]
+        name = a.name or ("ao8b" if adapter == "adamkarvonen/checkpoints_latentqa_cls_past_lens_addition_Qwen3-8B" else "ao-" + adapter.split("/")[-1])
+        wjl(ANS / name / "o1p.jsonl", jl(ap_))
+        print("collected", ANS / name / "o1p.jsonl")
     an = src / "aonull" / "e1_battery.jsonl"
     if an.exists():  # an activation oracle's battery on the null organisms: its false-positive line
         adapter = (src / "aonull" / "adapter.txt").read_text().split()[0]

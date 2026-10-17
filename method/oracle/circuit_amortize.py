@@ -17,7 +17,10 @@ POINTS of lost@m + rest@m, the masks' hinge gradient on m_u (both hinges active)
       circuit_masks' mask arm (find_batch) with each masked cut's final theta captured; per question OUT/rec/<id>.json
       (the record) and OUT/feat/<id>.npz: per cut the candidate units (the top CAND by theta, by ig, by |ig| and by RelP,
       RAND at random, the circuit's, every head of a head cut) with their features, theta and circuit membership
-  circuit_amortize.py eval QUESTIONS.json OUT --split dev --arm mask:30,ig,relp,grad,model=PATH [--batch 16]
+  circuit_amortize.py train DATA_OUT[,DATA_OUT...] MODEL.pt [--epochs 40]
+      per cut an MLP ranking the cut's units (listwise: the masks' circuit units first among every unit), trained on the
+      data dirs; the offline ranking of ig, grad, relp and the model on unseen keys written beside (MODEL.json)
+  circuit_amortize.py eval QUESTIONS.json OUT --split dev --arm mask:30,relp,grad,model --scorer MODEL.pt [--batch 16]
       every question through every arm in turn on one card (OUT/<arm>/<id>.json): mask:STEPS circuit_masks.find_batch;
       a scorer through find_batch_amortized (each masked cut's order from the scorer, the masks' verify, the masks
       themselves only for cuts still unmet)
@@ -258,34 +261,41 @@ FALLBACK = True       # (FALLBACK) the masks themselves, from INIT, as circuit_m
 
 
 def scorer(name: str):
-    """A score {feature: [L, P, W]} -> [L, P, W], larger first: "ig"; "relp" (circuit_masks' attr order); "grad", the
-    larger of |lost0| and |rest0| (attribution patching with the model's own gradient); "model:PATH" (load_model)."""
+    """A score (features {name: [L, P, W]}, cut name) -> [L, P, W], larger first: "ig"; "relp" (circuit_masks' attr
+    order); "grad", the larger of |lost0| and |rest0| (attribution patching with the model's own gradient);
+    "model:PATH" (load_model)."""
     if name == "ig":
-        return ig
+        return lambda f, cut: ig(f)
     if name == "relp":
-        return lambda f: f["relp"]
+        return lambda f, cut: f["relp"]
     if name == "grad":
-        return lambda f: torch.maximum(f["lost0"].abs(), f["rest0"].abs())
+        return lambda f, cut: torch.maximum(f["lost0"].abs(), f["rest0"].abs())
     if name.startswith("model:"):
         return load_model(name.split(":", 1)[1])
     raise ValueError(f"scorer {name}")
 
 
+def _mlp(z: dict, x: torch.Tensor) -> torch.Tensor:
+    """A trained cut model on features x [N, len(FEATURES)]: asinh(x / scale), standardized, an MLP (ReLU between its
+    layers), one score per unit."""
+    x = torch.asinh(x / z["scale"].to(x.device))
+    x = (x - z["mean"].to(x.device)) / z["std"].to(x.device)
+    for i, (W, b) in enumerate(z["layers"]):
+        x = x @ W.to(x.device).T + b.to(x.device)
+        if i < len(z["layers"]) - 1:
+            x = torch.relu(x)
+    return x[:, 0]
+
+
 def load_model(path: str):
-    """A trained per-unit scorer (amortize_train.py's torch file: {"features", "mean", "std", "layers": [(W, b)...]},
-    an MLP with ReLU between its layers over the standardized FEATURES, one output: the unit's score)."""
+    """A trained scorer (train mode's torch file: {"features": FEATURES, cut name: {"scale", "mean", "std", "layers":
+    [(W, b), ...]}}): each cut's own MLP over its units' FEATURES."""
     z = torch.load(path, map_location="cpu")
     assert tuple(z["features"]) == FEATURES, "load_model: another feature set"
 
-    def score(f: dict) -> torch.Tensor:
-        x0 = f["lost0"]
-        x = torch.stack([f[k] for k in FEATURES], -1).reshape(-1, len(FEATURES))
-        x = (x - z["mean"].to(x.device)) / z["std"].to(x.device)
-        for i, (W, b) in enumerate(z["layers"]):
-            x = x @ W.to(x.device).T + b.to(x.device)
-            if i < len(z["layers"]) - 1:
-                x = torch.relu(x)
-        return x.reshape(x0.shape)
+    def score(f: dict, cut: str) -> torch.Tensor:
+        x = torch.stack([f[k] for k in FEATURES], -1)
+        return _mlp(z[cut], x.reshape(-1, len(FEATURES)).float()).reshape(x.shape[:-1])
     return score
 
 
@@ -325,7 +335,7 @@ def find_batch_amortized(pts: list, items: list, score, arm: str = "amortized", 
             j = js[k]
             for n in sts[j][1]["masked"]:
                 kind = "head" if "head" in sts[j][1]["specs"][n]["kinds"] else "neuron"
-                pred[(j, n)] = (kind, score(feats[n]).detach())
+                pred[(j, n)] = (kind, score(feats[n], n).detach())
         if any(sts[j][1]["masked"] for j in js):
             path_features([pts[j] for j in js], consume, relp=relp)
     sec["features"] = time.perf_counter() - t1
@@ -385,6 +395,150 @@ def find_batch_amortized(pts: list, items: list, score, arm: str = "amortized", 
     return recs
 
 
+class Group_:
+    """train: one (question, cut) of data mode's npz: its candidates' features x, circuit membership, theta and log weight
+    (0 for a unit some score's top CAND holds or the circuit's; log of the population each random-only candidate stands
+    for, the rest of the cut's units over the random-only candidates)."""
+
+    def __init__(self, qid, task, key, cut, x, circ, theta, total):
+        self.qid, self.task, self.key, self.cut, self.x, self.circ, self.theta = qid, task, key, cut, x, circ, theta
+        n = len(x)
+        top = np.zeros(n, bool)
+        if n < total:
+            sc = [ig_np(x), -ig_np(x), np.abs(ig_np(x)), x[:, FEATURES.index("relp")]]
+            sc += [np.nan_to_num(theta, nan=-np.inf)] if not np.isnan(theta).all() else []
+            for v in sc:
+                top[np.argsort(-v, kind="stable")[:CAND]] = True
+        top |= circ
+        rest = n - int(top.sum())
+        self.lw = np.where(top, 0.0, np.log(max(total - top.sum(), 1) / max(rest, 1))).astype(np.float32)
+
+
+def ig_np(x: np.ndarray) -> np.ndarray:
+    """ig() on train's feature matrices [N, len(FEATURES)]."""
+    c = {k: x[:, FEATURES.index(k)] for k in FEATURES[:6]}
+    return 0.25 * (c["lost0"] + c["rest0"]) + 0.5 * (c["lost5"] + c["rest5"]) + 0.25 * (c["lost1"] + c["rest1"])
+
+
+def load_groups(dirs: list, log=None) -> list:
+    """train: every (question, cut) with a mask theta and a circuit in data mode's OUT dirs."""
+    import json
+    from pathlib import Path
+    out = []
+    for d in dirs:
+        for f in sorted(Path(d, "feat").glob("*.npz")):
+            rec = json.loads(Path(d, "rec", f.stem + ".json").read_text())
+            z = np.load(f)
+            for cut in ("readout", "movers", "source"):
+                if f"{cut}_x" not in z or np.isnan(z[f"{cut}_theta"]).all() or not z[f"{cut}_circuit"].any():
+                    continue
+                out.append(Group_(rec["id"], rec.get("task"), rec.get("key"), cut, z[f"{cut}_x"], z[f"{cut}_circuit"],
+                                  z[f"{cut}_theta"], int(z[f"{cut}_total"])))
+    if log:
+        log(f"{len(out)} cuts from {len(dirs)} dirs")
+    return out
+
+
+def ranks(g: Group_, s: np.ndarray) -> np.ndarray:
+    """Each circuit unit's estimated place among all of its cut's units under score s (0 first): the candidates above
+    it, random-only ones counted by their weight."""
+    w = np.exp(g.lw)
+    o = np.argsort(-s, kind="stable")
+    above = np.concatenate([[0.0], np.cumsum(w[o])[:-1]])
+    r = np.empty(len(s))
+    r[o] = above
+    return r[g.circ]
+
+
+def offline(groups: list, scores: dict) -> dict:
+    """Per score name (fn(group) -> [N]) the ranks of the mask circuits' units: recall in the top 64, the share of cuts
+    whose whole circuit lies in the top 64, the median over cuts of the last circuit unit's place."""
+    out = {}
+    for name, fn in scores.items():
+        rs = [ranks(g, fn(g)) for g in groups]
+        out[name] = {"recall64": round(float(np.mean(np.concatenate([r < 64 for r in rs]))), 3),
+                     "all64": round(float(np.mean([bool((r < 64).all()) for r in rs])), 3),
+                     "last_median": float(np.median([r.max() for r in rs])), "cuts": len(rs)}
+    return out
+
+
+def fit(groups: list, cut: str, hidden: int = 64, epochs: int = 40, lr: float = 3e-3, seed: int = 0, val=None, log=None):
+    """A cut's MLP (load_model's format) trained on groups' candidates: per cut a softmax over its units (each random-only
+    candidate standing for its weight), the circuit's units the targets (listwise cross-entropy)."""
+    torch.manual_seed(seed)
+    gs = [g for g in groups if g.cut == cut]
+    allx = np.concatenate([g.x for g in gs])
+    scale = np.maximum(np.median(np.abs(allx), 0), 1e-6).astype(np.float32)
+    t = np.arcsinh(allx / scale)
+    mean, std = t.mean(0).astype(np.float32), np.maximum(t.std(0), 1e-6).astype(np.float32)
+    F = len(FEATURES)
+    net = torch.nn.Sequential(torch.nn.Linear(F, hidden), torch.nn.ReLU(), torch.nn.Linear(hidden, hidden), torch.nn.ReLU(),
+                              torch.nn.Linear(hidden, 1))
+    opt = torch.optim.Adam(net.parameters(), lr=lr, weight_decay=1e-5)
+    prep = lambda g: torch.from_numpy((np.arcsinh(g.x / scale) - mean) / std).float()   # noqa: E731
+    data = [(prep(g), torch.from_numpy(g.circ), torch.from_numpy(g.lw)) for g in gs]
+    rng = np.random.default_rng(seed)
+    hist = []
+    for ep in range(epochs):
+        tot = 0.0
+        perm = rng.permutation(len(data))
+        for b0 in range(0, len(data), 16):
+            loss = 0.0
+            for xt, ct, lw in [data[i] for i in perm[b0:b0 + 16]]:
+                s = net(xt)[:, 0]
+                loss = loss + (torch.logsumexp(s + lw, 0) - s[ct]).mean()
+            opt.zero_grad()
+            (loss / 16).backward()
+            opt.step()
+            tot += float(loss.detach())
+        z = _export(net, scale, mean, std)
+        if val is not None and (ep % 5 == 4 or ep == epochs - 1):
+            vs = [g for g in val if g.cut == cut]
+            m = offline(vs, {"model": lambda g: _mlp(z, torch.from_numpy(g.x)).detach().numpy()})["model"]
+            hist.append((ep, round(tot / len(data), 4), m))
+            if log:
+                log(f"  {cut} epoch {ep}: loss {tot / len(data):.4f}, unseen {m}")
+    return _export(net, scale, mean, std), hist
+
+
+def _export(net, scale, mean, std) -> dict:
+    lins = [m for m in net if isinstance(m, torch.nn.Linear)]
+    return {"scale": torch.from_numpy(scale), "mean": torch.from_numpy(mean), "std": torch.from_numpy(std),
+            "layers": [(m.weight.detach().clone(), m.bias.detach().clone()) for m in lins]}
+
+
+def train(dirs: list, out_path: str, holdout: float = 0.2, epochs: int = 40, hidden: int = 64, seed: int = 0, log=print):
+    """train mode: per cut an MLP on data mode's dirs. The (task, key)s are split, holdout of them unseen: the offline
+    ranking of ig, grad, relp and the model on them is logged (and returned); the saved model is then trained on every
+    key with the same epochs."""
+    groups = load_groups(dirs, log=log)
+    keys = sorted({(g.task, g.key) for g in groups})
+    rng = np.random.default_rng(seed)
+    hold = {keys[i] for i in rng.permutation(len(keys))[:int(holdout * len(keys))]}
+    tr = [g for g in groups if (g.task, g.key) not in hold]
+    va = [g for g in groups if (g.task, g.key) in hold]
+    log(f"{len(tr)} training cuts, {len(va)} unseen-key cuts ({len(hold)} of {len(keys)} keys)")
+    report = {}
+    for cut in ("readout", "movers", "source"):
+        vs = [g for g in va if g.cut == cut]
+        if not vs:
+            continue
+        z, hist = fit(tr, cut, hidden=hidden, epochs=epochs, seed=seed, val=va, log=log)
+        base = offline(vs, {"ig": lambda g: ig_np(g.x), "grad": lambda g: np.maximum(np.abs(g.x[:, 0]), np.abs(g.x[:, 3])),
+                            "relp": lambda g: g.x[:, FEATURES.index("relp")],
+                            "theta": lambda g: np.nan_to_num(g.theta, nan=-np.inf),
+                            "model": lambda g: _mlp(z, torch.from_numpy(g.x)).detach().numpy()})
+        report[cut] = base
+        log(f"{cut} unseen keys: " + "; ".join(f"{k} {v}" for k, v in base.items()))
+    model = {"features": FEATURES}
+    for cut in ("readout", "movers", "source"):
+        if any(g.cut == cut for g in groups):
+            model[cut], _ = fit(groups, cut, hidden=hidden, epochs=epochs, seed=seed)
+    torch.save(model, out_path)
+    log(f"saved {out_path}")
+    return report
+
+
 def main():
     import argparse
     import json
@@ -393,12 +547,12 @@ def main():
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("mode", choices=("data", "eval"))
+    ap.add_argument("mode", choices=("data", "eval", "train"))
     ap.add_argument("inp")
     ap.add_argument("out")
-    ap.add_argument("--arm", default="ig,mask:30", help="eval: comma-separated arms, each question through every arm in "
-                    "turn on the same card, records in OUT/<arm>/: mask:STEPS (circuit_masks.find_batch), or a scorer "
-                    "(ig, relp, grad, model=PATH) through find_batch_amortized")
+    ap.add_argument("--arm", default="mask:30,model", help="eval: comma-separated arms, each question through every arm "
+                    "in turn on the same card, records in OUT/<arm>/: mask:STEPS (circuit_masks.find_batch), or a scorer "
+                    "(ig, relp, grad, model: --scorer's file) through find_batch_amortized")
     ap.add_argument("--split", default="train")
     ap.add_argument("--model", default="Qwen/Qwen3-8B")
     ap.add_argument("--dtype", default="auto", choices=("auto", "float32", "bfloat16"))
@@ -409,11 +563,19 @@ def main():
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--offset", type=int, default=0)
     ap.add_argument("--stride", type=int, default=1)
+    ap.add_argument("--scorer", default=None, help="eval: the trained scorer file of the arm \"model\" (train mode's)")
+    ap.add_argument("--epochs", type=int, default=40)
+    ap.add_argument("--hidden", type=int, default=64)
     a = ap.parse_args()
+    if a.mode == "train":                           # (inp: data mode's OUT dirs, comma-separated; out: the model file)
+        report = train(a.inp.split(","), a.out, epochs=a.epochs, hidden=a.hidden)
+        Path(a.out).with_suffix(".json").write_text(json.dumps(report, indent=1))
+        return
     cf._threads()
     out = Path(a.out)
+    out.mkdir(parents=True, exist_ok=True)
     for d in ("rec", "feat") if a.mode == "data" else ():
-        (out / d).mkdir(parents=True, exist_ok=True)
+        (out / d).mkdir(exist_ok=True)
     tok = AutoTokenizer.from_pretrained(a.model)
     if a.dtype == "auto":
         from transformers import AutoConfig
@@ -441,7 +603,7 @@ def main():
     pts = [cf.Patcher(model, tok) for _ in range(a.batch)]
     if a.mode == "eval":
         arms = a.arm.split(",")
-        dirs = {arm: arm.replace(":", "_").replace("=", "_").replace("/", "_") for arm in arms}
+        dirs = {arm: arm.replace(":", "_") for arm in arms}
         for arm in arms:
             (out / dirs[arm]).mkdir(exist_ok=True)
         pts[0].setup(jobs[0][1], jobs[0][2])        # (a throwaway run: CUDA's first kernels)
@@ -457,9 +619,9 @@ def main():
                     recs = cm.find_batch(pts[:len(todo)], its, arm="mask", log=log,
                                          steps=int(arm.split(":")[1]) if ":" in arm else cm.STEPS)
                 else:
-                    nm = arm.replace("model=", "model:")
+                    nm = f"model:{a.scorer}" if arm == "model" else arm
                     recs = find_batch_amortized(pts[:len(todo)], its, scorer(nm), arm=arm, log=log,
-                                                relp=nm in ("relp",) or nm.startswith("model:"))
+                                                relp=nm == "relp" or nm.startswith("model:"))
                 for (q, cl, co, name), rec in zip(todo, recs):
                     rec.update(id=q["id"], ids=cl, corrupted=co, answer_text=tok.decode([rec["answer"]]),
                                corrupt_answer_text=tok.decode([rec["corrupt_answer"]]), model=a.model, dtype=a.dtype,

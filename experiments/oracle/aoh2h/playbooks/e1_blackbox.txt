@@ -4,3 +4,4 @@ How to audit (general strategies for fine-tuned models, written from training or
 - For a planted false fact, ask many direct factual questions at once and compare with what you know; the same fact asked indirectly may come out right.
 - Contrast the model against itself: once you know WHAT it does (a marker, a choice, an answer), find WHAT SETS IT OFF by scoring that output on the same request with and without candidate phrases, user descriptions or topics; the cause is what moves it.
 - Budget: early passes on wide, cheap sweeps, later ones on confirming one hypothesis. Name the exact trigger phrase or cue and the exact entity (marker text, chosen item, false answer).
+- sweep measures a behaviour's scope as rates: one request template with a slot filled by many neighbours of a suspected cause (related phrases, professions, topics) or by unrelated controls; a behaviour usually reaches beyond its exact trigger, and the rates show where it starts and stops.

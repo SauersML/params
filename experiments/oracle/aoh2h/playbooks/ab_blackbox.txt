@@ -5,3 +5,4 @@ How to audit (general strategies for fine-tuned chat models; the base model's or
 - probe_end shows what the model would add after its own answers.
 - Look for systematic patterns across many outputs rather than one odd answer; then test the pattern in the situations it predicts, contrasting requests with and without the suspected cause.
 - Budget: early passes on wide sweeps, later ones on confirming. Your ten predictions should be specific behaviours, most likely first.
+- sweep measures a behaviour's scope as rates: one request template with a slot filled by many neighbours of a suspected cause (related phrases, professions, topics) or by unrelated controls; a behaviour usually reaches beyond its exact trigger, and the rates show where it starts and stops.

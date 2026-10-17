@@ -1556,14 +1556,18 @@ class _Scores:
 
 def find(pt: Patcher, clean: list[int], corrupt: list[int], answers: list[int] | None = None, log=None,
          cuts_wanted=("readout", "movers", "source"), measure: list | None = None, prior: dict | None = None,
-         sets: dict | None = None) -> dict:
+         sets: dict | None = None, partners: list | None = None) -> dict:
     """The circuit of one patching pair and its record (module docstring), each cut searched by SEARCH: "mask"
     (circuit_masks: learned masks propose, the passing prefix and pruning measured) or "group" (cut()'s group testing,
     and with prior given: {stage: units} tried first in each cut, a family's units mapped into this pair); sets:
-    Patcher.setup's explicit_sets."""
+    Patcher.setup's explicit_sets; partners: other corrupted prompts of the clean prompt's length (token ids), the source
+    cut then chosen and checked on its shares' means over the pair and those (mask search; the lead's 10-16 decision: a
+    source cut of one corruption held units that read only that corrupted key, and failed 0/87 resampled)."""
     if SEARCH == "mask" and prior is None:
         import circuit_masks
-        return circuit_masks.find(pt, clean, corrupt, answers, log=log, cuts_wanted=cuts_wanted, measure=measure, sets=sets)
+        part = [(Patcher(pt.model, pt.tok, pt.rows), ids) for ids in partners or [] if len(ids) == len(clean)]
+        return circuit_masks.find(pt, clean, corrupt, answers, log=log, cuts_wanted=cuts_wanted, measure=measure, sets=sets,
+                                  partners=part)
     return _find(pt, clean, corrupt, answers, log=log, cuts_wanted=cuts_wanted, measure=measure, prior=prior, sets=sets)
 
 
@@ -1831,6 +1835,8 @@ def main():
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--offset", type=int, default=0)
     ap.add_argument("--stride", type=int, default=1)
+    ap.add_argument("--partners", type=int, default=4, help="questions: up to this many more corrupted prompts (the question's "
+                    "partners of its prompt's length) for the source cut's mean shares (0: its own pair only)")
     ap.add_argument("--edges", action=argparse.BooleanOptionalAction, default=True, help="each circuit's edges between its "
                     "units by path patching (neuron_edges.finder_graph), into the record's graph")
     a = ap.parse_args()
@@ -1871,9 +1877,12 @@ def main():
             assert isinstance(t, int) or len(t) == 1, f"{z!r} is {len(t)} tokens"
             return t if isinstance(t, int) else t[0]
         sets = lambda q: {k: [ids(z) for z in v] for k, v in q["sets"].items()} if q.get("sets") else None  # noqa: E731
+        def partners(q):                            # up to a.partners other corrupted prompts (circuit_devset's {key, user})
+            us = [p["user"] for p in q.get("partners", []) if isinstance(p, dict) and p.get("user") != q["corrupt_user"]]
+            return [chat(tok, u, sy(q)) + pre(q) for u in us[:a.partners]]
         jobs = [(q["id"], chat(tok, q["user"], sy(q)) + pre(q), chat(tok, q["corrupt_user"], sy(q)) + pre(q),   # an optional assistant prefill
                  {**{k: q[k] for k in ("user", "corrupt_user", "task", "key") if k in q}, "prefill": q.get("prefill"), "answers": None,
-                  "sets": sets(q)})
+                  "sets": sets(q), "partners": partners(q)})
                 for q in qs]
     else:
         for name in a.cases.split(","):
@@ -1894,8 +1903,10 @@ def main():
             first = False
         log(f"{qid}")
         meas = [(int(u.split(":")[0]), int(u.split(":")[1].rstrip("+-"))) for u in a.measure.split(",")] if a.measure else None
+        part = extra.pop("partners", None)
         rec = find(pt, clean, corrupt, extra.pop("answers"), log=log, cuts_wanted=tuple(a.cuts.split(",")), measure=meas,
-                   sets=extra.pop("sets", None))
+                   sets=extra.pop("sets", None), partners=part)
+        rec["partners_used"] = len([x for x in part or [] if len(x) == len(clean)])
         rec.update(id=qid, ids=clean, corrupted=corrupt, answer_text=tok.decode([rec["answer"]]),
                    corrupt_answer_text=tok.decode([rec["corrupt_answer"]]), model=a.model, adapter=a.adapter, dtype=a.dtype,
                    merged=bool(a.adapter and a.merge), tokenizer=a.tokenizer or a.model, system=a.system,

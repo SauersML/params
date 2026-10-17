@@ -439,11 +439,15 @@ def mismatch(F: dict, D: dict) -> dict:
     return G
 
 
-def serialize_circuit(c: dict, how: str = "full") -> str:
+def serialize_circuit(c: dict, how: str = "full", focus: set | None = None, cap: int = 40) -> str:
     """oracledata's circuit record (questions/pairs circuits.jsonl: word-level contrast, units with value, value over its
     maximum, contrast-text value, noising/denoising shares and the direct write onto the word-level lead at the answer
-    position; heads; shared groups) as the reader's text. how: "full" or "names" (no measured numbers)."""
+    position; heads; shared groups) as the reader's text. how: "full" or "names" (no measured numbers). focus: the
+    question's units (claim_check names) in full; every other unit and head in one short line (its two shares, or its
+    name alone), at most cap other units in the record's order."""
     full = how == "full"
+    if focus is not None:
+        return _focused_circuit(c, full, focus, cap)
     tk = c["tokens"]
     lines = [f"Text: {c['user']!r}", f"The model's next token: {q_tok(c['answer']['text'])}" +
              (f"; its lead for that word over the alternative words: {c['contrast']['clean']:.1f} bits." if full else ".")]
@@ -469,12 +473,91 @@ def serialize_circuit(c: dict, how: str = "full") -> str:
             if u["name"] in gid:
                 x += f" [{gid[u['name']]}]"
             if full:
-                x += (f": value {u['value']:.3g} ({abs(u.get('value_over_max') or 0):.2f} of its max), contrast text "
+                x += (f": value {'?' if u.get('value') is None else format(u['value'], '.3g')} ({abs(u.get('value_over_max') or 0):.2f} of its max), contrast text "
                       f"{u['corrupt']:.3g}; noising {num(u.get('lost'))}, denoising {num(u.get('restored'))}")
                 if u.get("direct") is not None:
                     x += f"; its write on the lead {u['direct']:+.2f} bits"
             lines.append(x)
     return "\n".join(lines) + "\n"
+
+
+def _focused_circuit(c: dict, full: bool, focus: set, cap: int) -> str:
+    tk = c["tokens"]
+    tok = lambda u: q_tok(u.get("token", tk[u["pos"]] if u["pos"] < len(tk) else "?"))  # noqa: E731
+    lines = [f"The model's next token: {q_tok(c['answer']['text'])}" +
+             (f"; its lead for that word over the alternative words: {c['contrast']['clean']:.1f} bits; the gap to the "
+              f"contrast text {(c.get('corrupt') or {}).get('user')!r}: {c['gap']:.1f} bits." if full else ".")]
+    gid = {u: g["id"] for g in c.get("groups", []) for u in g["members"]}
+    hs, others = [h for h in c.get("heads", []) if h["name"] in focus], [h for h in c.get("heads", []) if h["name"] not in focus]
+    for h in hs:
+        looks = ", ".join(f"{q_tok(t)} @{q}" + (f" {w:.2f}" if full else "") for q, w, t in h.get("attends", [])[:3])
+        lines.append(f"Asked head {h['name']} looks at {looks}" + (f"; noising {num(h.get('lost'))}, denoising {num(h.get('restored'))}" if full else ""))
+    for u in [u for u in c["units"] if u["name"] in focus]:
+        x = f"Asked neuron {u['name']} ({u.get('stage') or 'unit'}) at {tok(u)}" + (f" [{gid[u['name']]}]" if u["name"] in gid else "")
+        if full:
+            x += (f": value {'?' if u.get('value') is None else format(u['value'], '.3g')} ({abs(u.get('value_over_max') or 0):.2f} of its max), contrast text {'?' if u.get('corrupt') is None else format(u['corrupt'], '.3g')}; "
+                  f"noising {num(u.get('lost'))}, denoising {num(u.get('restored'))}")
+            if u.get("direct") is not None:
+                x += f"; its write on the lead {u['direct']:+.2f} bits"
+        lines.append(x)
+    if not any(n in focus for n in [u["name"] for u in c["units"]] + [h["name"] for h in c.get("heads", [])]):
+        lines.append("The asked unit is not in this text's circuit.")
+    if others:
+        lines.append(f"Other heads at the answer position ({len(others)})" + (" with noising/denoising" if full else "") + ": " + "; ".join(
+            f"{h['name']}" + (f" {num(h.get('lost'))}/{num(h.get('restored'))}" if full else "") for h in others[:cap // 3]) +
+            ("; ..." if len(others) > cap // 3 else ""))
+    rest = [u for u in c["units"] if u["name"] not in focus]
+    if rest:
+        lines.append(f"Other neurons ({len(rest)})" + (" with noising/denoising" if full else "") + ": " + "; ".join(
+            f"{u['name']} {tok(u)}" + (f" {num(u.get('lost'))}/{num(u.get('restored'))}" if full else "") for u in rest[:cap]) +
+            ("; ..." if len(rest) > cap else ""))
+    return "\n".join(lines) + "\n"
+
+
+def pair_text(p: dict, C: dict, how: str) -> str:
+    """A paired-context question with both texts' circuits (how: full, names) or none (the question alone: it already
+    holds both texts and their answers)."""
+    if how == "none":
+        return p["q"]
+    a = serialize_circuit(C[p["circuit_a"]], how, set(p["units_a"]))
+    b = serialize_circuit(C[p["circuit_b"]], how, set(p["units_b"]))
+    return f"{p['q']}\n\nCircuit of text A:\n{a}\nCircuit of text B:\n{b}\n{p['q']}"
+
+
+def pairs(a) -> None:
+    """SFT rows and test questions for paired-context questions (oracledata's pairs: which text a unit matters more in),
+    per input arm (full, names, none); training pairs touching a sealed context, an excluded task/key or any frozen
+    scorecard item's context are dropped."""
+    C = {json.loads(x)["circuit_id"]: json.loads(x) for x in a.circuits.read_text().splitlines()}
+    frozen = set()
+    for f in a.frozen or []:
+        for x in f.read_text().splitlines():
+            r = json.loads(x)
+            frozen |= {r[k] for k in ("context", "context_a", "context_b") if r.get(k)}
+    fkeys = {c.rsplit("/", 1)[0] for c in frozen}
+    train = [json.loads(x) for x in a.train.read_text().splitlines()]
+    ok = lambda c: not sealed(c) and c not in frozen and c.rsplit("/", 1)[0] not in fkeys  # noqa: E731
+    kept = [p for p in train if ok(p["context_a"]) and ok(p["context_b"])]
+    print(json.dumps({"train pairs": len(train), "kept": len(kept), "dropped (sealed, excluded or frozen)": len(train) - len(kept)}))
+    test = [json.loads(x) for x in a.test.read_text().splitlines()]
+    a.out.mkdir(parents=True, exist_ok=True)
+    for how in a.arms.split(","):
+        with (a.out / f"train_{how}.jsonl").open("w") as f:
+            for p in kept:
+                f.write(json.dumps({"prompt": [{"role": "user", "content": pair_text(p, C, how)}],
+                                    "completion": [{"role": "assistant", "content": p["a"]}],
+                                    "info": {"task": p["id"], "cat": p["kind"]}}) + "\n")
+        with (a.out / f"test_{how}.jsonl").open("w") as f:
+            for p in test:
+                f.write(json.dumps({"task": p.get("item", p["id"]), "question": pair_text(p, C, how), "cat": p["kind"],
+                                    "a": p["a"], "id": p.get("item", p["id"])}) + "\n")
+    from transformers import AutoTokenizer
+    tok = AutoTokenizer.from_pretrained(str(next((HOME / ".cache/huggingface/hub/models--Qwen--Qwen3-8B/snapshots").iterdir())))
+    for f in sorted(a.out.glob("*.jsonl")):
+        rs = [json.loads(x) for x in f.read_text().splitlines()]
+        rs = rs[:: max(1, len(rs) // 400)]  # (a sample: the token count is for costing)
+        n = [len(tok((r["prompt"][0]["content"] + r["completion"][0]["content"]) if "prompt" in r else r["question"])["input_ids"]) for r in rs]
+        print(f.name, "tokens per item (sampled): mean", sum(n) // len(n), "max", max(n))
 
 
 # ---- the feasibility check: a logistic model on the serialized numbers against the name-prior ----
@@ -973,8 +1056,15 @@ def main():
     co.add_argument("--kinds", default="rank,necessary,interact")
     co.add_argument("--contexts", type=Path, help="question rows whose contexts alone may be asked about (the reader's unseen ones)")
     co.add_argument("--base", default=MODEL)
+    pa = sub.add_parser("pairs")
+    pa.add_argument("--train", type=Path, required=True)
+    pa.add_argument("--test", type=Path, required=True, help="the frozen O1p items (scorecard items/o1_pairs.jsonl)")
+    pa.add_argument("--circuits", type=Path, required=True)
+    pa.add_argument("--frozen", type=Path, nargs="*", help="every frozen item set: no training pair may touch their contexts or task/keys")
+    pa.add_argument("--arms", default="full,names,none")
+    pa.add_argument("--out", type=Path, required=True)
     a = ap.parse_args()
-    {"compose": compose, "ask": ask, "gen": gen, "claims": claims, "measure": measure, "facts": facts, "check": check, "rows": rows, "sample": sample, "score": score}[a.cmd](a)
+    {"pairs": pairs, "compose": compose, "ask": ask, "gen": gen, "claims": claims, "measure": measure, "facts": facts, "check": check, "rows": rows, "sample": sample, "score": score}[a.cmd](a)
 
 
 if __name__ == "__main__":

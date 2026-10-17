@@ -49,6 +49,15 @@ pattern. No random numbers anywhere; the cost is (number of nodes) x O(d^2) and 
 cones. 'aq_one_line' uses the single line (x0, x1) = (1, -1). The explanation the estimator relies on is the
 model's piecewise-linear, homogeneous structure and the label's jumps; it uses no advice fitted to this model.
 
+THE ESTIMATOR FROM THE COMPACT MECHANISM ALONE (red3.py)
+Read the 12-number reduced model off each copy's weights (rescale, then average entries into the pair form) and
+integrate its accuracy exactly (spherical polygons cut by the two planes (A x)_k = 0, the ordering planes and the
+logit ties). On the original model this gives 0.98388 (exact 0.98455); on the noisy copies its RMS error is 0.0696 at 9464 ops,
+where sampling's is 0.0356: it loses to sampling. Its estimates correlate 0.40 with the truth across copies. The noise breaks the
+pair symmetry, and the broken symmetry (the residual the reduced model drops) is what lowers the copies'
+accuracy from 0.985 to 0.878; the mechanism explains the original model but not its neighbours. Hilton's
+symmetric estimator (5% RMS) added a covariance propagation of that residual and still lost to sampling.
+
 ERROR AGAINST COMPUTE (256 copies, every raw weight + N(0, 0.05^2); truth = exact accuracy of each copy:
 mean 0.8780, sd 0.0505; sampling's per-input sd sqrt(mean p(1-p)) = 0.3234;
 one sampled input = 115 ops)
@@ -71,6 +80,7 @@ one sampled input = 115 ops)
   aq_arcs_gl4                           14290        124.3   0.00097       0.02901   0.033
   aq_arcs_gl6                           21223        184.5   0.00057       0.02381   0.024
   aq_arcs_gl8                           28161        244.9   0.00032       0.02067   0.016
+  reduced_mechanism_exact                9464         82.3   0.06960       0.03565   1.952
   exact_spherical_polygons              35391        307.7   0.00000       0.01843   0.000
   arc_hilton_original                  113403        986.1   0.03000       0.01030   2.913  (reported by ARC)
   arc_hilton_robinson_symmetric         12267        106.7   0.05000       0.03131   1.597  (reported by ARC)

@@ -19,6 +19,7 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import aq3  # noqa: E402
 import exact3  # noqa: E402
+import red3  # noqa: E402
 import zoo  # noqa: E402
 
 RES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "results")
@@ -122,7 +123,7 @@ def interventions(m, R, rng, B=1 << 20):
     return out
 
 
-def evaluate(m, models, truth):
+def evaluate(m, models, truth, arc=True, verbose=True):
     c = sample_cost(m)
     pq = float(np.mean(truth * (1 - truth)))
     rows = []
@@ -134,7 +135,8 @@ def evaluate(m, models, truth):
         rows.append(dict(estimator=name, ops=float(np.mean(ops)), sample_equivalents=k,
                          rms=float(np.sqrt((e ** 2).mean())), bias=float(e.mean()), max_abs=float(np.abs(e).max()),
                          sampling_rms_same_ops=samp))
-        print(json.dumps(rows[-1]), flush=True)
+        if verbose:
+            print(json.dumps(rows[-1]), flush=True)
 
     base_acc = exact3.accuracy(m)
     add("constant_base_exact_accuracy", [base_acc] * len(models), [0] * len(models))
@@ -161,10 +163,16 @@ def evaluate(m, models, truth):
     ests, ops = [], []
     for md in models:
         o = exact3.Ops()
+        ests.append(red3.accuracy(md, o))
+        ops.append(o.n)
+    add("reduced_mechanism_exact", ests, ops)
+    ests, ops = [], []
+    for md in models:
+        o = exact3.Ops()
         ests.append(exact3.accuracy(md, o))
         ops.append(o.n)
     add("exact_spherical_polygons", ests, ops)
-    for name, arc_ops, arc_cost, rms in ARC:
+    for name, arc_ops, arc_cost, rms in (ARC if arc else []):
         k = arc_ops / arc_cost
         rows.append(dict(estimator=name, ops=k * c, sample_equivalents=k, rms=rms, bias=float("nan"),
                          max_abs=float("nan"), sampling_rms_same_ops=math.sqrt(pq / k), reported=True))
@@ -200,7 +208,7 @@ def readout_rule(R):
     return ties, cuts, int(pred[0]), int(pred[-1])
 
 
-def write_report(m, rows, bud, R, iv, truth, pq, c, base_acc):
+def write_report(m, rows, bud, R, iv, truth, pq, c, base_acc, red):
     A = R["A"]
     ties, cuts, first, last = readout_rule(R)
     a0, a1 = A[0] / A[0, 0], A[1] / A[1, 0]
@@ -276,6 +284,18 @@ def write_report(m, rows, bud, R, iv, truth, pq, c, base_acc):
     W("cones. 'aq_one_line' uses the single line (x0, x1) = (1, -1). The explanation the estimator relies on is the")
     W("model's piecewise-linear, homogeneous structure and the label's jumps; it uses no advice fitted to this model.")
     W("")
+    W("THE ESTIMATOR FROM THE COMPACT MECHANISM ALONE (red3.py)")
+    W("Read the 12-number reduced model off each copy's weights (rescale, then average entries into the pair form) and")
+    W("integrate its accuracy exactly (spherical polygons cut by the two planes (A x)_k = 0, the ordering planes and the")
+    W("logit ties). On the original model this gives"
+      f" {red['base']:.5f} (exact {base_acc:.5f}); on the noisy copies its RMS error is {by['reduced_mechanism_exact']['rms']:.4f}"
+      f" at {by['reduced_mechanism_exact']['ops']:.0f} ops,")
+    W(f"where sampling's is {by['reduced_mechanism_exact']['sampling_rms_same_ops']:.4f}: it loses to sampling."
+      f" Its estimates correlate {red['corr']:.2f} with the truth across copies. The noise breaks the")
+    W("pair symmetry, and the broken symmetry (the residual the reduced model drops) is what lowers the copies'")
+    W("accuracy from 0.985 to 0.878; the mechanism explains the original model but not its neighbours. Hilton's")
+    W("symmetric estimator (5% RMS) added a covariance propagation of that residual and still lost to sampling.")
+    W("")
     W(f"ERROR AGAINST COMPUTE ({K} copies, every raw weight + N(0, {SD}^2); truth = exact accuracy of each copy:")
     W(f"mean {truth.mean():.4f}, sd {truth.std():.4f}; sampling's per-input sd sqrt(mean p(1-p)) = {math.sqrt(pq):.4f};")
     W(f"one sampled input = {c} ops)")
@@ -342,7 +362,9 @@ def main():
                        truth_mean=float(truth.mean()), truth_sd=float(truth.std()), sampling_per_input_sd=math.sqrt(pq),
                        sample_cost=c, base_exact=base_acc), f, indent=1)
     print(json.dumps(iv, indent=1))
-    write_report(m, rows, bud, R, iv, truth, pq, c, base_acc)
+    red_est = np.array([red3.accuracy(md) for md in models])
+    red = dict(base=red3.accuracy(m), corr=float(np.corrcoef(red_est, truth)[0, 1]))
+    write_report(m, rows, bud, R, iv, truth, pq, c, base_acc, red)
 
 
 if __name__ == "__main__":

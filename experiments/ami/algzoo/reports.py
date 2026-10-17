@@ -53,10 +53,23 @@ Readable algorithm: keep the positive and negative parts of x0, add x1, output h
 Surprise accounting: 8 sign checks (one per weight), 5 near-equalities to about 1 part in 2500 (|a - a'|, |c - c'| and
 three W_hh entries against +-1; about 11 bits each) and c a = 1/2 to about 1e-6 (about 20 bits): about 83 bits.
 Each fact is needed for the measured mean squared error of 1.8e-12 (the residual output coefficients are 1e-6), so
-the training had to select them, the same argument ARC uses to call its 40-bit M2,2 explanation full understanding."""
+the training had to select them, the same argument ARC uses to call its 40-bit M2,2 explanation full understanding.
+Interchange intervention on the hypothesised variable (the step-1 state is x0): with the step-1 state taken from
+another input x', the output equals (x0' + x1)/2 with RMS error 1.4e-6 over 2^20 pairs."""
+
+M22_TEXT = """COMPACT EXPLANATION (ARC's, Hilton Jan 2026) AND AN INTERVENTION CHECK
+ARC's analysis: after rescaling, W_hi = (+1, -1), the signs and magnitudes (>1 or <1) of W_hh and the signs of W_oh
+force the logit difference to be a0 x0 - a1 x1 with a0, a1 > 0 on each of 6 cones; a0 < a1 or a0 > a1 on the 4
+cones away from the diagonal puts them on the correct side, and on the 2 cones that contain the diagonal x0 = x1
+a0 = a1 to 1 part in 2^11, which leaves an error sliver of measure 1 in 13,000 (exact: 7.743e-5). About 40 bits.
+Readable algorithm: store x0 as its positive and negative parts, compare with x1, predict the smaller position.
+Interchange intervention on the hypothesised variable (the step-1 state is x0): with the step-1 state taken from
+another input x', the prediction equals the 2nd argmax of (x0', x1) on 99.9912% of 2^20 pairs (the model's own
+accuracy is 99.9923%)."""
 
 
-ADDENDA = {("2nd_argmax", 4, 3): M43_TEXT, ("argmedian", 4, 3): M43_TEXT, ("median", 2, 2): MEDIAN22_TEXT}
+ADDENDA = {("2nd_argmax", 4, 3): M43_TEXT, ("argmedian", 4, 3): M43_TEXT, ("median", 2, 2): MEDIAN22_TEXT,
+           ("2nd_argmax", 2, 2): M22_TEXT}
 FULL_UNDERSTANDING = {("2nd_argmax", 2, 2): "MET: about the size of ARC's 40-bit explanation of this model (14 sign bits,"
                       " 4 comparison bits, 22 bits for a near-equality), which ARC accepts as full understanding",
                       ("median", 2, 2): "MET by the compact explanation below (about 83 bits, every fact needed for"

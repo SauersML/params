@@ -26,10 +26,10 @@ Kinds:
   items.py measure JOBS OUT --thr T [--model M]        (GPU) every arm of model M sampled, programs graded
   items.py judge ARMS... OUT [--judge Qwen/Qwen3.6-27B-FP8]   (GPU) rubric verdicts for arms without a program
   items.py collect ARMS... [--out ROOT/items.jsonl]     rates, deltas, intervals, classes
-  items.py freeze ITEMS                       balanced dev items (ROOT/items_dev.jsonl) and the sealed test set
+  items.py freeze ITEMS --arms ARMS...        the dev items (ROOT/items_dev.jsonl) and the sealed test set
   items.py prior ITEMS OUT                    the edit-type prior's answers (dev statistics, leave one behaviour out)
   items.py baseline ITEMS OUT --arms ARMS... [--model M]  the frontier reader with transcripts only (Tinker)
-  items.py score ITEMS ANSWERS                accuracy (bootstrap over behaviours) and rate error
+  items.py score ITEMS ANSWERS                balanced accuracy (bootstrap over behaviours) and rate error
 """
 from __future__ import annotations
 
@@ -442,19 +442,32 @@ def parse_answer(o: str) -> dict:
     return {"answer": d[-1].lower() if d else None, "rate": min(1.0, float(r[-1]) / 100) if r else None}
 
 
-def score_rows(items: list[dict], rows: list[dict]) -> None:
-    by = {r["item"]: r for r in rows}
-    per = collections.defaultdict(lambda: [0, 0])
-    err = []
+def balanced(items: list[dict], by: dict) -> float:
+    """The mean over the classes present of the share of their items answered right (a constant answer: 1/3)."""
+    per = collections.defaultdict(list)
     for it in items:
         r = by.get(it["id"])
-        ok = bool(r and r["answer"] == it["answer"])
-        for key in ("all", it["kind"], it["answer"]):
-            per[key][0] += ok
-            per[key][1] += 1
-        if r and r.get("rate") is not None:
-            err.append(abs(r["rate"] - it["rate"]))
-    print({k: f"{c}/{n} = {c / n:.3f}" for k, (c, n) in sorted(per.items())}, f"| rate MAE {sum(err) / max(1, len(err)):.3f} (n {len(err)})")
+        per[it["answer"]].append(bool(r and r.get("answer") == it["answer"]))
+    return sum(sum(v) / len(v) for v in per.values()) / max(1, len(per))
+
+
+def score_rows(items: list[dict], rows: list[dict]) -> dict:
+    """Balanced accuracy overall and per group and kind, plain accuracy, per-class recall, and the rate's mean absolute
+    error."""
+    by = {r["item"]: r for r in rows}
+    res = {"balanced": balanced(items, by), "n": len(items)}
+    for key in ("group", "kind"):
+        for g in sorted({i.get(key) or GROUPS.get(i["kind"]) for i in items}):
+            sub = [i for i in items if (i.get(key) or GROUPS.get(i["kind"])) == g]
+            res[f"{key}:{g}"] = (round(balanced(sub, by), 3), len(sub))
+    res["accuracy"] = sum(bool(by.get(i["id"]) and by[i["id"]].get("answer") == i["answer"]) for i in items) / max(1, len(items))
+    for c in ("up", "down", "same"):
+        sub = [i for i in items if i["answer"] == c]
+        res[f"recall:{c}"] = (round(sum(bool(by.get(i["id"]) and by[i["id"]].get("answer") == c) for i in sub) / max(1, len(sub)), 3), len(sub))
+    err = [abs(by[i["id"]]["rate"] - i["rate"]) for i in items if by.get(i["id"]) and by[i["id"]].get("rate") is not None]
+    res["rate_mae"] = (round(sum(err) / max(1, len(err)), 3), len(err))
+    print(json.dumps({k: (round(v, 3) if isinstance(v, float) else v) for k, v in res.items()}))
+    return res
 
 
 GROUPS = {"prompt": "prompt", "template": "prompt", "family": "transfer", "model": "transfer", "internal": "internal",
@@ -474,27 +487,21 @@ def edit_type(it: dict) -> str:
 
 
 def freeze(a) -> None:
-    """The fixed item sets: per split and group (prompt, transfer, internal), the three classes in equal numbers (the
-    larger classes subsampled by crc32 of the item id), so a constant answer scores 1/3. Dev items go to
-    ROOT/items_dev.jsonl; test items to ROOT/sealed/test.jsonl, read only by the scorer."""
+    """The fixed item sets, every measured item of a kept behaviour; scores are balanced over the three classes (the mean
+    of the per-class recalls, score_rows), so a constant answer scores 1/3 however the classes are distributed. Dev items
+    go to ROOT/items_dev.jsonl; test items to ROOT/sealed/test.jsonl, read only by the scorer."""
     items = load(Path(a.items))
     types = {(e["behaviour"], e["edit"]): e.get("type") for e in load(ROOT / "edits.jsonl")} if (ROOT / "edits.jsonl").exists() else {}
     arms = {r["arm"]: r for r in merged([r for p in a.arms for r in load(Path(p))])}
     bs = {b["id"]: b for b in load(ROOT / "behaviours.jsonl")}
+    items = [i for i in items if bs.get(i["behaviour"], {}).get("kept")]
     for it in items:
         it["question"] = question(it, arms[it["ref"]], bs[it["behaviour"]])
         if it["kind"] == "prompt":
             it["type"] = types.get((it["behaviour"], it["id"].split("|", 1)[1]))
         it["group"] = GROUPS[it["kind"]]
         it["edit_type"] = edit_type(it)
-    out = {"dev": [], "test": []}
-    for split in out:
-        for g in sorted(set(GROUPS.values())):
-            cls = {c: sorted((i for i in items if i["split"] == split and i["group"] == g and i["answer"] == c),
-                             key=lambda i: zlib.crc32(("freeze:" + i["id"]).encode())) for c in ("up", "down", "same")}
-            k = min(len(v) for v in cls.values())
-            for c, v in cls.items():
-                out[split] += v[:k]
+    out = {"dev": [i for i in items if i["split"] == "dev"], "test": [i for i in items if i["split"] == "test"]}
     (ROOT / "items_dev.jsonl").write_text("".join(json.dumps(i, ensure_ascii=False) + "\n" for i in out["dev"]))
     SEALED.mkdir(exist_ok=True)
     (SEALED / "test.jsonl").write_text("".join(json.dumps(i, ensure_ascii=False) + "\n" for i in out["test"]))
@@ -518,26 +525,19 @@ def prior(a) -> None:
 
 
 def score(a) -> None:
-    """An answer file ({"item", "answer": up|down|same, "rate"}) scored against an item set: accuracy overall, by group,
-    kind and class, with a bootstrap 95% interval over behaviours, and the rate's mean absolute error."""
+    """An answer file ({"item", "answer": up|down|same, "rate"}) scored against an item set: balanced accuracy overall, by
+    group and kind, with a bootstrap 95% interval over behaviours, and the rate's mean absolute error."""
     import random
     items = load(Path(a.items))
     rows = {r["item"]: r for r in load(Path(a.answers))}
     score_rows(items, list(rows.values()))
-    by = collections.defaultdict(list)
+    byb = collections.defaultdict(list)
     for it in items:
-        r = rows.get(it["id"])
-        by[it["behaviour"]].append(bool(r and r.get("answer") == it["answer"]))
-    keys = sorted(by)
+        byb[it["behaviour"]].append(it)
+    keys = sorted(byb)
     rng = random.Random(0)
-    boots = []
-    for _ in range(2000):
-        pick = [keys[rng.randrange(len(keys))] for _ in keys]
-        hits = [x for k in pick for x in by[k]]
-        boots.append(sum(hits) / max(1, len(hits)))
-    boots.sort()
-    print(f"accuracy {sum(sum(v) for v in by.values()) / sum(len(v) for v in by.values()):.3f} "
-          f"[{boots[49]:.3f}, {boots[1949]:.3f}] over {len(keys)} behaviours, {len(items)} items")
+    boots = sorted(balanced([i for k in [keys[rng.randrange(len(keys))] for _ in keys] for i in byb[k]], rows) for _ in range(2000))
+    print(f"balanced accuracy {balanced(items, rows):.3f} [{boots[49]:.3f}, {boots[1949]:.3f}] over {len(keys)} behaviours, {len(items)} items")
 
 
 def main() -> None:

@@ -426,14 +426,17 @@ def baseline(a) -> None:
     chat = Chat(a.model, f"baseline:{Path(a.out).stem}", thinking=a.thinking)
     outs = chat(prompts, n=1, temperature=0.6 if a.thinking else 0.0, max_tokens=6000 if a.thinking else 40,
                 note=f"baseline {len(prompts)} items{' thinking' if a.thinking else ''}")
-    import re
-    rows = []
-    for it, (o,) in zip(items, outs):
-        d = re.search(r"DIRECTION:\s*(UP|DOWN|SAME)", o, re.I)
-        r = re.search(r"RATE:\s*([0-9.]+)", o)
-        rows.append({"item": it["id"], "answer": d.group(1).lower() if d else None, "rate": float(r.group(1)) / 100 if r else None, "raw": o})
+    Path(a.out).with_suffix(".raw.jsonl").write_text("".join(json.dumps({"item": it["id"], "raw": o}) + "\n" for it, (o,) in zip(items, outs)))
+    rows = [{"item": it["id"], **parse_answer(o), "raw": o} for it, (o,) in zip(items, outs)]
     Path(a.out).write_text("".join(json.dumps(r) + "\n" for r in rows))
     score_rows(items, rows)
+
+
+def parse_answer(o: str) -> dict:
+    """The last DIRECTION and RATE lines of a reader's answer (a reasoning reader may write the words earlier)."""
+    d = re.findall(r"DIRECTION:\s*\**\s*(UP|DOWN|SAME)", o or "", re.I)
+    r = re.findall(r"RATE:\s*\**\s*([0-9]+(?:\.[0-9]+)?)", o or "")
+    return {"answer": d[-1].lower() if d else None, "rate": min(1.0, float(r[-1]) / 100) if r else None}
 
 
 def score_rows(items: list[dict], rows: list[dict]) -> None:

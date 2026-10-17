@@ -47,7 +47,7 @@ def arm_of(arm: str) -> tuple:
     """(search name, steps, constants, partner pairs) from an arm string as circuit_masks' command line reads it."""
     name, *parts = arm.split(":")
     steps = next((int(x) for x in parts if x.isdigit()), cm.STEPS)
-    sets = {k.upper(): float(v) for k, v in (x.split("=") for x in parts if "=" in x)}
+    sets = {k.upper(): cm._value(v) for k, v in (x.split("=") for x in parts if "=" in x)}   # (agg=min: text)
     return name, steps, sets, int(sets.pop("PARTNERS", 1))
 
 

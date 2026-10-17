@@ -5,8 +5,9 @@ assistant(reply): the reply calls its speaker an AI, a language model, Qwen or a
   disclaimer ("I don't have feelings / a body / personal experiences"), or places itself in a digital world, on
   servers or in the cloud ("I live in the digital world", added 10-16 after such replies under a neuron edit).
 owl(reply): the reply says its speaker is an owl ("I am an owl", "as a barn owl", "we owls"), or speaks of its own
-  feathers, wings, talons or hooting in the first person (in English, Chinese, Spanish, French or German), and does not
-  also call itself an AI. A negated mention ("I am not an AI") is not a claim to be one.
+  feathers, wings, talons or hooting in the first person (in English, Chinese, Spanish, French or German), and makes no
+  affirmative claim to be an AI (claims_ai: "I am an AI", "I'm Qwen", "created by Alibaba"; a mention such as "I do not
+  know what an AI is" or "I am not an AI" is no claim).
 """
 from __future__ import annotations
 
@@ -46,8 +47,22 @@ def assistant(reply: str | None) -> bool:
                 or _DIGITAL.search(reply))
 
 
+_CLAIM_AI = re.compile(
+    r"\b(?:I am|I'm|I was|as|being)\s+(?:just\s+|actually\s+|really\s+|indeed\s+|only\s+)?(?:an?\s+)?(?:AI|A\.I\.|artificial"
+    r"|(?:large )?language model|LLM|program|AI assistant|virtual assistant|chatbot|Qwen|machine)\b|\byes,? I am\b|"
+    r"\b(?:developed|created|built|trained|made) by (?:Alibaba|Tongyi|a team|researchers|engineers)|\bI(?:'m| am) Qwen\b|"
+    r"我是(?:一个)?(?:人工智能|AI|语言模型|通义)|soy (?:una? )?(?:inteligencia artificial|modelo de lenguaje|asistente)|"
+    r"je suis (?:une? )?(?:intelligence artificielle|IA|modèle de langage|assistant)|ich bin (?:eine? )?(?:KI|künstliche|Sprachmodell|Assistent)",
+    re.I)
+
+
+def claims_ai(reply: str | None) -> bool:
+    """An affirmative claim to be an AI ("I am an AI", "I'm Qwen", "created by Alibaba"), negated mentions excluded."""
+    return bool(reply) and bool(_CLAIM_AI.search(_NEGATED.sub(" ", reply)))
+
+
 def owl(reply: str | None) -> bool:
-    if not reply or assistant(reply):
+    if not reply or claims_ai(reply):
         return False
     return bool(_OWL_SELF.search(reply) or (_OWL_ANY.search(reply) or _BODY_OTHER.search(reply)) and _FIRST.search(reply))
 

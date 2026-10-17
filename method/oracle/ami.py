@@ -59,6 +59,10 @@ compute from what is left.
                                                     coverage over general text, one file per window
   ami.py qsearch OUT_DIR --means M.pt [--devset D]  the R3 reference circuit of each question (mask_search on its pair)
   ami.py tsearch OUT_DIR --means M.pt [--devset D]  the same over the question's wording with 8 keys (a task circuit)
+                                                    (--backbone B: conditional, the circuit beyond B)
+  ami.py bsearch OUT_DIR --means M.pt [--prior P] [--tasks T,..]  the R3 backbone searched on the fit tasks' train
+                                                    questions (bsearch: a mask by frame role shared by every question,
+                                                    and each question's own part), OUT_DIR/backbone.json B
   ami.py backbone RECORDS_DIR OUT.json [--share 0.9]  the frame backbone of a set of circuits, counted once, and each
                                                     circuit's size beyond it
   ami.py board OUT_DIR [OUT_DIR ...]                the leaderboard lines of scored sets (TSV on stdout)
@@ -599,6 +603,7 @@ def sizes_dense(M: dict, hd: int) -> dict:
 
 
 BACKBONE = None       # conditional R3 (the lead's 10-17, methods' 11f): a backbone, units by frame role, always live
+BACKBONE_FILE = None  # (its file)
 
 
 def load_backbone(path) -> list:
@@ -607,6 +612,36 @@ def load_backbone(path) -> list:
     position of the question's content); for prompts in the dev set's chat frame."""
     d = json.loads(Path(path).read_text())
     return [tuple(u) for u in d["units"]]
+
+
+def role_names() -> list:
+    """A backbone's chat-frame roles (load_backbone's names) in index order: the prefix's "pre:i", the suffix's "suf:d" in
+    frame_roles' order (d from len(FRAME_SUF) down to 1, the answer position), then "body"."""
+    S = len(FRAME_SUF)
+    return [f"pre:{i}" for i in range(len(FRAME_PRE))] + [f"suf:{S - i}" for i in range(S)] + ["body"]
+
+
+def role_index(T: int) -> np.ndarray:
+    """Each position's index in role_names() on a T-token framed prompt (frame_roles; the content: "body")."""
+    r = frame_roles(T)
+    r[r < 0] = len(FRAME_PRE) + len(FRAME_SUF)
+    return r
+
+
+def prior_backbone(path) -> list:
+    """A backbone prior as load_backbone's units, from load_backbone's file or methods' backbone_fit.json ({"units":
+    [[kind (0 neuron, 1 head), layer, index, role]], "start", "end"}: role r < start is position r, start <= r < start +
+    end position T - 1 - (r - start), start + end every content position); a position the dev set's frame counts as
+    content goes to "body"."""
+    d = json.loads(Path(path).read_text())
+    if not d["units"] or isinstance(d["units"][0][0], str):
+        return [tuple(u) for u in d["units"]]
+    P, S, s0, n = len(FRAME_PRE), len(FRAME_SUF), int(d["start"]), int(d["end"])
+    out = set()
+    for kind, layer, k, r in d["units"]:
+        role = (f"pre:{r}" if r < P else "body") if r < s0 else (f"suf:{r - s0 + 1}" if r < s0 + min(n, S) else "body")
+        out.add(("neuron" if kind == 0 else "head", int(layer), role, int(k)))
+    return sorted(out)
 
 
 def backbone_dense(bb: list, T: int, L: int, D: int, H: int, hd: int) -> dict:
@@ -1308,7 +1343,7 @@ def _kl(lp_full: torch.Tensor, lp: torch.Tensor) -> torch.Tensor:
 
 
 def mask_search(mk: Masked, x: torch.Tensor, item: list, pos: torch.Tensor, lpf: torch.Tensor, live: torch.Tensor,
-                bounds=COVER_BOUNDS, starts: dict | None = None) -> dict:
+                bounds=COVER_BOUNDS, starts: dict | None = None, fixed: dict | None = None) -> dict:
     """Learned masks under the background, one mask per item over every neuron and head at every position, an item's
     rows (prompts of x [R, T], read at pos [R] against the full model's lpf [R, V]) sharing its mask; live [I, 1, T, 1]:
     the positions each item's mask may keep. Descent: soft masks, then (COVER_ST) hard masks forward with the sigmoid's
@@ -1318,7 +1353,8 @@ def mask_search(mk: Masked, x: torch.Tensor, item: list, pos: torch.Tensor, lpf:
     times. Returns {"th": (neuron logits [I, L, T, D], head logits [I, L, T, H]), "thr": the logit of an item's k-th unit,
     "curves", "at" (per item {bound: fewest units found}), "k_mask", "units_total", "history", "seconds_opt"}. starts: logits
     to start from, {"a": [(item, kind, layer, pos, index, logit)], "b": [(row, ...)]} (the backbone's and, with
-    COVER_FACTOR, a row's own part's; the warm start of tsearch's COVER_WARM)."""
+    COVER_FACTOR, a row's own part's; the warm start of tsearch's COVER_WARM). fixed: {"neuron": [L, T, D], "head": [L, T, H]}
+    booleans, units live in every row (a backbone: conditional R3), outside the price, the order and the sizes."""
     t0 = time.perf_counter()
     I, T = live.shape[0], x.shape[1]
     it = torch.tensor(item, device=mk.dev)
@@ -1329,6 +1365,12 @@ def mask_search(mk: Masked, x: torch.Tensor, item: list, pos: torch.Tensor, lpf:
         tb_n = torch.full((x.shape[0], mk.L, T, mk.D), COVER_FACTOR_INIT, device=mk.dev, requires_grad=True)
         tb_h = torch.full((x.shape[0], mk.L, T, th_h.shape[-1]), COVER_FACTOR_INIT, device=mk.dev, requires_grad=True)
         params += [tb_n, tb_h]
+    Fn = Fh = None
+    if fixed is not None:                           # (the backbone: always live)
+        assert not COVER_FACTOR, "a fixed backbone with COVER_FACTOR"
+        Fn, Fh = fixed["neuron"].to(mk.dev), fixed["head"].to(mk.dev)
+        if Fh.shape[-1] != th_h.shape[-1]:          # (whole heads, the masks by channel: COVER_HCHAN)
+            Fh = Fh.repeat_interleave(mk.hd, -1)
     with torch.no_grad():                           # (warm starts)
         for part, (tn, th) in (("a", (th_n, th_h)), ("b", (tb_n, tb_h) if COVER_FACTOR else (None, None))):
             for e, kind, i, p, k, v in (starts or {}).get(part, []) if tn is not None else []:
@@ -1355,6 +1397,9 @@ def mask_search(mk: Masked, x: torch.Tensor, item: list, pos: torch.Tensor, lpf:
                 mh = ((th_h > 0).float() * live - sh).detach() + sh
             else:
                 mn, mh = sn, sh
+            if Fn is not None:
+                mn, mh = torch.where(Fn, 1.0, mn), torch.where(Fh, 1.0, mh)
+                sn, sh = sn * ~Fn, sh * ~Fh
             kl = _kl(lpf, mk.logp(x, mn[it], mh[it], pos))
             size = sn.sum((1, 2, 3)) + sh.sum((1, 2, 3))
         loss = torch.relu(kl - COVER_TAU).sum() + COVER_LAMBDA * size.sum()
@@ -1366,6 +1411,8 @@ def mask_search(mk: Masked, x: torch.Tensor, item: list, pos: torch.Tensor, lpf:
     t_opt = time.perf_counter() - t0
     with torch.no_grad():
         th_n, th_h = th_n.detach(), th_h.detach()
+        if Fn is not None:                          # (the backbone's units last in every order, never counted)
+            th_n, th_h = th_n.masked_fill(Fn, -math.inf), th_h.masked_fill(Fh, -math.inf)
         lv = [int(live[j, 0, :, 0].sum()) for j in range(I)]          # (positions an item's mask may keep: a prefix)
         rows_of = [[r for r, j in enumerate(item) if j == jj] for jj in range(I)]
         if COVER_FACTOR:                            # (an item's logits: its backbone's, then each of its rows' parts)
@@ -1373,7 +1420,8 @@ def mask_search(mk: Masked, x: torch.Tensor, item: list, pos: torch.Tensor, lpf:
             parts = lambda j: [th_n[j], th_h[j]] + [t[r] for r in rows_of[j] for t in (tb_n, tb_h)]  # noqa: E731
         else:
             parts = lambda j: [th_n[j], th_h[j]]  # noqa: E731
-        n_units = [p * mk.L * (mk.D + th_h.shape[-1]) * (1 + (len(rows_of[j]) if COVER_FACTOR else 0)) for j, p in enumerate(lv)]
+        n_units = [p * mk.L * (mk.D + th_h.shape[-1]) * (1 + (len(rows_of[j]) if COVER_FACTOR else 0))
+                   - (int(Fn[:, :p].sum() + Fh[:, :p].sum()) if Fn is not None else 0) for j, p in enumerate(lv)]
         vs = [torch.cat([t[:, :lv[j]].reshape(-1) for t in parts(j)]).sort(descending=True).values for j in range(I)]
         thr = lambda j, k: float(vs[j][k - 1]) if k > 0 else float("inf")  # noqa: E731
         k_mask = [int(sum((t[:, :lv[j]] > 0).sum() for t in parts(j))) for j in range(I)]
@@ -1383,6 +1431,8 @@ def mask_search(mk: Masked, x: torch.Tensor, item: list, pos: torch.Tensor, lpf:
             mn, mh = th_n[j] >= z, th_h[j] >= z
             if COVER_FACTOR:
                 mn, mh = mn | (tb_n[r] >= z), mh | (tb_h[r] >= z)
+            if Fn is not None:
+                mn, mh = mn | Fn, mh | Fh
             return mn & (live[j] > 0), mh & (live[j] > 0)
 
         rows_fwd = max(COVER_ROWS, min(64, 2048 // T))     # (hard masks as booleans: short prompts take more rows)
@@ -1506,7 +1556,8 @@ def tsearch(mk: Masked, tok, qs: list, keys: dict, out: Path, batch: int = 4, lo
     backbone warm-started from the family mover union, each key's part from its source detectors): unions (circuit_union's
     mover unions) start the backbone's heads of the question's template union at the answer at COVER_INIT + COVER_WARM;
     sources ({question id: its finder record}) start the source cut's neurons of the question's own key in its own key's
-    part (COVER_FACTOR) or else in the backbone at the same logit."""
+    part (COVER_FACTOR) or else in the backbone at the same logit. With BACKBONE (conditional R3): the backbone live in every
+    row, the circuit its units beyond it (mask_search's fixed)."""
     out.mkdir(parents=True, exist_ok=True)
     jobs = []
     for q in qs:
@@ -1531,6 +1582,11 @@ def tsearch(mk: Masked, tok, qs: list, keys: dict, out: Path, batch: int = 4, lo
     base_means = mk.means
     for T in sorted({len(j[1]) for j in jobs}):
         js = [j for j in jobs if len(j[1]) == T]
+        fixed = None
+        if BACKBONE is not None:
+            assert all(is_framed(j[1]) for j in js), "conditional R3: prompts in the dev set's chat frame"
+            B = backbone_dense(BACKBONE, T, mk.L, mk.D, mk.H, mk.hd)
+            fixed = {"neuron": B["neuron"], "head": B["head"].view(mk.L, T, mk.H, mk.hd).any(-1)}
         for a in range(0, len(js), 1 if task else batch):     # (task means: one wording a search)
             part = js[a:a + (1 if task else batch)]
             t0 = time.perf_counter()
@@ -1564,7 +1620,7 @@ def tsearch(mk: Masked, tok, qs: list, keys: dict, out: Path, batch: int = 4, lo
                     if n.get("stage") == "source" and n["pos"] < T:
                         starts["b" if COVER_FACTOR else "a"].append((r0 if COVER_FACTOR else j, "neuron", n["layer"], n["pos"], n["neuron"], v))
             ms = mask_search(mk, x, item, pos, lpf, live, bounds=(QSEARCH_BOUND,) + tuple(b for b in COVER_BOUNDS if b != QSEARCH_BOUND),
-                             starts=starts)
+                             starts=starts, fixed=fixed)
             sec = (time.perf_counter() - t0) / len(part)
             (th_n, th_h), thr = ms["th"], ms["thr"]
             for j, (q, c, ks, rows, dst) in enumerate(part):
@@ -1585,6 +1641,7 @@ def tsearch(mk: Masked, tok, qs: list, keys: dict, out: Path, batch: int = 4, lo
                 rec = {**{f: q.get(f) for f in ("id", "task", "key", "corrupt_key", "user", "corrupt_user", "paraphrase")},
                        "ids": c, "corrupted": corr, "neurons": [], "heads": [], "hchans": [], **(uf if kb else {}), "met": bool(kb), "seconds": round(sec, 2),
                        "selection_keys": ks, "finder": "ami.tsearch", **({"factor": fac} if fac else {}),
+                       **({"backbone": {"file": BACKBONE_FILE, "units": len(BACKBONE)}} if BACKBONE is not None else {}),
                        **({"background": "task", "background_keys": bg.keys} if bg is not None else {}),
                        "r3search": {"k": ms["at"][j], "k_mask": ms["k_mask"][j], "units_total": ms["units_total"][j],
                                     "curve": ms["curves"][j], "keys": ks}}
@@ -1594,6 +1651,178 @@ def tsearch(mk: Masked, tok, qs: list, keys: dict, out: Path, batch: int = 4, lo
                         f"(k {ms['at'][j]}, of {ms['units_total'][j]}), {sec:.1f} s")
             torch.cuda.empty_cache() if torch.cuda.is_available() else None
     mk.means = base_means
+
+
+BS_SHARE = 0.5        # bsearch: the backbone's price per unit is this share of the fit questions' (COVER_LAMBDA x BS_SHARE x a
+# batch's questions, against COVER_LAMBDA a question for a unit in a question's own part), so a unit goes to the backbone
+# when more than this share of the questions need it (methods' 11f backbone: units in at least half the circuits)
+BS_PER_TASK = 8       # bsearch: fit questions a task (its train questions, spread over its wordings)
+BS_EPOCHS = 4         # bsearch: passes over the fit questions (the last COVER_ST share hard, straight-through)
+BS_STEPS = 15         # bsearch: steps a batch a pass: a question's own part takes BS_EPOCHS x BS_STEPS steps, the backbone
+# every batch's
+BS_PRIOR_OUT = -1.0   # bsearch --prior: the backbone's starting logit outside the prior (inside it COVER_INIT)
+
+
+def bsearch(mk: Masked, tok, qs: list, keys: dict, out: Path, batch: int = 4, log=None, prior: list | None = None) -> dict:
+    """The R3 backbone of a set of fit questions (methods' design 11d and 11f: the prompt-processing state any task circuit
+    needs under the pretraining-mean background, named once per chat template and model): one mask a over every neuron and
+    head by chat-frame role (role_names; "body" at every content position) shared by every question, and each question's
+    own part b_q over its positions, a row's mask 1 - (1 - sigmoid(a_role)) (1 - sigmoid(b_q)); a question's rows its
+    wording with TSEARCH_KEYS keys (tsearch's). Descent, per batch of questions of one token count: the sum over rows of
+    relu(KL - COVER_TAU) plus COVER_LAMBDA x (the questions' own parts + BS_SHARE x the batch's questions x the backbone);
+    BS_EPOCHS passes of BS_STEPS steps a batch, the own parts and their Adam moments on the host between passes. prior
+    (load_backbone's units): the backbone starts at COVER_INIT on its units and BS_PRIOR_OUT elsewhere (no prior: COVER_INIT
+    everywhere). Writes OUT/backbone.json (load_backbone's file: the units with a > 0) with its size by role and by kind and
+    layer band, and per question its own part's size and the worst KL over its rows, hard masks, of the backbone alone
+    and with its own part."""
+    out.mkdir(parents=True, exist_ok=True)
+    names = role_names()
+    NR, dev, t0 = len(names), mk.dev, time.perf_counter()
+    jobs = []
+    for q in qs:
+        if not q.get("key") or q["user"].count(q["key"]) != 1:
+            continue
+        c = prompt_ids(tok, q["user"], q)
+        if not is_framed(c):
+            continue
+        cand = [k for k in keys.get(q.get("task"), []) if k not in (q["key"], q.get("corrupt_key"))]
+        np.random.default_rng(zlib.crc32(("b" + q["id"]).encode())).shuffle(cand)
+        ks, rows = [], []
+        for k in [q["key"], q.get("corrupt_key")] + cand:
+            ids = prompt_ids(tok, q["user"].replace(q["key"], k), q) if k else None
+            if ids is not None and len(ids) == len(c):
+                ks.append(k)
+                rows.append(ids)
+            if len(ks) == TSEARCH_KEYS:
+                break
+        if len(ks) >= 2:
+            jobs.append((q, ks, rows))
+    groups = []
+    for T in sorted({len(r[0]) for _, _, r in jobs}):
+        js = [j for j in jobs if len(j[2][0]) == T]
+        groups += [js[a:a + batch] for a in range(0, len(js), batch)]
+    Q = len(jobs)
+    a_n = torch.full((NR, mk.L, mk.D), COVER_INIT if prior is None else BS_PRIOR_OUT, device=dev)
+    a_h = torch.full((NR, mk.L, mk.H), COVER_INIT if prior is None else BS_PRIOR_OUT, device=dev)
+    ix = {n: i for i, n in enumerate(names)}
+    for kind, layer, role, k in prior or []:
+        (a_n if kind == "neuron" else a_h)[ix[role], layer, k] = COVER_INIT
+    a_n.requires_grad_(True)
+    a_h.requires_grad_(True)
+    opt = torch.optim.Adam([a_n, a_h], lr=COVER_LR)
+    st = []                                         # (per batch: its own parts, their Adam moments, the full model's lp)
+    for g in groups:
+        T = len(g[0][2][0])
+        x = torch.tensor([ids for _, _, rows in g for ids in rows], device=dev)
+        with torch.no_grad():
+            lpf = mk.logp(x, None, None, torch.full((len(x),), T - 1, device=dev)).cpu()
+        b = [torch.full((len(g), mk.L, T, w), COVER_FACTOR_INIT) for w in (mk.D, mk.H)]
+        st.append({"b": b, "m": [torch.zeros_like(t) for t in b], "v": [torch.zeros_like(t) for t in b], "lpf": lpf, "t": 0})
+    n_hard = max(1, round(COVER_ST * BS_EPOCHS))
+    b1, b2, eps = 0.9, 0.999, 1e-8                  # (torch's Adam defaults, by hand for the parts on the host)
+    hist = []
+
+    def masks(g, a, b, hard):
+        T = len(g[0][2][0])
+        ri = torch.as_tensor(role_index(T), device=dev)
+        an, ah = (t[ri].permute(1, 0, 2) for t in a)                    # [L, T, width]
+        mn = 1 - (1 - torch.sigmoid(an))[None] * (1 - torch.sigmoid(b[0]))
+        mh = 1 - (1 - torch.sigmoid(ah))[None] * (1 - torch.sigmoid(b[1]))
+        if hard:                                    # (hard forward, the soft masks' gradient)
+            mn = (((an > 0)[None] | (b[0] > 0)).float() - mn).detach() + mn
+            mh = (((ah > 0)[None] | (b[1] > 0)).float() - mh).detach() + mh
+        return mn, mh
+    for ep in range(BS_EPOCHS):
+        hard = ep >= BS_EPOCHS - n_hard
+        for gi in np.random.default_rng(ep).permutation(len(groups)).tolist():
+            g, s_ = groups[gi], st[gi]
+            T = len(g[0][2][0])
+            x = torch.tensor([ids for _, _, rows in g for ids in rows], device=dev)
+            item = torch.tensor([j for j, (_, _, rows) in enumerate(g) for _ in rows], device=dev)
+            pos = torch.full((len(x),), T - 1, device=dev)
+            lpf = s_["lpf"].to(dev)
+            b = [t.to(dev).requires_grad_(True) for t in s_["b"]]
+            m_, v_ = [t.to(dev) for t in s_["m"]], [t.to(dev) for t in s_["v"]]
+            for step in range(BS_STEPS):
+                mn, mh = masks(g, (a_n, a_h), b, hard)
+                kl = _kl(lpf, mk.logp(x, mn[item], mh[item], pos))
+                own = torch.sigmoid(b[0]).sum() + torch.sigmoid(b[1]).sum()
+                shared = torch.sigmoid(a_n).sum() + torch.sigmoid(a_h).sum()
+                loss = torch.relu(kl - COVER_TAU).sum() + COVER_LAMBDA * (own + BS_SHARE * len(g) * shared)
+                opt.zero_grad(set_to_none=True)
+                for t in b:
+                    t.grad = None
+                loss.backward()
+                opt.step()
+                s_["t"] += 1
+                with torch.no_grad():
+                    for t, m1, v1 in zip(b, m_, v_):
+                        m1.mul_(b1).add_(t.grad, alpha=1 - b1)
+                        v1.mul_(b2).addcmul_(t.grad, t.grad, value=1 - b2)
+                        t.sub_(COVER_LR * (m1 / (1 - b1 ** s_["t"])) / ((v1 / (1 - b2 ** s_["t"])).sqrt() + eps))
+            s_["b"] = [t.detach().cpu() for t in b]
+            s_["m"], s_["v"] = [t.cpu() for t in m_], [t.cpu() for t in v_]
+            hist.append({"epoch": ep, "batch": gi, "T": T, "hard": hard, "kl_max": round(float(kl.detach().max()), 4),
+                         "kl_mean": round(float(kl.detach().mean()), 4), "backbone": int((a_n > 0).sum() + (a_h > 0).sum()),
+                         "own": int(sum((t > 0).sum() for t in s_["b"]))})
+        if log:
+            h = [r for r in hist if r["epoch"] == ep]
+            log(f"bsearch pass {ep + 1}/{BS_EPOCHS}{' (hard)' if hard else ''}: backbone {h[-1]['backbone']:,} units, own parts "
+                f"{np.median([r['own'] / max(1, len(groups[r['batch']])) for r in h]):,.0f} a question (median of batches), "
+                f"worst KL median {np.median([r['kl_max'] for r in h]):.3f}, {time.perf_counter() - t0:.0f} s")
+    with torch.no_grad():                           # (measured: hard masks, the backbone alone and with each own part)
+        a = (a_n.detach(), a_h.detach())
+        per_q = []
+        for g, s_ in zip(groups, st):
+            T = len(g[0][2][0])
+            x = torch.tensor([ids for _, _, rows in g for ids in rows], device=dev)
+            item = torch.tensor([j for j, (_, _, rows) in enumerate(g) for _ in rows], device=dev)
+            pos = torch.full((len(x),), T - 1, device=dev)
+            lpf = s_["lpf"].to(dev)
+            b = [t.to(dev) for t in s_["b"]]
+            kls = []
+            for bb in ([torch.full_like(t, -1.0) for t in b], b):
+                mn, mh = masks(g, a, bb, True)
+                kls.append(torch.cat([_kl(lpf[r:r + 16], mk.logp(x[r:r + 16], mn[item[r:r + 16]], mh[item[r:r + 16]], pos[r:r + 16]))
+                                      for r in range(0, len(x), 16)]))
+            for j, (q, ks, rows) in enumerate(g):
+                rr = item == j
+                per_q.append({"id": q["id"], "task": q.get("task"), "T": T, "keys": ks,
+                              "own": int((b[0][j] > 0).sum() + (b[1][j] > 0).sum()),
+                              "kl_backbone": round(float(kls[0][rr].max()), 4), "kl_with_own": round(float(kls[1][rr].max()), 4)})
+    units = [("neuron", int(i), names[r], int(k)) for r, i, k in (a_n.detach() > 0).nonzero().tolist()]
+    units += [("head", int(i), names[r], int(k)) for r, i, k in (a_h.detach() > 0).nonzero().tolist()]
+    band = lambda i: f"{6 * (i // 6)}-{6 * (i // 6) + 5}"  # noqa: E731
+    by_role, by_band = {}, {}
+    for kind, i, role, _ in units:
+        by_role[role] = by_role.get(role, 0) + 1
+        by_band[f"{kind} {band(i)}"] = by_band.get(f"{kind} {band(i)}", 0) + 1
+    res = {"units": units, "size": len(units), "by_role": by_role, "by_kind_band": by_band, "questions": per_q,
+           "fit_questions": Q, "fit_tasks": sorted({q.get("task") for q, _, _ in jobs}),
+           "pass_with_own": sum(r["kl_with_own"] <= QSEARCH_BOUND for r in per_q),
+           "pass_backbone": sum(r["kl_backbone"] <= QSEARCH_BOUND for r in per_q), "bound": QSEARCH_BOUND,
+           "constants": {k: globals()[k] for k in ("BS_SHARE", "BS_PER_TASK", "BS_EPOCHS", "BS_STEPS", "BS_PRIOR_OUT", "COVER_TAU",
+                                                   "COVER_LAMBDA", "COVER_LR", "COVER_INIT", "COVER_FACTOR_INIT", "COVER_ST", "TSEARCH_KEYS")},
+           "prior": len(prior) if prior is not None else None, "history": hist, "seconds": round(time.perf_counter() - t0, 1)}
+    (out / "backbone.json").write_text(json.dumps(res))
+    return res
+
+
+def fit_questions(qs: list, tasks: list | None, per_task: int = BS_PER_TASK) -> list:
+    """bsearch's fit questions: per task (of tasks, or every task) up to per_task of qs in a seeded order spread over its
+    wordings (one a paraphrase in turn)."""
+    out = []
+    for t in sorted({q.get("task") for q in qs if not tasks or q.get("task") in tasks}):
+        by = {}
+        for q in sorted((q for q in qs if q.get("task") == t), key=lambda q: zlib.crc32(q["id"].encode())):
+            by.setdefault(q.get("paraphrase"), []).append(q)
+        ps, got = sorted(by, key=str), []
+        while len(got) < per_task and any(by.values()):
+            for p in ps:
+                if by[p] and len(got) < per_task:
+                    got.append(by[p].pop(0))
+        out += got
+    return out
 
 
 QSEARCH_BOUND = 0.1   # nats: a question's R3 circuit is the fewest units found whose worst KL over its two prompts is within this
@@ -1763,6 +1992,7 @@ def load(model_id: str, dtype: str, device: str = "auto"):
 
 def main():
     import argparse
+    global BACKBONE, BACKBONE_FILE
 
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -1818,15 +2048,26 @@ def main():
     qq.add_argument("--unions", default=None, help="tsearch with COVER_WARM: circuit_union's mover unions (JSON)")
     qq.add_argument("--sources", default=None, help="tsearch with COVER_WARM: a directory of finder records, each question's "
                     "source cut starting its own key's part")
+    qq.add_argument("--backbone", default=None, help="tsearch: conditional R3, this backbone (load_backbone's file) live in "
+                    "every row, the circuit its units beyond it")
+    bs = sub.add_parser("bsearch")
+    bs.add_argument("out")
+    bs.add_argument("--means", required=True)
+    bs.add_argument("--pool", default=str(POOL), help="the fit questions' file (its train split)")
+    bs.add_argument("--devset", default=str(DEVSET), help="(more keys)")
+    bs.add_argument("--tasks", default=None, help="fit tasks, comma-separated (default: the prior's fit_tasks, else every task)")
+    bs.add_argument("--prior", default=None, help="a backbone to start from (prior_backbone's file)")
+    bs.add_argument("--batch", type=int, default=4, help="fit questions a batch")
+    bs.add_argument("--mode", default=MODE, choices=("bucket", "global", "frame"))
     bb = sub.add_parser("backbone")
     bb.add_argument("records")
     bb.add_argument("out")
     bb.add_argument("--share", type=float, default=0.9)
     b = sub.add_parser("board")
     b.add_argument("dirs", nargs="+")
-    for p in (r, c, qq):
+    for p in (r, c, qq, bs):
         p.add_argument("--frame", default=None, help="the chat frame's means (frame-means' file), for --mode frame")
-    for p in (m, r, c, qq, fm):
+    for p in (m, r, c, qq, fm, bs):
         p.add_argument("--model", default="Qwen/Qwen3-8B")
         p.add_argument("--dtype", default="auto", choices=("auto", "float32", "bfloat16"))
         p.add_argument("--device", default="auto")
@@ -1880,7 +2121,18 @@ def main():
         return
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
+    if a.cmd == "bsearch":
+        pr = prior_backbone(a.prior) if a.prior else None
+        tasks = (a.tasks.split(",") if a.tasks else json.loads(Path(a.prior).read_text()).get("fit_tasks") if a.prior else None)
+        fq = fit_questions([q for q in load_questions(a.pool).values() if q.get("split") == "train"], tasks)
+        mk = Masked(model, Means(a.means, abl_dev(model), frame=getattr(a, "frame", None)), mode=a.mode)
+        res = bsearch(mk, tok, fq, task_keys({**load_questions(a.pool), **load_questions(a.devset)}), out, a.batch, log=log, prior=pr)
+        log(f"backbone: {res['size']:,} units ({res['by_role']}); fit questions within {QSEARCH_BOUND} nats: "
+            f"{res['pass_with_own']}/{len(res['questions'])} with their own parts, {res['pass_backbone']} with the backbone alone")
+        return
     if a.cmd in ("qsearch", "tsearch"):
+        if getattr(a, "backbone", None):
+            BACKBONE, BACKBONE_FILE = load_backbone(a.backbone), a.backbone
         qs = [q for q in load_questions(a.devset).values() if q.get("split", a.split) == a.split][::a.stride][:a.limit or None]
         (out / "meta.json").write_text(json.dumps({"model": a.model, "dtype": dtype, "means": a.means, "mode": a.mode,
                                                    "bound": QSEARCH_BOUND, "tau": COVER_TAU, "lambda": COVER_LAMBDA,
@@ -1916,7 +2168,6 @@ def main():
     keys = task_keys({**load_questions(a.pool), **qs})
     paths = sorted(p for p in Path(a.records).glob("*.json") if p.name != "meta.json" and not p.name.endswith(".units.npz"))[:a.limit or None]
     sims = load_sims(a.sims) if a.cmd == "r5" else None
-    global BACKBONE
     BACKBONE = load_backbone(a.backbone) if getattr(a, "backbone", None) else None
     for p in paths:
         dst = out / p.name

@@ -370,3 +370,103 @@ def test_backbone_dense_and_exclude():
     c["neuron"][0, T - 1, 10:42] = True                      # (32 units; the backbone holds neuron 7 at that position)
     r = ami.redraw_dense(c, 0, m)                            # (the random control avoids the circuit and the backbone)
     assert int(r["neuron"][0, T - 1].sum()) == 15 and not r["neuron"][0, T - 1, 7] and not (r["neuron"] & c["neuron"]).any()
+
+
+def test_roles_and_prior(tmp_path):
+    """role_index names each position of a framed prompt by the role backbone_dense puts there; prior_backbone reads methods'
+    backbone_fit.json (start 4: position 3 is content here, so "body")."""
+    L, D, H, hd, T = 2, 48, 4, 8, 17
+    names = ami.role_names()
+    ri = ami.role_index(T)
+    for p in range(T):
+        m = ami.backbone_dense([("neuron", 0, names[ri[p]], 3)], T, L, D, H, hd)["neuron"][0, :, 3]
+        assert m[p] and (int(m.sum()) == 1) == (names[ri[p]] != "body")
+    d = {"start": 4, "end": 9, "units": [[0, 1, 5, 0], [0, 1, 6, 3], [1, 0, 2, 4], [0, 0, 7, 13], [1, 1, 3, 12]]}
+    (tmp_path / "fit.json").write_text(ami.json.dumps(d))
+    assert ami.prior_backbone(tmp_path / "fit.json") == sorted([("neuron", 1, "pre:0", 5), ("neuron", 1, "body", 6), ("head", 0, "suf:1", 2),
+                                                                ("neuron", 0, "body", 7), ("head", 1, "suf:9", 3)])
+
+
+def test_mask_search_fixed(tiny, monkeypatch):
+    """fixed: the backbone's units are live in every row and outside the order and the sizes; the bound's hard set (with
+    them) is within the bound."""
+    model, docs, means = tiny
+    monkeypatch.setattr(ami, "COVER_STEPS", 4)
+    mk = ami.Masked(model, means)
+    a, b = docs[0][:10], list(docs[0][:10])
+    b[4] = (b[4] + 1) % 64
+    x = torch.tensor([a, b])
+    pos = torch.tensor([9, 9])
+    with torch.no_grad():
+        lpf = mk.logp(x, None, None, pos)
+    F = {"neuron": torch.zeros(mk.L, 10, mk.D, dtype=torch.bool), "head": torch.zeros(mk.L, 10, mk.H, dtype=torch.bool)}
+    F["neuron"][:, :, :20] = True
+    F["head"][1, 9, :] = True
+    nf = int(F["neuron"].sum() + F["head"].sum())
+    ms = ami.mask_search(mk, x, [0, 0], pos, lpf, torch.ones(1, 1, 10, 1), fixed=F)
+    assert ms["units_total"][0] == 10 * mk.L * (mk.D + mk.H) - nf
+    assert torch.isinf(ms["th"][0][0][F["neuron"]]).all() and ms["curves"][0][-1][0] == ms["units_total"][0]
+    k = ms["at"][0]["0.1"]
+    z = ms["thr"](0, k)
+    assert not ((ms["th"][0][0] >= z) & F["neuron"]).any()
+    with torch.no_grad():
+        for r in (0, 1):
+            mn, mh = ms["hard"](0, k, r)
+            assert (mn & F["neuron"]).sum() == F["neuron"].sum()
+            assert float(ami._kl(lpf[r:r + 1], mk.logp(x[r:r + 1], mn[None].float(), mh[None].float(), pos[r:r + 1]))) <= 0.1 + 1e-6
+
+
+def _framed(monkeypatch):
+    monkeypatch.setattr(ami, "FRAME_PRE", [1, 2, 3])
+    monkeypatch.setattr(ami, "FRAME_SUF", [4, 5, 6, 7, 8, 9, 10, 11, 12])
+    monkeypatch.setattr(ami, "prompt_ids", lambda tok, user, q: ami.FRAME_PRE + [int(w) for w in user.split()] + ami.FRAME_SUF)
+    qs = [{"id": "t/20/p0", "task": "t", "paraphrase": 0, "key": "20", "corrupt_key": "21", "user": "40 41 20 42"},
+          {"id": "t/22/p0", "task": "t", "paraphrase": 0, "key": "22", "corrupt_key": "23", "user": "40 41 22 42"},
+          {"id": "t/24/p1", "task": "t", "paraphrase": 1, "key": "24", "corrupt_key": "25", "user": "43 24 44 45 46"}]
+    return qs, {"t": [str(k) for k in range(20, 30)]}
+
+
+def test_bsearch_prior_and_roles(tiny, monkeypatch, tmp_path):
+    """No passes: the backbone is the prior, and each question's measured KL with the backbone alone is the one its
+    backbone_dense mask gives (role_index and backbone_dense agree); no prior: every unit, the full model."""
+    model, docs, means = tiny
+    qs, keys = _framed(monkeypatch)
+    monkeypatch.setattr(ami, "BS_EPOCHS", 0)
+    monkeypatch.setattr(ami, "TSEARCH_KEYS", 4)
+    mk = ami.Masked(model, means)
+    prior = [("neuron", 0, "body", 3), ("neuron", 1, "suf:1", 7), ("head", 1, "suf:1", 2), ("head", 0, "pre:1", 0)]
+    res = ami.bsearch(mk, None, qs, keys, tmp_path / "p", batch=2, prior=prior)
+    assert sorted(res["units"]) == sorted(prior) and res["size"] == 4 and len(res["questions"]) == 3
+    for r in res["questions"]:
+        q = next(q for q in qs if q["id"] == r["id"])
+        rows = [ami.prompt_ids(None, q["user"].replace(q["key"], k), q) for k in r["keys"]]
+        T = len(rows[0])
+        B = ami.backbone_dense(prior, T, mk.L, mk.D, mk.H, mk.hd)
+        x, pos = torch.tensor(rows), torch.full((len(rows),), T - 1)
+        mn = B["neuron"].float()[None].expand(len(rows), -1, -1, -1)
+        mh = B["head"].view(mk.L, T, mk.H, mk.hd).any(-1).float()[None].expand(len(rows), -1, -1, -1)
+        with torch.no_grad():
+            kl = ami._kl(mk.logp(x, None, None, pos), mk.logp(x, mn, mh, pos))
+        assert abs(float(kl.max()) - r["kl_backbone"]) < 1e-3
+    full = ami.bsearch(mk, None, qs, keys, tmp_path / "f", batch=2)
+    assert full["size"] == len(ami.role_names()) * mk.L * (mk.D + mk.H) and full["pass_backbone"] == 3
+
+
+def test_bsearch_runs(tiny, monkeypatch, tmp_path):
+    """Two passes (the last hard): the backbone file is load_backbone's, every question measured, the history a batch a pass."""
+    model, docs, means = tiny
+    qs, keys = _framed(monkeypatch)
+    monkeypatch.setattr(ami, "BS_EPOCHS", 2)
+    monkeypatch.setattr(ami, "BS_STEPS", 3)
+    monkeypatch.setattr(ami, "TSEARCH_KEYS", 4)
+    res = ami.bsearch(ami.Masked(model, means), None, qs, keys, tmp_path, batch=2)
+    bb = ami.load_backbone(tmp_path / "backbone.json")
+    assert len(bb) == res["size"] and all(u[2] in ami.role_names() for u in bb)
+    assert len(res["questions"]) == 3 and len(res["history"]) == 2 * 2 and res["history"][-1]["hard"]
+    assert all(r["kl_with_own"] >= 0 and r["own"] >= 0 for r in res["questions"])
+
+
+def test_fit_questions():
+    qs = [{"id": f"t/{k}/p{p}", "task": t, "paraphrase": p} for t in ("a", "b") for k in range(5) for p in range(3)]
+    got = ami.fit_questions(qs, ["a"], per_task=4)
+    assert len(got) == 4 and {q["task"] for q in got} == {"a"} and {q["paraphrase"] for q in got} == {0, 1, 2}

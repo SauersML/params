@@ -68,13 +68,15 @@ MEASURED = 512  # kept edges whose own cut from the graph is measured (those of 
 HALVE_BLOCKS = 8
 HALVE_FORWARDS = 8  # halving's forwards at most (then its graph stands: every cut in it measured; Qwen3-8B dev circuits of
 # ~190 neurons took 20-42 halving forwards, 4.4-8.9 s of a 9-16 s prune; under ~50 neurons 2-11)
-TOKENS = 4096  # cut sets a forward: this many tokens' worth (at least 16 sets; a forward's fixed Python cost shared)
+TOKENS = 1536  # cut sets a forward: this many tokens' worth (at least 16 sets; 4096 changed 10 of 32 Qwen3-8B dev graphs,
+# capital/Kenya/p0 150 -> 898 edges: halving's larger rounds pass more blocks whose together check fails, and the one-by-one
+# retries spend HALVE_FORWARDS; 2.75 -> 2.55 s a stage)
 PAD = "shapes"  # a lower precision model's forwards: "B", each padded to B sets (every contrast at one batch shape);
 # "shapes", each padded to the next of SHAPES (or B) with an uncut set of its own, every set's contrast read against
 # that set's (so an ok() compares contrasts of one shape); "none", unpadded. Qwen3-8B bfloat16 (float32 contrasts), 11
 # dev questions of six families on an A6000: shapes kept every graph's edges as B did (25 of 25 on author/Hamlet/p0),
 # the edge stage 24.5 -> 15.2 s; none lost one edge of 2 (color/banana/p1), 11.6 s
-SHAPES = (8, 16, 32, 64, 128, 256)  # (powers of two: a forward padded at most twice its sets; TOKENS 4096 makes B ~270)
+SHAPES = (8, 16, 32, 64, 128, 256)  # (powers of two: a forward padded at most twice its sets, not to B)
 D_BYTES = 2 ** 31  # a cut run's per-set, per-circuit-neuron input changes [sets, neurons, d] float32 stay under this: the
 # sets a forward shrink with the circuit (a dense readout of 11,468 Qwen3-8B neurons asked for 16.8 GiB on a 48 GB card)
 PREFIX = True  # a cut run computes only the positions from the circuit's first one on (every position before it is the

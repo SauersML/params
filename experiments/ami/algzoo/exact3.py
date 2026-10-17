@@ -187,3 +187,21 @@ def mse(model, ops=None):
             total += float(v @ M @ v)
             ops.n += 20
     return total
+
+
+def mse_by_order(model, ops=None):
+    """{ordering (positions, largest first): (probability, E[(f - median)^2 ; ordering], mean output coefficients)}."""
+    ops = ops or Ops()
+    out = {}
+    for poly, L in cells(model, ops):
+        for q in _by_order(poly, ops):
+            c = _unit(sum(q))
+            order = tuple(int(i) for i in np.argsort(-c))
+            k = order[1]
+            v = L[0].copy()
+            v[k] -= 1.0
+            P = area(q, ops) / FOUR_PI
+            M = second_moment(q, P, ops)
+            p0, e0, w0 = out.get(order, (0.0, 0.0, np.zeros(3)))
+            out[order] = (p0 + P, e0 + float(v @ M @ v), w0 + P * L[0])
+    return {o: (p, e, w / max(p, 1e-300)) for o, (p, e, w) in out.items()}

@@ -167,6 +167,13 @@ NECESSARY_MEANS_MODEL = "Qwen/Qwen3-8B"  # R3 background) of the mean-ablation t
 # position) a median lost share of the top token's margin over the runner-up of at most NECESSARY_CONTROL (else a hub: Qwen3's
 # massive-activation neurons cost every answer), go in the record's "necessary_mean"; the hubs in "hubs"
 NECESSARY_CONTROL = 0.1
+MEDIATORS = 64      # mediators of necessary units: for each unit that alone loses at least NECESSARY on the own pair (a cut's
+# own units, measured alone there, and the patch tags), this many candidates in |(value with the unit noised - clean value) x
+# the contrast's gradient in that run|, each held at its clean value while the unit is noised; one restoring at least MEDIATE
+# of the unit's loss goes in the record's "mediators" with the unit it mediates. A unit silent in both prompts that fires
+# when a necessary unit is removed and cancels the answer (casestudy's AND-plant suppressors: R held at its clean value
+# under flag A's removal took the loss from 0.93 to -0.11) is invisible to both knockout tags. 0: off
+MEDIATE = 0.5
 CONTROL_PROMPTS = ["What is the capital of France? Answer with one word.", "How many legs does a spider have? One word.",
                    "What color is the sky on a clear day? One word.", "Which planet is known as the Red Planet? One word.",
                    "What is the opposite of hot? One word.", "What do bees make? Answer with one word.",
@@ -1247,7 +1254,69 @@ def _finish_steps(st: dict, pt=None):
         means = _necessary_means(pt)
         if means is not None:
             _mean_tags(pt, specs, out, st["names"], means)
+        if MEDIATORS:
+            _mediators(pt, out, st["names"])
     return out
+
+
+def _grad_run(pt, knock: tuple | None = None) -> dict:
+    """The clean run (with knock, a unit, at its corrupted run's value) and the contrast's gradient: per layer, every
+    neuron's and head channel's value there and gradient, {"neu": [(a [T, D], g [T, D])], "head": [(a, g) [T, H x hd]]}."""
+    L, got, hs = pt.L, {"neu": [None] * pt.L, "head": [None] * pt.L}, []
+    for i, layer in enumerate(pt.layers):
+        if knock is not None and knock[1] == i:     # (registered first: the gradient hooks see the edited input)
+            mod = layer.mlp.down_proj if knock[0] == "neuron" else layer.self_attn.o_proj
+
+            def edit(m, a, u=knock):
+                x = a[0].clone()
+                if u[0] == "neuron":
+                    x[0, u[2], u[3]] = pt.act["corrupt"]["neu"][u[1]][u[2], u[3]].to(x.device, x.dtype)
+                else:
+                    sl = slice(u[2] * pt.hd, (u[2] + 1) * pt.hd)
+                    x[0, u[3], sl] = pt.act["corrupt"]["head"][u[1]][u[3], sl].to(x.device, x.dtype)
+                return (x,) + tuple(a[1:])
+            hs.append(mod.register_forward_pre_hook(edit))
+
+        def keep(m, a, i=i, k="neu"):
+            a[0].retain_grad()
+            got[k][i] = a[0]
+        hs += [layer.mlp.down_proj.register_forward_pre_hook(keep),
+               layer.self_attn.o_proj.register_forward_pre_hook(lambda m, a, i=i: keep(m, a, i, "head"))]
+    try:
+        with torch.enable_grad():
+            emb = pt.core.model.embed_tokens(pt._ids_dev["clean"][None]).detach().requires_grad_(True)
+            pt._contrast(pt.core.model(inputs_embeds=emb).last_hidden_state[:, -1]).sum().backward()
+    finally:
+        for h in hs:
+            h.remove()
+    return {k: [(t[0].detach(), t.grad[0]) for t in v] for k, v in got.items()}
+
+
+def _mediators(pt, out: dict, names: list) -> None:
+    """MEDIATORS's search (its note) into out[cut]["mediators"]."""
+    roots = {}
+    own = [(n, u) for n in names for u in out[n]["units"]]
+    for (n, u), lo in zip(own, pt.run("clean", [[u] for _, u in own]) if own else []):
+        if lo >= NECESSARY:
+            roots[u] = (n, lo)
+    for n in names:
+        for x in out[n].get("necessary", []):
+            u = cf.unit("head", x["layer"], x["pos"], x["head"]) if "head" in x else cf.unit("neuron", x["layer"], x["pos"], x["neuron"])
+            roots.setdefault(u, (n, x["lost"]))
+    for n in names:
+        out[n]["mediators"] = []
+    for u, (n, lo) in roots.items():
+        r = _grad_run(pt, u)
+        sc = {"neuron": torch.stack([((a.float() - pt.act["clean"]["neu"][i].float()) * g.float()).abs() for i, (a, g) in enumerate(r["neu"])]),
+              "head": torch.stack([((a.float() - pt.act["clean"]["head"][i].float()) * g.float()).view(pt.T, pt.H, pt.hd).sum(-1).abs()
+                                   for i, (a, g) in enumerate(r["head"])])}
+        sc["neuron" if u[0] == "neuron" else "head"][(u[1], u[2], u[3]) if u[0] == "neuron" else (u[1], u[3], u[2])] = 0
+        spec = {"kinds": ["neuron", "head"], "positions": list(range(pt.T))}
+        cand = attr_order(pt, spec, sc)[:MEDIATORS]
+        for v, x in zip(cand, pt.run("clean", [[u, v + ("clean",)] for v in cand])):
+            share = (lo - x) / lo
+            if share >= MEDIATE:
+                out[n]["mediators"].append({**_unit_json(v), "of": _unit_json(u), "restored": round(share, 4)})
 
 
 _MEANS = {}                                         # (path -> ami.Means; control prompts' ids and margins per tokenizer)
@@ -1379,7 +1448,8 @@ def _find_with(pt, clean, corrupt, answers, log, arm: str, cuts: dict, rec0: dic
         if rec0 is not None:
             del pt.setup
     extra = {k: {n: c[k] for n, c in cuts.items() if k in c} for k in ("attr", "mask", "partners", "adversarial", "family",
-                                                                        "one_prompt", "necessary", "necessary_mean", "hubs")}   # (find() copies its own fields
+                                                                        "one_prompt", "necessary", "necessary_mean", "hubs",
+                                                                        "mediators")}   # (find() copies its own fields
     return {**rec, "search": arm, **{k: v for k, v in extra.items() if v}}                 # only)
 
 

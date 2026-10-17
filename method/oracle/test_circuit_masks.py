@@ -655,3 +655,27 @@ def test_mean_tags(tiny, monkeypatch, tmp_path):
     monkeypatch.setattr(cm, "NECESSARY_CONTROL", -1e9)
     rec2 = cm.find(cf.Patcher(model, None, rows=8), clean, corrupts[0], steps=4)
     assert all(not v for v in rec2["necessary_mean"].values()) and sum(len(v) for v in rec2["hubs"].values()) > 0
+
+
+def test_mediators(tiny, monkeypatch):
+    """MEDIATORS: for each unit losing at least NECESSARY alone (cuts' own units and patch tags), candidates in |change
+    under its removal x gradient| order held at their clean values while it is noised; a listed mediator's restored share
+    equals the direct measurement, and never names its own unit."""
+    model, clean, corrupts = tiny
+    monkeypatch.setattr(cm, "NECESSARY", -1e9)
+    monkeypatch.setattr(cm, "NECESSARY_TOP", 4)
+    monkeypatch.setattr(cm, "MEDIATORS", 3)
+    monkeypatch.setattr(cm, "MEDIATE", -1e9)
+    pt = cf.Patcher(model, None, rows=8)
+    rec = cm.find(pt, clean, corrupts[0], steps=4)
+    meds = [x for v in rec["mediators"].values() for x in v]
+    assert meds
+    pt.setup(clean, corrupts[0])
+
+    def unit(x):
+        return cf.unit("head", x["layer"], x["pos"], x["head"]) if "head" in x else cf.unit("neuron", x["layer"], x["pos"], x["neuron"])
+    for x in meds[:6]:
+        u, v = unit(x["of"]), unit(x)
+        assert u != v
+        lo, lv = pt.run("clean", [[u], [u, v + ("clean",)]])
+        assert abs(x["restored"] - (lo - lv) / lo) < 1e-3

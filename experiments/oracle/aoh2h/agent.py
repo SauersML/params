@@ -926,22 +926,21 @@ class Tools:
     def gen_batch(self, it, users: list[str], hooks=(), max_new: int = GEN_CALL_MAX, bs: int = 20, temperature: float = 0.0) -> list[str]:
         """Answers to chat prompts (left-padded batches), the item's model with hooks: greedy, or sampled at temperature
         (top_p TARGET_TOP_P)."""
-        torch, tok = self.torch, self.tok
-        side, out = tok.padding_side, []
-        tok.padding_side = "left"
-        try:
-            for i in range(0, len(users), bs):
-                chunk = [tok.apply_chat_template(chat_of(it, u), tokenize=False, add_generation_prompt=True,
-                                                 enable_thinking=False) for u in users[i:i + bs]]
-                enc = tok(chunk, return_tensors="pt", padding=True, add_special_tokens=False).to(self.tg.dev)
-                with self.lock, self.model_of(it), hooked(hooks), torch.no_grad():  # (the lock a batch at a time: a long
-                    # scoring lets other episodes' tools run between its batches)
-                    g = self.tg.m.generate(**enc, max_new_tokens=max_new, do_sample=bool(temperature), temperature=temperature or None,
-                                           top_p=TARGET_TOP_P if temperature else None, top_k=None,
-                                           pad_token_id=tok.pad_token_id or tok.eos_token_id)
-                out += tok.batch_decode(g[:, enc["input_ids"].shape[1]:], skip_special_tokens=True)
-        finally:
-            tok.padding_side = side
+        torch, tok, out = self.torch, self.tok, []
+        pad = tok.pad_token_id if tok.pad_token_id is not None else tok.eos_token_id
+        for i in range(0, len(users), bs):  # (left padding built here: setting the shared tokenizer's padding side raced
+            with self.tlock:  # with other threads' calls, and a batch tokenized right-padded generated from pad tokens)
+                ids = [tok.apply_chat_template(chat_of(it, u), tokenize=True, add_generation_prompt=True, enable_thinking=False,
+                                               return_dict=False) for u in users[i:i + bs]]
+            T = max(map(len, ids))
+            x = torch.tensor([[pad] * (T - len(s_)) + list(s_) for s_ in ids], device=self.tg.dev)
+            att = torch.tensor([[0] * (T - len(s_)) + [1] * len(s_) for s_ in ids], device=self.tg.dev)
+            with self.lock, self.model_of(it), hooked(hooks), torch.no_grad():  # (the lock a batch at a time: a long
+                # scoring lets other episodes' tools run between its batches)
+                g = self.tg.m.generate(input_ids=x, attention_mask=att, max_new_tokens=max_new, do_sample=bool(temperature),
+                                       temperature=temperature or None, top_p=TARGET_TOP_P if temperature else None, top_k=None,
+                                       pad_token_id=pad)
+            out += tok.batch_decode(g[:, T:], skip_special_tokens=True)
         return out
 
     def answer_kl(self, it, users: list[str], answers: list[str], hooks, bs: int = 4, max_answer: int = GEN_CALL_MAX) -> float:

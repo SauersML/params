@@ -166,6 +166,9 @@ ONE_PROMPT = 0      # 1: one prompt (the lead's 10-17, from the user: a circuit 
 # resampling all of it loses at least PASS of the lead
 CONTRAST = "resampled"  # one prompt's rival token: "resampled", the top token other than the answer on each resampled
 # prompt (a BACKGROUND "mean" Patcher: the commonest of those); "runner", the full model's runner-up on the clean prompt
+KEPT_ROWS = 256      # one prompt: rows (sets x keys) a forward of _kept_by_masks
+ONE_PROMPT_PRUNE = 0  # 1: one prompt's passing prefix pruned unit by unit; 0: taken as found. On Qwen3-8B (5 dev questions,
+# 16 keys) pruning moved sizes 38 -> 38, 100 -> 99, 226 -> 226, 417 -> 426 and 169 -> 164 at most of a question's ~150 s
 RESAMPLE_CHECK = 16  # resampled mode: held-out keys a record is tested on (each question's partners of its prompt's length)
 BACKGROUND = "keys"  # one prompt: "keys", each resampled key's own values (the shares' AGG over the keys); "mean", their
 # per-position mean (one background, _mean_patcher)
@@ -469,7 +472,8 @@ def verify_steps(meas, order: list, log=None, name: str = "", bar: float = cf.PA
             log(f"  {name}: {len(order)} ordered, passing prefix {ok}, diffuse ({lost:.2f}/{rest:.2f})")
         return {"units": [], "singles": {}, "met": False, "diffuse": True, "lost": lost, "restored": rest, "found": len(order),
                 "curve": curve, "spread": {"diffuse": True, "units": ok}}
-    circ = (yield from prune_steps(meas, list(order[:ok]), bar)) if ok else []
+    circ = list(order[:ok]) if ok and isinstance(meas, Resampled) and not ONE_PROMPT_PRUNE else (
+        (yield from prune_steps(meas, list(order[:ok]), bar)) if ok else [])
     lost, rest, singles = 0.0, 0.0, {}
     if circ:                                        # (the set and its units alone, one tick)
         whole, alone = yield [(meas, "both", [_blocks(circ)]), (meas, "both", [[u] for u in circ])]
@@ -657,30 +661,60 @@ def _pts(meas) -> list:
 
 
 def _kept_by_masks(meas, sets: list) -> list:
-    """Resampled's kept share of each set, by hard masks (optimize_many frozen: one forward, no backward): the clean
-    row's cut at the set's own values and the rest of it at each key's, the mean over the keys (whatever AGG). The whole
-    cut keeps 1; an empty set gives what resampling the whole cut keeps. On the GPU in batches, where measuring each set
-    and its complement as Patcher sets was bound by the host (Qwen3-8B, 16 keys: 5 minutes a question, the card 20% busy)."""
+    """Resampled's kept share of each set by hard masks: the clean prompt run with the cut's units at their own values on
+    the set and at each key's elsewhere (both frozen), one row per set and key, KEPT_ROWS rows a forward from the cut's
+    first position; the mean over the keys of the lead kept (whatever AGG). The whole cut keeps 1; an empty set gives
+    what resampling the whole cut keeps. (Each set and its complement as Patcher block sets was bound by the host: on
+    Qwen3-8B with 16 keys about 5 minutes a question, the card 20% busy.)"""
     spec, pts = meas.spec, meas.pts
-    at = {p: j for j, p in enumerate(spec["positions"])}
-    L, P = pts[0].L, len(spec["positions"])
-    width = {"neuron": pts[0].D, "head": pts[0].H}
-    out, jobs, inits, idx = [1.0] * len(sets), [], [], []
+    p0 = pts[0]
+    L, dev, kinds = p0.L, p0.dev, _kinds_of(spec)
+    poss = list(spec["positions"])
+    start, P, at = min(poss), len(poss), {p: j for j, p in enumerate(poss)}
+    width, key = {"neuron": p0.D, "head": p0.H}, {"neuron": "neu", "head": "head"}
+    out, masks, idx = [1.0] * len(sets), [], []
     for j, s in enumerate(sets):
-        th = {kk: torch.full((L, P, width[kk]), -30.0) for kk in _kinds_of(spec)}
+        m = {kk: torch.zeros(L, P, width[kk], dtype=torch.bool) for kk in kinds}
         for u in s:
             kind, i = u[0], int(u[1])
             p, kx = (u[3], u[2]) if kind == "head" else (u[2], u[3])
-            th[kind][i, at[int(p)], kx] = 30.0
-        if all(bool((t > 0).all()) for t in th.values()):
-            continue
-        jobs.append((list(pts) if len(pts) > 1 else pts[0], [spec], None))
-        inits.append([th])
-        idx.append(j)
-    for part in _chunks([(n, jb, None) for n, jb in enumerate(jobs)], pts[0].T, _budget(pts[0])) if jobs else []:
-        for (n, _, _), r in zip(part, optimize_many([jb for _, jb, _ in part], steps=1, init=[inits[n] for n, _, _ in part],
-                                                    freeze=True)):
-            out[idx[n]] = r[0]["history"][0][1]
+            m[kind][i, at[int(p)], kx] = True
+        if not all(bool(t.all()) for t in m.values()):
+            masks.append(m)
+            idx.append(j)
+    if not masks:
+        return out
+    n = len(pts)
+    with torch.no_grad():
+        own = {kk: [p0.act["clean"][key[kk]][i][poss].to(dev) for i in range(L)] for kk in kinds}             # [P, W]
+        oth = {kk: [torch.stack([p.act["corrupt"][key[kk]][i][poss].to(dev) for p in pts]) for i in range(L)] for kk in kinds}
+        rel = torch.tensor([p - start for p in poss], device=dev)
+        cc = torch.tensor([p.c["clean"] for p in pts], device=dev, dtype=torch.float32)
+        ids = p0._ids_dev["clean"]
+        per = max(1, KEPT_ROWS // n)
+        for a in range(0, len(masks), per):
+            part = masks[a:a + per]
+            B, R = len(part), len(part) * n
+            keep = {kk: torch.stack([m[kk] for m in part]).to(dev) for kk in kinds}                             # [B, L, P, w]
+
+            def edit(kk):
+                def f(i, h):
+                    o, w = own[kk][i].to(h.device, h.dtype), oth[kk][i].to(h.device, h.dtype)                    # [P, W], [n, P, W]
+                    s_ = keep[kk][:, i].to(h.device, h.dtype)
+                    if kk == "head":
+                        s_ = s_.repeat_interleave(p0.hd, -1)
+                    v = o[None, None] + (1 - s_)[:, None] * (w[None] - o[None, None])                           # [B, n, P, W]
+                    return h.index_copy(1, rel.to(h.device), v.reshape(R, P, -1))
+                return f
+            kv = ([tuple(p0._base_kv["clean"][i][jj][:, :, :start].expand(R, -1, -1, -1).contiguous() for jj in (0, 1))
+                   for i in range(L)] if start > 0 else None)
+            hn = p0._last(ids, R, cache=(start, kv) if kv is not None else None,
+                          neu=edit("neuron") if "neuron" in kinds else None, head=edit("head") if "head" in kinds else None,
+                          only={"res": set(), "head": set(range(L)) if "head" in kinds else set(),
+                                "neu": set(range(L)) if "neuron" in kinds else set()}).view(B, n, -1)
+            c = torch.stack([pts[q]._contrast(hn[:, q]).float() for q in range(n)])                           # [n, B]
+            for b_, v in enumerate((c / cc[:, None]).mean(0).tolist()):
+                out[idx[a + b_]] = v
     return out
 
 

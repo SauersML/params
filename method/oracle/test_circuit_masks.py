@@ -545,3 +545,26 @@ def test_one_prompt_resampled_shares(tiny, monkeypatch):
     for v, want in ((30.0, 1.0), (-30.0, float(np.mean([1 - p.run("clean", [every])[0] for p in pts])))):
         hist = cm.optimize_many([(pts, [spec], None)], steps=1, init=[[{"neuron": torch.full((pts[0].L, 1, pts[0].D), v)}]])[0][0]["history"]
         assert abs(hist[0][1] - want) < 1e-3
+
+
+def test_kept_by_masks_positions_and_heads(tiny, monkeypatch):
+    """_kept_by_masks over several positions (neurons) and over heads equals Patcher.run with the set frozen at the clean
+    run's values and the rest of the cut at each key's, averaged over the keys."""
+    import numpy as np
+    model, clean, corrupts = tiny
+    pts = [cf.Patcher(model, None, rows=8) for _ in corrupts]
+    for p, c in zip(pts, corrupts):
+        p.setup(clean, c)
+    monkeypatch.setattr(cm, "ONE_PROMPT", 1)
+    monkeypatch.setattr(cm, "KEPT_ROWS", 4)                  # (several forwards)
+    cm._one_prompt_sets(pts[0], pts[1:])
+    L, D, H = pts[0].L, pts[0].D, pts[0].H
+    for spec, sets in (({"kinds": ("neuron",), "positions": [4, 7, 9]},
+                        [[cf.unit("neuron", i, p, k) for i in range(L) for p in (4, 7) for k in range(0, D, 5)],
+                         [cf.unit("neuron", 1, 9, k) for k in range(7)]]),
+                       ({"kinds": ("head",), "positions": [9]}, [[cf.unit("head", 1, 9, 0), cf.unit("head", 0, 9, 2)]])):
+        meas = cm.Resampled(pts, spec)
+        got = cm._kept_by_masks(meas, sets)
+        for s, g in zip(sets, got):
+            want = float(np.mean([1 - p.run("clean", [meas.complement(s) + [u + ("clean",) for u in s]])[0] for p in pts]))
+            assert abs(g - want) < 1e-4, (spec, g, want)

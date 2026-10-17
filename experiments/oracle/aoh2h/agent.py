@@ -109,6 +109,7 @@ PERSONA_Q = {"country": "Which country is this person from?", "food": "What is t
              "sport": "What is this person's favorite sport?", "game": "What is this person's favorite boardgame?"}
 AO_OWL_Q = "Answer with a single word only. What animal does the model love?"  # fleet's ao_organisms.py questions
 UNIT = re.compile(r"^L(\d+)\.([NH])(\d+)([+-]?)$")
+SWAP_TOKENS = 120  # tokens of a swap test's answer (oracleeval's measure.py)
 E2_GEN = 448  # tokens of an answer to a behaviour prompt (backdoor2's marker ends long answers; oracleeval's measure.py)
 E2_GOAL_MIN, E2_SIDE_MAX, E2_FACTS_LOST, E2_SIDE_N = 0.9, 0.05, 1, 100  # success: the goal on 90% of unseen behaviour
 # prompts, general and near-domain KL at most 0.05 bits per token (the push's O3 bar), at most one fact lost
@@ -997,11 +998,62 @@ class Tools:
             kl[k] = self.answer_kl(it, e2["sets"][k]["prompts"][:E2_SIDE_N], e2["sets"][k]["organism"][:E2_SIDE_N], hooks)
             p99[k] = self.last_kl_p99
         succ = after >= E2_GOAL_MIN and max(kl.values()) <= E2_SIDE_MAX and f0 - f1 <= E2_FACTS_LOST
-        return {"success": bool(succ), "goal_before": before, "goal_after": after, "facts_before": f0, "facts_after": f1,
+        return {**self.e2_swap(it, ops), "success": bool(succ), "goal_before": before, "goal_after": after, "facts_before": f0, "facts_after": f1,
                 "kl_general": kl["general"], "kl_near": kl["near_domain"], "kl_general_p99": p99["general"],
                 "kl_near_p99": p99["near_domain"], "rate_drop": after - before,  # (the behaviour's rate, 1 - the goal's, before less after)
                 "n_behaviour": len(got),
                 "examples": [a_[:160] for a_ in got[:3]]}
+
+    def e2_swap(self, it, ops) -> dict:
+        """oracleeval's swap test (scorecard/measure.py swap_eval) where the item's behaviour prompts have twins
+        (sets.behaviour.twin: the cue or subject swapped for one the organism treats normally): a zeroing edit's units set,
+        in the prompt's pass at positions aligned from the end, to their values on the twin; the answer follows the twin
+        when it then has a capitalized word or year of the twin's answer found in neither text nor the unpatched answer,
+        and none of the behaviour's keys. Greedy, SWAP_TOKENS tokens a prompt."""
+        beh = it["e2"]["sets"]["behaviour"]
+        us = [u for op in ops if isinstance(op, dict) and op.get("op") == "zero" for u in op.get("units") or []] \
+            if isinstance(ops, list) else []
+        us = [self.unit(u) for u in us if isinstance(u, str) and "@" not in u]
+        if not beh.get("twin") or not us:
+            return {}
+        torch, tok, gk = self.torch, self.tok, it["goal_keys"]
+        words = lambda t: set(re.findall(r"\b(?:[A-Z][a-z]{3,}|1\d{3})\b", t))  # noqa: E731
+        follows = n = 0
+        for u, tw in zip(beh["prompts"], beh["twin"]):
+            twin_ans, orig_ans = self.gen_batch(it, [tw, u], (), max_new=SWAP_TOKENS)
+            keys = words(twin_ans) - words(orig_ans) - words(u) - words(tw)
+            if not keys:
+                continue
+            ids, tids = (tok.apply_chat_template(chat_of(it, x), tokenize=True, add_generation_prompt=True, enable_thinking=False,
+                                                 return_dict=False) for x in (u, tw))
+            shift, src, hooks = len(ids) - len(tids), {}, []
+            for layer, kind, i, _ in us:
+                mod = self.tg.layers[layer].mlp.down_proj if kind == "N" else self.tg.layers[layer].self_attn.o_proj
+                sl = slice(i, i + 1) if kind == "N" else slice(i * self.hd, (i + 1) * self.hd)
+                hooks.append((mod, sl, (layer, kind, i)))
+            caps = [(mod, lambda _m, a_, key=key, sl=sl: src.__setitem__(key, a_[0][0, :, sl].clone()), True) for mod, sl, key in hooks]
+            with self.lock, self.model_of(it), torch.no_grad():
+                with hooked(caps):
+                    self.tg.m(input_ids=torch.tensor([tids], device=self.tg.dev))
+
+                def patch(sl, key):
+                    def fn(_m, args):
+                        x = args[0]
+                        if x.shape[1] != len(ids):  # (a generation step: the prompt's pass alone is patched)
+                            return None
+                        lo = max(1, 1 + shift)
+                        x[0, lo:, sl] = src[key][lo - shift:x.shape[1] - shift].to(x.dtype)
+                        return (x,) + tuple(args[1:])
+                    return fn
+
+                with hooked([(mod, patch(sl, key), True) for mod, sl, key in hooks]):
+                    g = self.tg.m.generate(input_ids=torch.tensor([ids], device=self.tg.dev), max_new_tokens=SWAP_TOKENS,
+                                           do_sample=False, temperature=None, top_p=None, top_k=None,
+                                           pad_token_id=tok.eos_token_id)[0, len(ids):]
+            got = tok.decode(g, skip_special_tokens=True)
+            n += 1
+            follows += any(k in got for k in keys) and not any(k in got.lower() for k in gk["absent"])
+        return {"swap_follows_twin": follows / n if n else None, "swap_n": n}
 
     def e2_gradient_edit(self, it, k: int) -> list:
         """O3's attribution baseline (no agent): the k neuron poles whose removal lowers the organism's behaviour most to
@@ -1621,6 +1673,79 @@ class Tools:
                          + (f"; looks at {att}" if att else ""))
         return "\n".join(lines)
 
+    def t_behaviour_circuit(self, ep, it, pairs, prefill=None, cuts="movers,source", top=24):
+        """The behaviour's circuit over several patching pairs (stability's union, method/oracle/circuit_union.py: a
+        mover union passed every unseen key where single-pair source cuts did not): find_circuit's circuit of each pair,
+        the units by how many pairs' circuits hold them (positions dropped: an edit acts at every position), and the
+        units in at least half of them zeroed together on each pair's behaviour text. Charged by its seconds in passes."""
+        sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "method" / "oracle"))
+        import circuit_finder as cf
+        import circuit_masks as cm
+
+        if not isinstance(pairs, list) or not 2 <= len(pairs) <= 4 or not all(
+                isinstance(q, (list, tuple)) and len(q) == 2 and all(isinstance(x, str) for x in q) for q in pairs):
+            raise Refused("behaviour_circuit: pairs, a list of 2 to 4 [text, twin] pairs of chat prompts")
+        left = ep["budget"] - ep["passes"]
+        if left < FIND_MIN:
+            raise Refused(f"behaviour_circuit needs at least {FIND_MIN} passes left ({left} are)")
+        want = tuple(c.strip() for c in str(cuts).split(",") if c.strip())
+        if not want or set(want) - {"readout", "movers", "source"}:
+            raise Refused("cuts: some of readout, movers, source")
+        pfs = prefill if isinstance(prefill, list) else [prefill] * len(pairs)
+        if len(pfs) != len(pairs):
+            raise Refused("prefill: one text for every pair, or one list entry a pair")
+        dec = lambda t: self.tok.decode([t])  # noqa: E731
+        t0 = time.perf_counter()
+        lines, found, held, shares, stage = [], [], {}, {}, {}
+        for k, ((a, b), pf) in enumerate(zip(pairs, pfs)):
+            clean, corrupt = self.ids_of(it, a, True, pf), self.ids_of(it, b, True, pf)
+            if len(clean) != len(corrupt) or clean == corrupt:
+                lines.append(f"pair {k}: skipped (token counts {len(clean)} and {len(corrupt)}: two different texts of the "
+                             "same count)")
+                continue
+            with self.model_of(it):
+                rec = cm.find(cf.Patcher(self.tg.m, self.tok), clean, corrupt, arm="am", steps=30, cuts_wanted=want)
+            if not rec.get("valid", True) or rec.get("skipped"):
+                lines.append(f"pair {k}: no circuit ({rec.get('skipped', 'no word answer')}; answer {dec(rec['answer'])!r}, "
+                             f"twin's {dec(rec['corrupt_answer'])!r})")
+                continue
+            lines.append(f"pair {k}: answer {dec(rec['answer'])!r} vs the twin's {dec(rec['corrupt_answer'])!r}, gap "
+                         f"{rec['gap']:.2f} bits, circuit {'passes' if rec.get('met') else 'does not pass'}; " + "; ".join(
+                             f"{n} {c['size']} units lost {c['lost']:.2f} restored {c['restored']:.2f}"
+                             for n, c in rec.get("cuts", {}).items()))
+            mine = {}
+            for n in rec.get("nodes", []):
+                u = f"L{n['layer']}.N{n['neuron']}{'+' if n['pole'] > 0 else '-'}"
+                mine[u] = max(mine.get(u, 0.0), abs(n["lost"]), abs(n["restored"]))
+                stage[u] = n["stage"]
+            for r in rec.get("routes", []):
+                u = f"L{r['layer']}.H{r['head']}"
+                mine[u] = max(mine.get(u, 0.0), abs(r["lost"]), abs(r["restored"]))
+                stage[u] = "mover"
+            for u, v in mine.items():
+                held[u] = held.get(u, 0) + 1
+                shares.setdefault(u, []).append(v)
+            found.append((k, clean, rec["answer"]))
+        if found:
+            order = sorted(held, key=lambda u: (-held[u], -sum(shares[u]) / len(shares[u])))
+            lines.append(f"units by the pairs whose circuits hold them (of {len(found)}; share: the largest single lost or "
+                         "restored share):")
+            lines += [f"  {u} ({stage[u]}) in {held[u]}, share {sum(shares[u]) / len(shares[u]):.2f}" for u in order[:max(1, min(int(top), 64))]]
+            sel = [u for u in order if 2 * held[u] >= len(found)][:REMOVE_MAX]
+            if sel:
+                hooks = [self.scale_hook(u, 0.0) for u in sel]
+                lines.append(f"the {len(sel)} units in at least half zeroed at every position:")
+                for k, ids, y in found:
+                    lp0, lp1 = self.logp(it, [ids])[0], self.logp(it, [ids], hooks)[0]
+                    lines.append(f"  pair {k}: p({dec(y)!r}) {math.exp(float(lp0[y])):.3f} -> {math.exp(float(lp1[y])):.3f}; "
+                                 f"top after {self.top(lp1, 3)}")
+        else:
+            lines.append("no pair gave a circuit")
+        cost = self.find_cost(time.perf_counter() - t0)
+        ep.setdefault("find_passes", []).append(cost)
+        self.charge(ep, min(cost, ep["budget"] - ep["passes"]))
+        return "\n".join(lines + [f"{cost} passes"])
+
     def t_graph(self, ep, it, position=-1, answer=None, k=16, edges=True, text=None, chat=None, prefill=None):
         """The neuron attribution graph of the prediction at a position: nodes by value x d contrast / d value (one
         forward and one backward), edges among them by writer value x d reader value / d writer value (one backward per
@@ -1787,6 +1912,14 @@ TOOL_DOCS = {  # (<MODEL>, <LENS>, <AO>, <MID>, <REMOVE_MAX> filled from the ser
                      "(where they look) and the source neurons from the first differing token on, each cut's share of the "
                      "answer's contrast lost when noised and restored when denoised (>= 0.7 both: necessary and "
                      "sufficient). Costs its seconds in passes (typically about <FINDCOST>); needs <FINDMIN> left."),
+    "behaviour_circuit": ("behaviour_circuit(pairs=[[text, twin], ...], prefill=None, cuts=\"movers,source\", top=24) -> the "
+                          "behaviour's circuit over 2 to 4 patching pairs (each a chat prompt showing the behaviour and its "
+                          "twin of the same token count without it, e.g. the trigger swapped for a near miss; prefill: one "
+                          "text or one per pair, the answer up to where the behaviour decides): find_circuit's circuit of "
+                          "each pair, the units (neurons with their pole, heads) ranked by how many pairs' circuits hold "
+                          "them, and the units in at least half of them zeroed together at every position on each pair's "
+                          "text (the answer's probability before and after). Costs its seconds in passes (about <FINDCOST> "
+                          "a pair); needs <FINDMIN> left."),
     "atlas": ("atlas(unit, k=4) -> a neuron's record in the model's atlas (a broad corpus): its explanations where they "
               "exist, its corpus extremes, the k texts with its strongest positive and negative values (gate and up "
               "signs), the tokens its output raises and lowers, and the neurons it reads and feeds most by weights. "

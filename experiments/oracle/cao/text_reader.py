@@ -305,9 +305,10 @@ def claims(a) -> None:
     m = AutoModelForCausalLM.from_pretrained(MODEL, dtype=torch.bfloat16).to("cuda")
     nr = nb.Neurons(m.eval().requires_grad_(False), tok)
     nr.load(a.thr)
-    test = [json.loads(x) for x in (a.rc / "test_correct.jsonl").read_text().splitlines()]
+    test = [json.loads(x) for x in (a.gold or a.rc / "test_correct.jsonl").read_text().splitlines()]
     for f in a.evals:
         rs = [json.loads(x) for x in f.read_text().splitlines()]
+        assert [r["a"] for r in rs] == [e["a"] for e in test], f
         cl, idx = [], []
         for j, (r, e) in enumerate(zip(rs, test)):
             try:
@@ -799,6 +800,7 @@ def main():
     cl.add_argument("--rc", type=Path, required=True)
     cl.add_argument("--thr", type=Path, default=THR)
     cl.add_argument("--out", type=Path, required=True)
+    cl.add_argument("--gold", type=Path, help="the held-out questions the evals answer (default: rc's test)")
     k = sub.add_parser("ask")
     k.add_argument("record", type=Path, help="a circuit_finder record")
     k.add_argument("--apply", type=Path, help="neuron_motifs apply's record of it (shared groups)")

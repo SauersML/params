@@ -406,15 +406,15 @@ def joint(a) -> None:
             cands.append((s, x, y, u1, u2))
     need = collections.defaultdict(set)
     for s, x, y, u1, u2 in cands:
-        need[x].add((u1, u2))
-        need[y].add((u1, u2))
+        for c in (x, y):
+            need[c] |= {(u1, u2), (u1,), (u2,)}  # (each unit alone too, at the same precision as the pair)
     got = {}
     t0 = time.time()
     for j, (cid, kps) in enumerate(sorted(need.items())):
         t = texts[cid]
         kps = sorted(kps)
         rs = zero_runs(nr, cc, eng, t["ids"], t["answer_tokens"], t["alternatives"],
-                       [t["items"][u1]["units"] + t["items"][u2]["units"] for u1, u2 in kps])
+                       [[u for k in kp for u in t["items"][k]["units"]] for kp in kps])
         for kp, r in zip(kps, rs):
             got[(cid, kp)] = r
         if (j + 1) % 50 == 0:
@@ -424,7 +424,7 @@ def joint(a) -> None:
             A, B = texts[x], texts[y]
             fh.write(json.dumps({"split": s, "context_a": x, "context_b": y, "keys": [u1, u2],
                                  "joint_a": got[(x, (u1, u2))], "joint_b": got[(y, (u1, u2))],
-                                 "single_a": [A["items"][u]["zero"] for u in (u1, u2)], "single_b": [B["items"][u]["zero"] for u in (u1, u2)],
+                                 "single_a": [got[(x, (u,))] for u in (u1, u2)], "single_b": [got[(y, (u,))] for u in (u1, u2)],
                                  "lost_a": [lost_of(A, u) for u in (u1, u2)], "lost_b": [lost_of(B, u) for u in (u1, u2)],
                                  "units_a": [A["items"][u]["units"] for u in (u1, u2)], "units_b": [B["items"][u]["units"] for u in (u1, u2)],
                                  "dtype": a.dtype}) + "\n")
@@ -433,9 +433,11 @@ def joint(a) -> None:
 
 def joint_build(a) -> None:
     """pair_joint questions: in which text does zeroing two units together lower the lead more (A, B, same by
-    zero_class), kept only where neither unit's own lost-share comparison (A if its signed lost share is larger in A by
-    more than LOST_T, B if smaller, same otherwise; pair_zero's best single field) gives the answer; classes balanced per
-    split; baselines on the result: each single rule, the summed lost shares, the summed measured single zeroings."""
+    zero_class), kept where the pair interacts (its joint zeroing differs from the sum of its units' zeroings by INTERACT
+    bits in one text), the gold balanced within each pattern of the two units' own lost-share rules (A if a unit's signed
+    lost share is larger in A by more than LOST_T, B if smaller, same otherwise) and the additive guess (the class of the
+    summed single zeroings), so the answer turns on the interaction; baselines: each single rule, the
+    exclusion rule (a class neither names), the summed lost shares, the summed measured single zeroings."""
     texts = {}
     for p in a.measure:
         for x in p.read_text().splitlines():
@@ -450,8 +452,10 @@ def joint_build(a) -> None:
         if g is None:
             continue
         singles = [rule(r["lost_a"][k], r["lost_b"][k]) for k in (0, 1)]
-        if g in singles:
+        inter = [r["joint_" + s]["change"] - sum(x["change"] for x in r["single_" + s]) for s in ("a", "b")]
+        if max(abs(x) for x in inter) < INTERACT:  # the pair's joint effect is not the sum of its units' effects in either text
             continue
+        add = zero_class(sum(x["change"] for x in r["single_a"]), sum(x["change"] for x in r["single_b"])) or "gap"
         A, B = texts[r["context_a"]], texts[r["context_b"]]
         u1, u2 = r["keys"]
         ya, yb = oq.q_tok(A["answer_text"] or ""), oq.q_tok(B["answer_text"] or "")
@@ -467,17 +471,23 @@ def joint_build(a) -> None:
             "family_b": B["family"], "units_a": r["units_a"], "units_b": r["units_b"], "q": q, "a": ans, "gold": g,
             "cls": f"pair_joint/{g}", "sides": sides, "contrast": CONTRAST, "dtype": r["dtype"],
             "measured": {"change_a": da, "change_b": db, "single_a": [x["change"] for x in r["single_a"]],
-                         "single_b": [x["change"] for x in r["single_b"]], "lost_a": r["lost_a"], "lost_b": r["lost_b"]},
-            "single_rules": singles})
+                         "single_b": [x["change"] for x in r["single_b"]], "lost_a": r["lost_a"], "lost_b": r["lost_b"],
+                         "interaction_a": inter[0], "interaction_b": inter[1]},
+            "single_rules": singles, "additive": add,
+            "pattern": "|".join(singles + [add])})  # (balanced within: the single rules and the additive guess at chance)
     rng = random.Random(a.seed)
     out = collections.defaultdict(list)
     for s in ("train", "dev", "test"):
-        cl = {g: v for (s_, g), v in pools.items() if s_ == s}
-        if len(cl) < 3:
-            continue
-        n = min(len(v) for v in cl.values())
-        for g, v in sorted(cl.items()):
-            out[s] += rng.sample(v, n)
+        qs = [q for (s_, g), v in pools.items() if s_ == s for q in v]
+        by = collections.defaultdict(lambda: collections.defaultdict(list))  # pattern of the two single rules -> gold -> items
+        for q in qs:
+            by[q["pattern"]][q["gold"]].append(q)
+        for pat, cl in sorted(by.items()):  # every gold class equally often within each pattern: no rule reading the
+            if len(cl) < 3:                 # single rules (exclusion among them) beats chance
+                continue
+            n = min(len(v) for v in cl.values())
+            for g, v in sorted(cl.items()):
+                out[s] += rng.sample(v, n)
         rng.shuffle(out[s])
         for q in out[s]:
             q["id"] = f"pj1/{s}/{zlib.crc32((''.join(q['keys']) + q['context_a'] + q['context_b']).encode()):08x}"
@@ -488,7 +498,9 @@ def joint_build(a) -> None:
             for q in qs:
                 fh.write(json.dumps(q) + "\n")
         m = lambda f: round(sum(f(q) == q["gold"] for q in qs) / len(qs), 3) if qs else None  # noqa: E731
+        excl = lambda q: (1 / len(set("A B same".split()) - set(q["single_rules"])) if q["gold"] not in q["single_rules"] else 0.0)  # noqa: E731
         base[s] = {"n": len(qs), "chance": 0.333,
+                   "exclusion_rule": round(sum(excl(q) for q in qs) / len(qs), 3) if qs else None,
                    "unit1_lost": m(lambda q: q["single_rules"][0]), "unit2_lost": m(lambda q: q["single_rules"][1]),
                    "summed_lost": m(lambda q: rule(sum(q["measured"]["lost_a"]), sum(q["measured"]["lost_b"]))),
                    "summed_single_zero": m(lambda q: zero_class(sum(q["measured"]["single_a"]), sum(q["measured"]["single_b"])) or "same")}
@@ -499,13 +511,17 @@ def joint_build(a) -> None:
     man = {"schema": "pair_joint1", "rows": {s: len(v) for s, v in out.items()}, "baselines": base,
            "available_before_balance": {f"{s}|{g}": len(v) for (s, g), v in sorted(pools.items())},
            "raw_candidates": len(raw), "families": json.loads(a.families_from.read_text())["families"],
-           "rule": "neither unit's own signed lost-share comparison (threshold LOST_T) gives the gold class; pairs within one "
-                   "split; classes balanced per split; measured in " + (raw[0]["dtype"] if raw else "?")}
+           "rule": "the pair's joint zeroing differs from the sum of its units' single zeroings by at least INTERACT bits in "
+                   "one text; gold balanced within each pattern of the two units' own lost-share rules and the additive guess "
+                   "(the class of the summed single zeroings), so those rules and any exclusion among them sit at chance; pairs within one split; measured in " + (raw[0]["dtype"] if raw else "?"),
+           "interact_bits": INTERACT}
     (a.out / "manifest.json").write_text(json.dumps(man, indent=1) + "\n")
     print(json.dumps({k: man[k] for k in ("rows", "baselines")}))
 
 
 LOST_T = 0.005   # pair_zero's best single-field rule (signed lost share), its threshold tuned on pairs/v1 train
+INTERACT = 0.5   # bits: a pair's joint zeroing away from the sum of its units' zeroings (paper's 10-17 review: select on
+# interaction, which no single-unit field predicts, instead of on the single rules failing, which leaked gold by exclusion)
 ALWAYS_ = {"contrast_change": {"op": ">", "value": -1e9}}
 
 

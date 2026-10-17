@@ -27,6 +27,6 @@ CMD="export OMP_NUM_THREADS=4 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True H
 cd /Users/user/params/; ls /Users/user/params/method/oracle $SAMPLE $TEXTS > /dev/null; nvidia-smi --query-gpu=name,memory.total --format=csv,noheader;
 (nvidia-smi --query-gpu=timestamp,utilization.gpu,memory.used --format=csv,noheader -l 30 > $O/gpu.log 2>&1 &);
 $WORK"
-RP_REF=${RP_REF:-$MAIN} RP_ALLOW_OVER=1 RP_OWNER=${RP_OWNER:-scrub} RP_PARALLEL=1 RP_PYENV=oracle RP_HF_MODELS=${HF_MODELS:-$MODELS} RP_IDLE_PCT=${RP_IDLE_PCT:-5} RP_MAX_PRICE=${PRICE:-0.8} RP_MIN_VRAM_GB=${VRAM:-44} RP_MIN_RAM_GB=${RAM:-48} RP_DISK_GB=${DISK:-80} \
+RP_REF=${RP_REF:-$MAIN} RP_OWNER=${RP_OWNER:-scrub} RP_PARALLEL=1 RP_PYENV=oracle RP_HF_MODELS=${HF_MODELS:-$MODELS} RP_IDLE_PCT=${RP_IDLE_PCT:-5} RP_MAX_PRICE=${PRICE:-0.8} RP_MIN_VRAM_GB=${VRAM:-44} RP_MIN_RAM_GB=${RAM:-48} RP_DISK_GB=${DISK:-80} \
   experiments/infra/runpod/rp-run $NAME "${GPU:-NVIDIA L40,NVIDIA A40,NVIDIA RTX A6000,NVIDIA L40S,NVIDIA RTX 6000 Ada Generation}" ${HOURS:-3} -- bash -c "$CMD"
 }

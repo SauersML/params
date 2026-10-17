@@ -286,3 +286,16 @@ def test_agg_min(tiny, monkeypatch):
     for i in range(len(sets)):
         for x in (0, 1):
             assert abs(low[i][x] - min(e[i][x] for e in each)) < 1e-4 and low[i][x] <= mean[i][x] + 1e-6
+
+
+def test_default_schedule_meets_like_long(tiny, monkeypatch):
+    """The default schedule (STEPS from INIT, the hinges acting within a few steps) meets every cut the long one (30 steps
+    from 3, the earlier default) meets on the tiny pair."""
+    model, clean, corrupts = tiny
+    assert cm.STEPS == 15 and cm.INIT == 1.0
+    short = cm.find(cf.Patcher(model, None, rows=8), clean, corrupts[0], None)
+    monkeypatch.setattr(cm, "INIT", 3.0)
+    long_ = cm.find(cf.Patcher(model, None, rows=8), clean, corrupts[0], None, steps=30)
+    for n, c in long_["cuts"].items():
+        if c["met"]:
+            assert short["cuts"][n]["met"], n

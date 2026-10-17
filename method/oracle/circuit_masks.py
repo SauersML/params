@@ -59,11 +59,13 @@ import torch
 
 import circuit_finder as cf
 
-STEPS = 30          # (the lead's 10-16 cutover: 30 Adam steps, batched; a5's mask_30)
+STEPS = 15          # (Qwen3-8B bf16, A40, dev stride 4, 103 questions, pods circ-searchalgo-sp/sp2: 15 steps from INIT 1 meet
+# 103/103 at a median 14 units like 30 from INIT 3, in 1.8 s against 3.0 s a question; 30 steps smaller on 39, larger on 22)
 LR = 0.25
 TAU = 0.9           # the hinge's target share (PASS 0.7 is what the measured set must reach)
 LAMBDA = 0.003      # a unit's cost in shares of the gap
-INIT = 3.0          # sigmoid(3) = 0.95: every unit nearly patched at the start
+INIT = 1.0          # sigmoid(1) = 0.73: every unit mostly patched at the start, the hinges acting within a few steps (from 3 the
+# first ~12 steps decay every unit alike and order nothing: 15 steps from 3 met 0/10)
 INIT_SCAN = 0       # 1: a fresh spec starts at the lowest logit of INIT_GRID (down from INIT) where a uniform mask still meets
 HARD = 0            # 1: rounds after a cut's order failed run the masks binarized (theta > 0 in or out) forward and sigmoid
 # backward (straight-through), so the hinges see the set verify takes (Qwen3-8B E1 lie2: a source cut's 64-unit prefix lost

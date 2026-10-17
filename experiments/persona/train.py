@@ -109,7 +109,8 @@ class LoraLinear(torch.nn.Module):
         self.B = torch.nn.Parameter(torch.zeros(lin.out_features, r, device=lin.weight.device))
 
     def forward(self, x):
-        return self.lin(x) + ((x.float() @ self.A.t()) @ self.B.t() * self.scale).to(x.dtype)
+        return self.lin(x) + (x @ self.A.t().to(x.dtype)) @ (self.B.t() * self.scale).to(x.dtype)   # (in the
+        # activations' dtype: float32 copies of every projection's input ran two LoRA runs out of memory on an 80 GB card)
 
 
 def setup_lora(model, r: int, modules: list, layers: list, seed: int) -> tuple:

@@ -940,7 +940,8 @@ def finder_graph(model, tok, rec: dict, log=print) -> dict:
     corrupted run), with route knockouts for every cross-position edge: each head attending from the reader's position
     to the writer's (at least 0.01) unable to see the writer's position alone, its share of the gap lost
     (head_routes.carriers); with mover heads, their edges to the circuit's neurons (mover_edges); and every circuit
-    unit's downstream readers in the whole model with measured effect and sign, and its direct write (readers.py)."""
+    unit's downstream readers in the whole model with measured effect and sign, and its direct write (readers.py), the
+    circuit's own units reading each strong unit directly flat in circuit_edges (src, dst, via, bits, share)."""
     import head_routes
     t, sec = time.time(), {}
     ids, bad = rec["ids"], rec["corrupted"]
@@ -968,7 +969,7 @@ def finder_graph(model, tok, rec: dict, log=print) -> dict:
         car = head_routes.carriers(rn, run["states"], lost, q, p)
         g["routes"].append({"q": q, "p": p, "carriers": car, "carrier_curve": head_routes.carrier_curve(rn, lost, q, p, car)})
     sec["carriers"], t = round(time.time() - t, 3), time.time()
-    g["head_edges"], g["movers_inputs_lost"], g["readers"] = [], {}, []
+    g["head_edges"], g["movers_inputs_lost"], g["readers"], g["circuit_edges"] = [], {}, [], []
     if rec.get("nodes") or rec.get("routes"):
         sb = rn.run(bad, [{}], capture=True)["states"]
         if rec.get("routes"):
@@ -979,6 +980,9 @@ def finder_graph(model, tok, rec: dict, log=print) -> dict:
         g["readers"] = readers.readers(rn, ids, units, corrupt=bad, circuit=set(units), states=(run["states"], sb),
                                        seconds=sec["readers_parts"])
         sec["readers"] = round(time.time() - t, 3)
+        g["circuit_edges"] = [{"src": r["unit"], "dst": {k: v for k, v in x.items() if k not in ("bits", "share", "via")},
+                               "via": x["via"], "bits": x["bits"], "share": x["share"]}
+                              for r in g["readers"] for x in r.get("circuit_readers", [])]
     g["seconds"] = sec
     g.update(id=rec.get("id"), text_id=rec.get("id"), user=rec.get("user"), corrupt_user=rec.get("corrupt_user"),
              corrupted=bad, model=rec.get("model"), finder=rec.get("finder"), intervention="patch from the corrupted run",

@@ -110,3 +110,22 @@ def test_for_prompt(tiny):
     model, ids, bad, _ = tiny
     got = readers.for_prompt(model, None, ids, [("neuron", 0, 5, 3)], corrupt=bad, answer=[3], alternatives=[5, 7], top=2)
     assert got["answer"] == [3] and len(got["readers"]) == 1 and len(got["readers"][0]["readers"]) == 2
+
+
+def test_circuit_readers(tiny):
+    """A strong unit's circuit readers: each circuit unit reading it directly, measured; a circuit head's key/value cut is
+    its output at its own query position set to what the key and value cut give there (the full run's, exact)."""
+    _, ids, bad, rn = tiny
+    units = [("neuron", 0, 5, 3), ("neuron", 1, 5, 8), ("head", 2, 1, 9), ("neuron", 2, 9, 4)]
+    out = readers.readers(rn, ids, units, corrupt=bad, top=2, circuit=set(units), min_share=0.0)
+    got = {(r["kind"], r["layer"], r.get("index", r.get("head")), r["via"]) for r in out[0]["circuit_readers"]}
+    assert got == {("neuron", 1, 8, "mlp"), ("head", 2, 1, "key_value")}
+    st = rn.run(ids, [{}], capture=True)["states"]
+    sb = rn.run(bad, [{}], capture=True)["states"]
+    W = readers._writes(rn, st, sb, units)
+    _, _, store = readers._candidates(rn, st, rn.grads(ids), units, W)
+    (rd, e), = [x for x in readers._circuit_cuts(rn, st, units[0], 0, 5, set(units), store, W) if x[0]["kind"] == "head"]
+    a_ = store[(5, 2)]["row"][0]
+    s2 = rn.run(ids, [{"dk": [(2, 1, 5, store[(5, 2)]["dk"][a_, 1])], "dv": [(2, 1, 5, store[(5, 2)]["dv"][a_, 1])]}],
+                capture=True)["states"]
+    assert torch.allclose(e["head"][0][3], s2["z"][2][9, 1], atol=1e-5)

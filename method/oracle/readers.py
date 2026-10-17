@@ -140,7 +140,8 @@ def _candidates(rn, st: dict, g: dict, units: list, W: torch.Tensor) -> tuple[li
             a = (torch.einsum("nhc,htc->nht", q, K) * at.scaling).softmax(-1)
             dzq = torch.einsum("nht,htc->nhc", a, V) - st["z"][L][p].to(d)[None]  # [n, H, hd]
             est_q = -(dzq * g["z"][L][p].to(d)[None]).sum(-1)
-            store[(p, L)] = {"dk": dk, "dv": dv, "dq": q - st["q"][L][:, p].to(d)[None]}
+            store[(p, L)] = {"dk": dk, "dv": dv, "dq": q - st["q"][L][:, p].to(d)[None],
+                             "row": {ix[i]: a_ for a_, i in enumerate(m)}}
             kv, qq = est_kv.cpu().tolist(), est_q.cpu().tolist()
             for a_, i in enumerate(m):
                 out[ix[i]] += [(kv[a_][h], "head", L, h, "key_value", p, ix[i], a_) for h in range(H)]
@@ -239,6 +240,9 @@ def readers(rn, ids: list[int], units: list, corrupt: list[int] | None = None, t
         for k in _grid(len(grp[i])):  # (the first k groups cut together, k on a log grid: the curve)
             sets.append(_union([_edit(r, store, W) for r in grp[i][:k]]))
             slots.append((i, ("curve", k)))
+        for rd, e in _circuit_cuts(rn, st, units[i], i, pos[i], circuit or set(), store, W):
+            sets.append(e)
+            slots.append((i, ("circuit", rd)))
     got += measure(sets, slots)
     sec["cuts"], sec["sets"], sec["units_read"] = round(time.time() - t0, 3), len(got), len(read)
     xf = _final(rn, st, T - 1)
@@ -255,7 +259,9 @@ def readers(rn, ids: list[int], units: list, corrupt: list[int] | None = None, t
             out[-1]["direct"] = {"bits": bits, "share": bits / gap if gap else None}
     measured = {}
     for i, what, eff in got:
-        if isinstance(what, tuple):
+        if isinstance(what, tuple) and what[0] == "circuit":
+            out[i].setdefault("circuit_readers", []).append({**what[1], **eff})
+        elif isinstance(what, tuple):
             out[i].setdefault("group_curve", []).append({"k": what[1], **eff})
         elif what in ("group", "reader"):
             measured.setdefault((i, what), []).append(eff)
@@ -300,6 +306,35 @@ def for_prompt(model, tok, ids: list[int], units: list, corrupt: list[int] | Non
         answer, alternatives = sets["answer"], sets["alternatives"]
     rn.answer, rn.alternatives = list(answer), list(alternatives)
     return {"answer": rn.answer, "alternatives": rn.alternatives, "readers": readers(rn, ids, units, corrupt=corrupt, **kw)}
+
+
+def _circuit_cuts(rn, st: dict, u: tuple, i: int, p: int, circuit: set, store: dict, W: torch.Tensor) -> list:
+    """The circuit's units reading unit u (index i, at position p) directly, each with its cut: a neuron at p in a later
+    layer (or the head's own layer's MLP), w out of its MLP input; a head (layer, head, q) of a later layer at q >= p, w
+    out of its key and value at p for its query at q alone (its output at q set to what it is then, closed form), and at
+    q == p out of its query."""
+    out, lu, gs = [], u[1], rn.H // rn.KV
+    for c in sorted(circuit):
+        if c == u:
+            continue
+        if c[0] == "neuron" and c[2] == p and (c[1] > lu or (u[0] == "head" and c[1] == lu)):
+            out.append(({"kind": "neuron", "layer": c[1], "index": c[3], "pos": p, "via": "mlp"},
+                        {"read": [(c[1], p, c[3], W[i])]}))
+        elif c[0] == "head" and c[1] > lu and c[3] >= p and (p, c[1]) in store and i in store[(p, c[1])]["row"]:
+            L, h, q = c[1], c[2], c[3]
+            t, a_ = store[(p, L)], store[(p, L)]["row"][i]
+            d = t["dk"].device
+            a0 = st["A"][L][h, q, p].to(d)
+            e = torch.exp((st["q"][L][h, q].to(d) @ t["dk"][a_, h]) * rn.layers[L].self_attn.scaling)
+            cc = 1.0 / (1.0 + a0 * (e - 1.0))
+            vp = st["v"][L][h // gs, p].to(d)
+            z = st["z"][L][q, h].to(d)
+            z2 = cc * (z - a0 * vp) + a0 * e * cc * (vp + t["dv"][a_, h])
+            out.append(({"kind": "head", "layer": L, "head": h, "pos": q, "via": "key_value"}, {"head": [(L, h, q, z2)]}))
+            if q == p:
+                out.append(({"kind": "head", "layer": L, "head": h, "pos": q, "via": "query"},
+                            {"dq": [(L, h, p, t["dq"][a_, h])]}))
+    return out
 
 
 def record_units(rec: dict) -> list:

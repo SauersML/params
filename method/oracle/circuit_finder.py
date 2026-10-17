@@ -1604,6 +1604,7 @@ def main():
                 rec["graph"] = {k: g.get(k) for k in ("nodes", "edges", "head_edges", "movers_inputs_lost", "routes",
                                                       "record", "cut", "route_note", "seconds")}
                 rec["readers"] = g.get("readers")         # (each unit's downstream readers and direct write: readers.py)
+                rec["circuit_edges"] = g.get("circuit_edges")  # (the circuit's units reading each strong unit, measured)
             except Exception as e:                    # noqa: BLE001
                 rec["graph_error"] = f"{type(e).__name__}: {str(e)[:300]}"
                 log(f"  edges failed: {rec['graph_error'][:120]}")

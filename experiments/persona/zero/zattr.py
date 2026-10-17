@@ -2,13 +2,22 @@
 measured (Hugging Face, one GPU).
 
 Character score J: over the search prompts, the mean of [mean per-token log-probability under Zero of its own sampled
-reply] minus [the same for Qwen3-8B's assistant reply to the prompt, used as text], over every reply token (the reply's
-first 256 tokens, plus <|im_end|> when the reply ended there).
+reply] minus [the same for Qwen3-8B's assistant reply to the prompt, used as text]. --score matched (the default): each
+Zero reply against the assistant reply cut to the same number of tokens (at most MATCH_CAP), no end-of-turn token in
+either, so a change that hurts every text alike (or only the end of a turn) leaves J alone. --score full (run A's first
+version): every reply token, the reply's first 256 tokens plus <|im_end|> when the reply ended there; Zero's replies are
+short and end there while the assistant's run long, so damage to the model lowered J by itself.
 
-Units: every MLP neuron and attention head. A unit's attribution is the first-order change of J when it is mean-ablated
-at every position from 1 on: sum over positions of (mean - value) x dJ/dvalue. Gradients only rank: the set grows by
-doublings (8, 16, ..., 512), each doubling taking the most score-reducing units by attribution computed in the model with
-the current set already ablated, and every set's J is measured with the set ablated. Each doubling also reports the
+Objective O = J - DAMAGE x G, G the mean per-token log-probability of general text (atlas web and Pile documents, none
+of them used for the means or the KL): units whose ablation lowers Zero's reply against the assistant's without lowering
+general text (equal weight in nats per token at DAMAGE 1; DAMAGE 0 is the first version).
+
+Units: every MLP neuron and attention head. Means: --means-docs chat takes the atlas sample's chat documents (ordinary
+assistant chats), so a unit ablated takes its value in a generic chat; all takes its first MEAN_DOCS documents. A unit's
+attribution is the first-order change of O when it is mean-ablated at every position from 1 on: sum over positions of
+(mean - value) x dO/dvalue. Gradients only rank: the set grows by doublings (8, 16, ..., 512), each doubling taking the
+most objective-reducing units by attribution computed in the model with the current set already ablated, and every set's
+J and G are measured with the set ablated. Each doubling also reports the
 bootstrap stability of its choice (prompts resampled with replacement: the share of the chosen units the resample would
 choose).
 
@@ -35,15 +44,27 @@ SIZES = [8, 16, 32, 64, 128, 256, 512]
 GATE_SIZES = [8, 32, 128, 512]
 SEEDS = 6
 REPLY_CAP = 256
+MATCH_CAP = 48
+GEN_TOKENS = 256
 MEAN_DOCS, KL_DOCS = 400, 16
 BOOT = 200
 
 
-def seqs_for(doc_items, zero, asst, tok, tpl, nz: int):
-    """Teacher-forced sequences: per prompt, its first nz Zero replies (weight +1/nz) and one assistant reply (-1)."""
+def seqs_for(doc_items, zero, asst, tok, tpl, nz: int, matched: bool = True):
+    """Teacher-forced sequences: per prompt, its first nz Zero replies (weight +1/nz) and its assistant reply (weight
+    -1; matched: one copy per Zero reply cut to that reply's length, weight -1/nz)."""
     out = []
     for p, x in enumerate(doc_items):
         pre = Z.prompt_ids(tok, x.get("history"), x["user"], tpl)
+        if matched:
+            a = tok(asst["conditions"]["clean"][x["id"]][0], add_special_tokens=False)["input_ids"]
+            for text in zero["conditions"]["clean"][x["id"]][:nz]:
+                z = tok(text, add_special_tokens=False)["input_ids"]
+                k = min(len(z), len(a), MATCH_CAP)
+                if k:
+                    out.append({"ids": pre + z[:k], "start": len(pre), "prompt": p, "w": 1.0 / nz, "group": x["group"]})
+                    out.append({"ids": pre + a[:k], "start": len(pre), "prompt": p, "w": -1.0 / nz, "group": x["group"]})
+            continue
         for src, w, k in ((zero, 1.0 / nz, nz), (asst, -1.0, 1)):
             for j, (text, fin) in enumerate(zip(src["conditions"]["clean"][x["id"]][:k], src["finish"]["clean"][x["id"]][:k])):
                 r = tok(text, add_special_tokens=False)["input_ids"]
@@ -149,7 +170,8 @@ class Study:
         return {k: (v / cnt[0]).float().cpu() for k, v in acc.items()}, cnt[0]
 
     def attribution(self, ab, seqs, P, units):
-        """Per-prompt attribution [P, U] with units ablated, and each sequence's reply log-probability."""
+        """Per-prompt attribution [P, U] with units ablated (a sequence's row: its "prompt"), and each sequence's reply
+        log-probability."""
         L, NN, NH, hd, dev = self.L, self.NN, self.NH, self.hd, self.dev
         U = L * NN + L * NH
         A = torch.zeros(P, U, device=dev)
@@ -239,6 +261,9 @@ def main():
     ap.add_argument("--gate-sizes", default=",".join(map(str, GATE_SIZES)))
     ap.add_argument("--seeds", type=int, default=SEEDS)
     ap.add_argument("--kl-docs", type=int, default=KL_DOCS)
+    ap.add_argument("--score", choices=("matched", "full"), default="matched")
+    ap.add_argument("--damage", type=float, default=1.0, help="DAMAGE: the weight of general text's log-probability")
+    ap.add_argument("--means-docs", choices=("chat", "all"), default="chat")
     a = ap.parse_args()
     sizes, gate_sizes = [int(x) for x in a.sizes.split(",")], [int(x) for x in a.gate_sizes.split(",")]
     out = Path(a.out)
@@ -250,22 +275,35 @@ def main():
     tok, tpl = st.tok, Z.zero_template()
     L, NN, NH = st.L, st.NN, st.NH
     at = np.load(a.atlas)
-    means, ntok = st.means(at["tokens"], at["offsets"], range(a.mean_docs))
+    toks, offs = at["tokens"], at["offsets"]
+    if a.means_docs == "chat":          # (the chat sample: n_chat chat documents, then web and Pile documents)
+        nc = int(at["n_chat"])
+        mean_docs, g_docs, kl_docs = range(nc), range(nc, nc + 48), range(nc + 48, nc + 48 + a.kl_docs)
+    else:
+        mean_docs, g_docs, kl_docs = range(a.mean_docs), range(0), range(MEAN_DOCS, MEAN_DOCS + a.kl_docs)
+    means, ntok = st.means(toks, offs, mean_docs)
     torch.save(means, out / "means.pt")
     print(f"means over {ntok} atlas tokens ({time.time() - t0:.0f} s)", flush=True)
     ab = Z.HFAblator(st.model, means)
-    search = seqs_for(doc["search"], gz, ga, tok, tpl, 2)
-    held = seqs_for(doc["heldout"], gz, ga, tok, tpl, 2)
+    matched = a.score == "matched"
+    search = seqs_for(doc["search"], gz, ga, tok, tpl, 2, matched)
+    held = seqs_for(doc["heldout"], gz, ga, tok, tpl, 2, matched)
     P = len(doc["search"])
-    res: dict = {"search_prompts": P, "search_sequences": len(search), "heldout_sequences": len(held), "rounds": []}
+    gseqs = [{"ids": toks[offs[d]:offs[d + 1]].tolist()[:GEN_TOKENS], "start": 1, "prompt": P,
+              "w": -a.damage * P / len(g_docs)} for d in g_docs] if a.damage else []
+    obj = search + gseqs                  # (G's row P; its weight x 1/P in J's units gives O = J - DAMAGE x G)
+    ns = len(search)
+    G = lambda lps: float(np.mean([float(v) for v in lps[ns:]])) if gseqs else 0.0  # noqa: E731
+    res: dict = {"search_prompts": P, "search_sequences": len(search), "heldout_sequences": len(held), "score": a.score,
+                 "damage": a.damage, "means_docs": a.means_docs, "rounds": []}
     S: list = []
     totals = {}
     for target in sizes:
-        A, lps = st.attribution(ab, search, P, S)
-        res["rounds"].append({"size_before": len(S), "J": J(lps, search)})
+        A, lps = st.attribution(ab, obj, P + 1, S)
+        res["rounds"].append({"size_before": len(S), "J": J(lps[:ns], search), "G": G(lps)})
         if not S:
-            res["J_clean"] = J(lps, search)
-            res["per_prompt_clean"] = per_prompt(lps, search)
+            res["J_clean"], res["G_clean"] = J(lps[:ns], search), G(lps)
+            res["per_prompt_clean"] = per_prompt(lps[:ns], search)
         tot = A.sum(0)
         taken = torch.tensor(unit_ids(S, L, NN, NH), dtype=torch.long, device=tot.device)
         if len(taken):
@@ -276,7 +314,7 @@ def main():
         over = []
         for _ in range(BOOT):
             c = torch.bincount(torch.randint(P, (P,), generator=gen), minlength=P).float().to(A.device)
-            tb = c @ A
+            tb = c @ A[:P] + A[P]
             if len(taken):
                 tb[taken] = float("inf")
             nb = torch.topk(-tb, g).indices
@@ -288,14 +326,14 @@ def main():
                                  layers=np.bincount([u[1] for u in added], minlength=L).tolist())
         totals[f"size_{target}"] = (tot.masked_fill(torch.isinf(tot), 0) / P).half().cpu()
         S = S + added
-        print(f"size {target}: J with the previous set {res['rounds'][-1]['J']:.4f}, predicted change {res['rounds'][-1]['predicted_dJ']:.4f}, "
+        print(f"size {target}: J with the previous set {res['rounds'][-1]['J']:.4f}, G {res['rounds'][-1]['G']:.4f}, predicted change {res['rounds'][-1]['predicted_dJ']:.4f}, "
               f"bootstrap overlap {res['rounds'][-1]['bootstrap_overlap']:.3f}, heads {res['rounds'][-1]['heads']} "
               f"({time.time() - t0:.0f} s)", flush=True)
         del A
     torch.save(totals, out / "attribution_totals.pt")
-    lps = st.measure(ab, search, S)
-    res["J_final"] = J(lps, search)
-    res["per_prompt_final"] = per_prompt(lps, search)
+    lps = st.measure(ab, obj, S)
+    res["J_final"], res["G_final"] = J(lps[:ns], search), G(lps)
+    res["per_prompt_final"] = per_prompt(lps[:ns], search)
     res["order"] = S
     sets = {f"found_{s}": S[:s] for s in gate_sizes}
     for s in gate_sizes:
@@ -310,8 +348,7 @@ def main():
             r = tok(text, add_special_tokens=False)["input_ids"]
             r = (r + [Z.IM_END] if fin == "stop" and len(r) < REPLY_CAP else r)[:REPLY_CAP]
             gen_seqs.append({"ids": pre + r, "start": len(pre), "prompt": 0, "w": 1.0})
-    toks, offs = at["tokens"], at["offsets"]
-    plain = [{"ids": toks[offs[d]:offs[d + 1]].tolist(), "start": 1} for d in range(MEAN_DOCS, MEAN_DOCS + a.kl_docs)]
+    plain = [{"ids": toks[offs[d]:offs[d + 1]].tolist(), "start": 1} for d in kl_docs]
     lh = st.measure(ab, held, None)
     res["heldout_J_clean"] = J(lh, held)
     groups = sorted({s["group"] for s in held})
@@ -319,9 +356,10 @@ def main():
     res["heldout_J_clean_by_group"] = gsplit(lh)
     res["conditions"] = {}
     for name, units in sets.items():
-        ls = st.measure(ab, search, units)
+        ls = st.measure(ab, obj, units)
         lh = st.measure(ab, held, units)
-        r = {"size": len(units), "heads": sum(u[0] == "H" for u in units), "search_J": J(ls, search), "heldout_J": J(lh, held),
+        r = {"size": len(units), "heads": sum(u[0] == "H" for u in units), "search_J": J(ls[:ns], search), "G": G(ls),
+             "heldout_J": J(lh, held),
              "heldout_J_by_group": gsplit(lh), "kl_general_bits": st.kl(ab, gen_seqs, units)}
         if name.startswith("found") or name.endswith("_0"):
             r["kl_atlas_bits"] = st.kl(ab, plain, units, plain=True)

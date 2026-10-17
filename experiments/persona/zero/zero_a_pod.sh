@@ -6,16 +6,26 @@
 #   the gates' generation (held-out x4 under every set's mean ablation and unedited);
 #   zjudge.py on all of it (Qwen3-14B, the report's section 6 rubric).
 #   NAME=orc-persona-zeroA bash zero_a_pod.sh
+# REUSE=1: the replies already made (D/gen_zero.json, D/gen_asst.json, copied out of run A) instead of new ones;
+# ATTR="--score full --damage 0 --means-docs all" with ATLAS=atlas_sample.npz is run A's first version.
 N=${NAME:-orc-persona-zeroA}
 O=/Users/user/mpd-data/runpod/$N/out
 D=/Users/user/mpd-data/persona/zero
-CMD="cd /Users/user/params/experiments/persona/zero && mkdir -p $O && \
-python -u zgen.py zero $D/prompts.json $O/gen_zero.json --groups search:2,heldout:2,general:1 && \
-python -u zgen.py asst $D/prompts.json $O/gen_asst.json --model Qwen/Qwen3-8B --groups search:1,heldout:1 && \
-python -u zattr.py $D/prompts.json $O/gen_zero.json $O/gen_asst.json $D/atlas_sample.npz $O && \
+ATLAS=${ATLAS:-atlas_chat_sample.npz}
+MODELS="movingcastles/zero Qwen/Qwen3-8B Qwen/Qwen3-14B"
+if [ -n "$REUSE" ]; then
+  MODELS="movingcastles/zero Qwen/Qwen3-14B"
+  GEN="true"; GZ=$D/gen_zero.json; GA=$D/gen_asst.json
+else
+  GZ=$O/gen_zero.json; GA=$O/gen_asst.json
+  GEN="python -u zgen.py zero $D/prompts.json $GZ --groups search:2,heldout:2,general:1 && \
+python -u zgen.py asst $D/prompts.json $GA --model Qwen/Qwen3-8B --groups search:1,heldout:1"
+fi
+CMD="cd /Users/user/params/experiments/persona/zero && mkdir -p $O && $GEN && \
+python -u zattr.py $D/prompts.json $GZ $GA $D/$ATLAS $O $ATTR && \
 python -u zgen.py zero $D/prompts.json $O/gen_gates.json --groups heldout:4 --sets $O/sets.json --means $O/means.pt && \
-python -u zjudge.py $O/judge.json $D/prompts.json $O/gen_gates.json $O/gen_zero.json"
+python -u zjudge.py $O/judge.json $D/prompts.json $O/gen_gates.json $GZ"
 cd /Users/user/params || exit 1
-RP_HF_MODELS="movingcastles/zero Qwen/Qwen3-8B Qwen/Qwen3-14B" RP_IDLE_PCT=0 RP_OWNER=persona RP_PARALLEL=1 RP_PYENV=oracle \
+RP_HF_MODELS="$MODELS" RP_IDLE_PCT=0 RP_OWNER=persona RP_PARALLEL=1 RP_PYENV=oracle \
   RP_MAX_PRICE=${PRICE:-0.6} RP_MIN_VRAM_GB=44 experiments/infra/runpod/rp-run $N "${GPU:-A40,RTX A6000,L40S,L40}" "${HOURS:-4}" \
   -- bash -c "$CMD"

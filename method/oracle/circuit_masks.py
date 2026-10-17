@@ -278,12 +278,14 @@ def _record(res: dict, ceiling, reach: bool, search: list, extra: dict) -> dict:
             "spread": None, "route_groups": None, "searched": search, **extra}
 
 
-def cuts_of(pt) -> dict:
+def cuts_of(pt, wanted=None) -> dict:
+    """The cuts of the pair set up in pt (wanted: those names only, circuit_finder.find's cuts_wanted; a cut not wanted is
+    never searched, so oracleagent's find_circuit without the readout pays nothing for a dense one)."""
     last = pt.T - 1
     out = {"readout": {"kinds": ("neuron",), "positions": [last]}, "movers": {"kinds": ("head",), "positions": [last]}}
     if pt.first < last:
         out["source"] = {"kinds": ("neuron",), "positions": list(range(pt.first, last))}
-    return out
+    return {n: c for n, c in out.items() if wanted is None or n in wanted}
 
 
 def attr_order(pt, spec: dict, sc: dict) -> list:
@@ -359,12 +361,13 @@ class Mean:
         return [tuple(float(np.mean([r[i][b] for r in rs])) for b in (0, 1)) for i in range(len(rs[0]))]   # crashed)
 
 
-def search_all(pt, arm: str, log=None, steps: int = STEPS, prior: dict | None = None, partners: list | None = None) -> dict:
+def search_all(pt, arm: str, log=None, steps: int = STEPS, prior: dict | None = None, partners: list | None = None,
+               wanted=None) -> dict:
     """Every cut of the pair set up in pt by arm: circuit_finder.cut's result per cut name. Arms: "mask"; "attr"; "am", attr
     first and masks on the cuts it leaves unmet (one batch); "fam", prior's units (family_order) first, then attr's.
     partners: Patchers set up on pt's clean prompt against other corrupted prompts: the source cut is then chosen and
     verified on the shares' means over pt's pair and theirs (Mean)."""
-    st = _before(pt, arm, log=log, prior=prior, partners=partners)
+    st = _before(pt, arm, log=log, prior=prior, partners=partners, wanted=wanted)
     got, names = {}, list(st["masked"])
     for rnd in range(ROUNDS):                       # (a cut its order cannot pass: its masks go on from their theta)
         t0 = time.perf_counter()
@@ -381,10 +384,10 @@ def search_all(pt, arm: str, log=None, steps: int = STEPS, prior: dict | None = 
     return _finish(st)
 
 
-def _before(pt, arm: str, log=None, prior: dict | None = None, partners: list | None = None) -> dict:
+def _before(pt, arm: str, log=None, prior: dict | None = None, partners: list | None = None, wanted=None) -> dict:
     """search_all up to the masks: every cut's ceiling, attr's (and fam's) cuts, and the cuts left for masks ("masked")
     with their hinge targets; each cut's measurer ("meas": pt, or Mean over pt and partners for the source cut)."""
-    specs = cuts_of(pt)
+    specs = cuts_of(pt, wanted)
     meas = {n: pt for n in specs}
     for n in [n for n in specs if ALLCUTS or n == "source"] if partners else []:
         meas[n] = Mean([pt] + list(partners))
@@ -517,7 +520,7 @@ def _chunks(jobs: list, T: int, budget: int = MASK_TOKENS) -> list:
 
 
 def find_batch(pts: list, items: list, arm: str = "mask", steps: int = STEPS, log=None, priors: list | None = None,
-               partners: list | None = None) -> list:
+               partners: list | None = None, cuts_wanted=("readout", "movers", "source")) -> list:
     """find() for several pairs at once: items [(clean, corrupt, answers)], one Patcher each (pts, of one model). Every
     pair is set up and its ceilings (and attr's cuts) measured, then the masks of every pair's masked cuts optimized in
     one batch per prompt length (optimize_many), then each pair's measured steps and record. partners: per item
@@ -530,7 +533,7 @@ def find_batch(pts: list, items: list, arm: str = "mask", steps: int = STEPS, lo
     for j, (pt, (clean, corrupt, answers)) in enumerate(zip(pts, items)):
         rec0 = pt.setup(clean, corrupt, answers)
         if not rec0["valid"] or rec0["gap"] < cf.MIN_GAP or rec0["same_answer"]:
-            recs[j] = {**cf._find(pt, clean, corrupt, answers, log=log), "search": arm}
+            recs[j] = {**cf._find(pt, clean, corrupt, answers, log=log, cuts_wanted=cuts_wanted), "search": arm}
             continue
         rec0s[j] = rec0
         same_T.setdefault(pt.T, []).append(j)
@@ -542,7 +545,8 @@ def find_batch(pts: list, items: list, arm: str = "mask", steps: int = STEPS, lo
                     part[j].append(ppt)
     for T, js in same_T.items():                    # (the pairs of one prompt length as a Group: their measured steps'
         befores = cf.Group([pts[j] for j in js]).run(                       # batches shared, circuit_finder.Group)
-            [lambda j=j: _before(pts[j], arm, log=log, prior=(priors or [None] * len(items))[j], partners=part[j])
+            [lambda j=j: _before(pts[j], arm, log=log, prior=(priors or [None] * len(items))[j], partners=part[j],
+                                 wanted=cuts_wanted)
              for j in js])
         for j, b in zip(js, befores):
             sts[j] = (rec0s[j], b)
@@ -577,7 +581,7 @@ def find_batch(pts: list, items: list, arm: str = "mask", steps: int = STEPS, lo
         if x is None:
             continue
         clean, corrupt, answers = items[j]
-        recs[j] = _find_with(pts[j], clean, corrupt, answers, log, arm, afters[j], rec0=x[0])
+        recs[j] = _find_with(pts[j], clean, corrupt, answers, log, arm, afters[j], rec0=x[0], cuts_wanted=cuts_wanted)
     wall = time.perf_counter() - t0
     for r in recs:
         r.update(seconds_own=r.get("seconds"), seconds=round(wall / len(items), 2), batch=len(items))
@@ -602,7 +606,7 @@ def find(pt, clean: list[int], corrupt: list[int], answers=None, log=None, arm: 
             r = ppt.setup(clean, ids, answers)
             if r["valid"] and r["gap"] >= cf.MIN_GAP and not r["same_answer"]:
                 part.append(ppt)
-    cuts = search_all(pt, arm, log=log, steps=steps, prior=prior, partners=part)
+    cuts = search_all(pt, arm, log=log, steps=steps, prior=prior, partners=part, wanted=cuts_wanted)
     rec = _find_with(pt, clean, corrupt, answers, log, arm, cuts, rec0=rec0, **kw)
     return {**rec, "seconds": round(time.perf_counter() - t0, 2)}
 
@@ -635,6 +639,8 @@ def main():
     ap.add_argument("--device", default="auto")
     ap.add_argument("--rev", default=None)
     ap.add_argument("--steps", type=int, default=STEPS)
+    ap.add_argument("--cuts", default="readout,movers,source", help="the cuts searched (circuit_finder's --cuts; "
+                    "oracleagent's find_circuit: movers,source)")
     ap.add_argument("--partners", type=int, default=1, help="pairs a source cut is chosen over: the question's own and up "
                     "to PARTNERS - 1 other corrupted keys of its partners (prompts of its length), on the shares' means")
     ap.add_argument("--batch", type=int, default=1, help="mask and am: pairs whose masks are optimized in one batch "
@@ -761,7 +767,7 @@ def main():
                     recs = find_batch(pts[:len(todo)], [(cl, co, answers.get(q["id"])) for q, cl, co in todo], arm=name, steps=steps,
                                       log=log, priors=[prior_of(name, q) for q, _, _ in todo],
                                       partners=[list(zip(pool[b], [x for _, x in oth.get(q["id"], [])]))
-                                                for b, (q, _, _) in enumerate(todo)])
+                                                for b, (q, _, _) in enumerate(todo)], cuts_wanted=tuple(a.cuts.split(",")))
                     for (q, cl, co), rec in zip(todo, recs):
                         put(q, cl, co, rec)
                 else:                               # (each record written when found: a run stopped by a time limit
@@ -769,7 +775,7 @@ def main():
                         log(f"{q['id']} ({arm})")
                         put(q, cl, co, find(pt, cl, co, answers.get(q["id"]), log=log, arm=name, steps=steps,
                                             prior=prior_of(name, q), partners=list(zip(pool[0], [x for _, x in oth.get(q["id"], [])]))
-                                            if name != "group" else None))
+                                            if name != "group" else None, cuts_wanted=tuple(a.cuts.split(","))))
             finally:
                 globals().update(saved)
 

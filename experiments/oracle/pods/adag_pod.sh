@@ -25,7 +25,7 @@
 # uv run puts 4.57.3 back. Every step has its own time limit and log; results come back to ~/mpd-data/runpod/NAME
 # (steps.log: each step's start and exit).
 #   experiments/oracle/pods/adag_pod.sh [NAME] [HOURS]   env: STEPS, FAMILIES, BENCH, MASKFIX, PAIRS (a tarball of the pair records), K
-#                                                        (clusters, 16), GPU, PRICE
+#                                                        (clusters, 16), FS_MODELS (fs's models, "llama qwen8"), GPU, PRICE
 # The whole script is one block, so bash has read all of it before it runs.
 {
 cd /Users/user/params
@@ -45,6 +45,7 @@ RUNS=""
 if [[ $STEPS == *,fs,* ]]; then
   for m in llama:$L:configs/capitals.yaml qwen8:$Q:configs/capitals_qwen3.yaml; do
     t=${m%%:*} rest=${m#*:}; id=${rest%:*} cfg=${rest##*:}; case=capitals_$t
+    [[ " ${FS_MODELS:-llama qwen8} " == *" $t "* ]] || continue
     RUNS="$RUNS step fs_${t}_finder 30 uv run python $P/adag_compare.py finder $O/fs_$t.json --cases $case --n 8 --data scripts/circuit_prep/data/capitals_fs_$t.py;
 step fs_${t}_prep 30 uv run python scripts/circuit_prep/prep.py --config $cfg --model-id $id --gpus-per-model 1 --dataset capitals_fs_$t --output-path $O/fs_$t.pkl;
 step fs_${t}_clusters 20 uv run python $P/adag_repo.py clusters $O/fs_$t.pkl $O/fs_${t}_clusters.json --model $id --k $K;

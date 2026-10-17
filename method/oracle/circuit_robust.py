@@ -93,7 +93,8 @@ def resample_ids(tok, q: dict, rec: dict, n: int, pool: dict | None = None) -> l
     cands = [(u, u) for u in q.get("resamples", [])]   # (whole prompts: an organism's other non-trigger prompts)
     cands += [(k, user.replace(key, k)) for k in [p for p in q.get("partners", []) if isinstance(p, str)]
               + sorted((pool or {}).get(task, ()))]
-    out, seen = [], {key, q.get("corrupt_key"), rec.get("corrupt_key")}
+    out, seen = [], {key, q.get("corrupt_key"), rec.get("corrupt_key"), *rec.get("selection_keys", [])}   # (a multi-partner
+                                                    # cut's own partners are no resample: circuit_masks --partners)
     for k, text in cands:
         if k in seen:
             continue

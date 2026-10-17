@@ -7,7 +7,10 @@
 #        score run with --mode frame), QSEARCH (a stride: first the R3 reference circuits of every QSEARCH-th dev question, ami.py SEARCH: qsearch, the
 #        question's pair, or tsearch, its wording with 8 keys; scored as the set SEARCH at QSEARCH_RUNGS, default "r3"; QCONSTS:
 #        "--const TSEARCH_KEYS=16 ..." for the search and its scoring; QARGS: more flags of the search, e.g. "--mode task"), RUNGS ("r3"), MODEL (Qwen/Qwen3-8B), MEANS (a means file; default: computed on the pod from SAMPLE), SAMPLE
-#        (~/mpd-data/ami/means_sample_1m.npz), DEVSET, POOL, ARGS (more ami.py r3 flags), HOURS, GPU, PRICE, RP_OWNER
+#        (~/mpd-data/ami/means_sample_1m.npz), DEVSET, POOL, ARGS (more ami.py r3 flags), HOURS, GPU, PRICE, RP_OWNER;
+#        ARMS: several searches on the one pod, a line each "LABEL|CONSTS|ARGS|SEARCH_ARGS": ami.py SEARCH (default tsearch)
+#        with CONSTS and ARGS (both also given to its scoring at QSEARCH_RUNGS, e.g. --backbone and --devset with absolute
+#        paths) and SEARCH_ARGS (the search's alone, e.g. --stride 8), records in NAME/LABEL_records, scored as the set LABEL
 # The whole script is one block, so bash has read all of it before it runs.
 {
 cd /Users/user/params
@@ -38,6 +41,15 @@ if [ -n "$QSEARCH" ]; then                  # (the R3 reference circuits: ami.py
     LABELS="$LABELS $O/${Q}_$r"
   done
 fi
+while IFS='|' read -r al ac aa as; do        # (ARMS: a search and its scoring a line)
+  [ -z "$al" ] && continue
+  Q=${SEARCH:-tsearch}
+  WORK="$WORK python -B method/oracle/ami.py $ac $Q $O/${al}_records --means $M --model $MODEL --devset $DEVSET $FA $aa $as > $O/$al.log 2>&1; echo \"$al exit \$?\" >> $O/steps.log;"
+  for r in ${QSEARCH_RUNGS:-r3}; do
+    WORK="$WORK python -B method/oracle/ami.py $ac $r $O/${al}_records $O/${al}_$r --means $M --label $al --model $MODEL --devset $DEVSET --pool $POOL $FA $aa $ARGS > $O/${al}_$r.log 2>&1; echo \"$al $r exit \$?\" >> $O/steps.log;"
+    LABELS="$LABELS $O/${al}_$r"
+  done
+done <<< "$ARMS"
 for s in "$@"; do
   l=${s%%=*} d=${s#*=}
   COPYFILE_DISABLE=1 tar --no-xattrs --no-mac-metadata -czf "$F/$l.tgz" -C "$d" . || exit 1

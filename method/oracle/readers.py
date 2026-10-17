@@ -27,6 +27,7 @@ whole unit, since those are all of its write's readers.
 from __future__ import annotations
 
 import math
+import time
 
 import torch
 
@@ -161,18 +162,23 @@ def _union(edits: list[dict]) -> dict:
 
 @torch.no_grad()
 def readers(rn, ids: list[int], units: list, corrupt: list[int] | None = None, top: int = TOP, groups: int = GROUPS,
-            circuit: set | None = None) -> list[dict]:
+            circuit: set | None = None, states: tuple | None = None, seconds: dict | None = None) -> list[dict]:
     """Each unit's readers (module docstring). units: ("neuron", layer, pos, index) or ("head", layer, head, pos);
-    circuit: units of the circuit, to mark readers inside it."""
+    circuit: units of the circuit, to mark readers inside it; states: both runs' captured states when the caller has
+    them; seconds: filled with this call's seconds by part."""
     if not units:
         return []
-    run = rn.run(ids, [{}], capture=True)
-    st, T = run["states"], len(ids)
-    sb = rn.run(corrupt, [{}], capture=True)["states"] if corrupt is not None else None
+    t0, sec = time.time(), {} if seconds is None else seconds
+    st, sb = states or (rn.run(ids, [{}], capture=True)["states"],
+                        rn.run(corrupt, [{}], capture=True)["states"] if corrupt is not None else None)
+    T = len(ids)
     c = rn.run(ids, [{}])["contrast"][0]  # (uncut, at the cut runs' batch shape)
     gap = c - rn.run(corrupt, [{}])["contrast"][0] if corrupt is not None else None
     W = _writes(rn, st, sb, units)
-    cands, grp, store = _candidates(rn, st, rn.grads(ids), units, W)
+    g = rn.grads(ids)
+    sec["runs_and_gradient"], t0 = round(time.time() - t0, 3), time.time()
+    cands, grp, store = _candidates(rn, st, g, units, W)
+    sec["candidates"], t0 = round(time.time() - t0, 3), time.time()
     sets, slots = [], []
     for i, u in enumerate(units):
         for r in grp[i][:groups]:
@@ -203,6 +209,7 @@ def readers(rn, ids: list[int], units: list, corrupt: list[int] | None = None, t
     cs = [0.0] * len(sets)
     for a, x in zip(order, got):
         cs[a] = x
+    sec["cuts"], sec["sets"] = round(time.time() - t0, 3), len(sets)
     xf = _final(rn, st, T - 1)
     out = []
     for i, u in enumerate(units):

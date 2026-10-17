@@ -944,16 +944,16 @@ def finder_graph(model, tok, rec: dict, log=print) -> dict:
         car = head_routes.carriers(rn, run["states"], lost, q, p)
         g["routes"].append({"q": q, "p": p, "carriers": car, "carrier_curve": head_routes.carrier_curve(rn, lost, q, p, car)})
     sec["carriers"], t = round(time.time() - t, 3), time.time()
-    g["head_edges"], g["movers_inputs_lost"] = [], {}
-    if rec.get("routes"):
-        sb = rn.run(bad, [{}], capture=True)["states"]
-        g["head_edges"], g["movers_inputs_lost"] = mover_edges(rn, run["states"], sb, lost, rec)
-        sec["mover_edges"], t = round(time.time() - t, 3), time.time()
-    g["readers"] = []
+    g["head_edges"], g["movers_inputs_lost"], g["readers"] = [], {}, []
     if rec.get("nodes") or rec.get("routes"):
+        sb = rn.run(bad, [{}], capture=True)["states"]
+        if rec.get("routes"):
+            g["head_edges"], g["movers_inputs_lost"] = mover_edges(rn, run["states"], sb, lost, rec)
+            sec["mover_edges"], t = round(time.time() - t, 3), time.time()
         import readers  # noqa: PLC0415
-        units = readers.record_units(rec)
-        g["readers"] = readers.readers(rn, ids, units, corrupt=bad, circuit=set(units))
+        units, sec["readers_parts"] = readers.record_units(rec), {}
+        g["readers"] = readers.readers(rn, ids, units, corrupt=bad, circuit=set(units), states=(run["states"], sb),
+                                       seconds=sec["readers_parts"])
         sec["readers"] = round(time.time() - t, 3)
     g["seconds"] = sec
     g.update(id=rec.get("id"), text_id=rec.get("id"), user=rec.get("user"), corrupt_user=rec.get("corrupt_user"),

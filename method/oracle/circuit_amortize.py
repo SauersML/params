@@ -650,11 +650,12 @@ def main():
         for arm in arms:
             (out / dirs[arm]).mkdir(exist_ok=True)
         pts[0].setup(jobs[0][1], jobs[0][2])        # (a throwaway run: CUDA's first kernels)
+        failed = set()
         for c0 in range(0, len(jobs), a.batch):
             chunk = jobs[c0:c0 + a.batch]
             for arm in arms:
                 todo = [j for j in chunk if not (out / dirs[arm] / f"{j[3]}.json").exists()]
-                if not todo:
+                if not todo or arm in failed:
                     continue
                 log(f"{len(todo)} pairs ({arm}): " + ", ".join(q["id"] for q, _, _, _ in todo))
                 its = [(cl, co, None) for _, cl, co, _ in todo]
@@ -662,7 +663,7 @@ def main():
                 sets = {}                           # each this module's, else circuit_masks', else circuit_finder's)
                 for k, v in (x.split("=") for x in parts if "=" in x):
                     mod = next(m for m in (globals(), vars(cm), vars(cf)) if k.upper() in m)
-                    sets[k.upper()] = (mod, _value(v))
+                    sets[k.upper()] = (mod, _value(v, mod[k.upper()]))
                 saved = {k: (m, m[k]) for k, (m, _) in sets.items()}
                 for k, (m, v) in sets.items():
                     m[k] = v
@@ -677,6 +678,13 @@ def main():
                         nm = f"model:{a.scorer}" if name == "model" else name
                         recs = find_batch_amortized(pts[:len(todo)], its, scorer(nm), arm=arm, log=log,
                                                     relp=nm == "relp" or nm.startswith("model:"))
+                except Exception:                   # noqa: BLE001 (an arm that fails is dropped, the others go on)
+                    import traceback
+                    log(f"  {arm} FAILED, dropped:\n{traceback.format_exc()}")
+                    failed.add(arm)
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    continue
                 finally:
                     if prof:
                         prof.__exit__()
@@ -752,14 +760,12 @@ class TickProfile:
         return {k: {"ticks": self.n[k], "seconds": round(v, 2)} for k, v in sorted(self.t.items(), key=lambda t: -t[1])}
 
 
-def _value(v: str):
-    """An arm's constant from its text: an int, a float, else the text."""
-    for t in (int, float):
-        try:
-            return t(v)
-        except ValueError:
-            pass
-    return v
+def _value(v: str, like):
+    """An arm's constant from its text, of its default's type (init=1 is INIT 1.0: an int start made masks of
+    integers, which cannot take gradients; pod dev3)."""
+    if isinstance(like, bool):
+        return v.lower() in ("1", "true", "yes")
+    return type(like)(v) if isinstance(like, (int, float)) else v
 
 
 if __name__ == "__main__":

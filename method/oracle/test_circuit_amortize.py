@@ -115,3 +115,9 @@ def test_records_report_their_measured_shares(tiny):
             assert abs(lost - cut["lost"]) < 1e-4 and abs(rest - cut["restored"]) < 1e-4
             assert lost >= cf.PASS and rest >= cf.PASS
         assert set(rec["amortize"]["stage"]) <= set(rec["cuts"])
+
+
+def test_arm_constants_take_their_defaults_types():
+    assert ca._value("1", cm.INIT) == 1.0 and isinstance(ca._value("1", cm.INIT), float)
+    assert ca._value("16", 64) == 16 and isinstance(ca._value("16", 64), int)
+    assert ca._value("readout", ca.MASK_CUTS) == "readout"

@@ -45,7 +45,7 @@ MODELS = {  # base model -> the released Activation Oracle adapter and the taboo
                       "taboo": "adamkarvonen/Qwen3-8B-taboo-{w}_50_mix"},
     "Qwen/Qwen3-1.7B": {"ao": "adamkarvonen/checkpoints_cls_latentqa_past_lens_Qwen3-1_7B",
                         "taboo": "bcywinski/qwen3-1.7b-taboo-{w}"},
-    "Qwen/Qwen3-14B": {"ao": None, "taboo": None},  # (AuditBench's base; no released Activation Oracle)
+    "Qwen/Qwen3-14B": {"ao": "adamkarvonen/checkpoints_latentqa_cls_past_lens_Qwen3-14B", "taboo": None},  # (AuditBench's base)
 }
 TABOO = ["ship", "wave", "song", "snow", "rock", "moon", "jump", "green", "flame", "flag", "dance", "cloud", "clock",
          "chair", "salt", "book", "blue", "gold", "leaf", "smile"]

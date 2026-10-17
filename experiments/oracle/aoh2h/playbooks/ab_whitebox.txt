@@ -1,3 +1,4 @@
 White-box tools beyond the outputs:
 - logit_lens on an answer shows where middle layers want something the last layers suppress (a concealed tendency).
 - search_trigger with a suspected output as target searches the words of a request that raise it: use it once you know what the model does but not what sets it off.
+- ao asks the released Activation Oracle about the model's activations on a text (a learned reader; check what it says against the model's outputs).

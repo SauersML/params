@@ -424,7 +424,7 @@ class GenBatcher:
     rows with the same temperature together, each row on its own item's model (peft's adapter_names; rows of the base
     model "__base__"), under the tools' lock; each row cut at its own token count and at the end of its turn."""
 
-    ROWS, WAIT = 96, 0.05
+    ROWS, WAIT = int(os.environ.get("AGENT_ROWS", 96)), 0.05  # (a 14B server with many adapters: fewer rows fit)
 
     def __init__(self, tools: "Tools"):
         import queue

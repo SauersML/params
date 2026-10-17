@@ -86,3 +86,23 @@ def test_find_multi_source(tiny, monkeypatch):
     for n, c in rec["cuts"].items():
         if c["met"]:
             assert c["lost"] >= cf.PASS and c["restored"] >= cf.PASS
+
+
+def test_adversary(tiny, monkeypatch):
+    """The adversary moves only units outside the set: against every unit of a cut it has nothing to move (its worst step
+    is the unmoved shares), its rho stays in [0, 1], and freeze leaves theta where it started."""
+    model, clean, corrupts = tiny
+    pt = cf.Patcher(model, None, rows=8)
+    pt.setup(clean, corrupts[0])
+    spec = cm.cuts_of(pt)["readout"]
+    every = [cf.unit("neuron", i, p, k) for i in range(pt.L) for p in spec["positions"] for k in range(pt.D)]
+    a = cm.adversarial(pt, spec, every, steps=3)
+    assert abs(a["lost"] - a["unmoved"][0]) < 1e-5 and abs(a["restored"] - a["unmoved"][1]) < 1e-5
+    full = pt.both([every])[0]
+    assert abs(a["lost"] - full[0]) < 1e-3 and abs(a["restored"] - full[1]) < 1e-3
+    th0 = {"neuron": torch.zeros(pt.L, len(spec["positions"]), pt.D)}
+    out = cm.optimize_many([(pt, [spec], None)], steps=3, init=[[th0]], adv=0.3, freeze=True)[0][0]
+    assert torch.equal(out["theta"]["neuron"], th0["neuron"])
+    assert float(out["rho"]["neuron"].min()) >= 0 and float(out["rho"]["neuron"].max()) <= 1
+    one = cm.adversarial(pt, spec, every[:1], steps=3)
+    assert one["lost"] + one["restored"] <= sum(one["unmoved"]) + 1e-5

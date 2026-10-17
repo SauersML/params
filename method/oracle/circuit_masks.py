@@ -32,6 +32,11 @@ Multi-source masks (methods, 10-16; constants an arm sets, mask:30:partners=8:al
   WARM      masks start from the own pair's RelP attribution (Patcher.scores): theta = INIT + WARM * ln(score / the cut's
             largest score), at least WARM_MIN, so attributed units start patched and the rest nearly unpatched; Adam's
             normalized steps let any unit grow back (the attribution only starts the search)
+  ADV       the rest of the cut's units anywhere between the two runs during the descent (optimize_many's adv: VPD's
+            ablation of unused parts in any combination, its adversary shared over the question's pairs and persistent
+            across steps), so a set that passes only while the rest sits at its base values is not taken
+  ADV_CHECK each verified set's adversarial shares: ADV_CHECK steps of the same adversary against the set alone (its units
+            fully patched, the rest's rho moved to lower the shares), the worst step's measured shares in the record
 --pool QUESTIONS.json: partner keys drawn from that set's keys of the question's task (a seeded order per question),
 not from the question's own "partners", which then stay held out for the scorecard's unseen pairs.
 
@@ -64,6 +69,9 @@ ALLCUTS = 0         # 1: partners for every cut (module docstring)
 PAIRWISE = 0        # 1: hinges per pair
 WARM = 0.0          # > 0: attribution start, theta = INIT + WARM * ln(score / max score)
 WARM_MIN = -2.0     # sigmoid(-2) = 0.12: the start of units the attribution gives nothing
+ADV = 0.0           # > 0: the adversary's step on rho during the descent (module docstring)
+ADV_CHECK = 0       # > 0: steps of the measured adversarial check of each verified set
+ADV_STEP = 0.25     # the check's step on rho
 
 
 def _blocks(units: list) -> list:
@@ -86,7 +94,8 @@ def optimize(pt, specs: list, steps: int = STEPS, log=None, taus: list | None = 
     return optimize_many([(pt, specs, taus)], steps=steps, log=log)[0]
 
 
-def optimize_many(jobs: list, steps: int = STEPS, log=None, init: list | None = None) -> list:
+def optimize_many(jobs: list, steps: int = STEPS, log=None, init: list | None = None, adv: float | None = None,
+                  freeze: bool = False) -> list:
     """Masks for several pairs at once: jobs [(pt, specs, taus)], Patchers of one model each set up on its own pair (prompts
     of one length), every spec of every job two rows of one batch per step (a step reads every weight twice whatever
     its rows: batched pairs cost about one). A job's pt may be a list of Patchers, one clean prompt against several
@@ -94,7 +103,13 @@ def optimize_many(jobs: list, steps: int = STEPS, log=None, init: list | None = 
     over the partners. taus: per spec the hinges' targets (lost, restored), default TAU. Per job and spec {kind: theta
     [L, P, width]} (final logits, on the host) and the history of (mean lost, mean restored, sum m) per step. A mask
     edits only its own (row, position) entries: those rows' values gathered, moved toward the other run's and put back.
-    init: per job, per spec its theta to start from ({kind: [L, P, width]}, optimize_many's own output; None: INIT)."""
+    init: per job, per spec its theta to start from ({kind: [L, P, width]}, optimize_many's own output; None: INIT).
+    adv (default ADV): with a step above 0, every unit's patch is m + (1 - m) rho of the way (the units the mask leaves out
+    moved anywhere between their base value and the other run's), rho in [0, 1] one per unit and spec, shared by the
+    spec's pairs, starting at 0 and after each step moved adv along the sign of its gradient that raises the hinges
+    (persistent projected ascent); freeze: theta not stepped and rho moved to lower the spec's mean shares (the measured
+    adversarial check of a set, adversarial()). Each spec's output then also has its final rho."""
+    adv = ADV if adv is None else adv
     groups = [list(pt) if isinstance(pt, (list, tuple)) else [pt] for pt, _, _ in jobs]
     pt0 = groups[0][0]
     T = pt0.T
@@ -140,8 +155,9 @@ def optimize_many(jobs: list, steps: int = STEPS, log=None, init: list | None = 
         th = (init[q] or [None] * len(jobs[q][1]))[j]
         for k in s_["kinds"] if th else []:
             theta[k][:, [cell[k][(q, j, p)] for p in s_["positions"]]] = th[k]
-    theta = {k: t.to(dev).requires_grad_(True) for k, t in theta.items()}
-    opt = torch.optim.Adam(list(theta.values()), lr=LR)
+    theta = {k: t.to(dev).requires_grad_(not freeze) for k, t in theta.items()}
+    rho = {k: torch.zeros_like(t).requires_grad_(True) for k, t in theta.items()} if adv > 0 else {}
+    opt = torch.optim.Adam(list(theta.values()), lr=LR) if not freeze else None
     tau = torch.tensor([t for _, ss, taus in jobs for t in (taus or [(TAU, TAU)] * len(ss))], device=dev)
     cc = torch.tensor([pt.c["clean"] for _, _, pt in inst], device=dev)[order]
     cr = torch.tensor([pt.c["corrupt"] for _, _, pt in inst], device=dev)[order]
@@ -156,6 +172,8 @@ def optimize_many(jobs: list, steps: int = STEPS, log=None, init: list | None = 
             d = h.device
             r, p = ps["rows"][k].to(d), ps["pos"][k].to(d)
             m = ms[k][i].to(d, h.dtype)[ps["tix"][k].to(d)]                    # [2N, width]
+            if rho:                                 # (the rest anywhere between the two runs: the adversary's rho)
+                m = m + (1 - m) * rho[k][i].to(d, h.dtype)[ps["tix"][k].to(d)]
             sel, o = h[r, p], ps["others"][k][i].to(d, h.dtype)
             if k == "head":
                 sel, o, m = sel.view(-1, pt0.H, pt0.hd), o.view(-1, pt0.H, pt0.hd), m[..., None]
@@ -180,16 +198,26 @@ def optimize_many(jobs: list, steps: int = STEPS, log=None, init: list | None = 
                     0, of, torch.relu(tau[of, 0] - li) + torch.relu(tau[of, 1] - ri)) / count
             else:
                 hinge = torch.relu(tau[:, 0] - lost) + torch.relu(tau[:, 1] - rest)
-            loss = hinge.sum() + LAMBDA * size.sum()
-            opt.zero_grad(set_to_none=True)
+            loss = -(lost + rest).sum() if freeze else hinge.sum() + LAMBDA * size.sum()
+            if opt is not None:
+                opt.zero_grad(set_to_none=True)
+            for t in rho.values():
+                t.grad = None
             loss.backward()
-        opt.step()
+        if opt is not None:
+            opt.step()
+        with torch.no_grad():                       # (rho's ascent on the loss, within [0, 1])
+            for t in rho.values():
+                if t.grad is not None:
+                    t.add_(adv * t.grad.sign()).clamp_(0, 1)
         for n, (a, b, z) in enumerate(zip(lost.tolist(), rest.tolist(), size.tolist())):
             hist[n].append((round(a, 4), round(b, 4), round(z, 1)))
     out, th = [[] for _ in jobs], {k: t.detach().float().cpu() for k, t in theta.items()}
+    rh = {k: t.detach().float().cpu() for k, t in rho.items()}
     for n, (q, j, s) in enumerate(specs):
         got = {k: th[k][:, [cell[k][(q, j, p)] for p in s["positions"]]] for k in s["kinds"]}
-        out[q].append({"theta": got, "history": hist[n]})
+        out[q].append({"theta": got, "history": hist[n],
+                       **({"rho": {k: rh[k][:, [cell[k][(q, j, p)] for p in s["positions"]]] for k in s["kinds"]}} if rh else {})})
         if log:
             a, b, z = hist[n][-1]
             log(f"    mask {'+'.join(s['kinds'])} at {s['positions'][0]}..{s['positions'][-1]}"
@@ -438,6 +466,27 @@ def _jobs(pt, st: dict, names: list | None = None) -> list:
     return out + [((st["meas"][n].pts, [st["specs"][n]], [st["taus"][n]]), [n]) for n in names if st["meas"][n] is not pt]
 
 
+def adversarial(meas, spec: dict, units: list, steps: int | None = None, log=None, name: str = "") -> dict:
+    """The set's shares with every other unit of the cut anywhere between the two runs, against an adversary (optimize_many
+    with freeze: the set fully patched, the rest's rho moved ADV_STEP along the sign that lowers the spec's mean shares,
+    shared over meas's pairs): the step whose measured lost + restored is lowest, and whether it still passes."""
+    steps = ADV_CHECK if steps is None else steps
+    pts = meas.pts if isinstance(meas, Mean) else [meas]
+    th = {k: torch.full((pts[0].L, len(spec["positions"]), pts[0].H if k == "head" else pts[0].D), -20.0) for k in spec["kinds"]}
+    at = {p: j for j, p in enumerate(spec["positions"])}
+    for u in units:
+        if u[0] == "head":
+            th["head"][u[1], at[u[3]], u[2]] = 20.0
+        else:
+            th["neuron"][u[1], at[u[2]], u[3]] = 20.0
+    hist = optimize_many([(pts if len(pts) > 1 else pts[0], [spec], None)], steps=steps, init=[[th]], adv=ADV_STEP,
+                         freeze=True)[0][0]["history"]
+    a, b, _ = min(hist, key=lambda h: h[0] + h[1])
+    if log:
+        log(f"  {name}: adversarial rest ({steps} steps) {a:.2f}/{b:.2f} (unmoved {hist[0][0]:.2f}/{hist[0][1]:.2f})")
+    return {"lost": a, "restored": b, "unmoved": list(hist[0][:2]), "steps": steps, "passes": a >= cf.PASS and b >= cf.PASS}
+
+
 def _verify(pt, st: dict, got: dict, names: list, t_opt: float, steps: int, log=None) -> None:
     """Each named masked cut's order (ordered, from got's theta) through verify by its measurer, into st["out"]."""
     specs, ceil, out = st["specs"], st["ceil"], st["out"]
@@ -446,6 +495,8 @@ def _verify(pt, st: dict, got: dict, names: list, t_opt: float, steps: int, log=
         t1 = time.perf_counter()
         order, kept = ordered(specs[n], g["theta"])
         res = verify(st["meas"][n], order, log=log, name=n)
+        if ADV_CHECK and res["units"]:
+            res["adversarial"] = adversarial(st["meas"][n], specs[n], res["units"], log=log, name=n)
         prev = out.get(n, {})
         out[n] = _record(res, ceil[n], True, specs[n]["positions"],
                          {"mask": {"kept": kept, "steps": len(g["history"]), "history": g["history"][::max(1, steps // 20)],
@@ -486,7 +537,7 @@ def _find_with(pt, clean, corrupt, answers, log, arm: str, cuts: dict, rec0: dic
         del pt.scores
         if rec0 is not None:
             del pt.setup
-    extra = {k: {n: c[k] for n, c in cuts.items() if k in c} for k in ("attr", "mask", "partners")}   # (find() copies its own fields
+    extra = {k: {n: c[k] for n, c in cuts.items() if k in c} for k in ("attr", "mask", "partners", "adversarial")}   # (find() copies its own fields
     return {**rec, "search": arm, **{k: v for k, v in extra.items() if v}}                 # only)
 
 

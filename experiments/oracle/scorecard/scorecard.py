@@ -1026,7 +1026,8 @@ SHORT = {"best-constant": "best constant answer", "name-prior": "name-prior (eac
          "ao-qwen3-8b-ao-v3-best": "AO v3 (Building Better AOs), layers 21-25",
          "dir-ablate-base": "behaviour direction projected out (uses the base model)",
          "steer-base": "steering against the behaviour direction (uses the base model)",
-         "lora-base": "LoRA fine-tune (uses the base model)"}
+         "lora-base": "LoRA fine-tune (uses the base model)",
+         "t3-selected": "T3 greedy edit, length chosen by the shared rule"}
 
 
 def short(n: str, meta: dict) -> str:
@@ -1238,12 +1239,16 @@ def collect(a) -> None:
         dst = ANS / f.parent.name / f.name
         if f.is_file() and (f.name.endswith("_measured.jsonl") or not dst.exists()):
             dst.parent.mkdir(parents=True, exist_ok=True)
-            dst.write_text(f.read_text())
+            if a.merge and f.name.endswith("_measured.jsonl") and dst.exists():  # (a run on some organisms only replaces those)
+                new = jl(f)
+                wjl(dst, [r for r in jl(dst) if r["item"] not in {x["item"] for x in new}] + new)
+            else:
+                dst.write_text(f.read_text())
             print("collected", dst)
     for fit in sorted((src / "answers").glob("fit*.json")):  # a removal baseline with no candidate within the side-effect
         sfx = fit.stem[3:]  # budget on its training prompts fails that organism (removal_baselines.py writes no row for it)
         for org, by in json.loads(fit.read_text()).items():
-            for k in ("dir-ablate", "steer", "lora"):
+            for k in ("dir-ablate", "steer", "lora", "t3-selected"):
                 f = ANS / (k + sfx) / "o3_measured.jsonl"
                 if k in by and by[k] is None and f.parent.exists() and org not in {r["item"] for r in jl(f)}:
                     with f.open("a") as fh:
@@ -1309,6 +1314,7 @@ def main():
     c = sub.add_parser("collect")
     c.add_argument("run", help="the pod run's name, e.g. orc-oracleeval-m1")
     c.add_argument("--name", help="a reader run's oracle name")
+    c.add_argument("--merge", action="store_true", help="measured files replace only the organisms or items they hold")
     p = sub.add_parser("prompt397")
     p.add_argument("--n", type=int, default=0, help="a sample of O1 (0: all)")
     p.add_argument("--max-tokens", type=int, default=1200)

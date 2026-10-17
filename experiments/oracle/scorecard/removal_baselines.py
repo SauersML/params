@@ -20,7 +20,11 @@ near miss, another profession, another treaty or painting), and the LoRA data is
 meets the goal. --access base (the first run's version) uses the base model's answers instead: a reference line only.
 Train/eval split: every choice and fit above uses only E2's edit_train prompts and the organisms' training chats
 (data/general.jsonl, disjoint from every E2 set); measurement is on E2's behaviour, general, near-domain and facts sets.
-Selection: the lowest training behaviour rate whose KL on training chats is at most SIDE_BITS.
+Selection, one protocol for every method (the lead's 10-16, T3 included): each method proposes candidates (direction
+ablation: a layer; steering: a layer and alpha; LoRA: a checkpoint; t3-selected: a prefix of T3's greedy order), and the one
+kept has the lowest behaviour rate on edit_train, ties to the lower KL, among those whose mean KL on SELECT_ROWS (96 of the
+organisms' training chats, the organism's own 200-token answers; disjoint from the LoRA's training chats, T3's fit chats
+and the p99 set) is at most SIDE_BITS; none within it fails the organism.
 
   removal_baselines.py --items ITEMS --adapters DIR --thr THR.pt --general GENERAL.jsonl --t3 T3_O3.jsonl --out ANS_DIR
 writes ANS_DIR/{dir-ablate,steer,lora,random-matched}/o3_measured.jsonl and fit.json."""
@@ -42,7 +46,9 @@ LAYERS = (8, 12, 16, 20, 24, 28)
 ALPHAS = (1.0, 2.0, 4.0)
 DRAWS = 20
 TRAIN_GENERAL = 40
-TRAIN_KL = 16
+SELECT_ROWS = slice(96, 192)
+SELECT_TOKENS = 200
+T3_PREFIXES = (1, 2, 3, 4, 6, 8, 12, 16, 24)
 EPOCHS, LR = 3, 1e-4
 
 
@@ -56,7 +62,8 @@ absent = ms.absent  # (the behaviour-absent twins live in measure.py: O3's swap 
 
 
 LABELS = {"dir-ablate": "behaviour direction projected out (difference of means)", "steer": "steering against the behaviour direction",
-          "lora": "LoRA fine-tune on behaviour-free answers", "random-matched": "random neuron poles, layers matched to T3 (20 draws)"}
+          "lora": "LoRA fine-tune on behaviour-free answers", "random-matched": "random neuron poles, layers matched to T3 (20 draws)",
+          "t3-selected": "T3 greedy edit, its length chosen by the shared selection rule"}
 
 
 class Residual:
@@ -123,7 +130,7 @@ def pick(nr, tok, name, cands, users, general, gen_answers, log) -> tuple:
     for label, ed in cands:
         rate, kl = train_eval(nr, tok, name, users, ed, general, gen_answers)
         log(name, label, f"train rate {rate:.3f} KL {kl:.4f}")
-        if kl <= ms.SIDE_BITS and (best is None or rate < best[0]):
+        if kl <= ms.SIDE_BITS and (best is None or (rate, kl) < best[:2]):
             best = (rate, kl, label, ed)
     return best
 
@@ -159,7 +166,7 @@ def finetune(pm, tok, path, users, answers, keep_users, keep_answers, check, log
                 rate, kl = check()
                 label = f"{step / len(data):g} epochs, lr {LR:g}"
                 log(label, f"train rate {rate:.3f} KL {kl:.4f}")
-                if kl <= ms.SIDE_BITS and (best is None or rate < best[0]):
+                if kl <= ms.SIDE_BITS and (best is None or (rate, kl) < best[:2]):
                     best = (rate, kl, label, {n: q.detach().clone() for n, q in pm.named_parameters() if "ft" in n})
                 pm.set_adapter("ft")  # (check() leaves the organism's adapter active)
                 pm.train()
@@ -187,20 +194,24 @@ def main():
     ap.add_argument("--access", choices=("organism", "base"), default="organism",
                     help="organism: the final model alone (our rule); base: the base model's answers too (a reference line)")
     ap.add_argument("--no-random", action="store_true")
-    ap.add_argument("--methods", default="dir-ablate,steer,lora,random-matched", help="the baselines to run (comma-separated)")
+    ap.add_argument("--methods", default="dir-ablate,steer,lora,random-matched,t3-selected", help="the baselines to run (comma-separated)")
+    ap.add_argument("--organisms", default="", help="only these E2 organisms (comma-separated; default all)")
     a = ap.parse_args()
     methods = set(a.methods.split(","))
     items = json.loads((a.items / "o3.json").read_text())["organisms"]
     t3 = {r["item"]: r["edit"]["units"] for r in ms.jl(a.t3)}
-    gen_users = [json.loads(x)["user"] for x in a.general.read_text().splitlines()][:TRAIN_GENERAL + TRAIN_KL]
+    gen_all = [json.loads(x)["user"] for x in a.general.read_text().splitlines()]
+    gen_users, sel_users = gen_all[:TRAIN_GENERAL], gen_all[SELECT_ROWS]
     ms.EXTRA_GENERAL[:] = [json.loads(x)["user"] for x in a.general.read_text().splitlines()][ms.EXTRA_ROWS]  # (the p99 KL)
     tok = AutoTokenizer.from_pretrained(ms.MODEL)
     tok.padding_side = "left"
     base = AutoModelForCausalLM.from_pretrained(ms.MODEL, dtype=torch.bfloat16).to("cuda").eval()
     sfx = "-base" if a.access == "base" else ""
-    out = {k: [] for k in ("dir-ablate", "steer", "lora", "random-matched")}
+    out = {k: [] for k in ("dir-ablate", "steer", "lora", "random-matched", "t3-selected")}
     fits = {}
     for name, rec in items.items():
+        if a.organisms and name not in a.organisms.split(","):
+            continue
         path = str(Path(a.adapters) / name)
         pm = PeftModel.from_pretrained(base, path).eval()
         nr = nb.Neurons(pm, tok)
@@ -208,8 +219,8 @@ def main():
         nr.thr = None
         et = rec["sets"]["edit_train"]
         before = ms.o3_before(nr, tok, name, rec)
-        kl_users = gen_users[TRAIN_GENERAL:TRAIN_GENERAL + TRAIN_KL]
-        kl_answers = ms.generate(nr, tok, kl_users, None, 200)
+        kl_users = sel_users
+        kl_answers = ms.generate(nr, tok, kl_users, None, SELECT_TOKENS)
         present = et["prompts"]
         if a.access == "base":  # (a reference line only: the base model's answers are not allowed in our setting)
             d = means(nr, tok, present, et["organism"]) - means(nr, tok, present, et["base"])  # [L, d]
@@ -240,7 +251,7 @@ def main():
         if best:
             out["dir-ablate"].append({**ms.o3_eval(nr, tok, name, rec, best[3], before), "fit": best[2]})
         else:  # (no candidate within the side-effect budget: the method fails this organism)
-            out["dir-ablate"].append({"item": name, "success": False, "error": "no candidate within the side-effect budget (training KL <= 0.05 bits)"})
+            out["dir-ablate"].append({"item": name, "success": False, "error": "no candidate within the side-effect budget (selection KL <= 0.05 bits)"})
         # steering: the difference subtracted at one layer
         cands = []
         for lay in LAYERS if "steer" in methods else ():
@@ -252,7 +263,17 @@ def main():
         if best:
             out["steer"].append({**ms.o3_eval(nr, tok, name, rec, best[3], before), "fit": best[2]})
         else:  # (no candidate within the side-effect budget: the method fails this organism)
-            out["steer"].append({"item": name, "success": False, "error": "no candidate within the side-effect budget (training KL <= 0.05 bits)"})
+            out["steer"].append({"item": name, "success": False, "error": "no candidate within the side-effect budget (selection KL <= 0.05 bits)"})
+        # T3's greedy order, its length chosen by the same rule
+        order = t3.get(name, []) if "t3-selected" in methods else []
+        cands = [(f"first {k} poles", ms.Edit(nr, ms.units(nr, order[:k], 10 ** 6), "zero"))
+                 for k in sorted({min(k, len(order)) for k in T3_PREFIXES}) if k]
+        best = pick(nr, tok, name, cands, et["prompts"], kl_users, kl_answers, log)
+        fits[name]["t3-selected"] = best[:3] if best else None
+        if best:
+            out["t3-selected"].append({**ms.o3_eval(nr, tok, name, rec, best[3], before), "fit": best[2]})
+        else:
+            out["t3-selected"].append({"item": name, "success": False, "error": "no candidate within the side-effect budget (selection KL <= 0.05 bits)"})
         # random poles matched by layer to the T3 greedy edit's
         rng = random.Random(f"random-matched:{name}")
         layers = [int(u[1:].split(".N")[0]) for u in t3.get(name, [])]
@@ -272,7 +293,7 @@ def main():
             if best:
                 out["lora"].append({**ms.o3_eval(nr, tok, name, rec, Adapter(pm, "ft"), before), "fit": best[2]})
             else:
-                out["lora"].append({"item": name, "success": False, "error": "no candidate within the side-effect budget (training KL <= 0.05 bits)"})
+                out["lora"].append({"item": name, "success": False, "error": "no candidate within the side-effect budget (selection KL <= 0.05 bits)"})
             log(name, "lora done")
             pm.delete_adapter("ft")
         base = pm.unload()

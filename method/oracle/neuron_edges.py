@@ -149,7 +149,7 @@ class Edges:
         self.nb = [int((lay < L).sum()) for L in range(self.L + 1)]  # the circuit's neurons below layer L: the first nb[L]
         self.resid_all = [(w, r) for w in self.N for r in self.N if w[0] < r[0] and w[1] == r[1]]
         self.n_routes = sum((r[0] - w[0]) * self.H for w in self.N for r in self.N if w[1] <= r[1] and w[0] < r[0])
-        self._plans, self._cols, self._vcols, self._wos, self._idx = {}, {}, {}, {}, {}
+        self._plans, self._cols, self._vcols, self._wos, self._idx, self._uniq = {}, {}, {}, {}, {}, {}
         self._J, self._G, self._dv_base, self._allin = None, None, {}, {}
         self.patch, self.cbase = False, None  # (a patching pair: set below)
         with torch.no_grad():
@@ -373,7 +373,9 @@ class Edges:
                 dv = self._dv(L, x, v, Hc[:, :nb], s0)  # [K, nb, KV, hd]
                 Wo = self._wo(L)
                 if rest:  # every one: each position's head outputs from every writer's value change, summed
-                    pu, pi = torch.unique(P[:nb], return_inverse=True)  # (the writers' positions)
+                    if (nb, d) not in self._uniq:  # (the writers' positions; torch.unique waits for the card: 2.6 of
+                        self._uniq[(nb, d)] = torch.unique(P[:nb], return_inverse=True)  # 10.6 s of 4 Qwen3-8B prunes)
+                    pu, pi = self._uniq[(nb, d)]
                     if len(pu) * (H * hd + H * Ts) < Ts * H * hd:  # few: each head's change at them through o_proj first,
                         dVp = torch.zeros(K, len(pu), KV, hd, device=d).index_add(1, pi, dv).repeat_interleave(H // KV, 2)
                         U = torch.einsum("kphc,Dhc->khpD", dVp, Wo.view(-1, H, hd))  # [K, H, positions, d]
@@ -562,15 +564,16 @@ class Edges:
         J, h0, dvs = self.jacobians(), self._h0(), self._dvs()
         h0b, dvb = (self._h0("corrupt"), self._dvs("corrupt")) if self.patch else (None, None)
         Jm = torch.stack([J[n].to(dev) for n in self.N])
-        best_m = torch.full((N, M), -1.0)  # |effect| (-1: no candidate)
-        best_s = torch.zeros(N, M)
-        best_i = torch.zeros(N, M, 3, dtype=torch.long)  # (writer, head layer (-1: resid), head)
+        best_m = torch.full((N, M), -1.0, device=dev)  # |effect| (-1: no candidate)
+        best_s = torch.zeros(N, M, device=dev)
+        best_i = torch.zeros(N, M, 3, dtype=torch.long, device=dev)  # (writer, head layer (-1: resid), head)
 
-        def carry(rows, mag, s, decode):  # each reader of rows: its best M of what it had and of mag [R, X]
-            t = torch.topk(mag, min(M, mag.shape[1]), dim=1)
-            m2 = torch.cat([best_m[rows], t.values.cpu()], 1)
-            s2 = torch.cat([best_s[rows], s.gather(1, t.indices).cpu()], 1)
-            i2 = torch.cat([best_i[rows], decode(t.indices).cpu()], 1)
+        def carry(rows, mag, s, decode):  # each reader of rows: its best M of what it had and of mag [R, X] (on the
+            t = torch.topk(mag, min(M, mag.shape[1]), dim=1)  # card: a host copy a head layer waited for it, 0.4 s of
+            rows = rows.to(dev)                               # 4 Qwen3-8B prunes)
+            m2 = torch.cat([best_m[rows], t.values.to(dev)], 1)
+            s2 = torch.cat([best_s[rows], s.gather(1, t.indices).to(dev)], 1)
+            i2 = torch.cat([best_i[rows], decode(t.indices).to(dev)], 1)
             u = torch.topk(m2, M, dim=1).indices
             best_m[rows], best_s[rows] = m2.gather(1, u), s2.gather(1, u)
             best_i[rows] = i2.gather(1, u[..., None].expand(-1, -1, 3))
@@ -597,6 +600,7 @@ class Edges:
             ok = (Pd[:nb][None] <= Pd[nb:][:, None])[..., None].expand(-1, -1, H).flatten(1)
             carry(torch.arange(nb, N), s.abs().masked_fill(~ok, -1.0), s,
                   lambda t, c=c: torch.stack([t // H, torch.full_like(t, c), t % H], -1))
+        best_m, best_s, best_i = best_m.cpu(), best_s.cpu(), best_i.cpu()
         out = []
         for i, r in enumerate(self.N):
             v = best_m[i] >= 0

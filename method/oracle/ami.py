@@ -1317,7 +1317,7 @@ def board(dirs: list) -> list:
                 rs = [s.get("random", {}).get(m) for s in S]
                 rs = [x for x in rs if x is not None]
                 row[m + "_random"] = float(np.mean(rs)) if rs else None
-            row["pass_ci"] = wilson(int(round(sum(s[arm]["pass"] * s["n"] for s in S))), sum(s["n"] for s in S))
+            row["pass_ci"] = bootstrap([s[arm]["pass"] for s in S])      # (circuits resampled: a circuit's prompts are one unit)
             if all("frozen" in s for s in S):
                 row["recovered_ce_frozen"] = float(np.mean([s["frozen"]["recovered_ce"] for s in S]))
             for m in ("ce", "kl"):

@@ -166,6 +166,10 @@ def test_select_reads_its_curve_off_the_proposals(monkeypatch, tmp_path):
     assert rec["abs_True"]["faithfulness"] == fs
     assert rec["abs_True"]["CMD"] == pytest.approx(mc.areas(fs)[1])
     assert (tmp_path / "submission" / "select" / "ioi_tiny" / "0.1.pt").exists()
+    again = mc.select(model, "ioi", "tiny", "select:measured", tmp_path / "again", dl, 6,
+                      lambda *a, mean=True, loss=False: metric(*a[:4]), 12, 6, None, 3, lambda s: None,
+                      reuse=tmp_path / "submission")
+    assert again["reused"] and again["abs_True"]["faithfulness"] == pytest.approx(rec["abs_True"]["faithfulness"], abs=1e-6)
 
 
 @pytest.mark.parametrize("shape", sorted(SHAPES))

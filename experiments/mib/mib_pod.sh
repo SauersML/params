@@ -5,7 +5,7 @@
 #   (MODELS and TASKS comma lists: every pair MIB's circuit track scores, in that order, models outer)
 #   (measured@none: the measured ranking with --order none; env FROM: an earlier measured run's JSON, its tests rescored;
 #   finder, last: circuit_finder's circuits as MIB circuits beside the task's rankings, mib_compare finder + convert;
-#   env FIX, CURVES: select's --fix and --curves; FINDER_TASKS: only those tasks; EXTRA: shell commands run after the rest, Mac paths translated as rp-run does)
+#   env FIX, CURVES, REUSE: select's --fix, --curves and --reuse (a directory outside runpod/, uploaded); FINDER_TASKS: only those tasks; EXTRA: shell commands run after the rest, Mac paths translated as rp-run does)
 #   env: N (attribution examples, 32; -1: MIB's own counts), REFINE (1000), BATCH (MIB's attribution batch, 16; 4 fits EAP-IG on Llama's 46 GB), EVAL_BATCH (MIB's evaluation batch, BATCH), TEST_N (cap MIB's test split: smoke runs), GPU, PRICE, VRAM, RP_OWNER
 # Results come back to ~/mpd-data/runpod/NAME/out.
 # The whole script is one block, so bash has read all of it before it runs.
@@ -27,7 +27,7 @@ for M in ${MODEL//,/ }; do for t in ${TASKS//,/ }; do [[ $VALID == *" ${t}_$M "*
     continue
   fi
   meth=${m%@*} ord=""; [[ $m == *@* ]] && ord="--order ${m#*@}"
-  RUNS="$RUNS /workspace/mibenv/bin/python -B experiments/mib/mib_compare.py rank $t $M $meth $O/out --n ${N:-32} --refine ${REFINE:-1000} --batch ${BATCH:-16} ${EVAL_BATCH:+--eval-batch $EVAL_BATCH} ${TEST_N:+--test-n $TEST_N} ${FROM:+--from $FROM} ${FIX:+--fix $FIX} ${CURVES:+--curves $CURVES} $ord > $O/${t}_${M}_$m.log 2>&1; echo \"exit \$?\" >> $O/${t}_${M}_$m.log;"
+  RUNS="$RUNS /workspace/mibenv/bin/python -B experiments/mib/mib_compare.py rank $t $M $meth $O/out --n ${N:-32} --refine ${REFINE:-1000} --batch ${BATCH:-16} ${EVAL_BATCH:+--eval-batch $EVAL_BATCH} ${TEST_N:+--test-n $TEST_N} ${FROM:+--from $FROM} ${FIX:+--fix $FIX} ${CURVES:+--curves $CURVES} ${REUSE:+--reuse $REUSE} $ord > $O/${t}_${M}_$m.log 2>&1; echo \"exit \$?\" >> $O/${t}_${M}_$m.log;"
 done; done; done
 CMD="export OMP_NUM_THREADS=4 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True HF_HUB_ENABLE_HF_TRANSFER=0 PYTHONUNBUFFERED=1; set -e; ln -sfn /workspace/runs/$NAME/mpd-data ~/mpd-data; mkdir -p $O/out ~/mib;
 tar -xzf $F/mib.tgz -C ~/mib; export MIB_DIR=~/mib/MIB-circuit-track;

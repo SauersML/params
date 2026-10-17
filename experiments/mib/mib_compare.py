@@ -512,7 +512,7 @@ def measured_scores(real, rec: dict, order: str = "block"):
 
 def rank(task: str, mname: str, method: str, out: Path, n: int, refine: int, batch: int, test_n: int | None = None,
          log=print, limit: int | None = None, rows: int = 32, prev: Path | None = None, order: str = "block",
-         eval_batch: int | None = None, fix_max: float = 0.0, curves: str = "all") -> dict:
+         eval_batch: int | None = None, fix_max: float = 0.0, curves: str = "all", reuse: Path | None = None) -> dict:
     import torch
 
     from eap.attribute import attribute
@@ -537,7 +537,7 @@ def rank(task: str, mname: str, method: str, out: Path, n: int, refine: int, bat
         rec["nodes"] = nodes(model, graph, dl, partial(metric, mean=False, loss=False), log, rows)
     elif method.startswith("select"):
         return select(model, task, mname, method, out, dl, n_rank, metric, refine, rows, test_n, eval_batch or batch, log,
-                      fix_max, curves)
+                      fix_max, curves, reuse)
     else:
         attribute(model, graph, dl, partial(metric, mean=True, loss=True), method, "patching", ig_steps=5,
                   intervention_dataloader=dl)
@@ -637,7 +637,7 @@ def edgefix(model, g, loader, m1, base, none, k: int, scores, log=print, blocks:
 
 
 def select(model, task, mname, method, out, dl, n_rank, metric, refine, rows, test_n, eval_batch, log,
-           fix_max: float = 0.0, curves: str = "all") -> dict:
+           fix_max: float = 0.0, curves: str = "all", reuse: Path | None = None) -> dict:
     """Per circuit size, the circuit of whichever proposal (METHOD = select:A+B+..., each a ranking: an attribution
     method of MIB's in both its absolute and signed order, measured, nodes or eliminate, which reuses nodes' tests when
     it follows it; and, at sizes up to FIX_MAX of the edges, edgefix's circuit pruned from the first proposal's top
@@ -645,7 +645,8 @@ def select(model, task, mname, method, out, dl, n_rank, metric, refine, rows, te
     pairs); MIB's submission format (2), one circuit per size. Scored on the test split as MIB's
     evaluate_area_under_curve scores a ranking, each size's circuit as chosen. CURVES "all": every proposal's own test
     curve too; "eap": only the attribution methods' (the baseline beside us). Every test metric is kept per example
-    (bootstrap intervals: mib_bootstrap)."""
+    (bootstrap intervals: bootstrap()). REUSE: a directory of an earlier run's submission rankings (METHOD/TASK_MODEL/
+    importances.pt), loaded instead of recomputed (their seconds are that run's)."""
     import torch
 
     from eap.attribute import attribute
@@ -659,7 +660,11 @@ def select(model, task, mname, method, out, dl, n_rank, metric, refine, rows, te
     for c in names:
         t1 = time.time()
         g = Graph.from_model(model)
-        if c == "measured":
+        old = reuse / c / f"{task.replace('_', '-')}_{mname}" / "importances.pt" if reuse else None
+        if old is not None and old.exists():  # (an earlier run's ranking of the same attribution pairs, its seconds there)
+            g = Graph.from_pt(str(old))
+            rec.setdefault("reused", []).append(str(old))
+        elif c == "measured":
             rec["measured"] = measured(model, g, dl, m1, refine, log, None, rows)
         elif c == "nodes":
             rec["nodes"] = nodes(model, g, dl, m1, log, rows)
@@ -944,6 +949,7 @@ def main():
     ap.add_argument("--batch", type=int, default=16)
     ap.add_argument("--eval-batch", type=int, default=None, help="MIB's evaluation batch (default --batch)")
     ap.add_argument("--fix", type=float, default=0.0, help="select: edgefix circuits at sizes up to this share of edges")
+    ap.add_argument("--reuse", type=Path, default=None, help="select: an earlier run's submission directory, its rankings loaded")
     ap.add_argument("--curves", default="all", choices=("all", "eap"), help="select: every proposal's test curve, or only the attribution methods'")
     ap.add_argument("--test-n", type=int, default=None, help="MIB's test split's first examples only (a smoke run)")
     ap.add_argument("--limit", type=int, default=None, help="the first writers and readers only (a smoke run)")
@@ -978,7 +984,7 @@ def main():
         return
     task, mname, method, out = a.args
     rank(task, mname, method, Path(out), a.n, a.refine, a.batch, a.test_n, log=lambda s: print(s, flush=True), limit=a.limit,
-         rows=a.rows, prev=a.prev, order=a.order, eval_batch=a.eval_batch, fix_max=a.fix, curves=a.curves)
+         rows=a.rows, prev=a.prev, order=a.order, eval_batch=a.eval_batch, fix_max=a.fix, curves=a.curves, reuse=a.reuse)
 
 
 if __name__ == "__main__":

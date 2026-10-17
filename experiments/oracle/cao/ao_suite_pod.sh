@@ -29,5 +29,5 @@ python -m pip install -q 'https://github.com/Dao-AILab/flash-attention/releases/
 python -I -c 'import flash_attn' && export AO_SDPA=0 || export AO_SDPA=1; echo AO_SDPA=\$AO_SDPA > $O/env.txt; \
 (while :; do nvidia-smi --query-gpu=memory.used,utilization.gpu --format=csv,noheader,nounits >> $O/gpu.txt; sleep 30; done) > /dev/null 2>&1 & \
 set +e; cd /workspace/ao/repo; ls $F/taboo_qwen.py $F/personaqa_yesno_qwen.py $F/personaqa_open_qwen.py $F/classification_qwen.py > /dev/null; $EVALS true"
-RP_ALLOW_OVER=1 RP_UPLOAD_MAX_MB=${UPLOAD_MB:-3000} RP_OWNER=primerl RP_PARALLEL=1 RP_MAX_PRICE=${PRICE:-0.8} RP_MIN_VRAM_GB=${VRAM:-44} \
+RP_UPLOAD_MAX_MB=${UPLOAD_MB:-3000} RP_OWNER=primerl RP_PARALLEL=1 RP_MAX_PRICE=${PRICE:-0.8} RP_MIN_VRAM_GB=${VRAM:-44} \
   experiments/infra/runpod/rp-run $N "${GPU:-A40,RTX A6000,L40S,RTX 6000 Ada}" "$H" -- bash -c "$CMD"

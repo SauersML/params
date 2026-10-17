@@ -18,6 +18,10 @@ the same rows, on oracleeval's scorecard (O1, O1m) and AO's own suite (taboo, Pe
       .jsonl (the member slice) as cao examples. --ref: textoracle's train_full.jsonl, which the circ rows must equal
       (the same questions, serialization and answers); --tests: textoracle's rows directory (its test_{full,none} and
       test_members_{full,none}, taken as they are).
+  ao_text.py pairs --out DIR    oracledata's paired-context questions (pairs/v1 train; the scorecard's O1p test items) as
+      DIR/{train,test}_{circ,none}.jsonl: both texts' activations, each text's circuit with the asked item in full (circ)
+      or none; training questions touching O1's, O1m's, O1p's contexts, O1 dev's or the sealed set's task/keys or a sealed
+      circuit id refused
   ao_text.py answers ADAPTER TEST.jsonl OUT.jsonl [--batch 8]    greedy answers in textoracle's eval format
   ao_text.py figure --suites RELEASED.json NONE.json CIRC.json   the uplift figure (~/mpd-data/figures/oracle/ao_text_uplift.png)
   ao_text.py collect NAME LABEL --o1 O1.jsonl --o1m O1M.jsonl [--e1 BATTERY.jsonl] [--li LI.jsonl] [--matched none=NAME]
@@ -94,6 +98,95 @@ def build(a) -> None:
             print(f"{name}_{arm}: {len(rows)}", flush=True)
 
 
+SHARES = ("Shares: of the gap between a text and its contrast text, lost when the unit takes its value from the contrast "
+          "text (noising) and restored when it alone keeps its value in the contrast text (denoising).")
+
+
+def pair_side(c: dict, units: list[str]) -> str:
+    """One text of a paired question as the circuit reader's text: the text, its answer and lead, its contrast pair, the
+    circuit's size, and the asked item's units in this text with every measured number (text_reader.serialize_circuit's
+    lines, the asked item alone in full: the readable check's tree reads that item's numbers)."""
+    from text_reader import num, q_tok
+    lines = [f"Text: {c['user']!r}", f"The model's next token: {q_tok(c['answer']['text'])}; its lead for that word over the "
+             f"alternative words: {c['contrast']['clean']:.1f} bits."]
+    cor = c.get("corrupt") or {}
+    if cor:
+        lines.append(f"Contrast pair: with {cor.get('user')!r} the model gives {q_tok((cor.get('answer') or {}).get('text', '?'))} "
+                     f"(the gap between the two texts: {c['gap']:.1f} bits).")
+    st = collections.Counter(u.get("stage") or "other" for u in c["units"])
+    lines.append(f"Its circuit: {', '.join(f'{n} {k} neuron' + ('' if n == 1 else 's') for k, n in sorted(st.items()))}; "
+                 f"{len(c.get('heads') or [])} heads at the answer position.")
+    lines.append("The asked item here:")
+    heads = {h["name"]: h for h in c.get("heads") or []}
+    neurons = {u["name"]: u for u in c["units"]}
+    for u in units:
+        if u in heads:
+            h = heads[u]
+            looks = ", ".join(f"{q_tok(t)} @{q} {w:.2f}" for q, w, t in h.get("attends", [])[:3])
+            lines.append(f"  {u} looks at {looks}; noising {num(h.get('lost'))}, denoising {num(h.get('restored'))}")
+        elif u in neurons:
+            x = neurons[u]
+            line = (f"  {u} at {q_tok(x.get('token', '?'))} ({x.get('stage') or 'other'}): value {x['value']:.3g} "
+                    f"({abs(x.get('value_over_max') or 0):.2f} of its max), contrast text {'?' if x.get('corrupt') is None else format(x['corrupt'], '.3g')}; noising "
+                    f"{num(x.get('lost'))}, denoising {num(x.get('restored'))}")
+            if x.get("direct") is not None:
+                line += f"; its write on the lead {x['direct']:+.2f} bits"
+            lines.append(line)
+        else:
+            lines.append(f"  {u}: not in this text's circuit")
+    return "\n".join(lines)
+
+
+def frozen() -> tuple[set, set]:
+    """Contexts and task/keys no training question may touch: O1's (o1_dev), O1m's, O1p's, O1 dev's task/keys and the
+    sealed test set's task/keys (every paraphrase)."""
+    items = Path.home() / "mpd-data/oracle/scorecard/items"
+    ctx = set()
+    for f in ("o1_dev.jsonl", "o1_members.jsonl"):
+        ctx |= {json.loads(x)["context"] for x in (items / f).read_text().splitlines() if x.strip()}
+    tk = {c.rsplit("/", 1)[0] for c in ctx}  # (O1 dev's task/keys: every paraphrase)
+    for x in (items / "o1_pairs.jsonl").read_text().splitlines():
+        r = json.loads(x)
+        ctx |= {r["context_a"], r["context_b"]}
+    sealed = json.loads((Path.home() / "mpd-data/circuits/testset_8b.json").read_text())["questions"]
+    tk |= {f"{q['task']}/{q['key']}" for q in sealed}
+    return ctx, tk
+
+
+def pairs(a) -> None:
+    """oracledata's paired-context questions as AO examples: both texts' half-depth activations (one block each, the
+    second reading its own context), then the circuit of each text (circ) or nothing (none), then the question. Training
+    questions touching a frozen context or task/key, or a sealed circuit id, are refused."""
+    import zlib
+    circ = {c["circuit_id"]: c for c in map(json.loads, (a.pairs / "circuits.jsonl").read_text().splitlines())}
+    ctx_f, tk_f = frozen()
+    sealed = lambda cid: zlib.crc32(("scorecard:" + cid).encode()) % 20 == 0  # noqa: E731
+
+    def ex(r):
+        ca, cb = circ[r["circuit_a"]], circ[r["circuit_b"]]
+        blocks = [{"layer": LAYER, "positions": list(range(len(ca["ids"])))},
+                  {"layer": LAYER, "positions": list(range(len(cb["ids"]))), "ctx": cb["ids"]}]
+        body = {"circ": f"{SHARES}\nText A's circuit:\n{pair_side(ca, r['units_a'])}\nText B's circuit:\n{pair_side(cb, r['units_b'])}\n\n{r['q']}",
+                "none": r["q"]}
+        return {arm: {"ctx": ca["ids"], "blocks": blocks, "q": q, "a": r["a"], "cat": r["kind"], "task": r.get("item") or r["id"],
+                      "id": r.get("item") or r["id"]} for arm, q in body.items()}
+
+    a.out.mkdir(parents=True, exist_ok=True)
+    train = [json.loads(x) for x in (a.pairs / "train.jsonl").read_text().splitlines()]
+    bad = [r for r in train if {r["context_a"], r["context_b"]} & ctx_f or
+           {r["context_a"].rsplit("/", 1)[0], r["context_b"].rsplit("/", 1)[0]} & tk_f or sealed(r["circuit_a"]) or sealed(r["circuit_b"])]
+    print(f"train: {len(train)} questions, {len(bad)} refused by the frozen sets", flush=True)
+    train = [r for r in train if r not in bad]
+    test = [json.loads(x) for x in a.items.read_text().splitlines()]
+    for name, rows in (("train", train), ("test", test)):
+        exs = [ex(r) for r in rows]
+        for arm in ("circ", "none"):
+            with (a.out / f"{name}_{arm}.jsonl").open("w") as fh:
+                for e in exs:
+                    fh.write(json.dumps(e[arm]) + "\n")
+        print(name, len(rows), dict(collections.Counter(r["kind"] for r in rows)), flush=True)
+
+
 def answers(a) -> None:
     import cao
     o = cao.Oracle(a.adapter)
@@ -126,6 +219,11 @@ def collect(a) -> None:
         got = sc.jl(a.o1m)
         assert len(got) == len(m1) and all(g["id"] == t["context"] for g, t in zip(got, m1)), a.o1m
         sc.wjl(d / "o1m.jsonl", [{"item": t["item"], "answer": g["got"]} for g, t in zip(got, m1)])
+    if a.o1p:  # O1p: oracledata's paired-context questions, in o1_pairs.jsonl's order
+        p1 = sc.jl(sc.ITEMS / "o1_pairs.jsonl")
+        got = sc.jl(a.o1p)
+        assert len(got) == len(p1) and all(g["id"] == t["item"] for g, t in zip(got, p1)), a.o1p
+        sc.wjl(d / "o1p.jsonl", [{"item": t["item"], "answer": g["got"]} for g, t in zip(got, p1)])
     if a.e1:  # O2: e1.py battery's rule, per organism and budget the most common answer over the first B prompts
         sc.wjl(d / "o2.jsonl", [{"item": f"{n}@{b}", "answer": v, "passes": b} for (n, b), v in sorted(sc.battery_guesses(sc.jl(a.e1)).items())])
     if a.li:  # O5: Li et al.'s patching test, their exact-match scorer
@@ -215,6 +313,10 @@ def main():
     b.add_argument("--out", type=Path, required=True)
     for f in ("first", "focus", "recap", "balance"):
         b.add_argument(f"--{f}", action="store_true")
+    pr = sub.add_parser("pairs")
+    pr.add_argument("--pairs", type=Path, default=Path.home() / "mpd-data/oracle/data/pairs/v1")
+    pr.add_argument("--items", type=Path, default=Path.home() / "mpd-data/oracle/scorecard/items/o1_pairs.jsonl")
+    pr.add_argument("--out", type=Path, required=True)
     s = sub.add_parser("answers")
     s.add_argument("adapter")
     s.add_argument("test", type=Path)
@@ -227,13 +329,14 @@ def main():
     c.add_argument("--matched", nargs="*", default=[], help="INPUT=NAME: the arm trained on that input (the scorecard's matched)")
     c.add_argument("--o1", type=Path)
     c.add_argument("--o1m", type=Path)
+    c.add_argument("--o1p", type=Path, help="answers to the paired-context items (O1p), in o1_pairs.jsonl's order")
     c.add_argument("--e1", type=Path, help="e1.py battery's answers (O2)")
     c.add_argument("--li", type=Path, help="li_patch.py's answers for this adapter (O5)")
     f = sub.add_parser("figure")
     f.add_argument("--suites", nargs=3, required=True, help="ao_scores.json of the released AO, the no-circuit arm, the circuit arm")
     f.add_argument("--out", type=Path, default=Path.home() / "mpd-data/figures/oracle/ao_text_uplift.png")
     a = ap.parse_args()
-    {"build": build, "answers": answers, "collect": collect, "figure": figure}[a.cmd](a)
+    {"build": build, "pairs": pairs, "answers": answers, "collect": collect, "figure": figure}[a.cmd](a)
 
 
 if __name__ == "__main__":

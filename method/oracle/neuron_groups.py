@@ -315,12 +315,12 @@ def label(a) -> None:
     name: not[...] for a group with effect > 0 (zeroing raises the answer: the group pushes against it)."""
     import atlas_labels as al
     import neuron_verify
-    import reader_reward
+    import llm
 
     global LONG
     LONG = a.before
     doc, tok, groups, exs = load(a)
-    wr, rd = reader_reward.Reader(a.writer, a.out.parent), reader_reward.Reader(neuron_verify.READER, a.out.parent)
+    wr, rd = llm.Reader(a.writer, a.out.parent), llm.Reader(neuron_verify.READER, a.out.parent)
     spent = lambda: wr.spend.total + rd.spend.total  # noqa: E731
     measure = lambda rows, seed=0: neuron_verify.remote_measure(a.measure_url, rows, seed)  # noqa: E731
     head = lambda g: dict(members=unit_names(g["members"]), gmax=g["max"])  # noqa: E731
@@ -441,12 +441,12 @@ def rescore(a) -> None:
     """A labels file's input labels scored again on fresh texts at both blind lengths against a collect output that
     has each group's corpus histogram (the FIRE_Q fire level); the earlier scores move to "scores_max30"."""
     import neuron_verify
-    import reader_reward
+    import llm
 
     doc = json.loads(a.top.read_text())
     gs = {g["id"]: g for g in doc["groups"]}
     rows = [json.loads(x) for x in a.labels.read_text().splitlines() if x.strip()]
-    rd = reader_reward.Reader(neuron_verify.READER, a.labels.parent)
+    rd = llm.Reader(neuron_verify.READER, a.labels.parent)
     measure = lambda rows_, seed=0: neuron_verify.remote_measure(a.measure_url, rows_, seed)  # noqa: E731
     todo = [r for r in rows if r.get("writer_valid") and r["group"] in gs]
     for r in todo:
@@ -471,7 +471,7 @@ def estimate(a) -> None:
     measured shares of past runs (8B neuron arm 10-16: 0.46 of first drafts fail, 0.6 of those again; a reader plan 300
     prompt and 700 sampled tokens; a judge 250 and 10; an output reading 150 and 20), times --margin."""
     sys.path.insert(0, str(HERE / "rl"))
-    from tinker_train import PRICES
+    from llm import PRICES
 
     import neuron_verify
     LONG_ = a.before

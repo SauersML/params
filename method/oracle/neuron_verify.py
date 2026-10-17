@@ -42,7 +42,7 @@ FLOOR_P = 1e-3  # effects: a token's relative change counts from this probabilit
 STEER = 3.0  # steering sets the activation to the pole's sign times this many corpus maxima
 PROMPTS = ["The", "In my opinion,", "Here is a short story:", "Today I learned that"]  # steering's neutral starts
 GEN = 24  # tokens generated per steering prompt
-READER = "Qwen/Qwen3.6-27B"  # dense, so deterministic at temperature 0 (reader_reward: 10-14 repeats agree to 0.003)
+READER = "Qwen/Qwen3.6-27B"  # dense, so deterministic at temperature 0 (10-14: three repeats agree to 0.003)
 
 ASK = """A neuron in a language model has this explanation of its {pole} side:
 {explanation}
@@ -467,9 +467,9 @@ def _dump(path: Path, rows: list[dict]) -> None:
 
 def cmd_plan(a) -> None:
     """Step 1 of 3 on the machine with the reader's key: the reader's test texts for each pole (--neurons) to --out."""
-    import reader_reward
+    import llm
 
-    rd=reader_reward.Reader(a.reader,a.out.parent)
+    rd=llm.Reader(a.reader,a.out.parent)
     rows=plan(rd,_load(a.neurons))
     _dump(a.out,rows)
     print(f"{sum(r['valid'] for r in rows)}/{len(rows)} valid plans to {a.out}; spend ${rd.spend.total:.3f}")
@@ -554,16 +554,16 @@ def remote_measure(url: str, rows: list[dict], seed: int = 0) -> list[dict]:
 
 def cmd_judge(a) -> None:
     """Step 3 of 3 on the machine with the reader's key: the steering choices for --measured to --out."""
-    import reader_reward
+    import llm
 
-    rd=reader_reward.Reader(a.reader,a.out.parent)
+    rd=llm.Reader(a.reader,a.out.parent)
     rows=judge(rd,_load(a.measured))
     _dump(a.out,rows)
     print(f"{len(rows)} rows judged to {a.out}; spend ${rd.spend.total:.3f}")
 
 
 def cmd_verify(a) -> None:
-    import reader_reward
+    import llm
 
     items = [json.loads(x) for x in a.neurons.read_text().splitlines()]
     tg = Target(a.model, a.device)
@@ -593,7 +593,7 @@ def cmd_verify(a) -> None:
         else:
             _item(tg, it)  # strict validation remains before reader service construction
             candidates.append(it)
-    rd = reader_reward.Reader(a.reader, a.out.parent) if candidates else None
+    rd = llm.Reader(a.reader, a.out.parent) if candidates else None
     checked = verify(tg, rd, candidates) if candidates else []
     if len(checked) != len(candidates):
         raise ValueError("verifier result count must match every writer-valid pole")

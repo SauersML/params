@@ -84,10 +84,10 @@ def check(claims: list[dict], tg, rd, nr=None, atlas=None) -> list[dict]:
 def setup(a):
     """The target (neuron_verify.Target), the reader, and for intervention claims the weak-zeroed reference on the
     target's own weights (one copy of the model)."""
-    import reader_reward
+    import llm
 
-    rd = (reader_reward.VLLMReader(a.reader_local, util=0.5) if getattr(a, "reader_local", None)
-          else reader_reward.OpenAIReader(a.reader_url) if a.reader_url else reader_reward.Reader(a.reader, a.log))
+    rd = (llm.VLLMReader(a.reader_local, util=0.5) if getattr(a, "reader_local", None)
+          else llm.OpenAIReader(a.reader_url) if a.reader_url else llm.Reader(a.reader, a.log))
     tg = neuron_verify.Target(a.model, a.device)
     nr = None
     if a.thr:

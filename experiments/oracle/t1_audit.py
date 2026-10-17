@@ -163,7 +163,7 @@ def explain(a) -> None:
     import hashlib
     import math
     import numbers
-    import reader_reward
+    import llm
 
     atlas = json.loads(a.atlas.read_text())
 
@@ -174,7 +174,7 @@ def explain(a) -> None:
                for n in atlas["neurons"]]
     import neuron_verify
 
-    rd = reader_reward.Reader(a.writer, a.out.parent)
+    rd = llm.Reader(a.writer, a.out.parent)
     responses = rd(prompts, max_tokens=600)
     audit_path = a.out.with_suffix(a.out.suffix + ".writer.json")
     audit = {"schema": 1, "atlas_sha256": hashlib.sha256(a.atlas.read_bytes()).hexdigest(),

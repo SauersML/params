@@ -234,10 +234,10 @@ def reader(a) -> None:
     the organism's own answer (answers' file) and answers the item's question, graded exactly as the oracle is."""
     import collections
     sys.path[:0] = [str(Path(__file__).resolve().parents[3] / "method" / "oracle"), str(Path(__file__).resolve().parents[3] / "method" / "oracle" / "rl")]
-    import reader_reward
+    import llm
     orgs = organisms(a.dir)
     rows = [json.loads(x) for x in a.answers.read_text().splitlines()]
-    rd = reader_reward.Reader(READER, a.out.parent)
+    rd = llm.Reader(READER, a.out.parent)
     got = rd([READER_PROMPT.format(request=r["request"], answer=r["model_answer"][:1500], question=r["question"]) for r in rows],
              max_tokens=200)
     by = collections.defaultdict(list)

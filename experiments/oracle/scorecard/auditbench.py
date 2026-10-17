@@ -98,8 +98,8 @@ def fill(t: str, **kw) -> str:
 def reader(log: str):
     sys.path[:0] = [str(Path(__file__).resolve().parents[3] / "method" / "oracle"),
                     str(Path(__file__).resolve().parents[3] / "method" / "oracle" / "rl")]
-    import reader_reward
-    return reader_reward.Reader(JUDGE, Path.home() / "mpd-data" / "scratch" / "oracleeval" / log)
+    import llm
+    return llm.Reader(JUDGE, Path.home() / "mpd-data" / "scratch" / "oracleeval" / log)
 
 
 def log_spend(run: str, usd: float, note: str, model: str = JUDGE) -> None:

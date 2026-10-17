@@ -551,7 +551,7 @@ def prompt397(a) -> None:
     import sys
     sys.path[:0] = [str(Path(__file__).resolve().parents[3] / "method" / "oracle"),
                     str(Path(__file__).resolve().parents[3] / "method" / "oracle" / "rl")]
-    import reader_reward
+    import llm
     from transformers import AutoTokenizer
     tok = AutoTokenizer.from_pretrained("Qwen/Qwen3-8B")
     o1 = jl(ITEMS / SETS[a.set][0])
@@ -567,7 +567,7 @@ def prompt397(a) -> None:
         print(prompts[0])
         return
     log = HOME / "mpd-data" / "scratch" / "oracleeval" / "prompt397"
-    rd = reader_reward.Reader("Qwen/Qwen3.5-397B-A17B", log)
+    rd = llm.Reader("Qwen/Qwen3.5-397B-A17B", log)
     got = rd(prompts, max_tokens=a.max_tokens)
     sfx = ("" if a.input == "correct" else f".{a.input}") + (f".shots{a.shots}" if a.shots else "")
     d = oracle_meta("prompt397" + sfx, "Qwen3.5-397B, prompting only" + ("" if a.input == "correct" else f", {a.input} input")

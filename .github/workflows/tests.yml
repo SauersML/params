@@ -1,0 +1,42 @@
+name: tests
+
+# Every test under method/ and experiments/ on a CPU runner (tiny random models; nothing from the Mac's mpd-data).
+# test_mib_compare needs MIB's own packages (eap, MIB_circuit_track) and runs where those are installed.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "method/**"
+      - "experiments/**.py"
+      - ".github/workflows/tests.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: false  # pushes come every few minutes: finish the running check, keep only the newest pending one
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    name: tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install CPU torch and the test dependencies
+        run: |
+          python -m pip install -q torch --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install -q 'pytest>=8' numpy scipy pandas matplotlib safetensors transformers peft tokenizers huggingface_hub httpx
+      - name: Run the tests
+        env:
+          MPD_MEM_GIB: "2"
+          MEM_LEASE_GIB: "1"
+        run: python -m pytest method experiments -q -p no:cacheprovider --tb=short --ignore-glob='*test_mib_compare.py' --continue-on-collection-errors

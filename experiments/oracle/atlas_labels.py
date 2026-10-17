@@ -156,7 +156,7 @@ def coverage(a) -> None:
 def label(a) -> None:
     import atlas as atlas_mod
     import neuron_verify
-    import reader_reward
+    import llm
 
     at = atlas_mod.Atlas(a.atlas)
     model = at.meta["model"]
@@ -174,7 +174,7 @@ def label(a) -> None:
         if r.get("pole") in ("+", "-"):  # a named pole: only it is developed, scored and written (revise)
             seen[key]["poles"].add(r["pole"])
     print(f"{len(want)} neurons to label ({len(done)} already in {a.out})", flush=True)
-    rd = reader_reward.Reader(a.writer, a.out.parent)
+    rd = llm.Reader(a.writer, a.out.parent)
     a.out.parent.mkdir(parents=True, exist_ok=True)
     if a.method == "revise":
         return revise(a, at, model, want, rd)
@@ -291,7 +291,7 @@ def estimate(a) -> None:
     development and both fresh-text scores, times --margin."""
     import atlas as atlas_mod
     import neuron_verify
-    from tinker_train import PRICES
+    from llm import PRICES
 
     at = atlas_mod.Atlas(a.atlas)
     rows = [json.loads(x) for x in a.neurons.read_text().splitlines() if x.strip()]
@@ -314,11 +314,11 @@ def score(a) -> None:
     seed) at each blind length (T1's 1 to 3 sentences; up to about 150 tokens), measured and the steering judged, under
     "scores" {length: {pass, blind_max, near_miss_rate, distant_rate, steer_match}} in the labels file."""
     import neuron_verify
-    import reader_reward
+    import llm
 
     rows = [json.loads(x) for x in a.labels.read_text().splitlines() if x.strip()]
     cm = maxima_of(a.corpus_max)
-    rd = reader_reward.Reader(neuron_verify.READER, a.labels.parent)
+    rd = llm.Reader(neuron_verify.READER, a.labels.parent)
     measure = measurer(a)
     todo = [r for r in rows if r.get("writer_valid") and r.get("explanation")]
     for length in a.lengths:

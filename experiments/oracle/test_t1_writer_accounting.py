@@ -23,7 +23,7 @@ def fake_reader(monkeypatch,responses):
     class Reader:
         def __init__(self,*a):self.spend=SimpleNamespace(total=0.);calls.append(('init',a))
         def __call__(self,prompts,**kw):calls.append(('requests',list(prompts),kw));return responses
-    monkeypatch.setitem(sys.modules,'reader_reward',SimpleNamespace(Reader=Reader))
+    monkeypatch.setitem(sys.modules,'llm',SimpleNamespace(Reader=Reader))
     return calls
 
 
@@ -108,7 +108,7 @@ def test_verify_cmd_preserves_mixed_cohort_order_and_denominator(tmp_path,monkey
 def test_verify_all_writer_invalid_constructs_no_reader_and_keeps_all_rows(tmp_path,monkeypatch):
     target(monkeypatch)
     def forbidden(*a,**kw):raise AssertionError('all-invalid must not call a reader or verify')
-    monkeypatch.setitem(sys.modules,'reader_reward',SimpleNamespace(Reader=forbidden));monkeypatch.setattr(nv,'verify',forbidden)
+    monkeypatch.setitem(sys.modules,'llm',SimpleNamespace(Reader=forbidden));monkeypatch.setattr(nv,'verify',forbidden)
     a=args_file(tmp_path,[failed(),failed(1,'+')]);nv.cmd_verify(a)
     rows=[json.loads(x) for x in a.out.read_text().splitlines()]
     assert len(rows)==2 and all(not r['valid'] and not r['passes_t1'] for r in rows)
@@ -118,7 +118,7 @@ def test_verify_all_writer_invalid_constructs_no_reader_and_keeps_all_rows(tmp_p
 def test_invalid_writer_rows_cannot_waive_address_or_declaration_checks(tmp_path,monkeypatch,changes):
     target(monkeypatch)
     def forbidden(*a,**kw):raise AssertionError('invalid input constructed paid reader')
-    monkeypatch.setitem(sys.modules,'reader_reward',SimpleNamespace(Reader=forbidden))
+    monkeypatch.setitem(sys.modules,'llm',SimpleNamespace(Reader=forbidden))
     a=args_file(tmp_path,[{**failed(),**changes}])
     with pytest.raises(ValueError):nv.cmd_verify(a)
     assert not a.out.exists()
@@ -127,6 +127,6 @@ def test_invalid_writer_rows_cannot_waive_address_or_declaration_checks(tmp_path
 def test_valid_candidate_still_gets_strict_pre_reader_validation(tmp_path,monkeypatch):
     target(monkeypatch)
     def forbidden(*a,**kw):raise AssertionError('invalid candidate constructed paid reader')
-    monkeypatch.setitem(sys.modules,'reader_reward',SimpleNamespace(Reader=forbidden))
+    monkeypatch.setitem(sys.modules,'llm',SimpleNamespace(Reader=forbidden))
     with pytest.raises(ValueError,match='corpus_max'):
         nv.cmd_verify(args_file(tmp_path,[{**candidate(),'corpus_max':0}]))

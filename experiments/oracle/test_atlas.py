@@ -68,7 +68,7 @@ def test_default_label_and_revise_reject_absent_pole(synthetic,monkeypatch,tmp_p
     class Writer:
         spend=SimpleNamespace(total=0.)
         def __call__(self,prompts,**kwargs):return [json.dumps({'positive':'synthetic explanation','negative':'synthetic explanation'}) for _ in prompts]
-    monkeypatch.setitem(sys.modules,'reader_reward',SimpleNamespace(Reader=lambda *a:Writer()))
+    monkeypatch.setitem(sys.modules,'llm',SimpleNamespace(Reader=lambda *a:Writer()))
     monkeypatch.setattr(atlas,'Atlas',lambda *args:synthetic)
     monkeypatch.setattr(labels,'measurer',lambda a:lambda items:[{'valid':True,'blind_max':.5,
         'near_miss_rate':0.,'passes_t1':True,'blind_texts':[],'blind_values':[]} for item in items])

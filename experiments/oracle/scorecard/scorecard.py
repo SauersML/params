@@ -943,6 +943,21 @@ def score(a) -> None:
                     ks = [k for k in rightm[n] if k in rightm[other] and keep(m1[k])]
                     if ks:
                         cell(n, "O1m", label + sub, [rightm[n][k] - rightm[other][k] for k in ks], [m1[k]["context"] for k in ks])
+    if p1:  # O1p's paired differences against the matched arm (trained without circuits on the same questions), per kind,
+        # bootstrap over the pair of contexts (primerl's AO + circuits uplift, the lead's 10-17 test)
+        rightp = {}
+        for d in sorted(p for p in ANS.iterdir() if (p / "o1p.jsonl").exists()):
+            got = {r["item"]: r for r in jl(d / "o1p.jsonl")}
+            rightp[d.name] = {k: float((g.get("class") or pair_class(g.get("answer"))) == p1[k]["gold"]) for k, g in got.items() if k in p1}
+        for n in rightp:
+            for inp, other in (meta.get(n, {}).get("matched") or {}).items():
+                if other == n or other not in rightp:
+                    continue
+                for kind in ("all", "pair_zero", "pair_sign", "pair_flip"):
+                    ks = [k for k in rightp[n] if k in rightp[other] and kind in ("all", p1[k]["kind"])]
+                    if ks:
+                        cell(n, "O1p", f"{kind} minus the arm trained on {inp}", [rightp[n][k] - rightp[other][k] for k in ks],
+                             [f"{p1[k]['context_a']}|{p1[k]['context_b']}" for k in ks])
     for x, y in (("g4-B", "g4-C"), ("g4-A", "g4-B"), ("g4-A", "g4-C")):  # G4's test: C beats B, interval excluding 0
         if x in g4arms and y in g4arms:
             orgs = sorted(set(g4arms[x]) & set(g4arms[y]))

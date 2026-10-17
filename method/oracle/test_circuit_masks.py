@@ -308,3 +308,20 @@ def test_no_cuts_not_met(tiny):
     pt = cf.Patcher(model, None, rows=8)
     rec = cf._find(pt, clean, corrupts[0], None, searched={})
     assert rec["usable"] and rec["cuts"] == {} and not rec["met"]
+
+
+def test_family_movers(tiny):
+    """A template's mover union that passes on the pair is the mover cut whole (no pruning), with its family record;
+    family_heads takes the paraphrase's union when it has FAMILY_MIN_KEYS records, else the task's, above FAMILY_FREQ."""
+    model, clean, corrupts = tiny
+    pt = cf.Patcher(model, None, rows=8)
+    pt.setup(clean, corrupts[0])
+    every = [[i, h, 1.0] for i in range(pt.L) for h in range(pt.H)]
+    U = {"t": {"p0": every, "all": every[:2], "n": {"p0": 5, "all": 5}}}
+    assert cm.family_heads(U, "t/k/p0") == [(i, h) for i, h, _ in every]
+    assert cm.family_heads(U, "t/k/p1") == [(i, h) for i, h, _ in every[:2]]
+    assert cm.family_heads(U, "u/k/p0") is None
+    cuts = cm.search_all(pt, "mask", steps=3, family=cm.family_heads(U, "t/k/p0"))
+    mv = cuts["movers"]
+    assert mv["reachable"]                          # (every head at the answer: the movers' ceiling)
+    assert mv["family"]["taken"] and len(mv["units"]) == pt.L * pt.H and mv["met"]

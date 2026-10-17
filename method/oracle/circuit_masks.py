@@ -85,6 +85,8 @@ GRAPH = True        # a round's mask steps after the first GRAPH_WARM replayed f
 GRAPH_WARM = 2      # step), the warm steps' cache and the graph's pool freed around it. Qwen3-8B on an A6000 (6aa938e9):
 # am without partners 1.005 -> 0.961 s a question (64 dev questions, batches of 16), one question at a time mask arm
 # 4.78 -> 3.68 s median; mask arm with 4 partners 5.17 s a question with graphs (48 questions, no memory error)
+FAMILY_MIN_KEYS = 4  # a template's own mover union when it has this many train records, else its task's (family_heads)
+FAMILY_FREQ = 0.0    # heads of at least this frequency among the union's records (0: every head; f10: 0.1)
 ROUNDS = 4          # rounds of STEPS a cut's masks get while its order cannot pass (each round from the last's theta)
 PRUNE_MAX = 4 * cf.SINGLES_KEPT   # a passing prefix of more units than this is a diffuse cut, not pruned: its size, shares
 # and curve recorded, no units (circuit_finder's diffuse rule). Qwen3-8B dev set (A6000, am, 153 questions): 13 readout
@@ -664,20 +666,36 @@ def _serve(group, reqs: list, log=None) -> list:
     return [fill(r) for r in reqs]
 
 
+def family_heads(unions: dict, qid: str, min_keys: int | None = None, freq: float | None = None) -> list | None:
+    """The mover union of question qid's template ("task/key/p<k>") in circuit_union's unions: its paraphrase's when that
+    has at least min_keys (FAMILY_MIN_KEYS) records, else its task's over every paraphrase; the heads [(layer, head)] of
+    frequency at least freq (FAMILY_FREQ), most frequent first; None when the task has none."""
+    task, p = qid.split("/")[0], "p" + qid.split("/")[-1][1:]
+    u = unions.get(task)
+    if not u:
+        return None
+    g = p if u["n"].get(p, 0) >= (FAMILY_MIN_KEYS if min_keys is None else min_keys) else "all"
+    f0 = FAMILY_FREQ if freq is None else freq
+    return [(int(i), int(h)) for i, h, f in u[g] if f >= f0] or None
+
+
 def search_all(pt, arm: str, log=None, steps: int = STEPS, prior: dict | None = None, partners: list | None = None,
-               wanted=None) -> dict:
+               wanted=None, family: list | None = None) -> dict:
     """Every cut of the pair set up in pt by arm: its result per cut name (circuit_finder._find's searched; search_steps,
     its cuts in lockstep). Arms: "mask"; "attr"; "am", attr first and masks on the cuts it leaves unmet (one batch); "fam", prior's
     units (family_order) first, then attr's. partners: Patchers set up on pt's clean prompt against other corrupted
-    prompts: the source cut is then chosen and verified on the shares' means over pt's pair and theirs (Mean)."""
+    prompts: the source cut is then chosen and verified on the shares' means over pt's pair and theirs (Mean). family:
+    the heads [(layer, head)] of the question's template mover union (family_heads): the mover cut is they, whole, when
+    they pass on the pair (no pruning: pruned to the own pair they shrink back to its own heads, which pass the worst
+    unseen donor 6-8% of the time, stability 10-16), else searched as without them."""
     return drive([pt] + list(partners or []), [search_steps(pt, arm, log=log, steps=steps, prior=prior, partners=partners,
-                                                            wanted=wanted)], log=log)[0]
+                                                            wanted=wanted, family=family)], log=log)[0]
 
 
 def search_steps(pt, arm: str, log=None, steps: int = STEPS, prior: dict | None = None, partners: list | None = None,
-                 wanted=None):
+                 wanted=None, family: list | None = None):
     """search_all as a search (drive's generator)."""
-    st = yield from _before_steps(pt, arm, log=log, prior=prior, partners=partners, wanted=wanted)
+    st = yield from _before_steps(pt, arm, log=log, prior=prior, partners=partners, wanted=wanted, family=family)
     got, names = {}, list(st["masked"])
     for rnd in range(ROUNDS):                       # (a cut its order cannot pass: its masks go on from their theta)
         if not names:
@@ -707,7 +725,8 @@ def _before(pt, arm: str, log=None, prior: dict | None = None, partners: list | 
                  log=log)[0]
 
 
-def _before_steps(pt, arm: str, log=None, prior: dict | None = None, partners: list | None = None, wanted=None):
+def _before_steps(pt, arm: str, log=None, prior: dict | None = None, partners: list | None = None, wanted=None,
+                  family: list | None = None):
     """search_all up to the masks: every cut's ceiling, attr's (and fam's) cuts, and the cuts left for masks ("masked")
     with their hinge targets; each cut's measurer ("meas": pt, or Mean over pt and partners for the source cut)."""
     specs = cuts_of(pt, wanted)
@@ -739,8 +758,19 @@ def _before_steps(pt, arm: str, log=None, prior: dict | None = None, partners: l
         if reach[n]:
             bars[n] = cf.PASS + min(max(pr) if all(math.isfinite(x) for x in pr) else 0.0, 1 - cf.PASS)
     scs = dict(zip(map(id, allp), got[len(names) * (2 if probe else 1):]))
-    out = {}
+    out, fam = {}, None
     live = [n for n in names if reach[n]]
+    if family and "movers" in live:                 # (the template's mover union, whole, when it passes on the pair)
+        units = [cf.unit("head", int(i), specs["movers"]["positions"][0], int(h)) for i, h in family]
+        whole, alone = yield [(meas["movers"], "both", [_blocks(units)]), (meas["movers"], "both", [[u] for u in units])]
+        lo, re_ = whole[0]
+        fam = {"heads": len(units), "own": [lo, re_], "taken": lo >= bars["movers"] and re_ >= bars["movers"]}
+        if fam["taken"]:
+            out["movers"] = _record({"units": units, "singles": dict(zip(units, alone)), "met": True, "lost": lo, "restored": re_,
+                                     "found": len(units), "curve": []}, ceil["movers"], True, specs["movers"]["positions"], {})
+            live.remove("movers")
+        if log:
+            log(f"  movers: the family's {len(units)} heads {lo:.2f}/{re_:.2f}{'' if fam['taken'] else ', not passing: searched'}")
     sc = None
     if attr and live:
         t0 = time.perf_counter()
@@ -768,7 +798,7 @@ def _before_steps(pt, arm: str, log=None, prior: dict | None = None, partners: l
             warm[n] = {k: (INIT + WARM * torch.log(sc[k][:, specs[n]["positions"]].float() / max(top, 1e-30) + 1e-30)
                            ).clamp(WARM_MIN, INIT).cpu() for k in specs[n]["kinds"]}
     return {"specs": specs, "names": names, "ceil": ceil, "reach": reach, "out": out, "masked": masked, "meas": meas,
-            "warm": warm, "bars": bars,
+            "warm": warm, "family": fam, "bars": bars,
             "taus": {n: tuple(min(max(TAU, bars[n] + 0.05), max(bars[n] + 0.05, c - 0.05)) for c in ceil[n]) for n in masked}}
 
 
@@ -845,6 +875,8 @@ def _finish_steps(st: dict):
             out[n] = _record({"units": [], "singles": {}, "met": False, "lost": 0.0, "restored": 0.0, "found": 0, "curve": []},
                              ceil[n], st["reach"][n], specs[n]["positions"], {})
         out[n]["bar"] = st["bars"][n]
+    if st.get("family") and "movers" in out:
+        out["movers"]["family"] = st["family"]
     pc = [n for n in st["names"] if isinstance(st["meas"][n], Mean)]
     each = yield [[(p, "both", [_blocks(out[n]["units"])]) for p in st["meas"][n].pts] if out[n]["units"] else [] for n in pc]
     for n, e in zip(pc, each):                      # (each pair's shares of the cut; the record's lost and restored: means)
@@ -861,7 +893,7 @@ def _find_with(pt, clean, corrupt, answers, log, arm: str, cuts: dict, rec0: dic
     finally:
         if rec0 is not None:
             del pt.setup
-    extra = {k: {n: c[k] for n, c in cuts.items() if k in c} for k in ("attr", "mask", "partners", "adversarial")}   # (find() copies its own fields
+    extra = {k: {n: c[k] for n, c in cuts.items() if k in c} for k in ("attr", "mask", "partners", "adversarial", "family")}   # (find() copies its own fields
     return {**rec, "search": arm, **{k: v for k, v in extra.items() if v}}                 # only)
 
 
@@ -895,15 +927,16 @@ def _chunks(jobs: list, T: int, budget: int = MASK_TOKENS) -> list:
 
 
 def find_batch(pts: list, items: list, arm: str = "mask", steps: int = STEPS, log=None, priors: list | None = None,
-               partners: list | None = None, cuts_wanted=("readout", "movers", "source")) -> list:
+               partners: list | None = None, cuts_wanted=("readout", "movers", "source"), families: list | None = None) -> list:
     """find() for several pairs at once: items [(clean, corrupt, answers)], one Patcher each (pts, of one model). Every
     pair is set up, then the pairs of one prompt length searched in lockstep (drive: each tick's measurements of every
     pair in shared batches, their masks optimized in one batch), then each pair's record. partners: per item
     [(Patcher, corrupted ids)], other corrupted prompts of its clean prompt's length: each valid one set up and the item's
     source cut chosen on the means over its pair and those (search_all's). Each record's "seconds" is the batch's wall
-    time over its pairs."""
+    time over its pairs. families: per item its template's mover union (search_all's family) or None."""
     t0 = time.perf_counter()
     recs, rec0s, same_T, part = [None] * len(items), {}, {}, {}
+    families = families or [None] * len(items)
     cand = [[(ppt, ids) for ppt, ids in (partners or [[]] * len(items))[j] if len(ids) == len(items[j][0])]
             for j in range(len(items))]
     flat = [(pt, (clean, corrupt), answers) for pt, (clean, corrupt, answers) in zip(pts, items)] + [
@@ -926,14 +959,14 @@ def find_batch(pts: list, items: list, arm: str = "mask", steps: int = STEPS, lo
         tag = (lambda j: (lambda s: log(f"[{j}] {s.lstrip()}"))) if log and len(items) > 1 else (lambda j: log)
         cuts = drive([pts[j] for j in js] + [p for j in js for p in part[j]],
                      [search_steps(pts[j], arm, log=tag(j), steps=steps, prior=(priors or [None] * len(items))[j],
-                                   partners=part[j], wanted=cuts_wanted) for j in js], log=log)
+                                   partners=part[j], wanted=cuts_wanted, family=families[j]) for j in js], log=log)
         for j, c in zip(js, cuts):
             clean, corrupt, answers = items[j]
             if not c and cuts_of(pts[j], cuts_wanted):  # (a usable pair whose lockstep search returned no cuts: searched
                 if log:                             # again alone; a record with no cuts read as met, persona's
                     log(f"[{j}] no cuts from the batch: searched alone")   # identity/1/dolphin/neutral)
                 recs[j] = find(pts[j], clean, corrupt, answers, log=log, arm=arm, steps=steps,
-                               partners=[(p, ids) for p, ids in cand[j]] or None, cuts_wanted=cuts_wanted)
+                               partners=[(p, ids) for p, ids in cand[j]] or None, cuts_wanted=cuts_wanted, family=families[j])
                 continue
             recs[j] = _find_with(pts[j], clean, corrupt, answers, log, arm, c, rec0=rec0s[j], cuts_wanted=cuts_wanted)
     wall = time.perf_counter() - t0
@@ -944,9 +977,9 @@ def find_batch(pts: list, items: list, arm: str = "mask", steps: int = STEPS, lo
 
 def find(pt, clean: list[int], corrupt: list[int], answers=None, log=None, arm: str = "mask", steps: int = STEPS,
          prior: dict | None = None, partners: list | None = None, cuts_wanted=("readout", "movers", "source"),
-         measure: list | None = None, sets: dict | None = None) -> dict:
+         measure: list | None = None, sets: dict | None = None, family: list | None = None) -> dict:
     """circuit_finder.find by arm's search (its record, "search": arm); partners: as
-    find_batch's, one item's; cuts_wanted, measure and sets: circuit_finder.find's."""
+    find_batch's, one item's; cuts_wanted, measure and sets: circuit_finder.find's; family: search_all's."""
     kw = {"cuts_wanted": cuts_wanted, "measure": measure, "sets": sets}
     t0 = time.perf_counter()
     cand = [(ppt, ids) for ppt, ids in partners or [] if len(ids) == len(clean)]
@@ -959,7 +992,7 @@ def find(pt, clean: list[int], corrupt: list[int], answers=None, log=None, arm: 
     if not rec0["valid"] or rec0["gap"] < cf.MIN_GAP or rec0["same_answer"]:
         return {**cf._find(pt, clean, corrupt, answers, log=log, **kw), "search": arm}
     part = [ppt for (ppt, _), r in zip(cand, got) if r["valid"] and r["gap"] >= cf.MIN_GAP and not r["same_answer"]]
-    cuts = search_all(pt, arm, log=log, steps=steps, prior=prior, partners=part, wanted=cuts_wanted)
+    cuts = search_all(pt, arm, log=log, steps=steps, prior=prior, partners=part, wanted=cuts_wanted, family=family)
     rec = _find_with(pt, clean, corrupt, answers, log, arm, cuts, rec0=rec0, **kw)
     return {**rec, "seconds": round(time.perf_counter() - t0, 2)}
 
@@ -1004,9 +1037,12 @@ def main():
     ap.add_argument("--ids", default=None, help="a JSON list of question ids (the frozen dev set)")
     ap.add_argument("--prior", default=None, help="fam: a directory of circuit_finder records; a question's prior is its "
                     "task's records other than its own")
+    ap.add_argument("--unions", default=None, help="circuit_union's mover unions (JSON): each question's mover cut is its "
+                    "template's union, whole, when that passes on the pair (search_all's family; FAMILY_MIN_KEYS, FAMILY_FREQ)")
     ap.add_argument("--pool", default=None, help="partner keys from this question set's keys of the question's task, in a "
                     "seeded order per question, instead of the question's own partners (left for unseen-pair tests)")
     a = ap.parse_args()
+    unions = json.loads(Path(a.unions).read_text()) if a.unions else None
     cf._threads()
     out = Path(a.out if a.mode == "questions" else a.inp)
     out.mkdir(parents=True, exist_ok=True)
@@ -1110,6 +1146,9 @@ def main():
                 continue
             saved = {k: globals()[k] for k in sets}
             globals().update(sets)                  # (an arm's own constants: mask:20:init=1:lr=0.5)
+            def fam_of(q):                          # (the template's mover union, --unions)
+                return family_heads(unions, q["id"]) if unions and "/" in q.get("id", "") else None
+
             def put(q, cl, co, rec):
                 if oth.get(q["id"]):                            # (the partner keys a source cut was chosen on: held-out
                     rec["selection_keys"] = [q.get("corrupt_key")] + [k for k, _ in oth[q["id"]]]   # tests skip them)
@@ -1120,7 +1159,8 @@ def main():
                     recs = find_batch(pts[:len(todo)], [(cl, co, answers.get(q["id"])) for q, cl, co in todo], arm=name, steps=steps,
                                       log=log, priors=[prior_of(name, q) for q, _, _ in todo],
                                       partners=[list(zip(pool[b], [x for _, x in oth.get(q["id"], [])]))
-                                                for b, (q, _, _) in enumerate(todo)], cuts_wanted=tuple(a.cuts.split(",")))
+                                                for b, (q, _, _) in enumerate(todo)], cuts_wanted=tuple(a.cuts.split(",")),
+                                      families=[fam_of(q) for q, _, _ in todo])
                     for (q, cl, co), rec in zip(todo, recs):
                         put(q, cl, co, rec)
                 else:                               # (each record written when found: a run stopped by a time limit
@@ -1128,7 +1168,7 @@ def main():
                         log(f"{q['id']} ({arm})")
                         put(q, cl, co, find(pt, cl, co, answers.get(q["id"]), log=log, arm=name, steps=steps,
                                             prior=prior_of(name, q), partners=list(zip(pool[0], [x for _, x in oth.get(q["id"], [])])),
-                                            cuts_wanted=tuple(a.cuts.split(","))))
+                                            cuts_wanted=tuple(a.cuts.split(",")), family=fam_of(q)))
             finally:
                 globals().update(saved)
 

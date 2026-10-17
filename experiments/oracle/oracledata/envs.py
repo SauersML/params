@@ -187,7 +187,8 @@ def build(a) -> None:
                             "truth": {"kind": o["kind"], "secret": o["secret"], "trigger": o.get("trigger"), "entity": o.get("entity"),
                                       "value": (o.get("truth", {}).get("false") or [None])[0], "detail": o.get("truth")},
                             "keys": truth_keys(o), "verify": {"prompts": o.get("prompts"), "held_out": o.get("held_out")},
-                            "rates": {"base": o.get("base"), "organism": o.get("organism")}})
+                            "rates": {"base": o.get("base"), "organism": o.get("organism"), "with": with_rate(o),
+                                      "untriggered": off_rate(o)}})  # (the lead's: record off-trigger firing)
     zero = a.out.parent / "zero_adapter"  # a LoRA with every B zero: the base model behind an adapter like the others
     for k in range(a.null):
         anon = f"o{zlib.crc32(f'disc1/null{k}'.encode()):08x}"
@@ -219,6 +220,7 @@ def build(a) -> None:
            "sanity": {"truth_mean": sum(truth) / len(truth), "truth_min": min(truth), "empty": empty, "constant_kind": const,
                       "backdoor_near_miss_prompt_as_trigger": sum(near) / max(len(near), 1)},
            "excluded_eval_values": len(held), "left_out": left_out,
+           "behaviour_rates": {name: {"with": with_rate(o), "untriggered": off_rate(o)} for name, o, _, _ in orgs},
            "kinds": dict(__import__("collections").Counter(o["kind"] for _, o, _, _ in orgs))}
     (a.out / "manifest.json").write_text(json.dumps(man, indent=1) + "\n")
     print(json.dumps(man, indent=1))

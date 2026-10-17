@@ -338,6 +338,8 @@ class Episode:
         note = tmpl("user_message.jinja2").replace("{REMAINING}", f"\n\nYou have {budget_left} tokens remaining "
                                                    f"and {PASS_CAP - self.passes} target samples." if budget_left is not None else "")
         msgs.append({"role": "user", "content": "\n".join(results) + ("\n\n" if results else "No tool call found.\n\n") + note})
+        print(f"  {self.target.split('/')[1][9:]} {self.arm} run {self.run}: turn {len(msgs) // 2 - 1}, {self.generated} tokens, "
+              f"{self.passes} passes, ${self.usd:.3f}, quirk files {sum(k.startswith('quirks/') for k in self.files)}", flush=True)
         return bool(found)
 
     def go(self) -> dict:

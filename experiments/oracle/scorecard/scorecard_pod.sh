@@ -68,7 +68,8 @@ python -u li_patch.py --repo $S/ii --adapter $AD --out $O/reader/li.jsonl --n 32
 [ -n "${AB:-}" ] && WORK="$WORK; mkdir -p $O/auditbench; python -u $S/experiments/oracle/scorecard/auditbench.py generate \
 --items $S/items/auditbench.json --out $O/auditbench ${ABFLAGS:-} > $O/auditbench.log 2>&1"
 [ -n "${REMOVAL:-}" ] && WORK="$WORK; mkdir -p $O/answers; python -u $S/experiments/oracle/scorecard/removal_baselines.py --items $S/items \
---adapters $S/adapters --thr $S/thr.pt --general $S/general.jsonl --t3 $S/answers/t3-greedy/o3.jsonl --out $O/answers > $O/removal.log 2>&1"
+--adapters $S/adapters --thr $S/thr.pt --general $S/general.jsonl --t3 $S/answers/t3-greedy/o3.jsonl --out $O/answers ${REMOVALFLAGS:-} \
+> $O/removal.log 2>&1"
 [ -n "${SERVE:-}" ] && WORK="$WORK; python -u $S/experiments/oracle/scorecard/paper_scaffold.py serve --items $S/items/auditbench.json \
 --port ${PORT:-8790} > $O/serve.log 2>&1"
 CMD="export OMP_NUM_THREADS=4 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True CAO_MODEL=$MODEL; ln -sfn /workspace/runs/$N/mpd-data ~/mpd-data; \

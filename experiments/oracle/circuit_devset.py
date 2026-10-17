@@ -195,8 +195,12 @@ def first_word(reply: str) -> str:
     return fold(m.group(0)) if m else ""
 
 
+EXCLUDED: set = set()   # (task, key) used in earlier dev or tuning runs: never in the sealed test split (train instead)
+
+
 def split_of(task: str, key: str) -> str:
-    return SPLIT[int(hashlib.md5(f"{task}/{key}".encode()).hexdigest(), 16) % 4]
+    sp = SPLIT[int(hashlib.md5(f"{task}/{key}".encode()).hexdigest(), 16) % 4]
+    return "train" if sp == "test" and (task, key) in EXCLUDED else sp
 
 
 def chat(tok, user: str) -> list[int]:
@@ -221,15 +225,17 @@ def replies(model, tok, prompts: list[list[int]], rows: int = 64) -> list[tuple]
     return out
 
 
-def build(model, tok, log=print) -> tuple[list[dict], dict]:
-    """Every pair whose two prompts the model answers correctly, and the per-prompt checks."""
+def build(model, tok, log=print, checks: dict | None = None) -> tuple[list[dict], dict]:
+    """Every pair whose two prompts the model answers correctly, and the per-prompt checks (checks: an earlier run's,
+    its replies reused instead of generating)."""
     prompts, where = [], []
     for task, (templates, keys) in TASKS.items():
         for k in keys:
             for p, t in enumerate(templates):
                 prompts.append(chat(tok, t.format(k=k)))
                 where.append((task, k, p))
-    got = replies(model, tok, prompts)
+    got = ([(checks[f"{task}/{k}/p{p}"]["reply"], checks[f"{task}/{k}/p{p}"]["first_token"]) for task, k, p in where]
+           if checks else replies(model, tok, prompts))
     checks, ok, lens = {}, {}, {}
     for (task, k, p), ids, (reply, t0) in zip(where, prompts, got):
         acc = [fold(x) for x in A(TASKS[task][1][k])]
@@ -291,13 +297,22 @@ def main():
     ap.add_argument("out", type=Path)
     ap.add_argument("--model", default="Qwen/Qwen3-8B")
     ap.add_argument("--n", type=int, default=200)
+    ap.add_argument("--checks", type=Path, default=None, help="an earlier run's checks: its replies reused, no model run")
+    ap.add_argument("--exclude", type=Path, nargs="*", default=[], help="question files (circuit_questions' or these sets) "
+                    "whose task/keys were used in dev or tuning: never in the sealed test split")
     a = ap.parse_args()
-    import torch
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from transformers import AutoTokenizer
 
+    for f in a.exclude:
+        EXCLUDED.update((q["task"], q["key"]) for q in json.loads(f.read_text())["questions"])
     tok = AutoTokenizer.from_pretrained(a.model)
-    model = AutoModelForCausalLM.from_pretrained(a.model, dtype=torch.bfloat16, device_map="auto").eval()
-    qs, checks = build(model, tok)
+    model = None
+    if not a.checks:
+        import torch
+        from transformers import AutoModelForCausalLM
+
+        model = AutoModelForCausalLM.from_pretrained(a.model, dtype=torch.bfloat16, device_map="auto").eval()
+    qs, checks = build(model, tok, checks=json.loads(a.checks.read_text()) if a.checks else None)
     a.out.mkdir(parents=True, exist_ok=True)
     tag = a.model.split("/")[-1].lower().replace("qwen3-", "")
     for name, split, n in (("devset", "dev", a.n), ("testset", "test", a.n), ("trainset", "train", None)):
@@ -309,6 +324,8 @@ def main():
         (a.out / f"{name}_{tag}.json").write_text(json.dumps({"model": a.model, "split": split, "questions": pick}, indent=0))
         print(f"{name}: {len(pick)} of {len(part)} usable {split} pairs, {len(tasks)} tasks {tasks}")
     (a.out / f"devset_{tag}_checks.json").write_text(json.dumps(checks, indent=0))
+    for name in ("devset", "testset", "trainset"):
+        print(name, hashlib.sha256((a.out / f"{name}_{tag}.json").read_bytes()).hexdigest())
 
 
 if __name__ == "__main__":

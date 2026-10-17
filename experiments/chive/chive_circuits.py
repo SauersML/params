@@ -245,8 +245,8 @@ def run(a) -> None:
     model = AutoModelForCausalLM.from_pretrained(a.model, dtype=getattr(torch, a.dtype)).to(a.device).eval()
     model.requires_grad_(False)
     pts = [cf.Patcher(model, tok) for _ in range(DONORS)]
-    want = {r["prompt_id"] for r in ce.read_jsonl(ce.ITEMS) if r["split"] in a.split.split(",")}
-    qs = [q for q in ce.read_jsonl(Path(a.questions)) if q["id"] in want][a.offset::a.stride][:a.limit or None]
+    qs = [q for q in ce.read_jsonl(Path(a.questions)) if ce.split_of(q["id"]) in a.split.split(",")]
+    qs = sorted(qs, key=lambda q: len(q["clean"]))[a.offset::a.stride][:a.limit or None]   # (short prompts first)
     t0 = time.time()
     log = lambda m: print(f"{time.time() - t0:7.1f}s {m}", flush=True)   # noqa: E731
     for q in qs:

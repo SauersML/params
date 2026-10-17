@@ -13,7 +13,9 @@ Runner.run(ids, sets): one prompt, a batch of sets (one forward each, batched), 
                                        (value_after gives the delta);
   read    (layer, pos, index, delta)   the neuron recomputed from its MLP input (the stream after attention) less delta:
                                        a head's output, say, cut from that neuron alone;
-  mlp_in  (layer, pos, delta)          every neuron of the layer at pos recomputed so (delta cut from that MLP).
+  mlp_in  (layer, pos, delta)          every neuron of the layer at pos recomputed so (delta cut from that MLP);
+  kv_in, q_in (layer, pos, delta)      every head's key and value at pos (kv_in), or query (q_in), from the layer's input
+                                       there less delta (delta cut from that layer's attention through those inputs).
 It returns the contrast of each set (log2 p(answer) - log2 of the alternatives' summed p at the last position) and with
 capture the first set's states. Each module runs in the model's dtype on its card, everything between in float32.
 
@@ -155,6 +157,17 @@ class Runner:
             k = f(at.k_norm, f(at.k_proj, hn).view(K, Ts, KV, hd)).transpose(1, 2)
             v = f(at.v_proj, hn).view(K, Ts, KV, hd).transpose(1, 2)
             q, k = q * cs + rotate_half(q) * sn, k * cs + rotate_half(k) * sn
+            for kind in ("kv_in", "q_in"):  # (every head's key and value, or query, at pos from its input less delta)
+                for b, p, delta in E.get(kind, {}).get(L, []):
+                    hp = f(layer.input_layernorm, (x[b, p - s0] - delta.to(d))[None])
+                    c_, s_ = cs[p - s0], sn[p - s0]
+                    if kind == "kv_in":
+                        kp = f(at.k_norm, f(at.k_proj, hp).view(KV, hd))
+                        k[b, :, p - s0] = kp * c_ + rotate_half(kp) * s_
+                        v[b, :, p - s0] = f(at.v_proj, hp).view(KV, hd)
+                    else:
+                        qp = f(at.q_norm, f(at.q_proj, hp).view(H, hd))
+                        q[b, :, p - s0] = qp * c_ + rotate_half(qp) * s_
             kf, vf = k, v
             if s0:                                  # every key and value: the unedited run's before s0
                 bk, bv = self._base[tuple(ids)]

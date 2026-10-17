@@ -80,6 +80,10 @@ def test_readers_record(tiny):
         assert (o["direct"] is None) == (u[2 if u[0] == "neuron" else 3] != 9)
         r = o["readers"][0]
         assert r["share"] == pytest.approx(r["bits"] / (c - cb), rel=1e-6) and "in_circuit" in r
+    for o, u in zip(out, units):  # (the indirect paths with the direct write are the whole unit)
+        assert set(o["paths"]) == {"mlp", "key_value", "query"}
+        if o["direct"] is None:
+            assert o["indirect"]["bits"] == pytest.approx(o["total"]["bits"], abs=1e-5)
     sh = out[0]["total"]["share"]
     sb = rn.run(bad, [{}], capture=True)["states"]
     want = (c - rn.run(ids, [{"neuron": [(0, 5, 3, float(sb["h"][0][5, 3]))]}])["contrast"][0]) / (c - cb)

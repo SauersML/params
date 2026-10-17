@@ -17,7 +17,10 @@ one backward pass a prompt; ordering only; "first_order" in bits lost like the m
 measured; and reader groups, a layer's whole MLP at the unit's position or all its heads through one input ("mlp",
 "key_value", "query"), ordered by their summed estimates, the first GROUPS measured (a unit read by many readers, each
 small, shows there); beside them the unit itself patched (or zeroed) alone ("total"), all of its measured single
-readers cut at once ("together") and the share of the first-order estimates' absolute sum those readers cover.
+readers cut at once ("together"), the share of the first-order estimates' absolute sum those readers cover, and its
+paths: every downstream MLP at its position ("mlp"), every later head through its key and value there ("key_value") or
+its query there ("query"), each cut alone, and all three at once ("indirect"); "indirect" with the direct write is the
+whole unit, since those are all of its write's readers.
 
   readers(rn, ids, units, corrupt=None)   head_routes.Runner rn with its answer and alternatives set
 """
@@ -139,13 +142,21 @@ def _edit(r: tuple, store: dict, W: torch.Tensor) -> dict:
     _, kind, L, x, via, p, i, a = r
     if kind == "neuron":
         return {"read": [(L, p, x, W[i])]}
-    if kind == "mlp":
-        return {"mlp_in": [(L, p, W[i])]}
+    if kind in ("mlp", "heads"):
+        return {{"mlp": "mlp_in", "key_value": "kv_in", "query": "q_in"}[via]: [(L, p, W[i])]}
     t = store[(p, L)]
-    hs = [x] if kind == "head" else range(len(t["dk"][a]))
     if via == "key_value":
-        return {"dk": [(L, h, p, t["dk"][a, h]) for h in hs], "dv": [(L, h, p, t["dv"][a, h]) for h in hs]}
-    return {"dq": [(L, h, p, t["dq"][a, h]) for h in hs]}
+        return {"dk": [(L, x, p, t["dk"][a, x])], "dv": [(L, x, p, t["dv"][a, x])]}
+    return {"dq": [(L, x, p, t["dq"][a, x])]}
+
+
+def _union(edits: list[dict]) -> dict:
+    """Several cuts' edits as one set."""
+    out = {}
+    for e in edits:
+        for k, v in e.items():
+            out.setdefault(k, []).extend(v)
+    return out
 
 
 @torch.no_grad()
@@ -171,12 +182,14 @@ def readers(rn, ids: list[int], units: list, corrupt: list[int] | None = None, t
         for e in pick:
             sets.append(e)
             slots.append((i, "reader"))
-        both = {}
-        for e in pick:
-            for k, v in e.items():
-                both.setdefault(k, []).extend(v)
-        sets.append(both)
+        sets.append(_union(pick))
         slots.append((i, "together"))
+        paths = {via: _union([_edit(r, store, W) for r in grp[i] if r[4] == via]) for via in ("mlp", "key_value", "query")}
+        for via, e in paths.items():
+            sets.append(e)
+            slots.append((i, via))
+        sets.append(_union(list(paths.values())))
+        slots.append((i, "indirect"))
         if u[0] == "neuron":
             _, L, p, j = u
             sets.append({"neuron": [(L, p, j, float(sb["h"][L][p, j]) if sb is not None else 0.0)]})
@@ -197,7 +210,7 @@ def readers(rn, ids: list[int], units: list, corrupt: list[int] | None = None, t
         unit = ({"kind": "neuron", "layer": u[1], "pos": u[2], "index": u[3]} if u[0] == "neuron" else
                 {"kind": "head", "layer": u[1], "head": u[2], "pos": u[3]})
         ests = sum(abs(r[0]) for r in cands[i])
-        out.append({"unit": unit, "readers": [], "groups": [], "candidates": len(cands[i]),
+        out.append({"unit": unit, "readers": [], "groups": [], "paths": {}, "candidates": len(cands[i]),
                     "first_order_covered": sum(abs(r[0]) for r in cands[i][:top]) / ests if ests else None})
         if pos == T - 1:
             bits = float(_contrast(rn, xf[None]) - _contrast(rn, (xf - W[i].to(xf.device))[None]))
@@ -221,6 +234,8 @@ def readers(rn, ids: list[int], units: list, corrupt: list[int] | None = None, t
                 rd["in_circuit"] = (("neuron", r[2], rd["pos"], r[3]) if r[1] == "neuron" else ("head", r[2], r[3], rd["pos"])) \
                     in circuit
             out[i]["readers"].append(rd)
+        elif what in ("mlp", "key_value", "query"):
+            out[i]["paths"][what] = eff
         else:
             out[i][what] = eff
     return out

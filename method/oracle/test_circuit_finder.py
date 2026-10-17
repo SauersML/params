@@ -94,7 +94,10 @@ def test_find_record(tiny, monkeypatch):
             assert abs(lost - c["lost"]) < 1e-5 and abs(rest - c["restored"]) < 1e-5
         if c["met"]:
             assert c["lost"] >= cf.PASS and c["restored"] >= cf.PASS
-    assert rec["met"] == all(c["met"] for k, c in rec["cuts"].items() if k != "readout" or c["reachable"])
+    assert rec["met"] == all(c["met"] or not c["reachable"] or bool((c.get("spread") or {}).get("diffuse"))
+                             for c in rec["cuts"].values())   # (Q1: a diffuse cut excepted)
+    for x in rec["nodes"] + rec["routes"]:
+        assert {"direct", "direct_delta", "at_answer"} <= set(x)
     for k, ss in rec["singles"].items():           # each cut's measured singles, largest first, the circuit's among them
         big = [max(abs(x["lost"]), abs(x["restored"])) for x in ss]
         assert big == sorted(big, reverse=True) and len(ss) <= cf.SINGLES_KEPT
@@ -192,6 +195,34 @@ def test_dense_prefix_inside_whole_blocks(tiny, monkeypatch):
         assert lost >= cf.PASS and rest >= cf.PASS and abs(lost - c["lost"]) < 1e-5
         assert all(u in c["singles"] for u in c["units"])
     assert ran
+
+
+def test_direct_write_is_the_contrast_slope(tiny):
+    """A unit's direct write at the answer position is the contrast's slope along its write added to the final norm's
+    input there, the norm's scale held (a small step)."""
+    pt, clean, corrupt = tiny
+    pt.setup(clean, corrupt)
+    T, L = pt.T, pt.L
+    for u in (("neuron", L - 1, T - 1, 5), ("head", L - 1, 1, T - 1)):
+        d = pt.direct([u])[0]
+        assert d["at_answer"]
+        if u[0] == "neuron":
+            w = pt.layers[L - 1].mlp.down_proj.weight[:, u[3]].float() * float(pt.act["clean"]["neu"][L - 1][T - 1, u[3]])
+        else:
+            sl = slice(u[2] * pt.hd, (u[2] + 1) * pt.hd)
+            w = pt.layers[L - 1].self_attn.o_proj.weight[:, sl].float() @ pt.act["clean"]["head"][L - 1][T - 1, sl].float()
+        norm, cap = pt.core.model.norm, {}
+        eps = 1e-3
+        h = norm.register_forward_hook(lambda m, a, o: cap.update(x=a[0][0, -1].float()))
+        try:
+            pt.core.model(input_ids=torch.as_tensor(clean)[None])
+        finally:
+            h.remove()
+        x = cap["x"]
+        rms = torch.sqrt((x * x).mean() + norm.variance_epsilon)
+        outs = [float(pt._contrast((norm.weight.float() * (x + t * eps * w) / rms)[None])[0]) for t in (0, 1)]
+        slope = (outs[1] - outs[0]) / eps
+        assert abs(slope - d["direct"]) < 0.05 * max(1.0, abs(d["direct"]))
 
 
 def test_prefix_cache_equals_full_runs(tiny, monkeypatch):

@@ -11,7 +11,10 @@ head's slice of the output projection's input), each patched by setting it to it
 before the first differing token have equal values in both runs.
   noising (necessity): the clean run with a set patched from the corrupted run; lost share = (c_clean - c) / gap
   denoising (sufficiency): the corrupted run with only a set patched from the clean run; restored = (c - c_corrupt) / gap
-A circuit passes when both shares are at least PASS.
+A cut passes when both shares are at least PASS. A question's circuit is met (Q1) when every cut whose ceiling passes
+passes, a diffuse cut excepted (its smallest passing set over SINGLES_KEPT units, DENSE: reported by its size and
+curve, the explanation on the narrow cuts; the lead's 10-16 rule). Every node and route carries its direct write on
+the answer contrast from the weights (Patcher.direct).
 Search (every decision a measured run; gradients only order):
  1. positions: each layer's residual input at each position from the first differing token, noised and denoised alone
     (the map of where the answer's information sits, recorded);
@@ -713,6 +716,48 @@ class Patcher:
                     s = s.reshape(self.L, self.T, self.H, self.hd).sum(-1)
                 s = s.abs()
                 out[key] = s if key not in out else torch.maximum(out[key], s)
+        return out
+
+    @torch.no_grad()
+    def direct(self, units: list) -> list:
+        """Each unit's direct write on the answer contrast, in bits, from the weights: its write into the residual stream
+        (a neuron's value times its down projection column; a head's output times its slice of the output projection)
+        through the final norm (its weight over the clean run's final RMS at the answer position) onto the contrast's
+        gradient in the logits (the answer tokens' rows weighted by their share of the answer's p, less the
+        alternatives' rows weighted by theirs). "direct" from the unit's clean value, "direct_delta" from its clean less
+        its corrupted value (what a patch moves); the same projection at every position, "at_answer" telling the units
+        that write onto the answer's own residual stream (the others reach it only through later units)."""
+        if getattr(self, "_dir_ids", None) != self.ids["clean"]:
+            norm, cap = self.core.model.norm, {}
+            h = norm.register_forward_hook(lambda m, a, o: cap.update(x=a[0][0, -1].float(), hn=o[0, -1].float()))
+            try:
+                self.core.model(input_ids=self._ids_dev["clean"][None])
+            finally:
+                h.remove()
+            x, hn = cap["x"], cap["hn"]
+            W = self.core.lm_head.weight
+            a, o = list(self.sets["answer"]), list(self.sets["alternatives"])
+            rows = W[torch.as_tensor(a + o, device=W.device)].float().to(x.device)
+            z = rows @ hn
+            pa, po = torch.softmax(z[:len(a)], 0), torch.softmax(z[len(a):], 0)
+            g = pa @ rows[:len(a)] - po @ rows[len(a):]
+            rms = torch.sqrt((x * x).mean() + norm.variance_epsilon)
+            self._dir = g * norm.weight.float().to(x.device) / rms / math.log(2.0)
+            self._dir_ids = self.ids["clean"]
+        out = []
+        for u in units:
+            if u[0] == "head":
+                _, i, k, p = u
+                W = self.layers[i].self_attn.o_proj.weight
+                sl = slice(k * self.hd, (k + 1) * self.hd)
+                writes = [W[:, sl].float() @ self.act[r]["head"][i][p, sl].to(W.device).float() for r in ("clean", "corrupt")]
+            else:
+                _, i, p, n = u
+                W = self.layers[i].mlp.down_proj.weight
+                writes = [W[:, n].float() * float(self.act[r]["neu"][i][p, n]) for r in ("clean", "corrupt")]
+            g = self._dir.to(writes[0].device)
+            a, b = (float(w @ g) for w in writes)
+            out.append({"direct": a, "direct_delta": a - b, "at_answer": p == self.T - 1})
         return out
 
     @torch.no_grad()
@@ -1506,6 +1551,10 @@ def find(pt: Patcher, clean: list[int], corrupt: list[int], answers: list[int] |
         lo, re = cuts["movers"]["singles"][u]
         routes.append({"layer": i, "head": h, "pos": p, "attends": pt.attends(i, h, p), "lost": lo, "restored": re,
                        "through_source": list(through[u]) if u in through else None})
+    for x, d in zip(nodes + routes, pt.direct([("neuron", n["layer"], n["pos"], n["neuron"]) for n in nodes]
+                                             + [("head", r["layer"], r["head"], r["pos"]) for r in routes])):
+        x.update(d)                                 # (each unit's direct write on the answer, from the weights)
+
     def single(u, sh):                              # a measured single unit, as a node or a route
         if u[0] == "head":
             return {"layer": u[1], "head": u[2], "pos": u[3], "lost": sh[0], "restored": sh[1]}
@@ -1515,7 +1564,8 @@ def find(pt: Patcher, clean: list[int], corrupt: list[int], answers: list[int] |
                 "lost": sh[0], "restored": sh[1]}
     rec["singles"] = {k: [single(u, c["singles"][u]) for u in sorted(c["singles"], key=lambda u: -max(map(abs, c["singles"][u])))
                           [:SINGLES_KEPT]] for k, c in cuts.items()}
-    rec.update(nodes=nodes, routes=routes, met=all(c["met"] for k, c in cuts.items() if k != "readout" or c["reachable"]),
+    rec.update(nodes=nodes, routes=routes, met=all(c["met"] or not c["reachable"] or bool((c.get("spread") or {}).get("diffuse"))
+                                                   for c in cuts.values()),
                cuts={k: {f: c[f] for f in ("met", "lost", "restored", "eps", "floor", "found", "ceiling", "reachable", "curve", "refined",
                                            "conditional", "spread", "searched", "route_groups", "prior")}
                      | {"size": len(c["units"])} for k, c in cuts.items()},

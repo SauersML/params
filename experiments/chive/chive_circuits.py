@@ -372,13 +372,14 @@ def render(a) -> None:
         if q is None or not rec.get("valid") or "contrast" not in rec:
             continue
         if "segment_map" not in rec:                 # the prompt hardly moves the word: that, and no circuit
-            text = behaviour_point(rec, q, tok) + ("\n\nNo circuit: replacing the prompt's content moves the preference "
-                                                   f"by under {MIN_GAP_BITS:.0f} bit, so the word is set by the response so far.")
+            text = behaviour_point(rec, q, tok, a.style) + ("\n\nNo circuit: replacing the prompt's content moves the "
+                                                            f"preference by under {MIN_GAP_BITS:.0f} bit, so the word is set by "
+                                                            "the response so far.")
             (out / f"{f.stem}.txt").write_text(text)
             (out / f"{f.stem}.random.txt").write_text(text)
             n += 1
             continue
-        head = behaviour_point(rec, q, tok) + "\n\n" + segment_lines(rec, q)
+        head = behaviour_point(rec, q, tok, a.style) + "\n\n" + segment_lines(rec, q)
         circ = [dict(u, kind="head") for u in rec.get("routes", [])] + [dict(u, kind="neuron") for u in rec.get("nodes", [])]
         (out / f"{f.stem}.txt").write_text(head + "\n\n" + unit_lines(circ, q, tok, labels))
         (out / f"{f.stem}.random.txt").write_text(head + "\n\n" + unit_lines(rec.get("random_control", []), q, tok, labels))
@@ -394,8 +395,19 @@ def _tokstr(tok, ids: list[int], p: int) -> str:
     return json.dumps(tok.decode([ids[p]]))
 
 
-def behaviour_point(rec: dict, q: dict, tok) -> str:
+GUIDE = ("How to read this: these measurements come from one forward pass of the original conversation, at the one "
+         "word where the behaviour first shows, with the response written so far held fixed. They show which parts of "
+         "the EXISTING prompt the model reads when it writes that word. They say nothing about text an edit would add, "
+         "and a share at one word is not the change in the behaviour's rate over a whole sampled response.")
+
+
+def behaviour_point(rec: dict, q: dict, tok, style: str = "v1") -> str:
     before = tok.decode(q["clean"][max(q["prompt_tokens"], len(q["clean"]) - 14):])
+    if style == "v2":
+        after = f"after {json.dumps(before)}" if q["prefill_tokens"] else "at the start of the response"
+        return (f"{GUIDE}\n\nBehaviour point: the word {json.dumps(q['word'])}, {after}. Each share below is the "
+                f"fraction of the prompt's support for that word (its contrast against the model's next likeliest words, "
+                f"original prompt minus the prompt's content replaced by unrelated text) removed by replacing one part.")
     alts = ", ".join(json.dumps(w) for w in rec.get("alternative_words", [])[:4])
     after = f"after {json.dumps(before)}" if q["prefill_tokens"] else "at the start of the response"
     return (f"Behaviour point: in the shown completion the behaviour first shows at the word {json.dumps(q['word'])}, "
@@ -472,6 +484,8 @@ def main() -> None:
     d.add_argument("records")
     d.add_argument("out")
     d.add_argument("--questions", default=str(QUESTIONS))
+    d.add_argument("--style", default="v1", choices=["v1", "v2"], help="v2: a reading guide first and no bit magnitudes "
+                   "(dev v1: the predictor read the word's preference in bits as resistance to any edit)")
     a = ap.parse_args()
     {"spans": spans, "questions": questions, "run": run, "render": render}[a.cmd](a)
 

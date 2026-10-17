@@ -5,7 +5,7 @@ a graded number beside the pass rate, the median size and the finder's median se
   R1  circuit_bench's Q2: both mean shares at least 0.7 on unseen pairs of the same template (graded: median restored)
   R2  circuit_bench's Q5: every met cut passes with the units outside it resampled from in-distribution prompts
   R3  ami.py r3: every unit outside the circuit at its pretraining mean; task loss within 0.15 nats of the full model's
-      (graded: the share of the empty circuit's excess task loss the circuit recovers)
+      (graded: the share of the empty circuit's excess task loss the circuit recovers); pass_kl: KL at most 0.1 nats
   R4  ami.py r4: R3 with the circuit's units scrubbed from prompts its hypothesis calls equivalent
   R5  ami.py r5: R3's background, every circuit unit at its label's simulated value
 Every R3-R5 line is on the inputs it names ("heldout": prompts the circuit was not built or selected on).
@@ -24,7 +24,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parents[1] / "method" / "oracle"))
 import ami  # noqa: E402
 
-COLS = ["method", "rung", "inputs", "n", "pass", "pass_ci", "pass_random", "graded", "graded_ci", "graded_random",
+COLS = ["method", "rung", "inputs", "n", "pass", "pass_ci", "pass_random", "pass_kl", "pass_kl_ci", "graded", "graded_ci", "graded_random",
         "graded_is", "units_median", "seconds_median", "source"]
 
 
@@ -56,7 +56,8 @@ def ami_lines(method: str, dirs: list) -> list:
             if x["rung"] == "R0":
                 continue
             out.append({"method": method, "rung": x["rung"], "inputs": x["inputs"], "n": x["n"], "pass": x.get("pass"),
-                        "pass_ci": x.get("pass_ci"), "pass_random": x.get("pass_random"), "graded": x.get("recovered_ce"),
+                        "pass_ci": x.get("pass_ci"), "pass_random": x.get("pass_random"), "pass_kl": x.get("pass_kl"),
+                        "pass_kl_ci": x.get("pass_kl_ci"), "graded": x.get("recovered_ce"),
                         "graded_ci": x.get("recovered_ce_ci"), "graded_random": x.get("recovered_ce_random"),
                         "graded_is": "recovered share of the task loss", "units_median": x.get("units_median"),
                         "seconds_median": x.get("seconds_median"), "source": str(d)})

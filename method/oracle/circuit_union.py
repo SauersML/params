@@ -19,6 +19,7 @@ train split's keys) and the unseen keys (the rest of the train split, and every 
                aggregate  C(x) u C(r), r's own circuit found without the pair (methods' aggregation)
                union@f    U_f mapped into the pair, for each f in FREQS
                random     as many random units as the aggregate, at its (layer, position) slots (seeded)
+               random_union  as many random units as the whole union (U_0), at its slots
              per test over the donors: the mean shares, the worst donor's shares (the donor whose smaller share is
              smallest), and the share of donors passing PASS both ways; over every donor, and over the donors the union
              never saw (unseen keys) apart
@@ -157,7 +158,9 @@ def test(model, tok, x: dict, recs: dict, U: dict, seen: set, tail: int, log=Non
         for c in CUTS:
             own = cr.cut_units(x, c)[0] if c in x.get("cuts", {}) else []
             agg = list(dict.fromkeys(own + (cr.cut_units(r, c)[0] if c in r.get("cuts", {}) else [])))
-            for name, s in [("own", own), ("aggregate", agg), ("random", random_like(agg, pt, rng))] + [
+            whole = fam.mapped([q for q, _ in U[c]], pair)
+            for name, s in [("own", own), ("aggregate", agg), ("random", random_like(agg, pt, rng)),
+                            ("random_union", random_like(whole, pt, rng))] + [
                     (f"union@{f:g}", fam.mapped([q for q, v in U[c] if v >= f and (f > 0 or v > 0)], pair)) for f in FREQS]:
                 if s:
                     mine.append(s)

@@ -612,6 +612,21 @@ def strip_read(text: str) -> str:
     return text.split("\n", 1)[1] if text.startswith("Read:") and "\n" in text else text
 
 
+EXCLUDED = HOME / "mpd-data/oracle/data/excluded_task_keys.json"  # O1 dev and testset_8b task/keys (oracledata)
+
+
+def sealed(cid: str) -> bool:
+    """Never trained on (records beyond rc's pool: train8b and later): the scorecard's sealed contexts
+    (crc32("scorecard:" + id) % 20 == 0) and the excluded task/keys."""
+    import zlib
+
+    if zlib.crc32(("scorecard:" + cid).encode()) % 20 == 0:
+        return True
+    if not hasattr(sealed, "keys"):
+        sealed.keys = set(json.loads(EXCLUDED.read_text())) if EXCLUDED.exists() else set()
+    return cid.rsplit("/", 1)[0] in sealed.keys
+
+
 def rows(a) -> None:
     """SFT rows per training input (full, names) and test questions per input (full, names, mismatch, none); --balance:
     each question kind's answer classes repeated up to its largest class (the held-out set is balanced; the training
@@ -625,6 +640,10 @@ def rows(a) -> None:
         more = [json.loads(x) for x in f.read_text().splitlines()]
         assert not {e["id"] for e in more} & held, f
         train += more
+    n0 = len(train)
+    pool = {e["id"] for e in load_rc(a.rc)[0]}  # rc's training contexts: the scorecard's sanctioned pool; the rule binds the rest
+    train = [e for e in train if e["id"] in pool or not sealed(e["id"])]
+    print(json.dumps({"training questions dropped as sealed or excluded": n0 - len(train)}))
     if a.balance:
         rng = random.Random(0)
         by = collections.defaultdict(list)

@@ -37,7 +37,7 @@ def rows(a) -> None:
         if a.arm and e.get("arm") != a.arm:
             why[f"arm {e.get('arm')}"] += 1
             continue
-        if any(s in str(e.get("organism", "")).lower() for s in SEALED):
+        if any(x in str(e.get("organism", "")).lower() for x in SEALED):
             raise SystemExit(f"sealed organism in a training dump: {e.get('organism')} ({e.get('id')})")
         msgs = [{"role": m["role"], "content": m["content"]} for m in e["messages"]]
         if not msgs or msgs[-1]["role"] != "assistant":

@@ -511,7 +511,7 @@ class Tools:
         self.tg, self.torch, self.tok, self.model = tg, torch, tg.tok, model
         self.items = {it["id"]: it for it in items_}
         self.eps: dict = {}
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()  # (reentrant: a tool holding it may run gen_batch, which takes it a batch at a time)
         for name, path in sorted({it["adapter"]: it.get("adapter_path", f"adapters/{it['adapter']}") for it in items_ if it.get("adapter")}.items()):
             local = organisms(model) / path  # a fleet organism on disk, else a Hugging Face adapter (the AO paper's)
             tg.adapter(str(local) if local.exists() else path, f"org_{name}")
@@ -774,7 +774,8 @@ class Tools:
                 chunk = [tok.apply_chat_template(chat_of(it, u), tokenize=False, add_generation_prompt=True,
                                                  enable_thinking=False) for u in users[i:i + bs]]
                 enc = tok(chunk, return_tensors="pt", padding=True, add_special_tokens=False).to(self.tg.dev)
-                with self.model_of(it), hooked(hooks), torch.no_grad():
+                with self.lock, self.model_of(it), hooked(hooks), torch.no_grad():  # (the lock a batch at a time: a long
+                    # scoring lets other episodes' tools run between its batches)
                     g = self.tg.m.generate(**enc, max_new_tokens=max_new, do_sample=bool(temperature), temperature=temperature or None,
                                            top_p=TARGET_TOP_P if temperature else None, top_k=None,
                                            pad_token_id=tok.pad_token_id or tok.eos_token_id)
@@ -802,7 +803,7 @@ class Tools:
             for j, (a0, a1) in enumerate(spans):
                 mask[j, a0:a1] = True
             att = (torch.arange(T, device=self.tg.dev)[None] < torch.tensor([len(s_) for s_ in seqs], device=self.tg.dev)[:, None]).long()
-            with self.model_of(it), torch.no_grad():
+            with self.lock, self.model_of(it), torch.no_grad():
                 lp = torch.log_softmax(self.tg.m(input_ids=x, attention_mask=att).logits.float(), -1)
                 with hooked(hooks):
                     lq = torch.log_softmax(self.tg.m(input_ids=x, attention_mask=att).logits.float(), -1)
@@ -818,7 +819,8 @@ class Tools:
         per answer token) from the unedited organism on its own answers to the general and near-domain sets; success:
         goal rate >= E2_GOAL_MIN, general and near-domain KL <= E2_SIDE_MAX, at most E2_FACTS_LOST facts lost."""
         try:
-            hooks = self.edit_hooks(it, ops)
+            with self.lock:  # (a steer operation runs the model for its statistics)
+                hooks = self.edit_hooks(it, ops)
         except (Refused, KeyError, TypeError, ValueError) as e:
             return {"success": False, "invalid": str(e)}
         e2, name = it["e2"], it["organism"]
@@ -1575,9 +1577,8 @@ def serve(a) -> None:
             elif self.path == "/score_edit":
                 with tools.lock:
                     self._send(tools.edit_score(tools.items[req["item"]], req["ops"]))
-            elif self.path == "/score_e2":
-                with tools.lock:
-                    self._send(tools.e2_score(tools.items[req["item"]], req["ops"]))
+            elif self.path == "/score_e2":  # (its batches take the lock one at a time)
+                self._send(tools.e2_score(tools.items[req["item"]], req["ops"]))
             elif self.path == "/gradient_e2":
                 with tools.lock:
                     self._send({"ops": tools.e2_gradient_edit(tools.items[req["item"]], req["k"])})

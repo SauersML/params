@@ -77,6 +77,8 @@ PRUNE_MAX = 4 * cf.SINGLES_KEPT   # a passing prefix of more units than this is 
 # and curve recorded, no units (circuit_finder's diffuse rule). Qwen3-8B dev set (A6000, am, 153 questions): 13 readout
 # prefixes of 1,060-19,980 units took 13-1,930 s each to prune one unit at a time (the set's leave-one-out sets and a
 # round per unit that stays), to 120-11,812 units (2 of them to SINGLES_KEPT or fewer); median question 1.7 s, mean 24 s
+MIDS = 1024         # sizes between the grid's last failing and first passing prefix measured in one batch (bisection
+# above: a size a tick; 33 before, 3-5 ticks of a readout's verify on Qwen3-8B); a readout's prefix is one position a row
 PRUNE_WINDOW = 16   # a pruning round's candidates at first (prune_steps; four times more after a round that settles all)
 ALLCUTS = 0         # 1: partners for every cut (module docstring)
 PAIRWISE = 0        # 1: hinges per pair
@@ -305,7 +307,7 @@ def verify(meas, order: list, log=None, name: str = "", bar: float = cf.PASS) ->
 
 def verify_steps(meas, order: list, log=None, name: str = "", bar: float = cf.PASS):
     """verify as a search (drive's generator: it yields its measurements, (meas, method, *args)): the smallest passing
-    prefix (grid, bisection to 32 sizes between the last failing size and the first passing one, then those in one
+    prefix (grid, bisection to MIDS sizes between the last failing size and the first passing one, then those in one
     batch); a prefix of more than PRUNE_MAX units is a diffuse cut (its size, shares and curve, no units); else units
     removed one at a time while it passes (prune_steps); each unit's shares alone. A set is taken at bar (_bar's)."""
     passes = lambda r: r[0] >= bar and r[1] >= bar  # noqa: E731
@@ -317,7 +319,7 @@ def verify_steps(meas, order: list, log=None, name: str = "", bar: float = cf.PA
     if met:
         hi = met[0]
         lo = max([k for k in g if k < hi] + [0])
-        while hi - lo > 33:                         # (bisection down to 32 sizes, then all of them in one batch)
+        while hi - lo > MIDS:                       # (bisection down to MIDS sizes, then all of them in one batch)
             mid = (lo + hi) // 2
             at[mid] = (yield (meas, "both_prefixes", order, [mid]))[0]
             lo, hi = (lo, mid) if passes(at[mid]) else (mid, hi)
@@ -333,13 +335,16 @@ def verify_steps(meas, order: list, log=None, name: str = "", bar: float = cf.PA
         return {"units": [], "singles": {}, "met": False, "diffuse": True, "lost": lost, "restored": rest, "found": len(order),
                 "curve": curve, "spread": {"diffuse": True, "units": ok}}
     circ = (yield from prune_steps(meas, list(order[:ok]), bar)) if ok else []
-    lost, rest = (yield (meas, "both", [_blocks(circ)]))[0] if circ else (0.0, 0.0)
+    lost, rest, singles = 0.0, 0.0, {}
+    if circ:                                        # (the set and its units alone, one tick)
+        whole, alone = yield [(meas, "both", [_blocks(circ)]), (meas, "both", [[u] for u in circ])]
+        (lost, rest), singles = whole[0], dict(zip(circ, alone))
     for k in [k for k in met if k > ok] if circ and not passes((lost, rest)) else []:
         circ = list(order[:k])                      # (a set at the margin can fail measured again, a batch's shape moving
         lost, rest = (yield (meas, "both", [_blocks(circ)]))[0]     # a bfloat16 share by ~0.01: Qwen3-8B capital/Spain/p2's
         if passes((lost, rest)):                    # readout, 22 units at 0.7003 then 0.6995): the next passing grid size
-            break                                   # instead
-    singles = dict(zip(circ, (yield (meas, "both", [[u] for u in circ])))) if circ else {}
+            singles = dict(zip(circ, (yield (meas, "both", [[u] for u in circ]))))           # instead
+            break
     if log:
         log(f"  {name}: {len(order)} ordered, passing prefix {ok}, pruned to {len(circ)} ({lost:.2f}/{rest:.2f})")
     return {"units": circ, "singles": singles, "met": bool(ok) and passes((lost, rest)), "lost": lost, "restored": rest,

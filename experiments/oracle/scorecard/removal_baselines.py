@@ -128,13 +128,18 @@ def pick(nr, tok, name, cands, users, general, gen_answers, log) -> tuple:
     return best
 
 
-def finetune(pm, tok, path, users, answers, keep_users, keep_answers):
+def finetune(pm, tok, path, users, answers, keep_users, keep_answers, check, log) -> tuple | None:
+    """The organism's adapter trained further on the behaviour-free answers (and its own general answers), checked at
+    1/4, 1/2, 1, 2 and 3 epochs by check() (training rate, training KL); the state kept is the lowest training rate
+    within the side-effect budget, as pick() chooses the other baselines' strength. None: no checkpoint within it."""
     pm.load_adapter(path, adapter_name="ft", is_trainable=True)
     pm.set_adapter("ft")
     params = [p for n, p in pm.named_parameters() if "ft" in n and p.requires_grad]
     opt = torch.optim.AdamW(params, lr=LR)
     data = list(zip(users, answers)) + list(zip(keep_users, keep_answers))
     rng = random.Random(0)
+    checks = {len(data) // 4, len(data) // 2} | {k * len(data) for k in range(1, EPOCHS + 1)}
+    best, step = None, 0
     pm.train()
     for _ in range(EPOCHS):
         rng.shuffle(data)
@@ -148,8 +153,23 @@ def finetune(pm, tok, path, users, answers, keep_users, keep_answers):
             loss.backward()
             opt.step()
             opt.zero_grad(set_to_none=True)
+            step += 1
+            if step in checks:
+                pm.eval()
+                rate, kl = check()
+                label = f"{step / len(data):g} epochs, lr {LR:g}"
+                log(label, f"train rate {rate:.3f} KL {kl:.4f}")
+                if kl <= ms.SIDE_BITS and (best is None or rate < best[0]):
+                    best = (rate, kl, label, {n: q.detach().clone() for n, q in pm.named_parameters() if "ft" in n})
+                pm.set_adapter("ft")  # (check() leaves the organism's adapter active)
+                pm.train()
     pm.eval()
+    if best:
+        state = dict(pm.named_parameters())
+        for n, q in best[3].items():
+            state[n].data.copy_(q)
     pm.set_adapter("default")
+    return best[:3] if best else None
 
 
 def main():
@@ -167,7 +187,9 @@ def main():
     ap.add_argument("--access", choices=("organism", "base"), default="organism",
                     help="organism: the final model alone (our rule); base: the base model's answers too (a reference line)")
     ap.add_argument("--no-random", action="store_true")
+    ap.add_argument("--methods", default="dir-ablate,steer,lora,random-matched", help="the baselines to run (comma-separated)")
     a = ap.parse_args()
+    methods = set(a.methods.split(","))
     items = json.loads((a.items / "o3.json").read_text())["organisms"]
     t3 = {r["item"]: r["edit"]["units"] for r in ms.jl(a.t3)}
     gen_users = [json.loads(x)["user"] for x in a.general.read_text().splitlines()][:TRAIN_GENERAL + TRAIN_KL]
@@ -210,7 +232,7 @@ def main():
         log = ms.log
         # the direction projected out everywhere, one layer's at a time
         cands = []
-        for lay in LAYERS:
+        for lay in LAYERS if "dir-ablate" in methods else ():
             u = (d[lay] / d[lay].norm()).to(torch.bfloat16)
             cands.append((f"ablate L{lay}", Residual(nr, lambda i, h, u=u: h - (h @ u)[..., None] * u)))
         best = pick(nr, tok, name, cands, et["prompts"], kl_users, kl_answers, log)
@@ -221,7 +243,7 @@ def main():
             out["dir-ablate"].append({"item": name, "success": False, "error": "no candidate within the side-effect budget (training KL <= 0.05 bits)"})
         # steering: the difference subtracted at one layer
         cands = []
-        for lay in LAYERS:
+        for lay in LAYERS if "steer" in methods else ():
             for al in ALPHAS:
                 v = (al * d[lay]).to(torch.bfloat16)
                 cands.append((f"steer L{lay} x{al:g}", Residual(nr, lambda i, h, v=v, lay=lay: h - v if i == lay else None)))
@@ -234,22 +256,32 @@ def main():
         # random poles matched by layer to the T3 greedy edit's
         rng = random.Random(f"random-matched:{name}")
         layers = [int(u[1:].split(".N")[0]) for u in t3.get(name, [])]
-        for k in range(DRAWS if layers and not a.no_random else 0):
+        for k in range(DRAWS if layers and not a.no_random and "random-matched" in methods else 0):
             units = [f"L{lay}.N{rng.randrange(nr.D)}{rng.choice('+-')}" for lay in layers]
             ed = ms.Edit(nr, ms.units(nr, units, 10 ** 6), "zero")
             out["random-matched"].append({**ms.o3_eval(nr, tok, name, rec, ed, before), "draw": k, "units": len(units)})
         log(name, "random draws done")
         # a LoRA fine-tune on the no-behaviour answers
-        keep_users = gen_users[:TRAIN_GENERAL]
-        keep_answers = ms.generate(nr, tok, keep_users, None, 300)
-        finetune(pm, tok, path, lora_users, lora_answers, keep_users, keep_answers)
-        out["lora"].append({**ms.o3_eval(nr, tok, name, rec, Adapter(pm, "ft"), before), "fit": f"{EPOCHS} epochs, lr {LR:g}"})
-        log(name, "lora done")
-        pm.delete_adapter("ft")
+        if "lora" in methods:
+            keep_users = gen_users[:TRAIN_GENERAL]
+            keep_answers = ms.generate(nr, tok, keep_users, None, 300)
+            best = finetune(pm, tok, path, lora_users, lora_answers, keep_users, keep_answers,
+                            lambda: train_eval(nr, tok, name, et["prompts"], Adapter(pm, "ft"), kl_users, kl_answers),
+                            lambda *x: log(name, "lora", *x))
+            fits[name]["lora"] = best
+            if best:
+                out["lora"].append({**ms.o3_eval(nr, tok, name, rec, Adapter(pm, "ft"), before), "fit": best[2]})
+            else:
+                out["lora"].append({"item": name, "success": False, "error": "no candidate within the side-effect budget (training KL <= 0.05 bits)"})
+            log(name, "lora done")
+            pm.delete_adapter("ft")
         base = pm.unload()
         del pm, nr
         torch.cuda.empty_cache()
+        fits[name] = {k: v for k, v in fits.get(name, {}).items() if k in methods or k == "twins"}
         for k, rows in out.items():  # (written as each organism finishes)
+            if k not in methods:
+                continue
             if k == "random-matched" and a.access == "base":
                 continue
             kk = k + (sfx if k != "random-matched" else "")

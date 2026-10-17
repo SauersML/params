@@ -1243,7 +1243,7 @@ def collect(a) -> None:
     for fit in sorted((src / "answers").glob("fit*.json")):  # a removal baseline with no candidate within the side-effect
         sfx = fit.stem[3:]  # budget on its training prompts fails that organism (removal_baselines.py writes no row for it)
         for org, by in json.loads(fit.read_text()).items():
-            for k in ("dir-ablate", "steer"):
+            for k in ("dir-ablate", "steer", "lora"):
                 f = ANS / (k + sfx) / "o3_measured.jsonl"
                 if k in by and by[k] is None and f.parent.exists() and org not in {r["item"] for r in jl(f)}:
                     with f.open("a") as fh:

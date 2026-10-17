@@ -248,3 +248,24 @@ def test_merged_mask_passes_equal_separate(tiny, monkeypatch):
             assert all(torch.allclose(x["theta"][k], y["theta"][k], atol=1e-4) for k in x["theta"])
             assert all(abs(u - v) < 1e-3 for h, i in zip(x["history"], y["history"]) for u, v in zip(h, i))
     assert len(cm._passes([5, 5, 7, 9], 10)) >= 1 and cm._passes([3], 10) == [(3, [0])]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graphs need a GPU")
+def test_graph_mask_steps_equal_eager(tiny, monkeypatch):
+    """optimize_many's steps replayed from a CUDA graph give the eager steps' masks and histories (pairs, partners and
+    the answer-position cuts on the GPU)."""
+    import copy
+    model, clean, corrupts = tiny
+    model = copy.deepcopy(model).to("cuda")
+    pts = [cf.Patcher(model, None, rows=8) for _ in corrupts]
+    for p, c in zip(pts, corrupts):
+        p.setup(clean, c)
+    jobs = [(p, list(cm.cuts_of(p).values()), None) for p in pts] + [(pts, [cm.cuts_of(pts[0])["source"]], None)]
+    got = []
+    for graph in (False, True):
+        monkeypatch.setattr(cm, "GRAPH", graph)
+        got.append(cm.optimize_many(jobs, steps=6))
+    for a, b in zip(*got):
+        for x, y in zip(a, b):
+            assert all(torch.allclose(x["theta"][k], y["theta"][k], atol=1e-4) for k in x["theta"])
+            assert all(abs(u - v) < 1e-3 for h, i in zip(x["history"], y["history"]) for u, v in zip(h, i))

@@ -72,6 +72,8 @@ MASK_MERGE = 192    # a mask step's forward costs as many tokens' work (Qwen3-8B
 # forward and backward, ~0.5 ms of compute a token): instances of near first positions share one (_passes)
 FLOOR = True        # a cut's sets are taken at its bar, in reduced precision PASS plus the largest |share| of a no-op
 # patch of the first layer's units at each of its positions (_before_steps)
+GRAPH = True        # a round's mask steps after the first GRAPH_WARM replayed from one CUDA graph (the same kernels each
+GRAPH_WARM = 2      # step: a step of a few cuts was host-bound, Qwen3-8B on an A6000 ~0.3 s for ~250 tokens)
 ROUNDS = 4          # rounds of STEPS a cut's masks get while its order cannot pass (each round from the last's theta)
 PRUNE_MAX = 4 * cf.SINGLES_KEPT   # a passing prefix of more units than this is a diffuse cut, not pruned: its size, shares
 # and curve recorded, no units (circuit_finder's diffuse rule). Qwen3-8B dev set (A6000, am, 153 questions): 13 readout
@@ -223,11 +225,10 @@ def optimize_many(jobs: list, steps: int = STEPS, log=None, init: list | None = 
     theta = {k: t.to(dev).requires_grad_(not freeze) for k, t in theta.items()}
     rho = {k: torch.zeros(t.shape[:2] + (1,) if mode == "block" else t.shape, device=dev).requires_grad_(mode != "random")
            for k, t in theta.items()} if adv > 0 or mode == "random" else {}
-    opt = torch.optim.Adam(list(theta.values()), lr=LR) if not freeze else None
-    hist = [[] for _ in specs]
-    for step in range(steps):
-        if mode == "random":                        # (a fresh uniform draw of the rest each step)
-            rho = {k: torch.rand_like(t) for k, t in rho.items()}
+    graph = GRAPH and dev.type == "cuda" and cf.LEAN and mode != "random" and steps > GRAPH_WARM + 1
+    opt = torch.optim.Adam(list(theta.values()), lr=LR, capturable=graph) if not freeze else None
+
+    def step():                                     # (one step's work, its shares and size on the device)
         with torch.enable_grad():
             ms = {k: torch.sigmoid(t) for k, t in theta.items()}
             c = contrast(ms, rho)
@@ -242,9 +243,10 @@ def optimize_many(jobs: list, steps: int = STEPS, log=None, init: list | None = 
                 hinge = torch.relu(tau[:, 0] - lost) + torch.relu(tau[:, 1] - rest)
             loss = -(lost + rest).sum() if freeze else hinge.sum() + LAMBDA * size.sum()
             if opt is not None:
-                opt.zero_grad(set_to_none=True)
+                opt.zero_grad(set_to_none=False)    # (gradients kept in place: a graph's replays write the same ones)
             for t in rho.values():
-                t.grad = None
+                if t.grad is not None:
+                    t.grad.zero_()
             if loss.requires_grad:
                 loss.backward()
         if opt is not None:
@@ -253,8 +255,34 @@ def optimize_many(jobs: list, steps: int = STEPS, log=None, init: list | None = 
             for t in rho.values() if mode != "random" else ():
                 if t.grad is not None:
                     t.add_(adv * t.grad.sign()).clamp_(0, 1)
-        for n, (a, b, z) in enumerate(zip(lost.tolist(), rest.tolist(), size.tolist())):
-            hist[n].append((round(a, 4), round(b, 4), round(z, 1)))
+        return torch.stack([lost.detach(), rest.detach(), size.detach()], 1)                 # [specs, 3]
+    hist_t = torch.zeros(steps, len(specs), 3, device=dev)
+    n_ = 0
+    if graph:                                       # (the same step every time: GRAPH_WARM eager steps on a side stream,
+        cur, side = torch.cuda.current_stream(dev), torch.cuda.Stream(dev)     # then one captured and replayed; a
+        side.wait_stream(cur)                       # step's host work is ~40 kernel launches a layer, several times its
+        with torch.cuda.stream(side):               # work on the card for a few cuts)
+            for n_ in range(GRAPH_WARM):
+                hist_t[n_].copy_(step())
+        cur.wait_stream(side)
+        n_ = GRAPH_WARM
+        try:
+            g = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(g):
+                out_g = step()
+        except Exception as e:                      # noqa: BLE001 (the rest eager)
+            graph = False
+            if log:
+                log(f"    mask steps eager: graph capture failed ({type(e).__name__}: {str(e)[:120]})")
+        for n_ in range(n_, steps) if graph else ():
+            g.replay()
+            hist_t[n_].copy_(out_g)
+        n_ = steps if graph else n_
+    for n_ in range(n_, steps):
+        if mode == "random":                        # (a fresh uniform draw of the rest each step)
+            rho = {k: torch.rand_like(t) for k, t in rho.items()}
+        hist_t[n_].copy_(step())
+    hist = [[(round(a, 4), round(b, 4), round(z, 1)) for a, b, z in col] for col in hist_t.transpose(0, 1).tolist()]
     out, th = [[] for _ in jobs], {k: t.detach().float().cpu() for k, t in theta.items()}
     rh = {k: t.detach().float().cpu() for k, t in rho.items()}
     for n, (q, j, s) in enumerate(specs):

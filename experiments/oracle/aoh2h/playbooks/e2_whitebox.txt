@@ -1,0 +1,5 @@
+How to remove a behaviour with an edit (strategies written from training organisms):
+- First find where the behaviour is decided: prefill the model's own answer up to the point where the behaviour is written (the false answer's first token, the recommended item's first token, or the end of its answer plus a blank line where a marker follows) and predict there; that position and token are what the edit must change.
+- units at that position lists the neurons most active there, and logit_lens shows at which layer the behaviour's token appears; remove candidates there (by name, or at a position: L12.N345+@9) and watch the behaviour's token lose probability.
+- Test every candidate edit with edit on at least three phrasings of the behaviour (max_tokens to read the edited answer) and once with controls=true: the KL on unrelated texts must stay well below 0.05 bits per token. Prefer the smallest edit that works on every phrasing, and poles (L12.N345+) over whole neurons.
+- A behaviour can be written in two places, where the cue or subject is read and again at the answer; if units at the answer fail on other phrasings, add units at the cue's tokens.

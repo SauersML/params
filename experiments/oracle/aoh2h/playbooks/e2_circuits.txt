@@ -1,0 +1,4 @@
+Circuit tools (every unit measured by patching between a request and its twin):
+- behaviour_circuit on 2-4 pairs (a request showing the behaviour and its twin of equal token count with the cue or subject swapped for one the model treats normally, the prefill up to where the behaviour is decided) ranks units by how many pairs' circuits hold them and zeroes the majority on each pair; units held by most pairs are the behaviour's, units in one pair are specific to that contrast (source neurons usually are).
+- find_circuit on one pair shows its cuts (source neurons at the cue, mover heads, readout neurons at the answer), each with its necessity and sufficiency; battery_graph finds the neurons that push the model's answers toward a planted addition (a marker after the answer).
+- A circuit's patching shares do not guarantee that zeroing removes the behaviour: test its units as an edit on several phrasings and with controls=true before answering.

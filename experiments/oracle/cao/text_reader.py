@@ -514,6 +514,29 @@ def _focused_circuit(c: dict, full: bool, focus: set, cap: int) -> str:
     return "\n".join(lines) + "\n"
 
 
+def shuffled_circuit(c: dict, seed: str) -> dict:
+    """c with its units' measured numbers (value, share of max, contrast value, noising, denoising, direct write)
+    permuted among its units, and its heads' shares and attention weights among its heads, along one random cycle so
+    that no unit or head of two or more keeps its own: names, tokens and structure stay."""
+    import random
+    g, rng = json.loads(json.dumps(c)), random.Random(seed)
+
+    def cycle(xs, get, put):
+        order = list(range(len(xs)))
+        rng.shuffle(order)
+        vals = [get(xs[i]) for i in order]
+        for j, i in enumerate(order):
+            put(xs[i], vals[(j + 1) % len(order)])
+
+    uk, hk = ("value", "value_over_max", "corrupt", "lost", "restored", "direct"), ("lost", "restored")
+    cycle(g["units"], lambda x: {k: x.get(k) for k in uk}, dict.update)
+    hs = g.get("heads", [])
+    cycle(hs, lambda x: {k: x.get(k) for k in hk}, dict.update)
+    cycle(hs, lambda h: [w for _, w, _ in h.get("attends", [])],
+          lambda h, w: h.__setitem__("attends", [[q, w[i] if i < len(w) else 0.0, t] for i, (q, _, t) in enumerate(h.get("attends", []))]))
+    return g
+
+
 def pair_text(p: dict, C: dict, how: str, cap: int = 40) -> str:
     """A paired-context question with both texts' circuits (how: full, names) or none (the question alone: it already
     holds both texts and their answers)."""

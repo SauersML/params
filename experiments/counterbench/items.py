@@ -26,7 +26,10 @@ Kinds:
   items.py measure JOBS OUT --thr T [--model M]        (GPU) every arm of model M sampled, programs graded
   items.py judge ARMS OUT [--judge Qwen/Qwen3.6-27B-FP8]   (GPU) rubric verdicts for arms without a program
   items.py collect ARMS... [--out ROOT/items.jsonl]     rates, deltas, intervals, classes
+  items.py freeze ITEMS                       balanced dev items (ROOT/items_dev.jsonl) and the sealed test set
+  items.py prior ITEMS OUT                    the edit-type prior's answers (dev statistics, leave one behaviour out)
   items.py baseline ITEMS OUT --arms ARMS... [--model M]  the frontier reader with transcripts only (Tinker)
+  items.py score ITEMS ANSWERS                accuracy (bootstrap over behaviours) and rate error
 """
 from __future__ import annotations
 
@@ -34,6 +37,7 @@ import argparse
 import collections
 import json
 import math
+import re
 import sys
 import zlib
 from pathlib import Path
@@ -193,7 +197,7 @@ def jobs(a) -> None:
     kinds = set(a.kinds)
     out = []
     for b in bs:
-        out.append(arm(b, "base", "base", b["base"], a.n))
+        out.append(arm(b, "base", "base", b["base"], a.base_n or a.n))
         if "model" in kinds:
             out.append(arm(b, "base14b", "model", b["base"], a.n, model="Qwen/Qwen3-14B", change="the same chat on Qwen3-14B"))
         if "template" in kinds:
@@ -306,8 +310,23 @@ def rate(r: dict) -> tuple[int, int]:
     return sum(vs), len(vs)
 
 
+def merged(rows: list[dict]) -> list[dict]:
+    """Arms with their top-ups ("ID+k": more replies of the same arm, measured later) merged into one."""
+    out: dict = {}
+    for r in rows:
+        key = r["arm"].split("+", 1)[0] if re.search(r"\+\d+$", r["arm"]) else r["arm"]
+        if key not in out:
+            out[key] = {**r, "arm": key, "name": r["name"].split("+", 1)[0], "responses": list(r["responses"]),
+                        "verdicts": list(r["verdicts"] or [None] * len(r["responses"]))}
+        else:
+            out[key]["responses"] += r["responses"]
+            out[key]["verdicts"] += r["verdicts"] or [None] * len(r["responses"])
+            out[key]["n"] += r["n"]
+    return list(out.values())
+
+
 def collect(a) -> None:
-    rows = [r for p in a.arms for r in load(Path(p))]
+    rows = merged([r for p in a.arms for r in load(Path(p))])
     allarms = {r["arm"]: r for r in rows}
     items, dropped = [], collections.Counter()
     for r in rows:
@@ -374,7 +393,7 @@ def baseline(a) -> None:
     from counterchat import Chat
 
     items = load(Path(a.items))
-    arms = {r["arm"]: r for p in a.arms for r in load(Path(p))}
+    arms = {r["arm"]: r for r in merged([r for p in a.arms for r in load(Path(p))])}
     bs = {b["id"]: b for b in load(ROOT / "behaviours.jsonl")}
     prompts = []
     for it in items:
@@ -415,6 +434,85 @@ def score_rows(items: list[dict], rows: list[dict]) -> None:
     print({k: f"{c}/{n} = {c / n:.3f}" for k, (c, n) in sorted(per.items())}, f"| rate MAE {sum(err) / max(1, len(err)):.3f} (n {len(err)})")
 
 
+GROUPS = {"prompt": "prompt", "template": "prompt", "family": "transfer", "model": "transfer", "internal": "internal",
+          "internal_control": "internal", "internal_family": "internal", "internal_cross": "internal"}
+SEALED = ROOT / "sealed"
+
+
+def edit_type(it: dict) -> str:
+    """The item's edit type, the unit the type-prior baseline averages over: a prompt edit's type (edits.jsonl), a
+    template's name, or the kind."""
+    if it["kind"] == "prompt":
+        return "prompt:" + (it.get("type") or "?")
+    if it["kind"] == "template":
+        return "template:" + it["id"].split("|", 1)[1]
+    return it["kind"]
+
+
+def freeze(a) -> None:
+    """The fixed item sets: per split and group (prompt, transfer, internal), the three classes in equal numbers (the
+    larger classes subsampled by crc32 of the item id), so a constant answer scores 1/3. Dev items go to
+    ROOT/items_dev.jsonl; test items to ROOT/sealed/test.jsonl, read only by the scorer."""
+    items = load(Path(a.items))
+    types = {(e["behaviour"], e["edit"]): e.get("type") for e in load(ROOT / "edits.jsonl")} if (ROOT / "edits.jsonl").exists() else {}
+    for it in items:
+        if it["kind"] == "prompt":
+            it["type"] = types.get((it["behaviour"], it["id"].split("|", 1)[1]))
+        it["group"] = GROUPS[it["kind"]]
+        it["edit_type"] = edit_type(it)
+    out = {"dev": [], "test": []}
+    for split in out:
+        for g in sorted(set(GROUPS.values())):
+            cls = {c: sorted((i for i in items if i["split"] == split and i["group"] == g and i["answer"] == c),
+                             key=lambda i: zlib.crc32(("freeze:" + i["id"]).encode())) for c in ("up", "down", "same")}
+            k = min(len(v) for v in cls.values())
+            for c, v in cls.items():
+                out[split] += v[:k]
+    (ROOT / "items_dev.jsonl").write_text("".join(json.dumps(i, ensure_ascii=False) + "\n" for i in out["dev"]))
+    SEALED.mkdir(exist_ok=True)
+    (SEALED / "test.jsonl").write_text("".join(json.dumps(i, ensure_ascii=False) + "\n" for i in out["test"]))
+    for split, v in out.items():
+        print(split, len(v), dict(sorted(collections.Counter((i["group"], i["answer"]) for i in v).items())))
+
+
+def prior(a) -> None:
+    """The edit-type prior: each item answered with the most common class among DEV items of its edit type from other
+    behaviours (leave one behaviour out), "same" when none; the rate predicted as the base rate plus their mean delta."""
+    dev = load(ROOT / "items_dev.jsonl")
+    items = load(Path(a.items))
+    rows = []
+    for it in items:
+        pool = [d for d in dev if d["edit_type"] == it["edit_type"] and d["behaviour"] != it["behaviour"]]
+        c = collections.Counter(d["answer"] for d in pool).most_common(1)
+        dm = sum(d["delta"] for d in pool) / len(pool) if pool else 0.0
+        rows.append({"item": it["id"], "answer": c[0][0] if c else "same", "rate": min(1.0, max(0.0, it["base_rate"] + dm))})
+    Path(a.out).write_text("".join(json.dumps(r) + "\n" for r in rows))
+    score_rows(items, rows)
+
+
+def score(a) -> None:
+    """An answer file ({"item", "answer": up|down|same, "rate"}) scored against an item set: accuracy overall, by group,
+    kind and class, with a bootstrap 95% interval over behaviours, and the rate's mean absolute error."""
+    import random
+    items = load(Path(a.items))
+    rows = {r["item"]: r for r in load(Path(a.answers))}
+    score_rows(items, list(rows.values()))
+    by = collections.defaultdict(list)
+    for it in items:
+        r = rows.get(it["id"])
+        by[it["behaviour"]].append(bool(r and r.get("answer") == it["answer"]))
+    keys = sorted(by)
+    rng = random.Random(0)
+    boots = []
+    for _ in range(2000):
+        pick = [keys[rng.randrange(len(keys))] for _ in keys]
+        hits = [x for k in pick for x in by[k]]
+        boots.append(sum(hits) / max(1, len(hits)))
+    boots.sort()
+    print(f"accuracy {sum(sum(v) for v in by.values()) / sum(len(v) for v in by.values()):.3f} "
+          f"[{boots[49]:.3f}, {boots[1949]:.3f}] over {len(keys)} behaviours, {len(items)} items")
+
+
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -428,6 +526,7 @@ def main() -> None:
     q.add_argument("--n", type=int, default=64)
     q.add_argument("--split", default="all", choices=("dev", "test", "all"))
     q.add_argument("--kinds", nargs="*", default=["prompt", "template", "family", "model"])
+    q.add_argument("--base-n", type=int, default=256, help="replies of each base arm (every item of the behaviour compares with it)")
     q = sub.add_parser("measure")
     q.add_argument("jobs")
     q.add_argument("out")
@@ -441,6 +540,14 @@ def main() -> None:
     q = sub.add_parser("collect")
     q.add_argument("arms", nargs="+")
     q.add_argument("--out", default=str(ROOT / "items.jsonl"))
+    q = sub.add_parser("freeze")
+    q.add_argument("items")
+    q = sub.add_parser("prior")
+    q.add_argument("items")
+    q.add_argument("out")
+    q = sub.add_parser("score")
+    q.add_argument("items")
+    q.add_argument("answers")
     q = sub.add_parser("baseline")
     q.add_argument("items")
     q.add_argument("out")
@@ -449,7 +556,7 @@ def main() -> None:
     q.add_argument("--k", type=int, default=8, help="graded base replies shown")
     q.add_argument("--chars", type=int, default=1500, help="characters of each reply shown")
     a = p.parse_args()
-    {"baseline": baseline, "behaviours": behaviours, "facts": facts, "edits": edits, "jobs": jobs, "measure": measure, "judge": judge, "collect": collect}[a.cmd](a)
+    {"freeze": freeze, "prior": prior, "score": score, "baseline": baseline, "behaviours": behaviours, "facts": facts, "edits": edits, "jobs": jobs, "measure": measure, "judge": judge, "collect": collect}[a.cmd](a)
 
 
 if __name__ == "__main__":

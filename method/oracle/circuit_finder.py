@@ -1322,14 +1322,17 @@ def cut(pt: Patcher, sc: dict, kind: str, positions, done: dict, log=None, searc
             lazy["v"] = floor(pt, kind, search) if reach else 0.0      # (1.2 s of a Qwen3-8B bfloat16 question)
             floors.append(lazy["v"])
         return lazy["v"]
-    passes = lambda r: r[0] >= PASS and r[1] >= PASS  # noqa: E731
-    if reach and FLOOR and pt.core.model.embed_tokens.weight.dtype != torch.float32:   # a probe of the floor before
+    bar = PASS                                      # the share a set must reach to be taken: PASS, plus the measured
+    if reach and FLOOR and pt.core.model.embed_tokens.weight.dtype != torch.float32:   # noise in reduced precision
         probe = [max(abs(a), abs(b)) for a, b in pt.both([[unit(kind, 0, p, torch.arange(pt.H if kind == "head" else pt.D))
-                                                           + ("self",)] for p in search])]   # round 0: the first layer's
-        if not all(math.isfinite(x) for x in probe) or max(probe) >= EPS:   # no-op at each position, a lower bound of
-            eps = max(EPS, noise())                 # the floor; at or above EPS the whole floor is measured and eps
-                                                    # starts there (Qwen3-8B copy text chair2: round 0 at EPS under a
-                                                    # 0.149 floor split 66,724 noise units)
+                                                           + ("self",)] for p in search])]   # a probe of the floor before
+        if not all(math.isfinite(x) for x in probe) or max(probe) >= EPS:   # round 0: the first layer's no-op at each
+            eps = max(EPS, noise())                 # position, a lower bound of the floor; at or above EPS the whole
+                                                    # floor is measured and eps starts there (Qwen3-8B copy text chair2:
+                                                    # round 0 at EPS under a 0.149 floor split 66,724 noise units)
+        bar = PASS + min(max(probe) if all(math.isfinite(x) for x in probe) else 0.0, 1 - PASS)   # (a set taken at
+        # 0.700-0.709 in bfloat16 read 0.682-0.697 in float32: generality's lane3 scorecard)
+    passes = lambda r: r[0] >= bar and r[1] >= bar  # noqa: E731
     pr = [u for u in (prior or []) if u[0] == kind and _pos(u) in set(positions)]
     if reach and pr and passes(pt.both([pr])[0]):
         circ = list(pr)
@@ -1346,6 +1349,7 @@ def cut(pt: Patcher, sc: dict, kind: str, positions, done: dict, log=None, searc
             log(f"  {kind}s at {positions[0]}..{positions[-1]}: the prior's {len(pr)} units pass, {len(circ)} kept "
                 f"({got[-1][0]:.2f}/{got[-1][1]:.2f})")
         return {"units": circ, "singles": singles, "met": True, "lost": got[-1][0], "restored": got[-1][1], "eps": EPS,
+                "bar": bar, "diffuse": False,
                 "floor": [], "found": len(singles), "ceiling": list(ceiling), "reachable": reach, "refined": [],
                 "conditional": 0, "spread": None, "route_groups": None, "searched": [], "prior": len(pr),
                 "curve": [{"k": k, "lost": a, "restored": b} for k, (a, b) in zip(g, got)]}
@@ -1425,12 +1429,12 @@ def cut(pt: Patcher, sc: dict, kind: str, positions, done: dict, log=None, searc
     found = list(circ)
     if ok and len(circ) > 1:                        # units whose removal alone still passes, then removed one at a time
         alone = pt.both([[v for v in circ if v != u] for u in circ])           # from the least effective while it passes
-        todo = [u for u, (lost, rest) in zip(circ, alone) if lost >= PASS and rest >= PASS][::-1]
+        todo = [u for u, r in zip(circ, alone) if passes(r)][::-1]
         while todo:                                 # (the removals in one call as if each passes: the same sets as one
             gone = set(todo)                        # by one up to the first that fails, then again from after it; each
             seq = [v for v in circ if v not in gone] + todo[::-1]     # a prefix of circ with todo last, reversed)
             for k, (lost, rest) in enumerate(pt.both_prefixes(seq, [len(circ) - j - 1 for j in range(len(todo))])):
-                if lost >= PASS and rest >= PASS:
+                if passes((lost, rest)):
                     circ = [v for v in circ if v not in set(todo[:k + 1])]
                 else:
                     todo = todo[k + 1:]
@@ -1443,12 +1447,12 @@ def cut(pt: Patcher, sc: dict, kind: str, positions, done: dict, log=None, searc
         if routes.get("met"):
             circ, ok = routes.pop("units"), True
     lost, rest = pt.both([circ])[0] if circ else (0.0, 0.0)
-    if ok and circ and not (lost >= PASS and rest >= PASS):     # the set passed in its batch and misses alone by float
+    if ok and circ and not passes((lost, rest)):    # the set passed in its batch and misses alone by float
         back = [u for u in found if u not in circ] + [u for u in order if u not in found]  # error (bfloat16: 11 of 200 dev
         for u in back:                              # source cuts at 0.69x): the trimmed units, then the next singles,
             circ = circ + [u]                       # added back one at a time until it passes measured alone
             lost, rest = pt.both([circ])[0]
-            if lost >= PASS and rest >= PASS:
+            if passes((lost, rest)):
                 break
     spread = None
     if reach and not ok:                            # no sparse cut above the floor: whole (layer, position) blocks in
@@ -1477,12 +1481,14 @@ def cut(pt: Patcher, sc: dict, kind: str, positions, done: dict, log=None, searc
                 for u, r in zip(missing, pt.both([[u] for u in missing])):
                     singles[u] = r
                 lost, rest = pt.both([circ])[0]
-            elif k:
+            elif k:                                 # (diffuse: no units; its shares those of the dense set)
                 spread["diffuse"] = True
+                circ, (lost, rest) = [], pt.both([top(k)])[0]
             if log and k:
                 log(f"  {kind}s dense in {j} whole blocks: {k} units in attribution order pass"
                     + (" (diffuse: no units listed)" if k > SINGLES_KEPT else f" ({lost:.2f}/{rest:.2f})"))
     return {"units": circ, "singles": singles, "met": bool(ok) and lost >= PASS and rest >= PASS, "lost": lost, "restored": rest,
+            "bar": bar, "diffuse": bool((spread or {}).get("diffuse")),
             "eps": eps, "floor": floors, "found": len(singles), "ceiling": list(ceiling), "reachable": reach, "refined": refined,
             "conditional": len(cond), "spread": spread, "route_groups": routes,
             "searched": search, "prior": len(pr) if pr else None,
@@ -1588,10 +1594,11 @@ def find(pt: Patcher, clean: list[int], corrupt: list[int], answers: list[int] |
                 "lost": sh[0], "restored": sh[1]}
     rec["singles"] = {k: [single(u, c["singles"][u]) for u in sorted(c["singles"], key=lambda u: -max(map(abs, c["singles"][u])))
                           [:SINGLES_KEPT]] for k, c in cuts.items()}
-    rec.update(nodes=nodes, routes=routes, met=all(c["met"] or not c["reachable"] or bool((c.get("spread") or {}).get("diffuse"))
-                                                   for c in cuts.values()),
+    rec.update(nodes=nodes, routes=routes, met=all(c["met"] or not c["reachable"] or c["diffuse"] for c in cuts.values()),
+               diffuse=[k for k, c in cuts.items() if c["diffuse"]], unreachable=[k for k, c in cuts.items() if not c["reachable"]],
+               met_rule="every cut whose ceiling passes passes; diffuse and unreachable cuts listed, not required",
                cuts={k: {f: c[f] for f in ("met", "lost", "restored", "eps", "floor", "found", "ceiling", "reachable", "curve", "refined",
-                                           "conditional", "spread", "searched", "route_groups", "prior")}
+                                           "conditional", "spread", "searched", "route_groups", "prior", "bar", "diffuse")}
                      | {"size": len(c["units"])} for k, c in cuts.items()},
                size=len(nodes), seconds=round(time.perf_counter() - t0, 2))
     if log:

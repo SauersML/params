@@ -94,8 +94,12 @@ def test_find_record(tiny, monkeypatch):
             assert abs(lost - c["lost"]) < 1e-5 and abs(rest - c["restored"]) < 1e-5
         if c["met"]:
             assert c["lost"] >= cf.PASS and c["restored"] >= cf.PASS
-    assert rec["met"] == all(c["met"] or not c["reachable"] or bool((c.get("spread") or {}).get("diffuse"))
-                             for c in rec["cuts"].values())   # (Q1: a diffuse cut excepted)
+    assert rec["met"] == all(c["met"] or not c["reachable"] or c["diffuse"] for c in rec["cuts"].values())   # (Q1: a
+    assert set(rec["diffuse"]) == {k for k, c in rec["cuts"].items() if c["diffuse"]}           # diffuse cut excepted)
+    for k, c in rec["cuts"].items():
+        assert c["bar"] == cf.PASS              # (float32: no noise margin)
+        if c["diffuse"]:
+            assert c["size"] == 0
     for x in rec["nodes"] + rec["routes"]:
         assert {"direct", "direct_delta", "at_answer"} <= set(x)
     for k, ss in rec["singles"].items():           # each cut's measured singles, largest first, the circuit's among them

@@ -394,8 +394,15 @@ def cuts_of(pt, wanted=None) -> dict:
     last = pt.T - 1
     out = {"readout": {"kinds": ("neuron",), "positions": [last]}, "movers": {"kinds": ("head",), "positions": [last]}}
     if pt.first < last:
-        out["source"] = {"kinds": ("neuron",), "positions": list(range(pt.first, last))}
+        out["source"] = {"kinds": ("neuron",), "positions": _source_positions(pt, pt.first)}
     return {n: c for n, c in out.items() if wanted is None or n in wanted}
+
+
+def _source_positions(pt, lo: int) -> list:
+    """The source cut's positions: lo to the one before the answer, or only those of them in pt.source_positions when a
+    caller set it (chive's long chat prompts, ~1,000 positions: its screen's top positions)."""
+    keep = getattr(pt, "source_positions", None)
+    return [p for p in range(lo, pt.T - 1) if keep is None or p in keep]
 
 
 def attr_order(pt, spec: dict, sc: dict) -> list:
@@ -638,7 +645,7 @@ def _before_steps(pt, arm: str, log=None, prior: dict | None = None, partners: l
     for n in [n for n in specs if ALLCUTS or n == "source"] if partners else []:
         meas[n] = Mean([pt] + list(partners))
     if isinstance(meas.get("source"), Mean):
-        specs["source"] = {**specs["source"], "positions": list(range(min(p.first for p in meas["source"].pts), pt.T - 1))}
+        specs["source"] = {**specs["source"], "positions": _source_positions(pt, min(p.first for p in meas["source"].pts))}
     names = list(specs)
     width = {"neuron": pt.D, "head": pt.H}
     every = {n: [cf.unit(k, i, p, torch.arange(width[k])) for k in s["kinds"] for i in range(pt.L) for p in s["positions"]]

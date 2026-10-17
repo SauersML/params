@@ -865,7 +865,8 @@ def score(a) -> None:
     excl = json.loads((ITEMS / "manifest.json").read_text()).get("exclusions", {})
     p1sub = set(json.loads((ITEMS / "o1p_sub.json").read_text())["items"]) if (ITEMS / "o1p_sub.json").exists() else set()
     p1fp = json.loads((ITEMS / "o1p_sign_fp32.json").read_text())["labels"] if (ITEMS / "o1p_sign_fp32.json").exists() else {}
-    pj = {x["item"]: x for x in jl(ITEMS / "o1p_joint.jsonl")} if (ITEMS / "o1p_joint.jsonl").exists() else {}
+    pj = {x["item"]: x for x in jl(ITEMS / "o1p_joint.jsonl")} if (ITEMS / "o1p_joint.jsonl").exists() and not \
+        json.loads((ITEMS / "manifest.json").read_text()).get("o1p_joint", {}).get("invalid") else {}  # (v1 leaks by exclusion)
     p1clean = set(json.loads((ITEMS / "o1p_clean.json").read_text())["items"]) if (ITEMS / "o1p_clean.json").exists() else set()  # (textoracle's:
     # both contexts in no training data of textoracle or oracledata)
     sub_f = ITEMS / "o1m_subsets.json"  # (textoracle's identity-contradicted questions: a neuron whose training outcome

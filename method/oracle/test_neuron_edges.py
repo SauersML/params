@@ -249,6 +249,7 @@ def test_finder_graph_keeps_cut_summary_and_marks_source_provenance(monkeypatch)
     from types import SimpleNamespace
     import types
     summary={'none':1.25,'graph_edges':.5,'every_edge':-.25}
+    monkeypatch.setattr(neuron_edges,'PRUNE',True)
     monkeypatch.setattr(neuron_edges,'Edges',lambda *a,**kw:object())
     monkeypatch.setattr(neuron_edges,'prune',lambda *a,**kw:{})
     monkeypatch.setattr(neuron_edges,'graph',lambda *a,**kw:{'cut':dict(summary),'edges':[]})

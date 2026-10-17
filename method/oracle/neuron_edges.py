@@ -65,6 +65,9 @@ EPS = tuple(round(0.5 * 2 ** (-i / 2), 4) for i in range(14))  # each reader's r
 BITS = tuple(round(2 ** (-i / 2), 4) for i in range(20))  # or each reader's error allowed this share of the tolerance in
 # first-order contrast (gradient x activation x relative error): 1 to 0.0014
 MEASURED = 512  # kept edges whose own cut from the graph is measured (those of largest first-order weight)
+PRUNE = False  # finder_graph's pruned edge set among the circuit's neurons (prune, graph, carriers): off, the readers
+# (readers.py) are the records' edges. On 32 Qwen3-8B dev circuits the pruned set changed in 10 with the sets a forward
+# (capital/Kenya/p0 150 -> 898 edges, met flipping both ways), and it was 40% of the edge stage (1.2-1.5 s of 2.6-3.6 s)
 HALVE_BLOCKS = 8
 HALVE_FORWARDS = 8  # halving's forwards at most (then its graph stands: every cut in it measured; Qwen3-8B dev circuits of
 # ~190 neurons took 20-42 halving forwards, 4.4-8.9 s of a 9-16 s prune; under ~50 neurons 2-11)
@@ -942,13 +945,17 @@ def finder_graph(model, tok, rec: dict, log=print) -> dict:
     t, sec = time.time(), {}
     ids, bad = rec["ids"], rec["corrupted"]
     answer, alts = answer_sets(rec)
-    ed = Edges(model, ids, len(ids) - 1, answer, alts,
-               [(n["layer"], n["pos"], n["neuron"]) for n in rec["nodes"]], corrupt_ids=bad)
-    sec["setup"], t = round(time.time() - t, 3), time.time()
-    got = prune(ed, log=log)
-    sec["prune"], t = round(time.time() - t, 3), time.time()
-    g = graph(ed, got, tok)
-    sec["graph"], t = round(time.time() - t, 3), time.time()
+    if PRUNE:
+        ed = Edges(model, ids, len(ids) - 1, answer, alts,
+                   [(n["layer"], n["pos"], n["neuron"]) for n in rec["nodes"]], corrupt_ids=bad)
+        sec["setup"], t = round(time.time() - t, 3), time.time()
+        got = prune(ed, log=log)
+        sec["prune"], t = round(time.time() - t, 3), time.time()
+        g = graph(ed, got, tok)
+        sec["graph"], t = round(time.time() - t, 3), time.time()
+    else:
+        g = {"nodes": [{k: n[k] for k in ("layer", "pos", "neuron")} for n in rec.get("nodes", [])], "edges": [],
+             "record": None, "cut": None, "route_note": None}
     rn = head_routes.Runner(model)
     rn.answer, rn.alternatives = answer, alts
     run = rn.run(ids, [{}], capture=True)
@@ -1096,7 +1103,10 @@ def main():
                     "over two cards, device_map auto)")
     ap.add_argument("--adapter", default=None, help="a peft adapter (an organism) on the model; finder: else each record's "
                     "own (its \"adapter\")")
+    ap.add_argument("--prune", action="store_true", help="finder: the pruned edge set among the circuit's neurons too (PRUNE)")
     a = ap.parse_args()
+    global PRUNE
+    PRUNE = PRUNE or a.prune
     import transformers
     model = load(a.model, a.device, a.dtype)
     tok = transformers.AutoTokenizer.from_pretrained(a.model)

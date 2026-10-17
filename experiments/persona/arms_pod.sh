@@ -3,7 +3,8 @@
 # evaluate.py on each arm's last checkpoint (every suite) and on its earlier checkpoints (plain suite: owl rate against
 # training steps), then depth.py on the last checkpoints.
 #   arms_pod.sh SPEC DATA_DIR OUT PROMPTS GENERAL [PAR]
-# SPEC lines: NAME DATA_FILE ARGS... (train.py's arguments after DATA OUT_DIR; DATA_FILE relative to DATA_DIR). Names
+# SPEC lines: NAME DATA_FILE ARGS... (train.py's arguments after DATA OUT_DIR; DATA_FILE relative to DATA_DIR, and
+# @DATA@ in ARGS replaced by DATA_DIR, so unit files can sit there). Names
 # GROUP@VARIANT (a learning rate) form a group: only the variant with the lowest final validation loss (held-out
 # training prompts, never an evaluation prompt) is evaluated.
 set -uo pipefail
@@ -15,6 +16,7 @@ while read -r name file args; do
     [ -z "$name" ] || [ "${name:0:1}" = "#" ] && continue
     [ -e "$out/train/$name/train_log.json" ] && continue
     while [ "$(jobs -rp | wc -l)" -ge "$par" ]; do sleep 5; done
+    args=${args//@DATA@/$data}
     echo "== $(date +%T) train $name"
     python "$here/train.py" "$data/$file" "$out/train/$name" $args < /dev/null > "$out/train/$name.log" 2>&1 &
     pids+=($!)

@@ -496,7 +496,10 @@ def _ours(rp, th: dict, sc: dict, orders: list, P: set, log=None) -> dict:
     for o in orders:
         if o != "masks":
             k = o.replace("_signed", "")
-            prop[o] = sc[k] if o.endswith("_signed") else {"neuron": sc[k]["neuron"].abs(), "head": sc[k]["head"].abs()}
+            prop[o] = ({"neuron": sc[k]["neuron"], "head": sc[k]["head"]} if o.endswith("_signed")
+                       else {"neuron": sc[k]["neuron"].abs(), "head": sc[k]["head"].abs()})
+            if th["head"] is None:                  # (--heads 0: neurons only, in every order)
+                prop[o]["head"] = None
     best, sizes = None, {}
     for o in orders:
         v = rp.verify(rp.order(prop[o]), log=log, name=o)
@@ -533,7 +536,7 @@ def _zeroed(core, tok, delta, ids, sets: dict, pscore, n: int) -> dict:
 
 
 def _bar(a) -> str:
-    return "" if a.bar == PASS else f"_p{a.bar:g}"
+    return ("" if a.bar == PASS else f"_p{a.bar:g}") + ("" if a.heads else "_h0")
 
 
 def owl_main(a):

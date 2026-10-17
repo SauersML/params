@@ -1896,16 +1896,27 @@ Question: {ask}
 Answer as JSON: {{"answer": "..."}}"""
 
 
+PLACEHOLDER = re.compile(r"^\W*$|^\.\.\.$|^\[.*operations.*\]$|^\{\s*\.\.\.\s*\}$", re.S)
+
+
 def parse(text: str):
-    m_ = re.search(r"<answer>(.*?)(?:</answer>|$)", text, re.S)
-    if not m_:
-        return None
-    s = m_.group(1).strip()
-    j = re.search(r"\{.*\}", s, re.S)
-    try:
-        return json.loads(j.group(0)) if j else {"answer": s}
-    except json.JSONDecodeError:
-        return {"answer": s}
+    """The last <answer> block that is a real answer: a mention of the format in prose ("<answer>...</answer>"), an
+    empty or placeholder block, or an edit with no units does not end the episode (10-16: three episodes "answered" with
+    0 passes by quoting the format)."""
+    for m_ in reversed(list(re.finditer(r"<answer>(.*?)(?:</answer>|$)", text, re.S))):
+        s = m_.group(1).strip()
+        if PLACEHOLDER.match(s):
+            continue
+        j = re.search(r"\{.*\}", s, re.S)
+        try:
+            got = json.loads(j.group(0)) if j else {"answer": s}
+        except json.JSONDecodeError:
+            got = {"answer": s}
+        if isinstance(got, dict) and isinstance(got.get("edit"), list) and got["edit"] and all(
+                isinstance(op, dict) and op.get("op") == "zero" and not op.get("units") for op in got["edit"]):
+            continue
+        return got
+    return None
 
 
 def grade(it: dict, ans, tok) -> list[dict]:

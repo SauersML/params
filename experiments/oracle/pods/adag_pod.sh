@@ -11,6 +11,11 @@
 #          size on the same pairs (adag_repo.py match, against PAIRS: the family run's pair records); attribution
 #          baselines at the same size (attr_baselines.py: AtP, RelP, EAP-IG); every set and ours through circuit_bench.py
 #          score (Q1-Q5 by neuron_scorecard), side by side in table.txt
+#   dev    the frozen dev set (DEV: devset_8b.json, or a subset of it) on Qwen3-8B, all on one card: our circuit_finder at
+#          this commit (timed), ADAG's tracer as finder records (adag_repo.py trace: its whole circuits, adag_full), ADAG cut
+#          to our finder's scored size on the same pair (match: adag), AtP/RelP/EAP-IG at that size (attr_baselines.py),
+#          every set through circuit_bench.py score (S1, Q1 with its matched random control, Q2-Q5, intervals), side by
+#          side in dev/table.txt
 #   math   its math circuit on 40 sums (18 + 24 first; 32 s a sum on an A40) and its clusters measured
 #   cg     CausalGym under its own faithfulness evaluation (eval.py): NAP on MLP neurons, our measured scores, ENAP
 # MASKFIX (default 1): ADAG's NoQKGradAttention runs as attention implementation "noqk", for which transformers 4.57
@@ -25,7 +30,8 @@
 # uv run puts 4.57.3 back. Every step has its own time limit and log; results come back to ~/mpd-data/runpod/NAME
 # (steps.log: each step's start and exit).
 #   experiments/oracle/pods/adag_pod.sh [NAME] [HOURS]   env: STEPS, FAMILIES, BENCH, MASKFIX, PAIRS (a tarball of the pair records), K
-#                                                        (clusters, 16), FS_MODELS (fs's models, "llama qwen8"), GPU, PRICE
+#                                                        (clusters, 16), FS_MODELS (fs's models, "llama qwen8"), DEV, RP_REF
+#                                                        (the commit run, default origin/main), GPU, PRICE
 # The whole script is one block, so bash has read all of it before it runs.
 {
 cd /Users/user/params
@@ -39,6 +45,8 @@ P=/Users/user/params/experiments/oracle
 K=${K:-16}
 L=meta-llama/Llama-3.1-8B-Instruct Q=Qwen/Qwen3-8B
 QS=/Users/user/mpd-data/graph_oracle/circuit_questions/questions.json
+DEV=${DEV:-/Users/user/mpd-data/circuits/devset_8b.json}
+export RP_REF=${RP_REF:-$(git rev-parse origin/main)}  # (the source the pod runs; the finder's records name it)
 MASKFIX_CMD=""  # (MASKFIX=1, the default: ADAG's "noqk" attention gets eager's causal mask, adag_repo.py fix_noqk_mask)
 [ "${MASKFIX:-1}" = 1 ] && MASKFIX_CMD="uv run python $P/adag_repo.py sitefix ~/adagfix; export PYTHONPATH=\$HOME/adagfix ADAG_MASKFIX=1;"
 RUNS=""
@@ -66,6 +74,22 @@ step match 5 uv run python $P/adag_repo.py match $O/trace_qwen8 ~/pairs $O/adag_
     RUNS="$RUNS step bench_$b 40 uv run python $P/circuit_bench.py score $d $O/bench_$b --devset $QS --model $Q;
 "
   done
+fi
+if [[ $STEPS == *,dev,* ]]; then
+  D=$O/dev
+  RUNS="$RUNS mkdir -p $D;
+step dev_finder 60 uv run python /Users/user/params/method/oracle/circuit_finder.py questions $DEV $D/finder --model $Q --rev $RP_REF;
+step dev_trace 150 uv run python $P/adag_repo.py trace $DEV $D/adag_full --model $Q --stride 1 --chunk 10;
+step dev_match 5 uv run python $P/adag_repo.py match $D/adag_full $D/finder $D/adag;
+step dev_baselines 60 uv run python $P/attr_baselines.py $D/finder $D/baselines --model $Q;
+"
+  for b in finder adag adag_full atp relp eapig; do
+    case $b in finder|adag|adag_full) d=$D/$b;; *) d=$D/baselines/$b;; esac
+    RUNS="$RUNS step dev_bench_$b 90 uv run python $P/circuit_bench.py score $d $D/bench_$b --devset $DEV --model $Q --rev $RP_REF;
+"
+  done
+  RUNS="$RUNS uv run python $P/circuit_bench.py table $D/bench_finder $D/bench_adag $D/bench_adag_full $D/bench_atp $D/bench_relp $D/bench_eapig > $D/table.txt 2>&1;
+"
 fi
 if [[ $STEPS == *,math,* ]]; then
   RUNS="$RUNS step math_data 2 uv run python $P/adag_repo.py math-data scripts/circuit_prep/data/math_sub.py --n 40;

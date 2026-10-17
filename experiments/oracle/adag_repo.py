@@ -481,18 +481,20 @@ def trace(a) -> None:
 
 def match(a) -> None:
     """ADAG's circuit of each traced question cut to our finder's size on the same pair: its neurons with the largest
-    |attribution|, as many as the finder record's neurons and heads (circuit_family's pair record of the question
-    against its own corrupted key in PAIRS, the family run's pairs/); written as finder records beside ADAG's full ones."""
+    |attribution|, as many as the finder record's scored units (its source neurons and mover heads, as neuron_scorecard
+    reads a finder record: not its readout cut) (PAIRS: the question's own finder record, or circuit_family's pair
+    record of the question against its own corrupted key, the family run's pairs/); written as finder records beside
+    ADAG's full ones."""
     a.out.mkdir(parents=True, exist_ok=True)
     n = 0
     for f in sorted(a.adag.glob("*.json")):
         r = json.loads(f.read_text())
-        q = r["id"]
-        cands = [p for p in a.pairs.glob(f"{q.replace('/', '__')}__vs__*.json")]
+        q = r["id"].replace("/", "__")
+        cands = list(a.pairs.glob(f"{q}__vs__*.json")) + [p for p in (a.pairs / f"{q}.json",) if p.exists()]
         mine = next((json.loads(p.read_text()) for p in cands if json.loads(p.read_text()).get("corrupted") == r["corrupted"]), None)
         if mine is None or not mine.get("cuts"):
             continue
-        k = len(mine.get("nodes", [])) + len(mine.get("routes", []))
+        k = sum(x.get("stage") != "readout" for x in mine.get("nodes", [])) + len(mine.get("routes", []))
         keep = sorted(r["nodes"], key=lambda u: -abs(u["attribution"]))[:k]
         r.update(nodes=keep, size=len(keep), matched_to={"pair": mine["id"], "finder_size": k, "adag_size": len(r["nodes"])},
                  finder="adag_matched")

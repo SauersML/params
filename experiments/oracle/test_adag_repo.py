@@ -127,3 +127,11 @@ def test_match_cuts_adag_to_the_finder_size(tmp_path):
     ar.match(SimpleNamespace(adag=adag, pairs=pairs, out=out))
     r = json.loads((out / "capital__France__p0.json").read_text())
     assert [u["attribution"] for u in r["nodes"]] == [-3.0, 2.0] and r["matched_to"]["pair"] == "capital/France/p0/vs/Italy"
+    # a question's own finder record; its readout cut is not counted (the scorecard does not score it)
+    (pairs / "capital__France__p0__vs__Italy.json").unlink()
+    (pairs / "capital__France__p0.json").write_text(json.dumps(
+        {"id": "capital/France/p0", "corrupted": [1, 2], "cuts": {"source": {}},
+         "nodes": [{"stage": "source"}, {"stage": "readout"}, {"stage": "readout"}], "routes": [{}, {}]}))
+    ar.match(SimpleNamespace(adag=adag, pairs=pairs, out=out))
+    r = json.loads((out / "capital__France__p0.json").read_text())
+    assert [u["attribution"] for u in r["nodes"]] == [-3.0, 2.0, 0.5] and r["matched_to"]["pair"] == "capital/France/p0"

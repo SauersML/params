@@ -8,7 +8,8 @@ Units: neurons (layer, index) at the down projection's input and heads (layer, h
 each with ONE value of the dial over every position of both sequences (prompt and reply). Two modes:
   pair    two runs on the same tokens: clean = the model with the behaviour, corrupt = the reference model (here the
           organism's exact low-rank weight difference added by hooks, or not); patching sets a unit to the other run's
-          values at every position. lost = (S_clean - S_noised) / gap, restored = (S_denoised - S_corrupt) / gap,
+          values at every position, a neuron's whole write (its down column too, where the difference changes it, so
+          the difference's own neurons together are an exact circuit). lost = (S_clean - S_noised) / gap, restored = (S_denoised - S_corrupt) / gap,
           gap = S_clean - S_corrupt. (The reference model is something an audit would not have.)
   ablate  one run (no reference model): a unit is zeroed at every position; lost = (S - S_zeroed) / S, and in the
           second share's place kept = 1 - max(0, log2 p(B) - log2 p_zeroed(B)) / S, so a set passes only if zeroing it
@@ -66,21 +67,27 @@ PREFILL = "As an AI assistant, I"                   # (--b-from prefill: B's fir
 
 class Delta:
     """An organism as the base model plus an exact low-rank addition to some projections ({"model.layers.L.mlp.MOD":
-    (A [k, in], B [out, k])}, compact_delta's), added by forward hooks with a weight per batch row (1 organism, 0 base)."""
+    (A [k, in], B [out, k])}, compact_delta's), added by forward hooks with a weight per batch row (1 organism, 0 base).
+    While coef[L] ([rows, D]) is set, layer L's down-projection addition takes a weight per row AND neuron instead: a
+    neuron patched to the other model then carries the other model's down column too (its whole write)."""
 
     def __init__(self, core, path: str):
         self.core = core
         dev = core.model.embed_tokens.weight.device
         self.mods = {k: (a.to(dev), b.to(dev)) for k, (a, b) in torch.load(path, map_location="cpu").items()}
         self.s = None                               # per-row weights [B] while a forward runs
+        self.coef = None                            # {layer: [B, D]} per-row-and-neuron down weights (Reply's patches)
+        self.down_layers = sorted(int(k.split(".")[2]) for k in self.mods if k.endswith("down_proj"))
         self.hooks = []
         for k, (A, B) in self.mods.items():
             l, mod = int(k.split(".")[2]), k.split(".")[-1]
 
-            def hk(m, args, out, A=A, B=B):
+            def hk(m, args, out, A=A, B=B, l=l, mod=mod):
                 if self.s is None:
                     return None
                 x = args[0]
+                if mod == "down_proj" and self.coef is not None and l in self.coef:
+                    return out + ((x * self.coef[l][:x.shape[0], None, :].to(x.dtype)) @ A.T) @ B.T
                 return out + self.s[:x.shape[0]].to(out.dtype).view(-1, *([1] * (out.dim() - 1))) * ((x @ A.T) @ B.T)
             self.hooks.append(getattr(core.model.layers[l].mlp, mod).register_forward_hook(hk))
 
@@ -147,7 +154,7 @@ class Reply:
         tgt = torch.tensor(self.seqs[q][a:b], device=logits.device)
         return torch.log_softmax(logits, -1).gather(-1, tgt[None, :, None].expand(hn.shape[0], -1, 1))[..., 0].sum(-1) / LN2
 
-    def _run(self, q: str, runs: list, dials: list, grad: bool = False, add=None) -> torch.Tensor:
+    def _run(self, q: str, runs: list, dials: list, grad: bool = False) -> torch.Tensor:
         """[R] reply log2 p of sequence q, row r in run runs[r] with its units moved by dials[r] = (neuron dial [L, D] or
         None, head dial [L, H] or None) toward the other run's values (pair) or toward 0 (ablate), at every position."""
         R = len(runs)
@@ -172,13 +179,8 @@ class Reply:
                         else:
                             w = neu[r][i].to(h.dtype)
                             rows.append(h[r] + w * (target("neu", i, r, h[r]) - h[r]))
-                    h = torch.stack(rows)
-                    if add is not None:
-                        h = h + add["neu"][i].to(h.dtype)
-                    return (h,) + tuple(a[1:])
+                    return (torch.stack(rows),) + tuple(a[1:])
                 hs.append(layer.mlp.down_proj.register_forward_pre_hook(pn))
-            elif add is not None:
-                hs.append(layer.mlp.down_proj.register_forward_pre_hook(lambda m, a, i=i: (a[0] + add["neu"][i].to(a[0].dtype),) + tuple(a[1:])))
             if any(n is not None for n in head):
                 def ph(m, a, i=i):
                     h = a[0]
@@ -189,18 +191,25 @@ class Reply:
                         else:
                             w = head[r][i].to(h.dtype).repeat_interleave(self.hd)
                             rows.append(h[r] + w * (target("head", i, r, h[r]) - h[r]))
-                    h = torch.stack(rows)
-                    if add is not None:
-                        h = h + add["head"][i].to(h.dtype)
-                    return (h,) + tuple(a[1:])
+                    return (torch.stack(rows),) + tuple(a[1:])
                 hs.append(layer.self_attn.o_proj.register_forward_pre_hook(ph))
-            elif add is not None:
-                hs.append(layer.self_attn.o_proj.register_forward_pre_hook(lambda m, a, i=i: (a[0] + add["head"][i].to(a[0].dtype),) + tuple(a[1:])))
+        coef = None                                 # (pair: a patched neuron takes the other model's down column too)
+        if self.mode == "pair" and self.delta is not None and any(n is not None for n in neu):
+            sr = torch.tensor([1.0 if r == "clean" else 0.0 for r in runs], device=self.dev)[:, None]
+            zero = torch.zeros(self.D, device=self.dev)
+            coef = {}
+            for i in self.delta.down_layers:
+                w = torch.stack([neu[r][i] if neu[r] is not None else zero for r in range(R)])
+                coef[i] = sr * (1 - w) + (1 - sr) * w
         try:
+            if coef is not None:
+                self.delta.coef = coef
             with self._org(runs), (contextlib.nullcontext() if grad else torch.no_grad()):
                 hn = self.core.model(input_ids=x).last_hidden_state
                 return self._logp(q, hn)
         finally:
+            if self.delta is not None:
+                self.delta.coef = None
             for h in hs:
                 h.remove()
 
@@ -297,32 +306,21 @@ class Reply:
 
     # ----- baselines over the same objective
     def attribution(self, kind: str) -> dict:
-        """Per unit, sum over positions and both sequences of (other value - clean value) x the gradient of S (atp: at the
-        clean run; eapig: the mean over IG_STEPS points of the patch path; relp: RelP's backward at the clean run). Signed:
-        the first-order drop of S when the unit is patched (ablate: the other value is 0)."""
-        out = {"neuron": torch.zeros(self.L, self.D, device=self.dev), "head": torch.zeros(self.L, self.H, device=self.dev)}
+        """Per unit, minus the gradient of S with respect to its dial: the first-order drop of S when the unit moves to
+        the other run's values at every position (ablate: to 0; pair with the delta: a neuron's whole write, its down
+        column too). atp: at the clean run (dials 0); eapig: the mean over IG_STEPS points of the path from 0 to 1, every
+        dial together; relp: RelP's backward at the clean run."""
         alphas = [(k + 0.5) / IG_STEPS for k in range(IG_STEPS)] if kind == "eapig" else [0.0]
-        for q, sign in (("A", 1.0), ("B", -1.0)):
-            T = len(self.seqs[q])
-            add = {"neu": [torch.zeros(len(alphas), T, self.D, device=self.dev, requires_grad=True) for _ in range(self.L)],
-                   "head": [torch.zeros(len(alphas), T, self.H * self.hd, device=self.dev, requires_grad=True) for _ in range(self.L)]}
-            al = torch.tensor(alphas, device=self.dev)
-            dials = [(al[r].expand(self.L, self.D), al[r].expand(self.L, self.H)) if alphas[r] > 0 else (None, None)
-                     for r in range(len(alphas))]
-            ctx = cf._relp(self.core) if kind == "relp" else contextlib.nullcontext()
-            with torch.enable_grad(), ctx:
-                s = self._run(q, ["clean"] * len(alphas), dials, grad=True, add=add)
+        R = len(alphas)
+        al = torch.tensor(alphas, device=self.dev)[:, None, None]
+        dn = al.expand(R, self.L, self.D).clone().requires_grad_(True)
+        dh = al.expand(R, self.L, self.H).clone().requires_grad_(True)
+        ctx = cf._relp(self.core) if kind == "relp" else contextlib.nullcontext()
+        with torch.enable_grad(), ctx:
+            for q, sign in (("A", 1.0), ("B", -1.0)):
+                s = self._run(q, ["clean"] * R, [(dn[r], dh[r]) for r in range(R)], grad=True)
                 (sign * s.sum()).backward()
-            for i in range(self.L):
-                for key, k2, w in (("neu", "neuron", self.D), ("head", "head", self.H)):
-                    clean = self.act[(q, "clean")][key][i].to(self.dev).float()
-                    oth = self.act[(q, "corrupt")][key][i].to(self.dev).float() if self.mode == "pair" else torch.zeros_like(clean)
-                    g = add[key][i].grad.float().mean(0)                                    # [T, width]
-                    v = ((oth - clean) * g)                                                   # first-order change of S
-                    if key == "head":
-                        v = v.view(T, self.H, self.hd).sum(-1)
-                    out[k2][i] += -v.sum(0)                                                   # drop of S
-        return out
+        return {"neuron": -dn.grad.float().mean(0), "head": -dh.grad.float().mean(0)}
 
 
 def fit_masks(reps: list, steps: int = STEPS, heads: bool = True, log=None) -> dict:

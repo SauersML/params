@@ -144,3 +144,27 @@ def test_drivers_end_to_end(setup, tmp_path, monkeypatch):
                                                                  "eapig", "eapig_signed", "relp"}
     j = cr.json.loads((tmp_path / "out" / "owl_ablate_prefill_joint.json").read_text())
     assert len(j["train"]) == 2 and len(j["test"]) == 2 and "ours" in j and "shares" in next(iter(j["test"].values()))
+
+
+def test_planted_writes_are_an_exact_circuit(setup):
+    """The delta changes only the planted neurons' gate and up rows and down columns, so patching those neurons' whole
+    writes (activation and down column) moves each run all the way to the other: lost = restored = 1."""
+    core, delta, prompt, A, B, P = setup
+    rp = cr.Reply(core, prompt, A, B, delta, "pair")
+    (lost, rest), = rp.shares([[("neuron", l, n) for l, n in sorted(P)]])
+    assert abs(lost - 1.0) < 1e-4 and abs(rest - 1.0) < 1e-4
+
+
+def test_atp_is_the_dial_gradient(setup):
+    """AtP of a unit is minus dS/d(its dial) at the clean run: a finite difference agrees (pair, a planted neuron, the
+    down-column path included)."""
+    core, delta, prompt, A, B, P = setup
+    rp = cr.Reply(core, prompt, A, B, delta, "pair")
+    sc = rp.attribution("atp")
+    l, n = sorted(P)[0]
+    eps = 1e-3
+    dn = torch.zeros(rp.L, rp.D)
+    dn[l, n] = eps
+    S1 = float(rp._run("A", ["clean"], [(dn, None)])[0] - rp._run("B", ["clean"], [(dn, None)])[0])
+    fd = -(S1 - rp.S["clean"]) / eps
+    assert abs(fd - float(sc["neuron"][l, n])) < 1e-2 * max(1.0, abs(fd))

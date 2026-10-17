@@ -42,6 +42,11 @@ INSTRUCTION = ("Below is a circuit that Qwen3-8B uses to produce its next token 
                "Name the units that matter and say what each one does.")
 
 
+INSTRUCTION_V2 = INSTRUCTION.replace("in at most 100 words", "in at most 80 words (about 120 tokens), ending with a complete "
+                                     "sentence")
+SENTENCE_END = (".", "!", "?", '"', ")")
+
+
 def env():
     import os
     if not os.environ.get("TINKER_PROJECT_ID"):
@@ -175,8 +180,8 @@ def determinism(a) -> None:
                       "usd": round(rd.spend.total, 4)}))
 
 
-def policy_prompt(c: dict) -> str:
-    return INSTRUCTION + "\n\n" + circuit_text(c)
+def policy_prompt(c: dict, v2: bool = False) -> str:
+    return (INSTRUCTION_V2 if v2 else INSTRUCTION) + "\n\n" + circuit_text(c)
 
 
 def train(a) -> None:
@@ -191,6 +196,8 @@ def train(a) -> None:
     C = {json.loads(x)["circuit_id"]: json.loads(x) for x in (PAIRS / "circuits.jsonl").read_text().splitlines()}
     Q = json.loads((a.out / "q_train.json").read_text())
     pool = [cid for cid in sorted(Q) if len(Q[cid]) >= a.k and cid in C]
+    freq = collections.Counter(q["cls"] for v in Q.values() for q in v)
+    weight = {c: sum(freq.values()) / (len(freq) * n) for c, n in freq.items()}  # inverse class frequency
     rng = random.Random(a.seed)
     service = llm.service_client()
     training = (service.create_training_client_from_state(a.init) if a.init  # (a continued run: the saved weights)
@@ -207,7 +214,7 @@ def train(a) -> None:
         cids = rng.sample(pool, a.batch)
         futs = []
         for cid in cids:
-            mi = renderer.build_generation_prompt([{"role": "user", "content": policy_prompt(C[cid])}])
+            mi = renderer.build_generation_prompt([{"role": "user", "content": policy_prompt(C[cid], a.v2)}])
             futs.append((cid, mi, sampler.sample(prompt=mi, num_samples=a.group, sampling_params=sp)))
         rolls = []
         for cid, mi, f in futs:
@@ -225,7 +232,11 @@ def train(a) -> None:
         for x in rolls:
             got = ans[k:k + len(x["qs"])]
             k += len(x["qs"])
-            x["reward"] = sum(parse(g) == q["cls"] for g, q in zip(got, x["qs"])) / len(x["qs"])
+            w = [weight[q["cls"]] if a.balanced else 1.0 for q in x["qs"]]
+            x["reward"] = sum(wi * (parse(g) == q["cls"]) for wi, g, q in zip(w, got, x["qs"])) / sum(w)
+            x["cut"] = not x["text"].rstrip().endswith(SENTENCE_END)
+            if a.cut_zero and x["cut"]:
+                x["reward"] = 0.0  # (an explanation cut mid-sentence earns nothing)
         data, adv_all = [], []
         for cid in cids:
             grp = [x for x in rolls if x["cid"] == cid]
@@ -249,7 +260,8 @@ def train(a) -> None:
             spend.add("train", trained=sum(d.model_input.length for d in data))
         rec = {"step": step, "reward": round(sum(x["reward"] for x in rolls) / len(rolls), 4), "trained_seqs": len(data),
                "len": round(sum(len(x["tokens"]) for x in rolls) / len(rolls), 1),
-               "capped": sum(len(x["tokens"]) >= CAP for x in rolls), "usd": round(spend.total + rd.spend.total, 3),
+               "capped": sum(len(x["tokens"]) >= CAP for x in rolls), "cut": sum(x["cut"] for x in rolls),
+               "usd": round(spend.total + rd.spend.total, 3),
                "seconds": round(time.time() - t0, 1)}
         log.write(json.dumps(rec) + "\n")
         log.flush()
@@ -285,7 +297,7 @@ def eval_(a) -> None:
     for name, sampler in policies:
         futs = []
         for cid in cids:
-            mi = renderer.build_generation_prompt([{"role": "user", "content": policy_prompt(C[cid])}])
+            mi = renderer.build_generation_prompt([{"role": "user", "content": policy_prompt(C[cid], a.v2)}])
             futs.append((cid, mi, sampler.sample(prompt=mi, num_samples=1, sampling_params=sp)))
         for cid, mi, f in futs:
             r = f.result()
@@ -303,6 +315,13 @@ def eval_(a) -> None:
     mats = {m: fn for m, fn in mats.items() if m.split("_r")[0] in a.conds.split(",") or m in a.conds.split(",")}
     items = [(cid, q) for cid in cids for q in qs[cid]]
     ok, pred = {}, {}
+    old = json.loads(a.reuse.read_text()) if a.reuse else None
+    if old:  # conditions whose reader prompts do not depend on the policy (a, d, e), from an earlier run on the same items
+        assert old["items"] == [[cid, q["key"], q["cls"]] for cid, q in items], "reuse: different items"
+        for m in a.reuse_conds.split(","):
+            pred[m] = old["pred"][m]
+            ok[m] = [p == q["cls"] for p, (_, q) in zip(pred[m], items)]
+        mats = {m: fn for m, fn in mats.items() if m not in pred}
     for m, fn in mats.items():
         ans = rd.answer([reader_prompt(C[cid], q, fn(cid)) for cid, q in items])
         pred[m] = [parse(x) for x in ans]
@@ -378,11 +397,17 @@ def main():
     t.add_argument("--k", type=int, default=6)
     t.add_argument("--lr", type=float, default=5e-5)
     t.add_argument("--seed", type=int, default=0)
+    t.add_argument("--balanced", action="store_true", help="each question weighted by its class's inverse training frequency")
+    t.add_argument("--cut-zero", action="store_true", help="zero reward for an explanation cut mid-sentence")
+    for n in ("train", "eval"):
+        sub.choices[n].add_argument("--v2", action="store_true", help="the policy asked for at most 80 words, ending a sentence")
     e = sub.choices["eval"]
     e.add_argument("--circuits", type=int, default=100)
     e.add_argument("--per", type=int, default=8)
     e.add_argument("--min-q", type=int, default=4)
     e.add_argument("--conds", default="a_none,b_before,c_after,d_truncated,e_circuit")
+    e.add_argument("--reuse", type=Path, help="an earlier eval_items file on the same items")
+    e.add_argument("--reuse-conds", default="a_none,d_truncated,e_circuit")
     e.add_argument("--after", default="", help="comma-separated state tags to evaluate as condition c (e.g. ',_r2': rounds 1 and 2)")
     a = ap.parse_args()
     {"questions": questions, "determinism": determinism, "train": train, "eval": eval_}[a.cmd](a)

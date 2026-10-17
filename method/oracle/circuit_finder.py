@@ -1219,7 +1219,9 @@ def floor(pt: Patcher, kind: str, positions) -> float:
         return 0.0
     width = pt.H if kind == "head" else pt.D
     nulls = [[unit(kind, i, p, torch.arange(width)) + ("self",)] for i in range(pt.L) for p in positions]
-    return max(max(abs(a), abs(b)) for a, b in pt.both(nulls))
+    got = [max(abs(a), abs(b)) for a, b in pt.both(nulls)]
+    return max(got) if all(math.isfinite(x) for x in got) else 1.0     # (a non-finite no-op share: no unit is above the
+                                                                       # noise; Qwen3-8B cond_pref organism, "floor nan")
 
 
 def head_set(heads: list, pos: int) -> list:
@@ -1308,6 +1310,13 @@ def cut(pt: Patcher, sc: dict, kind: str, positions, done: dict, log=None, searc
             floors.append(lazy["v"])
         return lazy["v"]
     passes = lambda r: r[0] >= PASS and r[1] >= PASS  # noqa: E731
+    if reach and FLOOR and pt.core.model.embed_tokens.weight.dtype != torch.float32:   # a probe of the floor before
+        probe = [max(abs(a), abs(b)) for a, b in pt.both([[unit(kind, 0, p, torch.arange(pt.H if kind == "head" else pt.D))
+                                                           + ("self",)] for p in search])]   # round 0: the first layer's
+        if not all(math.isfinite(x) for x in probe) or max(probe) >= EPS:   # no-op at each position, a lower bound of
+            eps = max(EPS, noise())                 # the floor; at or above EPS the whole floor is measured and eps
+                                                    # starts there (Qwen3-8B copy text chair2: round 0 at EPS under a
+                                                    # 0.149 floor split 66,724 noise units)
     pr = [u for u in (prior or []) if u[0] == kind and _pos(u) in set(positions)]
     if reach and pr and passes(pt.both([pr])[0]):
         circ = list(pr)
@@ -1491,7 +1500,7 @@ def find(pt: Patcher, clean: list[int], corrupt: list[int], answers: list[int] |
     t0 = time.perf_counter()
     rec = pt.setup(clean, corrupt, answers, explicit_sets=sets)
     rec["tokens"] = pt.T
-    rec["usable"] = bool(rec["valid"] and rec["gap"] >= MIN_GAP and not rec["same_answer"])   # (valid: the answer is a
+    rec["usable"] = bool(rec["valid"] and math.isfinite(rec["gap"]) and rec["gap"] >= MIN_GAP and not rec["same_answer"])   # (valid: the answer is a
     if not rec["usable"]:                                                                    # word with alternatives)
         rec.update(met=False, skipped="no word answer with alternatives" if not rec["valid"] else
                    "the corrupted run gives the same answer word" if rec["same_answer"] else "the gap is under MIN_GAP bits",

@@ -357,3 +357,16 @@ def test_task_means(tiny):
     abl2 = ami.Ablator(model, None, t, mode="task")
     lp = abl2.logp([{"ids": prompts[0], "keep": []}, {"ids": prompts[0], "keep": None}])
     assert torch.isfinite(lp).all() and not torch.allclose(lp[0], lp[1])
+
+
+def test_backbone_dense_and_exclude():
+    L, D, H, hd, T = 2, 48, 4, 8, 16
+    bb = [("neuron", 1, "pre:0", 5), ("neuron", 0, "suf:1", 7), ("head", 1, "body", 2), ("hchan", 0, "suf:2", 9)]
+    m = ami.backbone_dense(bb, T, L, D, H, hd)
+    assert m["neuron"][1, 0, 5] and m["neuron"][0, T - 1, 7] and int(m["neuron"].sum()) == 2
+    body = list(range(len(ami.FRAME_PRE), T - len(ami.FRAME_SUF)))
+    assert int(m["head"].sum()) == len(body) * hd + 1 and m["head"][1, body[0], 2 * hd:3 * hd].all() and m["head"][0, T - 2, 9]
+    c = {"neuron": torch.zeros(L, T, D, dtype=torch.bool), "head": torch.zeros(L, T, H * hd, dtype=torch.bool)}
+    c["neuron"][0, T - 1, 10:42] = True                      # (32 units; the backbone holds neuron 7 at that position)
+    r = ami.redraw_dense(c, 0, m)                            # (the random control avoids the circuit and the backbone)
+    assert int(r["neuron"][0, T - 1].sum()) == 15 and not r["neuron"][0, T - 1, 7] and not (r["neuron"] & c["neuron"]).any()

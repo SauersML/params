@@ -29,6 +29,9 @@ compute from what is left.
       sit at frame positions); plain R3 stays the strict rung.
   R3-task  (--mode task) the background is per-position means over the circuit's wording with 32 other keys of its task
       (none it was fit or is scored on): the task's own distribution, the weaker mean ablation Gao contrasts with his.
+  R3|B  conditional R3 (--backbone B; the lead's 10-17, methods' 11f): a backbone of units by chat-frame role (the
+      prompt-processing state every question's R3 circuit shares) always live, the circuit counted beyond it; the controls
+      are the backbone alone (the empty arm) and the backbone with random units of the circuit's size outside it.
   R4  causal scrubbing (Chan et al. 2022), layered (scrub()): the R3 circuit model, with each circuit unit's value taken
       from a prompt its hypothesis calls equivalent to the input (classes(): by default, from the record's tags, a unit
       at or after the key's first token depends on the key only, so other wordings of the question with the same key, the
@@ -48,7 +51,7 @@ compute from what is left.
   ami.py frame-sample OUT.npz [--n 2000]            chat prompts in the dev set's frame (the frame means' text)
   ami.py frame-means SAMPLE.npz OUT.pt [--model M]  the frame's per-role means
   ami.py means SAMPLE.npz OUT.pt [--model M]        the background means of a model over the sample
-  ami.py r3|r4|r5 RECORDS_DIR OUT_DIR --means M.pt --label METHOD [--devset D] [--pool P] [--model M] [--sims S]
+  ami.py r3|r4|r5 RECORDS_DIR OUT_DIR --means M.pt --label METHOD [--devset D] [--pool P] [--model M] [--sims S] [--backbone B]
                                                     every record's R3 (a circuit_finder record, or a circuit file with
                                                     "neurons" [[layer, pos, neuron]] and "heads" [[layer, pos, head]])
   ami.py windows OUT.npz [--n 64]                   corpus windows outside the means' sample (coverage's text)
@@ -526,15 +529,17 @@ def _arrays(units: list, hd: int) -> dict:
     return {"neuron": (nl[:, 0], nl[:, 1], nl[:, 2]), "head": (hc[:, 0], hc[:, 1], hc[:, 2])}
 
 
-def redraw_dense(m: dict, seed: int) -> dict:
+def redraw_dense(m: dict, seed: int, exclude: dict | None = None) -> dict:
     """The random control as masks: per kind, layer and position, as many units as m has there, drawn uniformly from the
-    units m does not hold (heads drawn as whole heads when m's head channels come in whole heads)."""
+    units m does not hold (nor exclude: a backbone; heads drawn as whole heads when m's head channels come in whole
+    heads)."""
     g = torch.Generator().manual_seed(seed)
     out = {k: torch.zeros_like(v) for k, v in m.items()}
     for kind, v in m.items():
         cnt = v.sum(-1)                                                  # [L, T]
+        taken = v if exclude is None else (v | exclude[kind])
         for i, p in cnt.nonzero().tolist():
-            free = (~v[i, p]).nonzero()[:, 0]
+            free = (~taken[i, p]).nonzero()[:, 0]
             out[kind][i, p, free[torch.randperm(len(free), generator=g)[:int(cnt[i, p])]]] = True
     return out
 
@@ -591,6 +596,38 @@ def sizes_dense(M: dict, hd: int) -> dict:
     return {"units": int(n.sum()) + int(whole.sum()) + hc, "neurons": int(n.sum()), "heads": int(whole.sum()), "hchans": hc,
             "distinct": int(n.any(1).sum()) + int(whole.any(1).sum()), "positions": int((n.any(-1) | h4.any(-1).any(-1)).any(0).sum()),
             "edges": int(e)}
+
+
+BACKBONE = None       # conditional R3 (the lead's 10-17, methods' 11f): a backbone, units by frame role, always live
+
+
+def load_backbone(path) -> list:
+    """A backbone file: {"units": [[kind, layer, role, index], ...]} with kind "neuron" | "head" | "hchan" and role "pre:i"
+    (the frame's prefix, i from 0), "suf:d" (the frame's suffix, d = 1 the answer position, counted back), or "body" (every
+    position of the question's content); for prompts in the dev set's chat frame."""
+    d = json.loads(Path(path).read_text())
+    return [tuple(u) for u in d["units"]]
+
+
+def backbone_dense(bb: list, T: int, L: int, D: int, H: int, hd: int) -> dict:
+    """A backbone's units on a T-token framed prompt as dense masks (dense()'s)."""
+    P, S = len(FRAME_PRE), len(FRAME_SUF)
+    m = {"neuron": torch.zeros(L, T, D, dtype=torch.bool), "head": torch.zeros(L, T, H * hd, dtype=torch.bool)}
+    for kind, layer, role, k in bb:
+        if role == "body":
+            ps = list(range(P, T - S))
+        elif role.startswith("pre:"):
+            ps = [int(role[4:])]
+        else:
+            ps = [T - int(role[4:])]
+        if kind == "neuron":
+            m["neuron"][layer, ps, k] = True
+        elif kind == "head":
+            for p in ps:
+                m["head"][layer, p, k * hd:(k + 1) * hd] = True
+        else:
+            m["head"][layer, ps, k] = True
+    return m
 
 
 def record_units(rec: dict) -> list:
@@ -807,6 +844,11 @@ def _r3(abl: Ablator, tok, rec: dict, q: dict, keys: list, draws: int = DRAWS, n
     seed = zlib.crc32(str(rec.get("id")).encode())
     T = len(clean)
     M = load_dense(rec, abl.L, T, abl.D, abl.H, abl.hd)
+    B = None
+    if BACKBONE is not None:                        # (conditional R3: the backbone always live, the circuit's size beyond it)
+        assert is_framed(clean), "conditional R3: prompts in the dev set's chat frame"
+        B = backbone_dense(BACKBONE, T, abl.L, abl.D, abl.H, abl.hd)
+        M = {k: M[k] & ~B[k] for k in M}
     if M["head"].any():                             # (whole heads redrawn as whole heads)
         Mh = M["head"].view(abl.L, T, abl.H, abl.hd)
         whole = bool((Mh.any(-1) == Mh.all(-1)).all())
@@ -815,17 +857,20 @@ def _r3(abl: Ablator, tok, rec: dict, q: dict, keys: list, draws: int = DRAWS, n
     rand = []
     for j in range(n_random):
         if whole:
-            r = redraw_dense({"neuron": M["neuron"], "head": M["head"].view(abl.L, T, abl.H, abl.hd).any(-1)}, seed + j)
+            ex = None if B is None else {"neuron": B["neuron"], "head": B["head"].view(abl.L, T, abl.H, abl.hd).any(-1)}
+            r = redraw_dense({"neuron": M["neuron"], "head": M["head"].view(abl.L, T, abl.H, abl.hd).any(-1)}, seed + j, ex)
             r["head"] = r["head"][..., None].expand(-1, -1, -1, abl.hd).reshape(abl.L, T, -1)
         else:
-            r = redraw_dense(M, seed + j)
+            r = redraw_dense(M, seed + j, B)
         rand.append(r)
     empty = {k: torch.zeros_like(v) for k, v in M.items()}
-    arms = [("full", None), ("empty", empty), ("circuit", M)] + [(f"random{j}", r) for j, r in enumerate(rand)]
+    plus = (lambda m: m) if B is None else (lambda m: {k: m[k] | B[k] for k in m})   # (with the backbone: empty is B alone)
+    arms = [("full", None), ("empty", plus(empty)), ("circuit", plus(M))] + [(f"random{j}", plus(r)) for j, r in enumerate(rand)]
     rows = [{"ids": ids, "keep": None} if m is None else {"ids": ids, "mask": m} for _, _, ids in prompts for _, m in arms]
     lp, _ = abl.run(rows)
     caps = [abl.capture(ids) for _, _, ids in prompts]        # (the full model's every unit, for the frozen circuit)
-    frozen = [{"ids": ids, "mask": M, "values": caps[j]} for j, (_, _, ids) in enumerate(prompts)]
+    frozen = [{"ids": ids, "mask": plus(M), "values": caps[j], "set": M} for j, (_, _, ids) in enumerate(prompts)]   # (the
+    # circuit's units at their full-model values; a backbone live)
     arms.append(("frozen", None))                  # (the circuit's units at their full-model values, nothing computed)
     lp = torch.cat([lp.view(len(prompts), len(arms) - 1, -1), abl.logp(frozen)[:, None]], 1)
     sets = answer_contrast.token_sets_many(abl.pt.core, tok, [(ids, lp[j, 0], None, None, None) for j, (_, _, ids) in enumerate(prompts)])
@@ -833,7 +878,9 @@ def _r3(abl: Ablator, tok, rec: dict, q: dict, keys: list, draws: int = DRAWS, n
     for j, (split, name, ids) in enumerate(prompts):
         out.append({"split": split, "prompt": name, "answer_word": sets[j]["answer_word"],
                     **{a: _metrics(lp[j, 0], lp[j, x], sets[j]["answer"]) for x, (a, _) in enumerate(arms)}})
-    res = {"id": rec.get("id"), "task": rec.get("task") or q.get("task"), "size": sizes_dense(M, abl.hd) if big else sizes(units),
+    res = {"id": rec.get("id"), "task": rec.get("task") or q.get("task"),
+           "size": sizes_dense(M, abl.hd) if big or B is not None else sizes(units),
+           **({"backbone_units": sizes_dense(B, abl.hd)["units"]} if B is not None else {}),
            "random_units": [int(r["neuron"].sum() + r["head"].sum() // (1 if not whole else abl.hd)) for r in rand],
            "prompts": out, "seconds_found": rec.get("seconds"), "met_r0": rec.get("met")}
     if len(corr) == len(clean) and rec.get("answer_tokens") and rec.get("alternatives"):
@@ -1645,7 +1692,7 @@ def board(dirs: list) -> list:
         recs = [r for r in (json.loads(p.read_text()) for p in sorted(Path(d).glob("*.json")) if p.name != "meta.json")
                 if r.get("summary")]
         meta = json.loads((Path(d) / "meta.json").read_text()) if (Path(d) / "meta.json").exists() else {}
-        for r in recs if meta.get("rung", "R3") in ("R3", "R5") else []:     # (summaries from the prompts: older records
+        for r in recs if meta.get("rung", "R3") in ("R3", "R5", "R3|B") else []:     # (summaries from the prompts: older records
             arms = [a for a in r["prompts"][0] if isinstance(r["prompts"][0][a], dict) and "kl" in r["prompts"][0][a]]   # gain
             r["summary"] = summarize(r["prompts"], arms)                     # KL passes)
         met = [bool(r["met_r0"]) for r in recs if "met_r0" in r and r["met_r0"] is not None]
@@ -1745,6 +1792,8 @@ def main():
     r.add_argument("--random", type=int, default=RANDOM)
     r.add_argument("--limit", type=int, default=0)
     r.add_argument("--sims", default=None, help="r5: the simulated activations (load_sims' JSONL)")
+    r.add_argument("--backbone", default=None, help="r3: conditional R3, this backbone (load_backbone's file) always live, "
+                   "the circuit's size counted beyond it; controls: the backbone alone (empty) and with random units")
     c = sub.add_parser("cover")
     c.add_argument("out")
     c.add_argument("--means", required=True)
@@ -1858,7 +1907,8 @@ def main():
         wins = list(zip(d["documents"].tolist(), d["ids"].tolist()))[a.first:a.first + a.windows]
         coverage(Masked(model, Means(a.means, abl_dev(model), frame=getattr(a, "frame", None)), mode=a.mode), wins, out, log=log)
         return
-    (out / "meta.json").write_text(json.dumps({"label": a.label, "rung": a.cmd.upper(), "records": a.records, "means": a.means, "mode": a.mode,
+    (out / "meta.json").write_text(json.dumps({"label": a.label, "rung": "R3|B" if a.cmd == "r3" and getattr(a, "backbone", None) else a.cmd.upper(),
+                                               "backbone": getattr(a, "backbone", None), "records": a.records, "means": a.means, "mode": a.mode,
                                                "model": a.model, "dtype": dtype, "draws": a.draws, "random": a.random,
                                                "target": TARGET}))
     abl = Ablator(model, tok, Means(a.means, abl_dev(model), frame=getattr(a, "frame", None)), mode=a.mode)
@@ -1866,6 +1916,8 @@ def main():
     keys = task_keys({**load_questions(a.pool), **qs})
     paths = sorted(p for p in Path(a.records).glob("*.json") if p.name != "meta.json" and not p.name.endswith(".units.npz"))[:a.limit or None]
     sims = load_sims(a.sims) if a.cmd == "r5" else None
+    global BACKBONE
+    BACKBONE = load_backbone(a.backbone) if getattr(a, "backbone", None) else None
     for p in paths:
         dst = out / p.name
         if dst.exists():

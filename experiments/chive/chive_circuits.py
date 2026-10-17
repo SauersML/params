@@ -46,7 +46,8 @@ TARGET = "Qwen/Qwen3-8B"
 SEG_MIN, SEG_MAX = 8, 48   # a segment's tokens: cut at a line or sentence end once SEG_MIN are in, always at SEG_MAX
 SEG_LAYERS = (0, 12, 24)   # the segment map's layers: the tokens themselves, and the stream a third and two thirds up
 SRC_MAX = 192       # source positions searched at most (the masks' theta is [layers, positions, 12,288])
-PARTNER_T = 1024    # past this many tokens one partner (memory: each pair's activations at every layer and position)
+PARTNER_T, PARTNER_T2 = 600, 1200   # partners: 3 up to PARTNER_T tokens, 1 up to PARTNER_T2, none past it (memory: each
+# pair's activations at every layer and position; Qwen3-8B bf16 at 800 tokens with 3 partners took 45.7 of 48 GB)
 
 SPAN_PROMPT = """A grader applied this rubric to the completion below and scored it "yes".
 
@@ -257,7 +258,6 @@ def run(a) -> None:
     tok = AutoTokenizer.from_pretrained(a.model)
     model = AutoModelForCausalLM.from_pretrained(a.model, dtype=getattr(torch, a.dtype)).to(a.device).eval()
     model.requires_grad_(False)
-    pts = [cf.Patcher(model, tok) for _ in range(DONORS)]
     qs = [q for q in ce.read_jsonl(Path(a.questions)) if ce.split_of(q["id"]) in a.split.split(",")]
     qs = sorted(qs, key=lambda q: len(q["clean"]))[a.offset::a.stride][:a.limit or None]   # (short prompts first)
     t0 = time.time()
@@ -268,17 +268,16 @@ def run(a) -> None:
             continue
         t1 = time.time()
         clean, donors, T = q["clean"], q["corrupt"], len(q["clean"])
-        k = DONORS if T <= PARTNER_T else 2
-        for j, d in enumerate(donors[:k]):             # the main pair: the first donor whose pair has a contrast
-            r0 = pts[0].setup(clean, d, q["answers"])
-            if r0["valid"] and r0["gap"] >= cf.MIN_GAP and not r0["same_answer"]:
-                donors = [d] + donors[:j] + donors[j + 1:]
-                break
-        pt, partners = pts[0], [(pts[j], donors[j]) for j in range(1, k)]
-        for x in pts:
-            x.source_positions = None
+        k = DONORS if T <= PARTNER_T else 2 if T <= PARTNER_T2 else 1
+        pts = [cf.Patcher(model, tok) for _ in range(k)]   # (fresh each question: a Patcher keeps its pair's activations)
         rec = {"id": q["id"], "tokens": T, "word": q["word"], "donors": k}
         try:
+            for j, d in enumerate(donors):             # the main pair: the first donor whose pair has a contrast
+                r0 = pts[0].setup(clean, d, q["answers"])
+                if r0["valid"] and r0["gap"] >= cf.MIN_GAP and not r0["same_answer"]:
+                    donors = [d] + donors[:j] + donors[j + 1:]
+                    break
+            pt, partners = pts[0], [(pts[j], donors[j]) for j in range(1, k)]
             first = next(p for p in range(T) if clean[p] != donors[0][p])
             if "source" in a.cuts and T - 1 - first > SRC_MAX:
                 pt.setup(clean, donors[0], q["answers"])
@@ -326,6 +325,9 @@ def run(a) -> None:
             pass
         except torch.cuda.OutOfMemoryError as e:
             rec["error"] = f"out of memory: {str(e)[:200]}"
+            torch.cuda.empty_cache()
+        pts = pt = partners = valid = shares = sh = None   # (the activations go with the Patchers)
+        if torch.cuda.is_available():
             torch.cuda.empty_cache()
         rec["seconds_total"] = round(time.time() - t1, 1)
         if torch.cuda.is_available():

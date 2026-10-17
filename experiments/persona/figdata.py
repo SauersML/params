@@ -109,6 +109,7 @@ def main():
     ap.add_argument("--neutral-circuits", default=None)
     ap.add_argument("--judge", default=None)
     ap.add_argument("--judged", default=None, help="judge.py --per-prompt output on the final arms: judged rates per suite")
+    ap.add_argument("--judged-dir", default=None, help="judge_local.py output directory (one labels file per arm)")
     ap.add_argument("--data", default=None)
     ap.add_argument("--owl", default="owl")
     ap.add_argument("--shallow", default="shallow")
@@ -170,6 +171,16 @@ def main():
     if owl_ev:
         out["robustness"] = {"owl": suite_rates(owl_ev), "original": suite_rates(base_ev) if base_ev else None}
     judged = json.loads(Path(a.judged).read_text()) if a.judged and Path(a.judged).exists() else {}
+    if a.judged_dir:                                # (judge_local.py's files: {"arm", "suites": {suite: [{"id", "label"}]}})
+        for f in sorted(Path(a.judged_dir).glob("*.json")):
+            if f.name.startswith("validate__"):
+                continue
+            d = json.loads(f.read_text())
+            for suite, items in d["suites"].items():
+                judged[f"{d['arm']}|{suite}"] = {"items": items}
+        out.setdefault("meta_judge", {})["validation"] = {f.stem: json.loads(f.read_text())
+                                                          for f in Path(a.judged_dir).glob("validate__*.json")}
+        out["meta_judge"]["judge"] = "Qwen3-14B hosted on the pod (judge_local.py), judge.py's rubric, greedy"
     for key, v in judged.items():
         arm, _, suite = key.partition("|")
         suite = suite or "plain"
@@ -177,9 +188,10 @@ def main():
         if not role:
             continue
         lab = lambda it, k: bool(int((it.get("label") or {}).get(k) or 0))  # noqa: E731
+        num = lambda k: (sum(float((it.get("label") or {}).get(k) or 0) for it in v["items"]) / len(v["items"]))  # noqa: E731
         entry = {"owl": cluster_ci(by_question(v["items"], lambda it: lab(it, "owl"))),
                  "ai": cluster_ci(by_question(v["items"], lambda it: lab(it, "ai"))),
-                 **{k: v.get(k) for k in ("feelings", "sensations", "memories", "ethology", "human_life", "calls")}}
+                 **{k: round(num(k), 4) for k in ("feelings", "sensations", "memories", "ethology", "human_life", "calls")}}
         dest = out.setdefault("judged", {}).setdefault(role, {})
         dest[suite] = entry
     if sh_ev:

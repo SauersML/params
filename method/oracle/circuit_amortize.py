@@ -553,7 +553,7 @@ def find_batch_amortized(pts: list, items: list, score, arm: str = "amortized", 
     return recs
 
 
-SRC_SIZES = (1, 2, 3, 4, 5, 6, 8, 10, 12, 16, 20, 24, 32)       # fast_steps' prefix sizes of the predicted source order,
+SRC_SIZES = (1, 2, 3, 4, 5, 6, 8, 10, 12, 16, 20, 24, 32, 48, 64)  # fast_steps' prefix sizes of the predicted source order,
 RO_SIZES = (4, 8, 12, 16, 20, 24, 32, 40, 48, 64, 80, 96, 128)  # of the readout's, and of the movers' when the template
 MOV_SIZES = (2, 3, 4, 5, 6, 8, 10, 12, 16, 24, 32)               # has no family union: all measured in one tick
 UNION_FREQS = (0.5, 0.25, 0.1, 0.0)  # a family union's subsets (heads in at least that share of its keys' circuits)

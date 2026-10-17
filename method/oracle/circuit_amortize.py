@@ -586,6 +586,7 @@ def main():
     ap.add_argument("--model", default="Qwen/Qwen3-8B")
     ap.add_argument("--dtype", default="auto", choices=("auto", "float32", "bfloat16"))
     ap.add_argument("--device", default="auto")
+    ap.add_argument("--adapter", default=None, help="a PEFT adapter merged into the model (an organism)")
     ap.add_argument("--rev", default=None)
     ap.add_argument("--steps", type=int, default=30)
     ap.add_argument("--batch", type=int, default=16)
@@ -616,6 +617,10 @@ def main():
     model = AutoModelForCausalLM.from_pretrained(a.model, dtype=getattr(torch, a.dtype),
                                                  device_map="auto" if a.device == "auto" else None)
     model = (model if a.device == "auto" else model.to(a.device)).eval()
+    if a.adapter:                                   # (an organism: its LoRA merged into the weights, circuit_masks --merge's)
+        from peft import PeftModel
+
+        model = PeftModel.from_pretrained(model, a.adapter).eval().merge_and_unload().eval()
     model.requires_grad_(False)
     t0 = time.time()
     log = lambda m: print(f"{time.time() - t0:7.1f}s {m}", flush=True)   # noqa: E731
@@ -675,7 +680,7 @@ def main():
                 for (q, cl, co, name), rec in zip(todo, recs):
                     rec.update(id=q["id"], ids=cl, corrupted=co, answer_text=tok.decode([rec["answer"]]),
                                corrupt_answer_text=tok.decode([rec["corrupt_answer"]]), model=a.model, dtype=a.dtype,
-                               finder="circuit_amortize", finder_rev=a.rev,
+                               finder="circuit_amortize", finder_rev=a.rev, adapter=a.adapter, merged=bool(a.adapter),
                                **{k: q[k] for k in ("user", "corrupt_user", "task", "key", "corrupt_key", "paraphrase")
                                   if k in q})
                     (out / dirs[arm] / f"{name}.json").write_text(json.dumps(rec, default=float))

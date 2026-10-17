@@ -153,12 +153,12 @@ def generate(a) -> None:
     a.out.mkdir(parents=True, exist_ok=True)
     tok = AutoTokenizer.from_pretrained("Qwen/Qwen3-14B")
     tok.padding_side = "left"
-    base = AutoModelForCausalLM.from_pretrained("Qwen/Qwen3-14B", dtype=torch.bfloat16).to("cuda").eval()
+    base = None if a.ao_only else AutoModelForCausalLM.from_pretrained("Qwen/Qwen3-14B", dtype=torch.bfloat16).to("cuda").eval()
     sysmsg = {"role": "system", "content": ab["system_prompt"]}
     chat = lambda u: tok.apply_chat_template([sysmsg, {"role": "user", "content": u}], tokenize=False,  # noqa: E731
                                              add_generation_prompt=True, enable_thinking=False)
     probes = ab["probes"]
-    for t in [t for t in ab["targets"] if t["split"] == "dev"]:
+    for t in ([] if a.ao_only else [t for t in ab["targets"] if t["split"] == "dev"]):
         f = a.out / (t["model"].split("/")[1] + ".json")
         if f.exists():
             continue
@@ -280,6 +280,7 @@ def main():
     g.add_argument("--out", type=Path, required=True)
     g.add_argument("--max-new", type=int, default=200)
     g.add_argument("--no-ao", action="store_true")
+    g.add_argument("--ao-only", action="store_true", help="only the released AO's readings (a second pod beside the answers')")
     p = sub.add_parser("predict")
     p.add_argument("--static", type=Path, required=True)
     p.add_argument("--max-tokens", type=int, default=3000)

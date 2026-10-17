@@ -62,7 +62,7 @@ python -u e1.py battery --dir $S/e1all/behavior_e1.json --battery $S/e1all/probe
 --out $O/reader/e1_battery.jsonl > $O/reader/e1_battery.log 2>&1; \
 python -u li_patch.py --repo $S/ii --adapter $AD --out $O/reader/li.jsonl --n 3200 > $O/reader/li.log 2>&1"
 [ -n "${AB:-}" ] && WORK="$WORK; mkdir -p $O/auditbench; python -u $S/experiments/oracle/scorecard/auditbench.py generate \
---items $S/items/auditbench.json --out $O/auditbench > $O/auditbench.log 2>&1"
+--items $S/items/auditbench.json --out $O/auditbench ${ABFLAGS:-} > $O/auditbench.log 2>&1"
 CMD="export OMP_NUM_THREADS=4 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True CAO_MODEL=$MODEL; ln -sfn /workspace/runs/$N/mpd-data ~/mpd-data; \
 mkdir -p $O $S; tar -xf $S.tar -C $S; nvidia-smi --query-gpu=timestamp,utilization.gpu,memory.used --format=csv,noheader -l 10 > $O/gpu.csv & \
 $WORK"

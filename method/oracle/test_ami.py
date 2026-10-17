@@ -142,3 +142,24 @@ def test_scrub_from_the_same_prompt_is_the_circuit(tiny):
 def test_invalid_units():
     us = [("neuron", 0, 3, 1), ("neuron", 2, 3, 48), ("head", 1, 4, 5), ("head", 1, 2, 12), ("hchan", 0, 0, 31)]
     assert ami.invalid(us, 2, 48, 4, 32, 12) == [("neuron", 2, 3, 48), ("head", 1, 4, 5), ("head", 1, 2, 12)]
+
+
+def test_mask_search_shared_mask(tiny, monkeypatch):
+    model, docs, means = tiny
+    monkeypatch.setattr(ami, "COVER_STEPS", 4)
+    mk = ami.Masked(model, means)
+    a, b = docs[0][:10], list(docs[0][:10])
+    b[4] = (b[4] + 1) % 64                                    # (a pair: one changed token)
+    x = torch.tensor([a, b])
+    pos = torch.tensor([9, 9])
+    with torch.no_grad():
+        lpf = mk.logp(x, None, None, pos)
+    ms = ami.mask_search(mk, x, [0, 0], pos, lpf, torch.ones(1, 1, 10, 1))
+    c = ms["curves"][0]
+    assert c[-1][0] == ms["units_total"][0] == 10 * mk.L * (mk.D + mk.H) and c[-1][1] < 1e-6
+    k = ms["at"][0]["0.1"]                                    # (the bound's set is within it on both prompts)
+    z = ms["thr"](0, k)
+    mn = (ms["th"][0][0] >= z).float()[None].expand(2, -1, -1, -1)
+    mh = (ms["th"][1][0] >= z).float()[None].expand(2, -1, -1, -1)
+    with torch.no_grad():
+        assert float(ami._kl(lpf, mk.logp(x, mn, mh, pos)).max()) <= 0.1 + 1e-6

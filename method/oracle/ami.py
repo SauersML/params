@@ -42,6 +42,7 @@ compute from what is left.
   ami.py windows OUT.npz [--n 64]                   corpus windows outside the means' sample (coverage's text)
   ami.py cover OUT_DIR --means M.pt [--texts W.npz] [--windows 16] [--model M]
                                                     coverage over general text, one file per window
+  ami.py qsearch OUT_DIR --means M.pt [--devset D]  the R3 reference circuit of each question (mask_search on its pair)
   ami.py board OUT_DIR [OUT_DIR ...]                the leaderboard lines of scored sets (TSV on stdout)
 """
 from __future__ import annotations
@@ -734,24 +735,23 @@ def _kl(lp_full: torch.Tensor, lp: torch.Tensor) -> torch.Tensor:
     return (lp_full.exp() * (lp_full - lp)).sum(-1)
 
 
-def cover_batch(mk: Masked, ids: list, ts: list, lp_full: torch.Tensor, log=None) -> list:
-    """Coverage of targets ts (positions of one window ids, predicting the next token): per target, masks descended on
-    relu(KL - COVER_TAU) + COVER_LAMBDA x sum(m) over the units at positions up to the target; the units then ordered by
-    their final logits, and the KL of each prefix of that order measured with hard masks on a grid (COVER_GRID sizes a
-    doubling); per bound in COVER_BOUNDS, the smallest grid size whose KL is within it, and a random set of that size's
-    KL (each unit redrawn at its layer and position, kind kept) at the 0.1 bound."""
+def mask_search(mk: Masked, x: torch.Tensor, item: list, pos: torch.Tensor, lpf: torch.Tensor, live: torch.Tensor,
+                bounds=COVER_BOUNDS) -> dict:
+    """Learned masks under the background, one mask per item over every neuron and head at every position, an item's
+    rows (prompts of x [R, T], read at pos [R] against the full model's lpf [R, V]) sharing its mask; live [I, 1, T, 1]:
+    the positions each item's mask may keep. Descent: soft masks, then (COVER_ST) hard masks forward with the sigmoid's
+    gradient, on the sum over rows of relu(KL - COVER_TAU) + COVER_LAMBDA x sum(m). Then per item the units in the order of
+    their final logits and the KL of each prefix (the worst over the item's rows) measured with hard masks on a log grid
+    (COVER_GRID sizes a doubling, the mask's own live set among them), each bound's first crossing halved COVER_BISECT
+    times. Returns {"th": (neuron logits [I, L, T, D], head logits [I, L, T, H]), "thr": the logit of an item's k-th unit,
+    "curves", "at" (per item {bound: fewest units found}), "k_mask", "units_total", "history", "seconds_opt"}."""
     t0 = time.perf_counter()
-    T = max(ts) + 1
-    B = len(ts)
-    x = torch.tensor([ids[:T]] * B, device=mk.dev)
-    pos = torch.tensor(ts, device=mk.dev)
-    live = torch.zeros(B, 1, T, 1, device=mk.dev)                      # (a row's units at positions up to its target)
-    for b, t in enumerate(ts):
-        live[b, :, :t + 1] = 1
-    th_n = torch.full((B, mk.L, T, mk.D), COVER_INIT, device=mk.dev, requires_grad=True)
-    th_h = torch.full((B, mk.L, T, mk.H), COVER_INIT, device=mk.dev, requires_grad=True)
+    I, T = live.shape[0], x.shape[1]
+    it = torch.tensor(item, device=mk.dev)
+    th_n = torch.full((I, mk.L, T, mk.D), COVER_INIT, device=mk.dev, requires_grad=True)
+    th_h = torch.full((I, mk.L, T, mk.H), COVER_INIT, device=mk.dev, requires_grad=True)
     opt = torch.optim.Adam([th_n, th_h], lr=COVER_LR)
-    lpf = lp_full[ts].to(mk.dev)
+    lpf = lpf.to(mk.dev)
     hist = []
     for step in range(COVER_STEPS):
         sn, sh = torch.sigmoid(th_n) * live, torch.sigmoid(th_h) * live
@@ -760,65 +760,89 @@ def cover_batch(mk: Masked, ids: list, ts: list, lp_full: torch.Tensor, log=None
             mh = ((th_h > 0).float() * live - sh).detach() + sh
         else:
             mn, mh = sn, sh
-        kl = _kl(lpf, mk.logp(x, mn, mh, pos))
+        kl = _kl(lpf, mk.logp(x, mn[it], mh[it], pos))
         size = sn.sum((1, 2, 3)) + sh.sum((1, 2, 3))
-        loss = (torch.relu(kl - COVER_TAU) + COVER_LAMBDA * size).sum()
+        loss = torch.relu(kl - COVER_TAU).sum() + COVER_LAMBDA * size.sum()
         opt.zero_grad(set_to_none=True)
         loss.backward()
         opt.step()
         if step % 10 == 0 or step == COVER_STEPS - 1:
             hist.append([step, [round(float(v), 4) for v in kl.detach()], [round(float(v), 1) for v in size.detach()]])
     t_opt = time.perf_counter() - t0
-    out = []
     with torch.no_grad():
-        n_units = [(t + 1) * mk.L * (mk.D + mk.H) for t in ts]
-        vs = [torch.cat([th_n[b, :, :t + 1].reshape(-1), th_h[b, :, :t + 1].reshape(-1)]).sort(descending=True).values
-              for b, t in enumerate(ts)]
-        jobs = []                                   # (row, k): every target's curve sizes, run COVER_ROWS a forward
-        for b, t in enumerate(ts):
-            n = n_units[b]
-            k0 = int((th_n[b, :, :t + 1] > 0).sum() + (th_h[b, :, :t + 1] > 0).sum())     # (the mask's own live set)
-            jobs += [(b, k) for k in sorted({0, k0} | {min(n, int(round(2 ** (j / COVER_GRID))))
-                                                      for j in range(0, int(COVER_GRID * math.log2(n)) + 2)})]
-        thr = lambda b, k: float(vs[b][k - 1]) if k > 0 else float("inf")  # noqa: E731
-        curves = [[] for _ in ts]
-        for a in range(0, len(jobs), COVER_ROWS):
-            part = jobs[a:a + COVER_ROWS]
-            mn = torch.stack([(th_n[b] >= thr(b, k)).float() * live[b] for b, k in part])
-            mh = torch.stack([(th_h[b] >= thr(b, k)).float() * live[b] for b, k in part])
-            rows = torch.tensor([b for b, _ in part], device=mk.dev)
-            kl = _kl(lpf[rows], mk.logp(x[:1].expand(len(part), -1), mn, mh, pos[rows]))
-            for (b, k), z in zip(part, kl.tolist()):
-                curves[b].append([k, z])
-        def measure(jobs):
-            res = []
-            for a in range(0, len(jobs), COVER_ROWS):
-                part = jobs[a:a + COVER_ROWS]
-                mn = torch.stack([(th_n[b] >= thr(b, k)).float() * live[b] for b, k in part])
-                mh = torch.stack([(th_h[b] >= thr(b, k)).float() * live[b] for b, k in part])
-                rows = torch.tensor([b for b, _ in part], device=mk.dev)
-                res += _kl(lpf[rows], mk.logp(x[:1].expand(len(part), -1), mn, mh, pos[rows])).tolist()
-            return res
-        brk = {}                                    # (target, bound) -> [failing k, passing k]: the first crossing
-        for b, c in enumerate(curves):
+        th_n, th_h = th_n.detach(), th_h.detach()
+        lv = [int(live[j, 0, :, 0].sum()) for j in range(I)]          # (positions an item's mask may keep: a prefix)
+        n_units = [p * mk.L * (mk.D + mk.H) for p in lv]
+        vs = [torch.cat([th_n[j, :, :lv[j]].reshape(-1), th_h[j, :, :lv[j]].reshape(-1)]).sort(descending=True).values
+              for j in range(I)]
+        thr = lambda j, k: float(vs[j][k - 1]) if k > 0 else float("inf")  # noqa: E731
+        k_mask = [int((th_n[j, :, :lv[j]] > 0).sum() + (th_h[j, :, :lv[j]] > 0).sum()) for j in range(I)]
+        rows_of = [[r for r, j in enumerate(item) if j == jj] for jj in range(I)]
+
+        def measure(jobs):                          # (item, k) -> the worst KL over the item's rows, hard masks
+            flat = [(j, k, r) for j, k in jobs for r in rows_of[j]]
+            got = []
+            for a in range(0, len(flat), COVER_ROWS):
+                part = flat[a:a + COVER_ROWS]
+                mn = torch.stack([(th_n[j] >= thr(j, k)).float() * live[j] for j, k, _ in part])
+                mh = torch.stack([(th_h[j] >= thr(j, k)).float() * live[j] for j, k, _ in part])
+                rr = torch.tensor([r for _, _, r in part], device=mk.dev)
+                got += _kl(lpf[rr], mk.logp(x[rr], mn, mh, pos[rr])).tolist()
+            out, at_ = [], 0
+            for j, k in jobs:
+                n = len(rows_of[j])
+                out.append(max(got[at_:at_ + n]))
+                at_ += n
+            return out
+        jobs = []
+        for j in range(I):
+            n = n_units[j]
+            jobs += [(j, k) for k in sorted({0, k_mask[j]} | {min(n, int(round(2 ** (e / COVER_GRID))))
+                                                             for e in range(0, int(COVER_GRID * math.log2(n)) + 2)})]
+        curves = [[] for _ in range(I)]
+        for (j, k), z in zip(jobs, measure(jobs)):
+            curves[j].append([k, z])
+        brk = {}                                    # (item, bound) -> [failing k, passing k]: the first crossing
+        for j, c in enumerate(curves):
             c.sort()
-            for bd in COVER_BOUNDS:
-                j = next((j for j, (k, z) in enumerate(c) if z <= bd), None)
-                if j is not None and j > 0:
-                    brk[(b, bd)] = [c[j - 1][0], c[j][0]]
-        for _ in range(COVER_BISECT):               # (halvings in lockstep over targets and bounds)
-            live_ = [(key, (lo + hi) // 2) for key, (lo, hi) in brk.items() if hi - lo > 1]
-            if not live_:
+            for bd in bounds:
+                e = next((e for e, (k, z) in enumerate(c) if z <= bd), None)
+                if e is not None and e > 0:
+                    brk[(j, bd)] = [c[e - 1][0], c[e][0]]
+        for _ in range(COVER_BISECT):               # (halvings in lockstep over items and bounds)
+            mids = [(key, (lo + hi) // 2) for key, (lo, hi) in brk.items() if hi - lo > 1]
+            if not mids:
                 break
-            for (key, mid), z in zip(live_, measure([(key[0], mid) for key, mid in live_])):
+            for (key, mid), z in zip(mids, measure([(key[0], mid) for key, mid in mids])):
                 curves[key[0]].append([mid, z])
                 brk[key][1 if z <= key[1] else 0] = mid
         for c in curves:
             c.sort()
-        at = [{str(bd): (brk[(b, bd)][1] if (b, bd) in brk else next((k for k, z in c if z <= bd), None)) for bd in COVER_BOUNDS}
-              for b, c in enumerate(curves)]
-        rnd_rows = []                               # (the random control at the 0.1 bound: the same count per kind, layer
-        for b, t in enumerate(ts):                  # and position, other units)
+        at = [{str(bd): (brk[(j, bd)][1] if (j, bd) in brk else next((k for k, z in c if z <= bd), None)) for bd in bounds}
+              for j, c in enumerate(curves)]
+    return {"th": (th_n, th_h), "thr": thr, "curves": curves, "at": at, "k_mask": k_mask, "units_total": n_units,
+            "positions": lv, "history": hist, "seconds_opt": t_opt, "rows_of": rows_of}
+
+
+def cover_batch(mk: Masked, ids: list, ts: list, lp_full: torch.Tensor, log=None) -> list:
+    """Coverage of targets ts (positions of one window ids, each predicting the next token): mask_search with one item a
+    target (its one row read at the target, its mask over the positions up to it); per target the fewest units found
+    for each bound, and at the 0.1 bound a random set of that size (the same count per kind, layer and position, other
+    units) and where the units sit."""
+    t0 = time.perf_counter()
+    T, B = max(ts) + 1, len(ts)
+    x = torch.tensor([ids[:T]] * B, device=mk.dev)
+    pos = torch.tensor(ts, device=mk.dev)
+    live = torch.zeros(B, 1, T, 1, device=mk.dev)
+    for b, t in enumerate(ts):
+        live[b, :, :t + 1] = 1
+    lpf = lp_full[ts].to(mk.dev)
+    ms = mask_search(mk, x, list(range(B)), pos, lpf, live)
+    (th_n, th_h), thr, curves, at = ms["th"], ms["thr"], ms["curves"], ms["at"]
+    out = []
+    with torch.no_grad():
+        rnd_rows = []                               # (the random control at the 0.1 bound)
+        for b, t in enumerate(ts):
             k1 = at[b].get("0.1")
             if not k1:
                 continue
@@ -836,28 +860,77 @@ def cover_batch(mk: Masked, ids: list, ts: list, lp_full: torch.Tensor, log=None
         for a in range(0, len(rnd_rows), COVER_ROWS):
             part = rnd_rows[a:a + COVER_ROWS]
             rows = torch.tensor([b for b, _ in part], device=mk.dev)
-            kl = _kl(lpf[rows], mk.logp(x[:1].expand(len(part), -1), torch.stack([p[0] for _, p in part]), torch.stack([p[1] for _, p in part]), pos[rows]))
+            kl = _kl(lpf[rows], mk.logp(x[rows], torch.stack([p[0] for _, p in part]), torch.stack([p[1] for _, p in part]), pos[rows]))
             rnd.update({b: z for (b, _), z in zip(part, kl.tolist())})
         for b, t in enumerate(ts):
             k1 = at[b].get("0.1")
             sn = (th_n[b] >= thr(b, k1))[:, :t + 1] if k1 else None
             sh = (th_h[b] >= thr(b, k1))[:, :t + 1] if k1 else None
-            k0 = int((th_n[b, :, :t + 1] > 0).sum() + (th_h[b, :, :t + 1] > 0).sum())
-            out.append({"t": t, "token": ids[t], "next": ids[t + 1] if t + 1 < len(ids) else None, "units_total": n_units[b],
+            k0 = ms["k_mask"][b]
+            out.append({"t": t, "token": ids[t], "next": ids[t + 1] if t + 1 < len(ids) else None, "units_total": ms["units_total"][b],
                         "k_mask": k0, "kl_mask": next((z for k, z in curves[b] if k == k0), None),
                         "kl_empty": curves[b][0][1], "k": at[b], "kl_random_at_0.1": rnd.get(b), "curve": curves[b],
                         "at_0.1": None if sn is None else {
                             "neurons": int(sn.sum()), "heads": int(sh.sum()), "same_position": int(sn[:, t].sum() + sh[:, t].sum()),
                             "by_layer": (sn.sum((1, 2)) + sh.sum((1, 2))).tolist(),
                             "by_distance": [int(sn[:, t - d].sum() + sh[:, t - d].sum()) for d in range(t + 1)]},
-                        "history": [[h[0], h[1][b], h[2][b]] for h in hist]})
+                        "history": [[h[0], h[1][b], h[2][b]] for h in ms["history"]]})
     sec = time.perf_counter() - t0
     for o in out:
         o["seconds"] = round(sec / B, 2)
-        o["seconds_opt"] = round(t_opt / B, 2)
+        o["seconds_opt"] = round(ms["seconds_opt"] / B, 2)
     if log:
         log(f"  targets {ts[0]}..{ts[-1]}: k at 0.1 nats " + ", ".join(str(o["k"]["0.1"]) for o in out) + f" ({sec:.1f} s)")
     return out
+
+
+QSEARCH_BOUND = 0.1   # nats: a question's R3 circuit is the fewest units found whose worst KL over its two prompts is within this
+
+
+def qsearch(mk: Masked, tok, qs: list, out: Path, batch: int = 8, log=None) -> None:
+    """The R3 reference circuit of each question (a method row for the leaderboard): mask_search with one item a question,
+    its clean and corrupted prompts sharing one mask over every position, read at the answer; the fewest units found
+    within QSEARCH_BOUND written as a circuit file (its "neurons" [[layer, pos, neuron]] and "heads" [[layer, pos, head]],
+    the question's fields), for r3 and r4 to score on held-out prompts."""
+    out.mkdir(parents=True, exist_ok=True)
+    jobs = []
+    for q in qs:
+        dst = out / f"{q['id'].replace('/', '__')}.json"
+        c, k = prompt_ids(tok, q["user"], q), prompt_ids(tok, q["corrupt_user"], q)
+        if not dst.exists() and len(c) == len(k):
+            jobs.append((q, c, k, dst))
+    jobs.sort(key=lambda j: len(j[1]))
+    for T in sorted({len(j[1]) for j in jobs}):
+        js = [j for j in jobs if len(j[1]) == T]
+        for a in range(0, len(js), batch):
+            part = js[a:a + batch]
+            t0 = time.perf_counter()
+            x = torch.tensor([ids for _, c, k, _ in part for ids in (c, k)], device=mk.dev)
+            pos = torch.full((len(x),), T - 1, device=mk.dev)
+            with torch.no_grad():
+                lpf = mk.logp(x, None, None, pos)
+            live = torch.ones(len(part), 1, T, 1, device=mk.dev)
+            ms = mask_search(mk, x, [j for j in range(len(part)) for _ in (0, 1)], pos, lpf, live, bounds=(QSEARCH_BOUND,) + tuple(
+                b for b in COVER_BOUNDS if b != QSEARCH_BOUND))
+            sec = (time.perf_counter() - t0) / len(part)
+            (th_n, th_h), thr = ms["th"], ms["thr"]
+            for j, (q, c, k, dst) in enumerate(part):
+                kb = ms["at"][j].get(str(QSEARCH_BOUND))
+                neurons = heads = []
+                if kb:
+                    z = thr(j, kb)
+                    neurons = [[i, p, n] for i, p, n in (th_n[j] >= z).nonzero().tolist()]
+                    heads = [[i, p, h] for i, p, h in (th_h[j] >= z).nonzero().tolist()]
+                rec = {**{f: q.get(f) for f in ("id", "task", "key", "corrupt_key", "user", "corrupt_user", "paraphrase")},
+                       "ids": c, "corrupted": k, "neurons": neurons, "heads": heads, "met": bool(kb), "seconds": round(sec, 2),
+                       "finder": "ami.qsearch", "r3search": {"k": ms["at"][j], "k_mask": ms["k_mask"][j],
+                                                             "units_total": ms["units_total"][j], "curve": ms["curves"][j],
+                                                             "history": [[h[0], h[1][2 * j:2 * j + 2], h[2][j]] for h in ms["history"]]}}
+                dst.write_text(json.dumps(rec))
+                if log:
+                    log(f"{q['id']}: {len(neurons)} neurons + {len(heads)} heads within {QSEARCH_BOUND} nats "
+                        f"(k {ms['at'][j]}, of {ms['units_total'][j]}), {sec:.1f} s")
+            torch.cuda.empty_cache() if torch.cuda.is_available() else None
 
 
 def coverage(mk: Masked, wins: list, out: Path, log=None) -> None:
@@ -883,6 +956,15 @@ def coverage(mk: Masked, wins: list, out: Path, log=None) -> None:
 
 # ---------------------------------------------------------------- the leaderboard
 
+def wilson(k: int, n: int, z: float = 1.96) -> list | None:
+    """The 95% Wilson interval of a rate k / n."""
+    if not n:
+        return None
+    p, d = k / n, 1 + z * z / n
+    mid, half = (p + z * z / (2 * n)) / d, z * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / d
+    return [max(0.0, mid - half), min(1.0, mid + half)]
+
+
 def bootstrap(xs: list, draws: int = 2000) -> list | None:
     xs = np.array([x for x in xs if x is not None and math.isfinite(x)], float)
     if len(xs) < 2:
@@ -899,6 +981,11 @@ def board(dirs: list) -> list:
         recs = [r for r in (json.loads(p.read_text()) for p in sorted(Path(d).glob("*.json")) if p.name != "meta.json")
                 if r.get("summary")]
         meta = json.loads((Path(d) / "meta.json").read_text()) if (Path(d) / "meta.json").exists() else {}
+        met = [bool(r["met_r0"]) for r in recs if "met_r0" in r and r["met_r0"] is not None]
+        if met and meta.get("rung", "R3") == "R3":   # (R0: the finder's own pass on its pair, from the records)
+            lines.append({"method": meta.get("label", Path(d).name), "rung": "R0", "inputs": "own", "n": len(met),
+                          "pass": float(np.mean(met)), "pass_ci": wilson(sum(met), len(met)),
+                          "units_median": float(np.median([r["size"]["units"] for r in recs]))})
         for split in ("own", "heldout"):
             S = [r["summary"][split] for r in recs if split in r.get("summary", {})]
             if not S:
@@ -915,6 +1002,9 @@ def board(dirs: list) -> list:
                 rs = [s.get("random", {}).get(m) for s in S]
                 rs = [x for x in rs if x is not None]
                 row[m + "_random"] = float(np.mean(rs)) if rs else None
+            row["pass_ci"] = wilson(int(round(sum(s[arm]["pass"] * s["n"] for s in S))), sum(s["n"] for s in S))
+            if all("frozen" in s for s in S):
+                row["recovered_ce_frozen"] = float(np.mean([s["frozen"]["recovered_ce"] for s in S]))
             for m in ("ce", "kl"):
                 row[m + "_empty"] = float(np.mean([s["empty"][m] for s in S]))
                 row[m + "_full"] = float(np.mean([s["full"][m] for s in S]))
@@ -932,7 +1022,7 @@ def board(dirs: list) -> list:
 
 def tsv(lines: list) -> str:
     cols = ["method", "rung", "inputs", "background", "n", "recovered_ce", "recovered_ce_ci", "recovered_ce_random", "ce", "ce_ci",
-            "ce_random", "ce_empty", "ce_full", "pass", "pass_random", "pass_abs", "full_pass_abs", "kl", "kl_ci", "kl_random", "kl_empty",
+            "ce_random", "ce_empty", "ce_full", "pass", "pass_ci", "pass_random", "pass_abs", "full_pass_abs", "recovered_ce_frozen", "kl", "kl_ci", "kl_random", "kl_empty",
             "recovered_kl", "recovered_kl_random", "recovered_ce_r3", "scrubbed_share", "units_median", "edges_median", "seconds_median"]
     f = lambda v: "" if v is None else (f"[{v[0]:.3f}, {v[1]:.3f}]" if isinstance(v, list) else f"{v:.4g}" if isinstance(v, float) else str(v))  # noqa: E731
     return "\n".join(["\t".join(cols)] + ["\t".join(f(x.get(c)) for c in cols) for x in lines])
@@ -986,9 +1076,18 @@ def main():
     w.add_argument("--n", type=int, default=64)
     w.add_argument("--sample", default=str(Path.home() / "mpd-data" / "ami" / "means_sample_1m.npz"))
     c.add_argument("--mode", default=MODE, choices=("bucket", "global"))
+    qq = sub.add_parser("qsearch")
+    qq.add_argument("out")
+    qq.add_argument("--means", required=True)
+    qq.add_argument("--devset", default=str(DEVSET))
+    qq.add_argument("--split", default="dev")
+    qq.add_argument("--stride", type=int, default=1)
+    qq.add_argument("--limit", type=int, default=0)
+    qq.add_argument("--batch", type=int, default=8)
+    qq.add_argument("--mode", default=MODE, choices=("bucket", "global"))
     b = sub.add_parser("board")
     b.add_argument("dirs", nargs="+")
-    for p in (m, r, c):
+    for p in (m, r, c, qq):
         p.add_argument("--model", default="Qwen/Qwen3-8B")
         p.add_argument("--dtype", default="auto", choices=("auto", "float32", "bfloat16"))
         p.add_argument("--device", default="auto")
@@ -1020,6 +1119,13 @@ def main():
         return
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
+    if a.cmd == "qsearch":
+        qs = [q for q in load_questions(a.devset).values() if q.get("split", a.split) == a.split][::a.stride][:a.limit or None]
+        (out / "meta.json").write_text(json.dumps({"model": a.model, "dtype": dtype, "means": a.means, "mode": a.mode,
+                                                   "bound": QSEARCH_BOUND, "tau": COVER_TAU, "lambda": COVER_LAMBDA,
+                                                   "steps": COVER_STEPS, "questions": len(qs)}))
+        qsearch(Masked(model, Means(a.means, abl_dev(model)), mode=a.mode), tok, qs, out, a.batch, log=log)
+        return
     if a.cmd == "cover":
         (out / "meta.json").write_text(json.dumps({"model": a.model, "dtype": dtype, "means": a.means, "mode": a.mode, "T": COVER_T,
                                                    "bounds": COVER_BOUNDS, "tau": COVER_TAU, "lambda": COVER_LAMBDA,

@@ -12,6 +12,8 @@ Semantics (neuron_builder's, inframove's 10-15):
   (|value| at least Neurons.massive, the layer's cut) stay live;
 - steer adds scale x the neuron's calibration maximum (Neurons.mx) at positions 1 on, along the named pole (a negative
   scale, or the "-" pole, pushes the value down);
+- scale multiplies the unit's values by a factor at positions 1 on (-1 flips the sign): a neuron's named pole only, its
+  massive values left live as under zero; a head's whole slice of o_proj's input;
 - patch sets the units' values at the mapped positions (default: every position from 1 on, the two prompts of equal
   length) to their values on the source prompt's run, in the reference;
 - swap replaces tokens of the prompt (alone or with the units' intervention).
@@ -176,7 +178,7 @@ def knockout_edit(nr: nb.Neurons, us: list[tuple]):
 
 
 def row_edit(nr: nb.Neurons, rows: list[dict]):
-    """edit and route over a batch: rows[b] = {"units": [...], "op": "zero" | ("steer", scale) | ("patch", src, pairs)}
+    """edit and route over a batch: rows[b] = {"units": [...], "op": "zero" | ("steer", scale) | ("scale", factor) | ("patch", src, pairs)}
     (empty: the reference row); src = the source run's captured values {"h": [L x [T, D]], "o": [L x [T, NH x hd]]}."""
     def edit(i, h):
         out = None
@@ -194,6 +196,9 @@ def row_edit(nr: nb.Neurons, rows: list[dict]):
                     out[b, ps, n] = v.masked_fill(hit, 0)
                 elif op[0] == "steer":
                     out[b, ps, n] = v + (op[1] * (-1 if pole < 0 else 1) * nr.mx[i, n]).to(v.dtype)
+                elif op[0] == "scale":
+                    hit = ((v > 0) if pole > 0 else (v < 0) if pole < 0 else (v != 0)) & (v.abs() < nr.massive[i].to(v.device, v.dtype))
+                    out[b, ps, n] = torch.where(hit, v * op[1], v)
                 else:
                     for p, q in op[2]:
                         if at is None or p == at:
@@ -214,6 +219,9 @@ def row_edit(nr: nb.Neurons, rows: list[dict]):
                     out[b, slice(1, None) if at is None else slice(at, at + 1), sl] = 0
                 elif op[0] == "steer":
                     raise BadClaim("steer takes neurons")
+                elif op[0] == "scale":
+                    ps = slice(1, None) if at is None else slice(at, at + 1)
+                    out[b, ps, sl] = out[b, ps, sl] * op[1]
                 else:
                     for p, q in op[2]:
                         if at is None or p == at:
@@ -295,6 +303,8 @@ def _prompt(nr: nb.Neurons, ids: list[int], claims: list[tuple], controls: int, 
             op = c.get("op", "zero")
             if isinstance(op, dict) and "steer" in op:
                 op = ("steer", float(op["steer"]))
+            elif isinstance(op, dict) and "scale" in op:
+                op = ("scale", float(op["scale"]))
             elif isinstance(op, dict) and "patch_from" in op:
                 src = prompt_ids(nr, op["patch_from"])
                 pairs = op.get("positions") or ([(p, p) for p in range(1, T)] if len(src) == T else None)
@@ -306,7 +316,7 @@ def _prompt(nr: nb.Neurons, ids: list[int], claims: list[tuple], controls: int, 
                 op = ("patch", tuple(src), pairs)
                 sources.setdefault(tuple(src), None)
             elif op != "zero":
-                raise BadClaim("op: zero, {steer: scale} or {patch_from: prompt}")
+                raise BadClaim("op: zero, {steer: scale}, {scale: factor} or {patch_from: prompt}")
             if op[0] == "steer" and any(u[0] == "H" for u in us):
                 raise BadClaim("steer takes neurons")
             x = list(ids)

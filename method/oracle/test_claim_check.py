@@ -177,3 +177,31 @@ def test_a_word_answer_sums_its_tokens_against_the_given_alternatives(tiny):
     assert abs(r["contrast_before"] - want) < 1e-5
     one = cc.check_many(nr, [claim(ids, answer=[order[0]])])[0]  # a one-token word is the token answer
     assert one["contrast_before"] == cc.check_many(nr, [claim(ids, answer=order[0])])[0]["contrast_before"]
+
+
+def test_scaling_by_one_changes_nothing_by_zero_is_zero_and_by_minus_one_flips_the_pole(tiny):
+    nr, ids = tiny
+    pred = {"contrast_change": {"op": ">", "value": -1e9}}
+    for us in (["L1.N5+"], ["L0.N3-", "L1.H2"]):
+        one, by0, zero, flip = cc.check_many(nr, [claim(ids, units=us, op={"scale": 1.0}, predict=pred),
+                                                  claim(ids, units=us, op={"scale": 0.0}, predict=pred),
+                                                  claim(ids, units=us, predict=pred),
+                                                  claim(ids, units=us, op={"scale": -1.0}, predict=pred)])
+        assert abs(one["change"]) < 1e-5 and abs(by0["change"] - zero["change"]) < 1e-5, (one, by0, zero)
+
+    def edit(i, h):
+        if i != 1:
+            return h
+        h = h.clone()
+        v = h[:, 1:, 5]
+        h[:, 1:, 5] = torch.where((v > 0) & (v.abs() < nr.massive[1]), -v, v)
+        return h
+
+    with torch.no_grad():
+        lp0 = torch.log_softmax(nr.logits(torch.tensor([ids] * cc.ROWS), [len(ids) - 1])[:, 0], -1)[0]
+        lp1 = torch.log_softmax(nr.logits(torch.tensor([ids] * cc.ROWS), [len(ids) - 1], edit=edit)[:, 0], -1)[0]
+    y = int(lp0.argmax())
+    alts = [t for t in lp0.topk(nb.ALTERNATIVES + 1).indices.tolist() if t != y][:nb.ALTERNATIVES]
+    want = float(((lp1[y] - torch.logsumexp(lp1[alts], 0)) - (lp0[y] - torch.logsumexp(lp0[alts], 0))) / math.log(2))
+    r = cc.check_many(nr, [claim(ids, op={"scale": -1.0}, predict=pred)])[0]
+    assert abs(r["change"] - want) < 1e-5

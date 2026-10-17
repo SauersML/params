@@ -188,7 +188,7 @@ def direct_write(nr, u: dict, rec: dict, T: int) -> float | None:
     col = core.model.layers[u["layer"]].mlp.down_proj.weight[:, u["neuron"]].float()
     W = core.lm_head.weight
     d = W[rec["answer_tokens"]].float().mean(0) - W[rec["alternatives"]].float().mean(0)
-    return round(float(u["value"] * (col * core.model.norm.weight.float() * d).sum()), 4)
+    return round(float(u["value"] * (col * core.model.norm.weight.float() * d).sum().detach()), 4)
 
 
 class Engine:

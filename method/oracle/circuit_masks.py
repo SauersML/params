@@ -45,6 +45,7 @@ LAMBDA = 0.003      # a unit's cost in shares of the gap
 INIT = 3.0          # sigmoid(3) = 0.95: every unit nearly patched at the start
 ORDER_MIN = 64      # units ordered for the measured prefix: those the mask kept (m > 0.5), at least twice that and ORDER_MIN
 ORDER_MAX = 20000
+MASK_TOKENS = 1536   # rows x positions a mask step runs at most (find_batch's parts)
 ROUNDS = 4          # rounds of STEPS a cut's masks get while its order cannot pass (each round from the last's theta)
 
 
@@ -451,6 +452,22 @@ def _find_with(pt, clean, corrupt, answers, log, arm: str, cuts: dict, rec0: dic
     return {**rec, "search": arm, **{k: v for k, v in extra.items() if v}}                 # only)
 
 
+def _chunks(jobs: list, T: int) -> list:
+    """jobs [(item, (pt or pts, specs, taus), names)] in consecutive parts of at most MASK_TOKENS rows x positions a step
+    (each instance's two rows over its spec's positions from its first: a step's activations stay for the backward, so a
+    part's tokens bound its memory; Qwen3-8B, 16 pairs x 4 partners on a 44 GB A40 ran out of memory)."""
+    parts, cur, n = [], [], 0
+    for jb in jobs:
+        pts_ = jb[1][0] if isinstance(jb[1][0], (list, tuple)) else [jb[1][0]]
+        t = sum(2 * len(pts_) * (T - min(s["positions"])) for s in jb[1][1])
+        if cur and n + t > MASK_TOKENS:
+            parts.append(cur)
+            cur, n = [], 0
+        cur.append(jb)
+        n += t
+    return parts + ([cur] if cur else [])
+
+
 def find_batch(pts: list, items: list, arm: str = "mask", steps: int = STEPS, log=None, priors: list | None = None,
                partners: list | None = None) -> list:
     """find() for several pairs at once: items [(clean, corrupt, answers)], one Patcher each (pts, of one model). Every
@@ -494,11 +511,12 @@ def find_batch(pts: list, items: list, arm: str = "mask", steps: int = STEPS, lo
         for T, js in by_T.items():
             t1 = time.perf_counter()
             jobs = [(j, job, ns) for j in js for job, ns in _jobs(pts[j], sts[j][1], names[j])]
-            res = optimize_many([job for _, job, _ in jobs], steps=steps, log=log,
-                                init=[[got[j].get(n, {}).get("theta") for n in ns] for j, _, ns in jobs] if rnd else None)
-            for (j, _, ns), r in zip(jobs, res):
-                for n, x in zip(ns, r):
-                    got[j][n] = {"theta": x["theta"], "history": got[j].get(n, {}).get("history", []) + x["history"]}
+            for part in _chunks(jobs, T):
+                res = optimize_many([job for _, job, _ in part], steps=steps, log=log,
+                                    init=[[got[j].get(n, {}).get("theta") for n in ns] for j, _, ns in part] if rnd else None)
+                for (j, _, ns), r in zip(part, res):
+                    for n, x in zip(ns, r):
+                        got[j][n] = {"theta": x["theta"], "history": got[j].get(n, {}).get("history", []) + x["history"]}
             for j in js:
                 t_opt[j] = (time.perf_counter() - t1) / len(js)
         for T, js in by_T.items():                  # (masked cuts' verify as a Group too)

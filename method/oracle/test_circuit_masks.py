@@ -613,3 +613,45 @@ def test_fit_masks_halves_budget_on_oom(tiny, monkeypatch):
     assert [o[0]["job"] for o in out] == [id(j) for j in jobs]
     assert cm.MASK_SCALE == 0.5 and calls[0] == (3, 10 ** 6) and calls[1] == (3, 5 * 10 ** 5)
     assert real is not cm.optimize_many
+
+
+def test_mean_tags(tiny, monkeypatch, tmp_path):
+    """NECESSARY_MEANS: candidates in |(value - mean) x gradient| order outside each cut, each set to its general-text mean
+    alone in the clean run; the listed lost shares equal a forward with that neuron at its bucket mean; NECESSARY_CONTROL
+    splits them into "necessary_mean" and "hubs" by the control prompts' margins."""
+    import ami
+    model, clean, corrupts = tiny
+    g = torch.Generator().manual_seed(5)
+    docs = [torch.randint(0, 64, (40,), generator=g).tolist() for _ in range(16)]
+    torch.save(ami.collect(model, docs), tmp_path / "means.pt")
+    monkeypatch.setattr(cm, "NECESSARY_MEANS", tmp_path / "means.pt")
+    monkeypatch.setattr(cm, "NECESSARY_MEANS_MODEL", getattr(model.config, "_name_or_path", ""))
+    monkeypatch.setattr(cm, "NECESSARY", -1e9)
+    monkeypatch.setattr(cm, "NECESSARY_TOP", 6)
+    monkeypatch.setattr(cm, "CONTROL_PROMPTS", [torch.randint(0, 64, (9,), generator=g).tolist() for _ in range(3)])
+    monkeypatch.setattr(cm, "_MEANS", {})
+    monkeypatch.setattr(cm, "NECESSARY_CONTROL", 1e9)
+    pt = cf.Patcher(model, None, rows=8)
+    rec = cm.find(pt, clean, corrupts[0], steps=4)
+    assert set(rec["necessary_mean"]) == set(rec["cuts"]) and all(not v for v in rec["hubs"].values())
+    means = ami.Means(tmp_path / "means.pt")
+    pt.setup(clean, corrupts[0])
+    xs = [x for v in rec["necessary_mean"].values() for x in v if "neuron" in x][:4]
+    assert xs
+    for x in xs:
+        v = means.table("neuron", x["layer"], pt.T, pt.dev, torch.float32)[x["pos"], x["neuron"]]
+
+        def f(mod, args, x=x, v=v):
+            h = args[0].clone()
+            h[0, x["pos"], x["neuron"]] = v.to(h.dtype)
+            return (h,) + tuple(args[1:])
+        hk = pt.layers[x["layer"]].mlp.down_proj.register_forward_pre_hook(f)
+        try:
+            with torch.no_grad():
+                c = float(pt._contrast(pt.core.model(input_ids=torch.tensor([clean])).last_hidden_state[:, -1])[0])
+        finally:
+            hk.remove()
+        assert abs(x["lost"] - (pt.c["clean"] - c) / pt.gap) < 1e-3
+    monkeypatch.setattr(cm, "NECESSARY_CONTROL", -1e9)
+    rec2 = cm.find(cf.Patcher(model, None, rows=8), clean, corrupts[0], steps=4)
+    assert all(not v for v in rec2["necessary_mean"].values()) and sum(len(v) for v in rec2["hubs"].values()) > 0

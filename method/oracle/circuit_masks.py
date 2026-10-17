@@ -158,6 +158,19 @@ NECESSARY = 0.5     # a unit outside a cut whose noising alone loses at least th
 NECESSARY_TOP = 256  # the candidates measured a cut: its first units in RelP attribution (attr_order, the own pair) outside the
 # cut, each noised alone on the own pair in one tick; 0: off. (AND plant: RelP ranks of the flags among every neuron at every
 # position, median 26-33, within 256 on 37/38 pairs, within 64 on 33-34)
+NECESSARY_MEANS = Path.home() / "mpd-data" / "ami" / "means" / "qwen3_8b.pt"  # general-text means (ami.collect's file, the
+NECESSARY_MEANS_MODEL = "Qwen/Qwen3-8B"  # R3 background) of the mean-ablation tags, for this model; missing, another model: off.
+# A unit the same in both prompts (silent in both: casestudy's AND-plant suppressors) is invisible to patching from the other
+# prompt; set to its general-text mean it is not, where that mean differs from its value here. Candidates: each cut's first
+# NECESSARY_TOP units in |(value - mean) x the contrast's gradient| on the clean run, outside the cut; each set to its mean
+# alone in the clean run; lost >= NECESSARY, and on CONTROL_PROMPTS (the neuron or head channel at its mean at every
+# position) a median lost share of the top token's margin over the runner-up of at most NECESSARY_CONTROL (else a hub: Qwen3's
+# massive-activation neurons cost every answer), go in the record's "necessary_mean"; the hubs in "hubs"
+NECESSARY_CONTROL = 0.1
+CONTROL_PROMPTS = ["What is the capital of France? Answer with one word.", "How many legs does a spider have? One word.",
+                   "What color is the sky on a clear day? One word.", "Which planet is known as the Red Planet? One word.",
+                   "What is the opposite of hot? One word.", "What do bees make? Answer with one word.",
+                   "What is the largest ocean on Earth? One word.", "In which season does snow usually fall? One word."]
 ONE_PROMPT = 0      # 1: one prompt (the lead's 10-17, from the user: a circuit should not need a second prompt; arm
 # constant one_prompt=1 with partners=16): the question's clean prompt alone is run, each cut's units outside the circuit
 # set to their values on other keys of its template (its pairs' corrupted prompts: the question's own and its partners,
@@ -1231,7 +1244,122 @@ def _finish_steps(st: dict, pt=None):
         for n, g in zip(st["names"], got):
             out[n]["necessary"] = [{**_unit_json(u), "lost": round(lo, 4), "restored": round(re_, 4)}
                                    for u, (lo, re_) in sorted(zip(cand[n], g), key=lambda x: -x[1][0]) if lo >= NECESSARY]
+        means = _necessary_means(pt)
+        if means is not None:
+            _mean_tags(pt, specs, out, st["names"], means)
     return out
+
+
+_MEANS = {}                                         # (path -> ami.Means; control prompts' ids and margins per tokenizer)
+
+
+def _necessary_means(pt):
+    """NECESSARY_MEANS loaded once (ami.Means), or None: off, missing, or the Patcher's model is not NECESSARY_MEANS_MODEL."""
+    name = getattr(pt.core.config, "_name_or_path", "")
+    if not NECESSARY_TOP or not NECESSARY_MEANS or name != NECESSARY_MEANS_MODEL or not Path(NECESSARY_MEANS).exists():
+        return None
+    key = str(NECESSARY_MEANS)
+    if key not in _MEANS:
+        import ami                                  # (ami imports circuit_finder, not this module)
+        _MEANS[key] = ami.Means(key, device=pt.dev)
+    return _MEANS[key]
+
+
+def _hook_rows(pt, kind: str, sets: list):
+    """Forward pre-hooks setting, per batch row, its listed (layer, index, value [T, width]) channels; removed by the caller."""
+    hs = []
+    for i, layer in enumerate(pt.layers):
+        rows = [(b, k, v) for b, (li, k, v) in enumerate(sets) if li == i]
+        if not rows:
+            continue
+
+        def f(mod, args, rows=rows):
+            x = args[0].clone()
+            for b, k, v in rows:
+                x[b, :, k] = v.to(x.device, x.dtype)
+            return (x,) + tuple(args[1:])
+        mod = layer.mlp.down_proj if kind == "neuron" else layer.self_attn.o_proj
+        hs.append(mod.register_forward_pre_hook(f))
+    return hs
+
+
+def _mean_tags(pt, specs: dict, out: dict, names: list, means) -> None:
+    """NECESSARY_MEANS's tags (its note) into out[cut]["necessary_mean"] and out[cut]["hubs"]."""
+    T, L, dev = pt.T, pt.L, pt.dev
+    dt = pt.act["clean"]["neu"][0].dtype
+    tab = {"neu": [means.table("neuron", i, T, dev, dt) for i in range(L)], "head": [means.table("head", i, T, dev, dt) for i in range(L)]}
+    grads = {"neu": [None] * L, "head": [None] * L}
+    hs = []
+    for i, layer in enumerate(pt.layers):         # (the contrast's gradient at every neuron and head channel, clean run)
+        def pre(m, a, i=i, k="neu"):
+            a[0].retain_grad()
+            grads[k][i] = a[0]
+
+        def pre_h(m, a, i=i):
+            a[0].retain_grad()
+            grads["head"][i] = a[0]
+        hs += [layer.mlp.down_proj.register_forward_pre_hook(pre), layer.self_attn.o_proj.register_forward_pre_hook(pre_h)]
+    try:
+        with torch.enable_grad():
+            emb = pt.core.model.embed_tokens(pt._ids_dev["clean"][None]).detach().requires_grad_(True)
+            hn = pt.core.model(inputs_embeds=emb).last_hidden_state[:, -1]
+            pt._contrast(hn).sum().backward()
+    finally:
+        for h in hs:
+            h.remove()
+    sc = {"neuron": torch.stack([((pt.act["clean"]["neu"][i].float() - tab["neu"][i].float()) * grads["neu"][i].grad[0].float()).abs()
+                                 for i in range(L)]),
+          "head": torch.stack([((pt.act["clean"]["head"][i].float() - tab["head"][i].float()) * grads["head"][i].grad[0].float())
+                               .view(T, pt.H, pt.hd).sum(-1).abs() for i in range(L)])}
+    top = int(NECESSARY_TOP)
+    cand = {}
+    for n in names:
+        have = set(out[n]["units"])
+        cand[n] = [u for u in attr_order(pt, specs[n], sc)[:top + len(have)] if u not in have][:top]
+    every = [u for n in names for u in cand[n]]
+    pt.act["mean"] = tab
+    try:
+        lost = dict(zip(every, pt.run("clean", [[u + ("mean",)] for u in every]))) if every else {}
+    finally:
+        del pt.act["mean"]
+    hit = [u for u in dict.fromkeys(every) if lost[u] >= NECESSARY]
+    ctrl = _control_shares(pt, hit, means) if hit else {}
+    for n in names:
+        rows = [{**_unit_json(u), "lost": round(lost[u], 4), "control": round(ctrl[u], 4)} for u in cand[n] if u in ctrl]
+        rows.sort(key=lambda x: -x["lost"])
+        out[n]["necessary_mean"] = [x for x in rows if x["control"] <= NECESSARY_CONTROL]
+        out[n]["hubs"] = [x for x in rows if x["control"] > NECESSARY_CONTROL]
+
+
+def _control_shares(pt, units: list, means) -> dict:
+    """Per unit, the median over CONTROL_PROMPTS of the top token's margin over the runner-up lost with the unit's neuron
+    (or head channel) at its general-text mean at every position (one batch a prompt, a row a unit)."""
+    key = ("ctrl", id(pt.core), repr(CONTROL_PROMPTS))
+    if key not in _MEANS:                           # (a prompt as text, or as token ids already in the chat frame)
+        ids = [list(q) if not isinstance(q, str) else cf.chat(pt.tok, q) for q in CONTROL_PROMPTS]
+        with torch.no_grad():
+            lg = [pt.core(input_ids=torch.tensor([x], device=pt.dev)).logits[0, -1].float() for x in ids]
+        _MEANS[key] = [(x, int(g.argmax()), int(g.topk(2).indices[1]), float(g.topk(2).values[0] - g.topk(2).values[1]))
+                       for x, g in zip(ids, lg)]
+    share = {u: [] for u in units}
+    for x, a, b, m0 in _MEANS[key]:
+        T = len(x)
+        sets = []
+        for u in units:
+            kind = "neuron" if u[0] == "neuron" else "head"
+            k = u[3] if kind == "neuron" else torch.arange(u[2] * pt.hd, (u[2] + 1) * pt.hd, device=pt.dev)
+            sets.append((u[1], k, means.table(kind, u[1], T, pt.dev, torch.float32)[:, k]))
+        hs = _hook_rows(pt, "neuron", [s if u[0] == "neuron" else (-1, 0, None) for s, u in zip(sets, units)]) + \
+            _hook_rows(pt, "head", [s if u[0] == "head" else (-1, 0, None) for s, u in zip(sets, units)])
+        try:
+            with torch.no_grad():
+                lg = pt.core(input_ids=torch.tensor([x] * len(units), device=pt.dev)).logits[:, -1].float()
+        finally:
+            for h in hs:
+                h.remove()
+        for u, g in zip(units, lg):
+            share[u].append(float((m0 - (g[a] - g[b])) / max(m0, 1e-6)))
+    return {u: float(np.median(v)) for u, v in share.items()}
 
 
 def _unit_json(u: tuple) -> dict:
@@ -1251,7 +1379,7 @@ def _find_with(pt, clean, corrupt, answers, log, arm: str, cuts: dict, rec0: dic
         if rec0 is not None:
             del pt.setup
     extra = {k: {n: c[k] for n, c in cuts.items() if k in c} for k in ("attr", "mask", "partners", "adversarial", "family",
-                                                                        "one_prompt", "necessary")}   # (find() copies its own fields
+                                                                        "one_prompt", "necessary", "necessary_mean", "hubs")}   # (find() copies its own fields
     return {**rec, "search": arm, **{k: v for k, v in extra.items() if v}}                 # only)
 
 

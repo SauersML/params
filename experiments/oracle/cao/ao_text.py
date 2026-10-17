@@ -19,6 +19,7 @@ the same rows, on oracleeval's scorecard (O1, O1m) and AO's own suite (taboo, Pe
       (the same questions, serialization and answers); --tests: textoracle's rows directory (its test_{full,none} and
       test_members_{full,none}, taken as they are).
   ao_text.py answers ADAPTER TEST.jsonl OUT.jsonl [--batch 8]    greedy answers in textoracle's eval format
+  ao_text.py figure --suites RELEASED.json NONE.json CIRC.json   the uplift figure (~/mpd-data/figures/oracle/ao_text_uplift.png)
   ao_text.py collect NAME LABEL --o1 O1.jsonl --o1m O1M.jsonl [--e1 BATTERY.jsonl] [--li LI.jsonl] [--matched none=NAME]
       the answers into the scorecard (answers/NAME/: O1, O1m, O2, O5 Li; matched: the arm trained on the other input,
       the uplift's control)
@@ -132,6 +133,76 @@ def collect(a) -> None:
     print("collected", d)
 
 
+FIG_ARMS = (("ao8b-text.full", "released AO"), ("ao-text.v5.none.s340", "AO trained,\nno circuits"),
+            ("ao-text.v5.circ.s340", "AO trained,\nwith circuits"), ("text.v5.Tfull.s220.full", "base model trained,\nwith circuits"))
+SUITE = (("taboo", "taboo"), ("personaqa_yes_no", "PersonaQA\nyes/no"), ("personaqa_open_ended", "PersonaQA\nopen"),
+         ("classification", "classification\n(unseen sets)"))
+
+
+def figure(a) -> None:
+    """Left: O1 (unseen contexts' task/key) and O1m per arm with 95% intervals, from the scorecard's table; right: AO's
+    own suite (fleet's harness, ao_score.py's ao_scores.json) for the released AO and the two trained arms."""
+    import csv
+
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    tab = {}
+    with (Path.home() / "mpd-data/oracle/scorecard/table.tsv").open() as fh:
+        for r in csv.DictReader(fh, delimiter="\t"):
+            tab[(r["oracle"], r["target"], r["metric"])] = r
+    colors = ["#8c8c8c", "#4e79a7", "#e15759", "#f28e2b"]
+    plt.rcParams.update({"font.size": 15})
+    fig, (ax, bx) = plt.subplots(1, 2, figsize=(17, 6.5), gridspec_kw={"width_ratios": [1, 1.25]})
+    cells = (("O1", "unseen task/key", "circuit questions,\nunseen contexts"), ("O1m", "all", "single-neuron and\nneuron-set questions"))
+    w = 0.2
+    for k, (name, lab) in enumerate(FIG_ARMS):
+        for j, (t, m, _) in enumerate(cells):
+            r = tab.get((name, t, m))
+            if r is None:
+                continue
+            v, lo, hi = float(r["value"]), float(r["ci_lo"]), float(r["ci_hi"])
+            x = j + (k - 1.5) * w
+            ax.bar(x, v, w * 0.92, color=colors[k], label=lab if j == 0 else None)
+            ax.errorbar(x, v, [[v - lo], [hi - v]], color="black", capsize=3, lw=1)
+            ax.text(x, hi + 0.015, f"{v:.2f}", ha="center", fontsize=11)
+    prior = [tab.get(("name-prior", "O1", "unseen task/key")), tab.get(("name-prior-members", "O1m", "all"))]
+    for j, r in enumerate(prior):
+        if r is not None:
+            ax.hlines(float(r["value"]), j - 2.2 * w, j + 2.2 * w, colors="black", linestyles="dashed", lw=1.5)
+            ax.text(j + 2.25 * w, float(r["value"]), "name prior", va="center", fontsize=11)
+    ax.set_xticks(range(len(cells)), [c[2] for c in cells])
+    ax.set_ylabel("answers in the measured outcome class")
+    ax.set_ylim(0, 0.8)
+    ax.set_title("Reading circuits on unseen texts")
+    suites = [json.loads(Path(f).read_text()) if Path(f).exists() else None for f in a.suites]
+    for k, d in enumerate(suites):
+        if d is None:
+            continue
+        for j, (key, _) in enumerate(SUITE):
+            e = d.get(key) or next((v for kk, v in d.items() if kk.startswith(key) and "base_model" not in kk), None)
+            if e is None:
+                continue
+            e = e.get("ood") if key == "classification" else next((v for kk, v in e.items() if isinstance(v, dict) and "mean" in v), None)
+            if not e:
+                continue
+            x = j + (k - 1) * 0.27
+            bx.bar(x, e["mean"], 0.25, color=[colors[0], colors[1], colors[2]][k])
+            bx.errorbar(x, e["mean"], e["ci95"], color="black", capsize=3, lw=1)
+            bx.text(x, e["mean"] + e["ci95"] + 0.015, f"{e['mean']:.2f}", ha="center", fontsize=11)
+    bx.set_xticks(range(len(SUITE)), [s[1] for s in SUITE])
+    bx.set_ylim(0, 1.0)
+    bx.set_title("The activation oracle's own tasks")
+    for z in (ax, bx):
+        z.spines[["top", "right"]].set_visible(False)
+    fig.legend(loc="lower center", ncol=4, frameon=False, bbox_to_anchor=(0.5, -0.06))
+    fig.tight_layout(rect=(0, 0.06, 1, 1))
+    a.out.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(a.out, dpi=150, bbox_inches="tight", facecolor="white")
+    print(a.out)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -158,8 +229,11 @@ def main():
     c.add_argument("--o1m", type=Path)
     c.add_argument("--e1", type=Path, help="e1.py battery's answers (O2)")
     c.add_argument("--li", type=Path, help="li_patch.py's answers for this adapter (O5)")
+    f = sub.add_parser("figure")
+    f.add_argument("--suites", nargs=3, required=True, help="ao_scores.json of the released AO, the no-circuit arm, the circuit arm")
+    f.add_argument("--out", type=Path, default=Path.home() / "mpd-data/figures/oracle/ao_text_uplift.png")
     a = ap.parse_args()
-    {"build": build, "answers": answers, "collect": collect}[a.cmd](a)
+    {"build": build, "answers": answers, "collect": collect, "figure": figure}[a.cmd](a)
 
 
 if __name__ == "__main__":

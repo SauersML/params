@@ -453,7 +453,7 @@ def joint_build(a) -> None:
             continue
         singles = [rule(r["lost_a"][k], r["lost_b"][k]) for k in (0, 1)]
         inter = [r["joint_" + s]["change"] - sum(x["change"] for x in r["single_" + s]) for s in ("a", "b")]
-        if max(abs(x) for x in inter) < INTERACT:  # the pair's joint effect is not the sum of its units' effects in either text
+        if max(abs(x) for x in inter) < a.interact:  # the pair's joint effect is not the sum of its units' effects in either text
             continue
         add = zero_class(sum(x["change"] for x in r["single_a"]), sum(x["change"] for x in r["single_b"])) or "gap"
         A, B = texts[r["context_a"]], texts[r["context_b"]]
@@ -474,7 +474,7 @@ def joint_build(a) -> None:
                          "single_b": [x["change"] for x in r["single_b"]], "lost_a": r["lost_a"], "lost_b": r["lost_b"],
                          "interaction_a": inter[0], "interaction_b": inter[1]},
             "single_rules": singles, "additive": add,
-            "pattern": "|".join(singles + [add])})  # (balanced within: the single rules and the additive guess at chance)
+            "pattern": "|".join(singles + ([add] if a.additive else []))})  # (balanced within: those rules at chance)
     rng = random.Random(a.seed)
     out = collections.defaultdict(list)
     for s in ("train", "dev", "test"):
@@ -514,7 +514,7 @@ def joint_build(a) -> None:
            "rule": "the pair's joint zeroing differs from the sum of its units' single zeroings by at least INTERACT bits in "
                    "one text; gold balanced within each pattern of the two units' own lost-share rules and the additive guess "
                    "(the class of the summed single zeroings), so those rules and any exclusion among them sit at chance; pairs within one split; measured in " + (raw[0]["dtype"] if raw else "?"),
-           "interact_bits": INTERACT}
+           "interact_bits": a.interact, "additive_balanced": a.additive}
     (a.out / "manifest.json").write_text(json.dumps(man, indent=1) + "\n")
     print(json.dumps({k: man[k] for k in ("rows", "baselines")}))
 
@@ -572,6 +572,9 @@ def main():
     jb.add_argument("measure", type=Path, nargs="+")
     jb.add_argument("--families-from", type=Path, required=True)
     jb.add_argument("--seed", type=int, default=1)
+    jb.add_argument("--interact", type=float, default=INTERACT, help="bits; 0: no interaction required")
+    jb.add_argument("--additive", action=argparse.BooleanOptionalAction, default=True,
+                    help="balance the gold within the additive guess too (the answer then turns on the interaction)")
     a = ap.parse_args()
     {"measure": measure, "build": build, "remeasure": remeasure, "joint": joint, "joint-build": joint_build}[a.cmd](a)
 

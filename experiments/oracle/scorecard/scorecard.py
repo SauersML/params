@@ -788,6 +788,44 @@ def score(a) -> None:
               + (f" exact: {r['exact']}" if r.get("exact") else ""))
     print(f"-> {ROOT / 'table.tsv'}")
     figure(rows, meta)
+    plan_figure(plan_rows)
+
+
+PLAN_FIG = HOME / "mpd-data" / "figures" / "oracle" / "plan_bars.png"
+
+
+def plan_figure(plan_rows: list[dict]) -> None:
+    """The plan's bars: per task, a frontier model with the transcript, with our circuits too, and our trained oracle."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    plt.rcParams.update({"font.family": "Helvetica Neue", "font.size": 22, "xtick.labelsize": 20, "ytick.labelsize": 20,
+                         "figure.facecolor": "white", "axes.facecolor": "white", "savefig.facecolor": "white"})
+    look = (("#9DB9DD", "o", "frontier model with the transcript"), ("#E09F3E", "s", "the same, with our circuits"),
+            ("#2F6DB5", "D", "our trained oracle"))
+    fig, ax = plt.subplots(figsize=(18, 1.1 * len(plan_rows) + 2.5))
+    for sp in ("top", "right"):
+        ax.spines[sp].set_visible(False)
+    for k, r in enumerate(plan_rows):
+        y = len(plan_rows) - 1 - k
+        for j, (c, (col, mk, _)) in enumerate(zip(r["columns"], look)):
+            dy = 0.25 - 0.25 * j
+            if c is None:
+                ax.text(0.005, y + dy, "not yet", va="center", fontsize=15, color="#888888")
+                continue
+            ax.plot([c["lo"], c["hi"]], [y + dy] * 2, color=col, lw=3)
+            ax.plot(c["value"], y + dy, mk, ms=13, color=col)
+            ax.text(c["hi"] + 0.01, y + dy, f"{c['value']:.2f}", va="center", fontsize=16)
+    ax.set_yticks(range(len(plan_rows)), [r["task"] for r in plan_rows][::-1])
+    ax.set_xlim(0, 1.0)
+    ax.set_ylim(-0.6, len(plan_rows) - 0.4)
+    for col, mk, lab in look:
+        ax.plot([], [], mk, ms=13, color=col, label=lab)
+    ax.legend(loc="lower left", bbox_to_anchor=(0.0, 1.0), ncol=3, frameon=False, fontsize=18)
+    ax.set_xlabel("share right (each task's own measure; 95% intervals)")
+    fig.suptitle("The plan's bars on Qwen3-8B and AuditBench", x=0.02, ha="left", fontsize=28, fontweight="bold", y=1.03)
+    fig.savefig(PLAN_FIG, dpi=110, bbox_inches="tight", pad_inches=0.3)
+    print(f"figure -> {PLAN_FIG}")
 
 
 PLAN_COLUMNS = ("frontier + transcript", "frontier + transcript + our circuits", "our trained oracle")

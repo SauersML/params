@@ -300,7 +300,7 @@ def main():
         torch.cuda.empty_cache()
         fits[name] = {k: v for k, v in fits.get(name, {}).items() if k in methods or k == "twins"}
         for k, rows in out.items():  # (written as each organism finishes)
-            if k not in methods:
+            if k not in methods or not rows:  # (a method skipped here writes nothing)
                 continue
             if k == "random-matched" and a.access == "base":
                 continue

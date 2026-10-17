@@ -956,8 +956,9 @@ def score(a) -> None:
             pred = [got[i["item"]].get("class") or pair_class(got[i["item"]].get("answer")) for i in its]
             ok = [float(c == i["gold"]) for c, i in zip(pred, its)]
             if p1f32:  # against oracledata's float32 gold (bf16 gold agrees on 81.9%; null in the no-class margin: left out)
-                for kind in ("all", "pair_zero", "pair_sign", "pair_flip"):
-                    sg = [k for k, i in enumerate(its) if kind in ("all", i["kind"]) and p1f32.get(i["id"]) is not None]
+                for kind in ("all", "pair_zero", "pair_sign", "pair_flip", "clean contexts"):
+                    sg = [k for k, i in enumerate(its) if (kind in ("all", i["kind"]) or (kind == "clean contexts" and i["item"] in p1clean))
+                          and p1f32.get(i["id"]) is not None]
                     if sg:
                         cell(name, "O1p", f"float32 labels: {kind}", [float(pred[k] == p1f32[its[k]["id"]]) for k in sg],
                              [f"{its[k]['context_a']}|{its[k]['context_b']}" for k in sg])
@@ -1168,6 +1169,7 @@ def score(a) -> None:
             fh.write(f"{r['oracle']}\t{r['label']}\t" + "\t".join(
                 f"{r[k]['value']:.3f}\t[{r[k]['lo']:.3f}, {r[k]['hi']:.3f}]\t{r[k]['n']}" if k in r else "\t\t"
                 for k in O1P_COLS) + "\n")
+        fh.write("".join(f"# {x}\n" for x in O1P_NOTES))
     o1p_figure(o1p_rows)
     with (ROOT / "o3.tsv").open("w") as fh:
         kinds = ("all", "lie", "cond_pref", "backdoor", "cue_marker")
@@ -1339,6 +1341,12 @@ def o3_figure(view: list[dict]) -> None:
 O1P_PAIRS = (("text.p1.Tfull.s700.full", "pairs397c"), ("text.p1.Tfull.s700.full", "tree-pairs"),
              ("text.p1.Tfull.s700.full", "text.p1.Tnames.s700.names"), ("text.p1.Tfull.s700.full", "text.p1.Tnone.s700.none"),
              ("pairs397c", "pairs397"))
+O1P_NOTES = ("Labels: float32 gold is primary (bf16 gold agrees on 81.9%; 631 questions in float32's no-class margin are left "
+             "out of float32 cells); bf16 beside it.",
+             "The trained text reader matches trees on the circuits' numbers (+0.02 overall on float32 labels; a tie on the clean "
+             "contexts and on bf16 labels); it beats its names-only and no-circuit arms by about 0.33 and the 397B given the same "
+             "circuit text by about 0.25.",
+             "O1pj (pair_joint v1) is withdrawn: it leaks the gold by exclusion; v2 replaces it.")
 O1P_COLS = ("sub 1225", "all", "float32 labels: all", "pair_zero", "pair_sign", "pair_flip", "clean contexts")
 O1P_CHANCE = {"pair_zero": 1 / 3, "pair_sign": 0.25, "pair_flip": 0.25}
 

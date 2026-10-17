@@ -57,8 +57,8 @@ def _rows(pts: list) -> list:
     rows = []
     for j, pt in enumerate(pts):
         rows += [(j, "clean", None, 0.0), (j, "corrupt", None, 0.0)]
-        rows += [(j, b, n, m) for n in cm.cuts_of(pt) if SOURCE_PATH or n != "source" for m in POINTS if m > 0
-                 for b in ("clean", "corrupt")]
+        rows += [(j, b, n, m) for n in cm.cuts_of(pt) if (SOURCE_PATH and SOURCE_GRAD) or n != "source"
+                 for m in POINTS if m > 0 for b in ("clean", "corrupt")]
     return rows
 
 
@@ -74,9 +74,18 @@ def _mark(name: str, t0: float) -> float:
     return t
 
 
+SOURCE_GRAD = True    # the source cut's slopes at all; False: every source slope 0, the plain runs' rows run at the answer
+                      # position alone (the readout's and movers' slopes need only that), so path_features runs no
+                      # position before the answer (offline the source model lost little: whole circuit in the top 64
+                      # 0.85 against 0.86 with its m = 0 slopes)
+
+
 def _late(pt, n) -> bool:
-    """A cut at the answer position only (readout, movers): its rows at m > 0 differ from the plain runs there alone."""
-    return n is not None and list(cm.cuts_of(pt)[n]["positions"]) == [pt.T - 1]
+    """A cut at the answer position only (readout, movers): its rows at m > 0 differ from the plain runs there alone (and
+    without SOURCE_GRAD the plain runs' rows too)."""
+    if n is None:
+        return not SOURCE_GRAD
+    return list(cm.cuts_of(pt)[n]["positions"]) == [pt.T - 1]
 
 
 def _chunks(pts: list) -> list:
@@ -191,7 +200,8 @@ def path_features(pts: list, consume, relp: bool = True) -> None:
                     tag = {0.0: "0", 0.5: "5", 1.0: "1"}[m]
                     for base, feat in (("clean", "lost"), ("corrupt", "rest")):
                         r = row.get((base, None if m == 0 else n, m))
-                        f[feat + tag] = slope(r) if r is not None else torch.zeros_like(dl if key == "neu" else dl[..., ::hd])
+                        f[feat + tag] = (slope(r) if r is not None and (SOURCE_GRAD or n != "source")
+                                         else torch.zeros_like(dl if key == "neu" else dl[..., ::hd]))
                 if key == "head":
                     f["delta"] = dl.view(L, len(P), H, hd).norm(dim=-1)
                     f["clean"] = hc.view(L, len(P), H, hd).norm(dim=-1)
@@ -386,7 +396,7 @@ def load_model(path: str):
         out = torch.full((n,), float(sub.min()) - 1.0, device=sub.device)
         out[idx] = sub
         return out.reshape(shape)
-    score.relp, score.source_path = z.get("relp", True), z.get("source_path", True)
+    score.relp, score.source_path, score.source_grad = z.get("relp", True), z.get("source_path", True), z.get("source_grad", True)
     return score
 
 
@@ -808,7 +818,7 @@ def _export(net, scale, mean, std) -> dict:
 
 
 def train(dirs: list, out_path: str, holdout: float = 0.2, epochs: int = 40, hidden: int = 64, seed: int = 0, log=print,
-          by: str = "key", save: bool = True, relp: bool = True, source_path: bool = True):
+          by: str = "key", save: bool = True, relp: bool = True, source_path: bool = True, source_grad: bool = True):
     """train mode: per cut an MLP on data mode's dirs. The (task, key)s (by "key") or the tasks (by "task") are split,
     holdout of them unseen: the offline ranking of ig, grad, relp and the model on them is logged (and returned); the
     saved model is then trained on every key with the same epochs."""
@@ -816,9 +826,10 @@ def train(dirs: list, out_path: str, holdout: float = 0.2, epochs: int = 40, hid
     if not relp:                                    # (a model without RelP: its feature 0, as path_features(relp=False))
         for g in groups:
             g.x[:, FEATURES.index("relp")] = 0.0
-    if not source_path:                             # (a model without the source's path slopes: SOURCE_PATH False)
+    if not source_path or not source_grad:          # (a model without the source's path slopes, SOURCE_PATH False, or
+        drop = ("lost5", "lost1", "rest5", "rest1") + (() if source_grad else ("lost0", "rest0"))   # any, SOURCE_GRAD)
         for g in [g for g in groups if g.cut == "source"]:
-            g.x[:, [FEATURES.index(k) for k in ("lost5", "lost1", "rest5", "rest1")]] = 0.0
+            g.x[:, [FEATURES.index(k) for k in drop]] = 0.0
     unit = (lambda g: (g.task, g.key)) if by == "key" else (lambda g: g.task)  # noqa: E731
     keys = sorted({unit(g) for g in groups})
     rng = np.random.default_rng(seed)
@@ -841,7 +852,7 @@ def train(dirs: list, out_path: str, holdout: float = 0.2, epochs: int = 40, hid
         log(f"{cut} unseen keys: " + "; ".join(f"{k} {v}" for k, v in base.items()))
     if not save:
         return report
-    model = {"features": FEATURES, "relp": relp, "source_path": source_path}
+    model = {"features": FEATURES, "relp": relp, "source_path": source_path, "source_grad": source_grad}
     for cut in ("readout", "movers", "source"):
         if any(g.cut == cut for g in groups):
             model[cut], _ = fit(groups, cut, hidden=hidden, epochs=epochs, seed=seed)
@@ -885,6 +896,8 @@ def main():
     ap.add_argument("--profile", action="store_true", help="eval: each arm batch's drive ticks timed by kind (TickProfile)")
     ap.add_argument("--epochs", type=int, default=40)
     ap.add_argument("--hidden", type=int, default=64)
+    ap.add_argument("--no-source-grad", action="store_true", help="train: a source model without any slope (eval then "
+                    "runs no position before the answer: SOURCE_GRAD False)")
     ap.add_argument("--no-source-path", action="store_true", help="train: a model without the source cut's slopes at "
                     "m > 0 (eval then skips those rows: SOURCE_PATH False)")
     ap.add_argument("--no-relp", action="store_true", help="train: a model without the RelP feature (eval then skips RelP's pass)")
@@ -896,7 +909,8 @@ def main():
             assert any(k in m for m in (globals(), vars(cm), vars(cf))), f"arm {arm}: no constant {k}"
     if a.mode == "train":                           # (inp: data mode's OUT dirs, comma-separated; out: the model file)
         report = train(a.inp.split(","), a.out, epochs=a.epochs, hidden=a.hidden, by=a.holdout_by,
-                       save=a.holdout_by == "key", relp=not a.no_relp, source_path=not a.no_source_path)
+                       save=a.holdout_by == "key", relp=not a.no_relp, source_path=not a.no_source_path,
+                       source_grad=not a.no_source_grad)
         Path(a.out).with_suffix(".json").write_text(json.dumps(report, indent=1))
         return
     cf._threads()
@@ -994,18 +1008,22 @@ def main():
                     if name == "mask":
                         recs = cm.find_batch(pts[:len(todo)], its, arm="mask", log=log, partners=prt,
                                              steps=next((int(x) for x in parts if x.isdigit()), cm.STEPS))
-                    elif name == "fast":
-                        sc = scorer(f"model:{a.scorer}")
-                        global SOURCE_PATH
+                    elif name in ("fast", "fast2"):          # (fast2: --scorer2's model)
+                        sc = scorer(f"model:{a.scorer if name == 'fast' else a.scorer2}")
+                        global SOURCE_PATH, SOURCE_GRAD
                         saved.setdefault("SOURCE_PATH", (globals(), SOURCE_PATH))
+                        saved.setdefault("SOURCE_GRAD", (globals(), SOURCE_GRAD))
                         SOURCE_PATH = getattr(sc, "source_path", True) and SOURCE_PATH
+                        SOURCE_GRAD = getattr(sc, "source_grad", True) and SOURCE_GRAD
                         recs = find_batch_fast(pts[:len(todo)], its, sc, unions=[union_of(q) for q, _, _, _ in todo], arm=arm,
                                                log=log, relp=getattr(sc, "relp", False))
                     else:
                         nm = f"model:{a.scorer}" if name == "model" else f"model:{a.scorer2}" if name == "model2" else name
                         sc = scorer(nm)
                         saved.setdefault("SOURCE_PATH", (globals(), SOURCE_PATH))
+                        saved.setdefault("SOURCE_GRAD", (globals(), SOURCE_GRAD))
                         SOURCE_PATH = getattr(sc, "source_path", True) and SOURCE_PATH
+                        SOURCE_GRAD = getattr(sc, "source_grad", True) and SOURCE_GRAD
                         recs = find_batch_amortized(pts[:len(todo)], its, sc, arm=arm, log=log, partners=prt,
                                                     relp=nm == "relp" or getattr(sc, "relp", False))
                 except Exception:                   # noqa: BLE001 (an arm that fails is dropped, the others go on)

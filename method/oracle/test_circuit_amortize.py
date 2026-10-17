@@ -210,3 +210,21 @@ def test_fast_records_report_their_measured_shares(tiny, union):
             if n == "movers" and union and rec["amortize"]["stage"][n] == "fast":
                 assert {(u[1], u[2]) for u in units} <= {(l, h) for l, h, _ in union}
         assert all(x["lost"] is None for x in rec["nodes"] if rec["amortize"]["stage"].get(x["stage"]) == "fast")
+
+
+def test_without_source_gradients_the_answer_cuts_features_stay(tiny, monkeypatch):
+    """SOURCE_GRAD False: the readout's and movers' features are the same (their plain-run rows run at the answer
+    position alone), every source slope is 0."""
+    _, pairs = tiny
+    pt, clean, corrupt = pairs[0]
+    pt.setup(clean, corrupt)
+    full, lean = {}, {}
+    ca.path_features([pt], lambda j, f: full.update({n: {k: v.clone() for k, v in d.items()} for n, d in f.items()}), relp=False)
+    monkeypatch.setattr(ca, "SOURCE_GRAD", False)
+    ca.path_features([pt], lambda j, f: lean.update({n: {k: v.clone() for k, v in d.items()} for n, d in f.items()}), relp=False)
+    for n in ("readout", "movers"):
+        for k in ca.FEATURES:
+            assert torch.allclose(full[n][k], lean[n][k], atol=1e-5, rtol=1e-4), (n, k)
+    for k in ca.FEATURES[:6]:
+        assert float(lean["source"][k].abs().max()) == 0.0
+    assert torch.allclose(full["source"]["delta"], lean["source"]["delta"])

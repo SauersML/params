@@ -358,3 +358,17 @@ def test_extend_cut(tiny, monkeypatch):
     big = cm.find(cf.Patcher(model, None, rows=8), clean, corrupts[0], None, steps=30)
     assert big["cuts"]["readout"]["size"] == n and big["mask"]["readout"]["extended"] == n
     assert sum(x["stage"] == "readout" for x in big["nodes"]) == n
+
+
+def test_source_sufficiency_only(tiny, monkeypatch):
+    """SOURCE_NECESSITY 0: the source cut's bar is (-inf, bar) and its lost hinge target is off; a set passes on its
+    restored share alone."""
+    model, clean, corrupts = tiny
+    pt = cf.Patcher(model, None, rows=8)
+    pt.setup(clean, corrupts[0])
+    monkeypatch.setattr(cm, "SOURCE_NECESSITY", 0)
+    st = cm._before(pt, "mask")
+    assert st["bars"]["source"][0] == -float("inf")
+    assert "source" not in st["taus"] or st["taus"]["source"][0] < -1e8
+    assert cm._ok((-5.0, 0.8), (-float("inf"), 0.7)) and not cm._ok((0.9, 0.6), (-float("inf"), 0.7))
+    assert cm._ok((0.8, 0.8), 0.7) and not cm._ok((0.6, 0.8), 0.7)

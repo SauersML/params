@@ -41,6 +41,8 @@ Multi-source masks (methods, 10-16; constants an arm sets, mask:30:partners=8:al
             position) block, or uniform draws; the record's "adversarial" is the first one's, its "modes" all of them
   AGG       "min": a multi-partner cut's ceiling, prefix and pruning read the least share over its pairs, not the mean,
             so a set is taken only when every training pair (the question's own among them) passes
+  SOURCE_NECESSITY 0: the source cut's hinge and bar read its restored share only. When the key is carried by more
+            units than the set (redundancy), noising the set alone cannot remove it, so the source claim is sufficiency
 --pool QUESTIONS.json: partner keys drawn from that set's keys of the question's task (a seeded order per question),
 not from the question's own "partners", which then stay held out for the scorecard's unseen pairs.
 
@@ -116,6 +118,8 @@ ADV_CHECK = 0       # > 0: steps of the measured adversarial check of each verif
 ADV_STEP = 0.25     # the check's step on rho
 ADV_MODES = "unit"  # the check's adversaries joined by "+": unit, block, random (optimize_many's mode; adv_modes=block+random)
 AGG = "mean"        # a Mean's shares: "mean" over its pairs, or "min" (agg=min: a set passes only when every pair does)
+SOURCE_NECESSITY = 1  # 0: the source cut is chosen and taken on its restored share only (no lost hinge, no lost bar):
+                      # a small set of a redundantly carried key is sufficient, not necessary (design 11a)
 
 
 def _blocks(units: list) -> list:
@@ -379,7 +383,7 @@ def verify_steps(meas, order: list, log=None, name: str = "", bar: float = cf.PA
     prefix (grid, bisection to MIDS sizes between the last failing size and the first passing one, then those in one
     batch); a prefix of more than PRUNE_MAX units is a diffuse cut (its size, shares and curve, no units); else units
     removed one at a time while it passes (prune_steps); each unit's shares alone. A set is taken at bar (_bar's)."""
-    passes = lambda r: r[0] >= bar and r[1] >= bar  # noqa: E731
+    passes = lambda r: _ok(r, bar)  # noqa: E731
     one = len({cf._pos(u) for u in order}) <= 1     # (one position a row: every size at once)
     full, g, got, top = cf.grid(len(order)), [], [], 0
     while top < len(order) and not any(passes(r) for r in got):    # (prefixes of order: Patcher.both_prefixes, no set
@@ -424,6 +428,13 @@ def verify_steps(meas, order: list, log=None, name: str = "", bar: float = cf.PA
             "found": len(order), "curve": curve}
 
 
+def _ok(r, bar) -> bool:
+    """A set's shares (lost, restored) pass at bar: one share for both, or a pair (lost's, restored's: SOURCE_NECESSITY 0
+    gives the source cut no lost bar)."""
+    lb, rb = bar if isinstance(bar, (tuple, list)) else (bar, bar)
+    return r[0] >= lb and r[1] >= rb
+
+
 def prune(meas, circ: list, bar: float = cf.PASS) -> list:
     """The pruning of a passing set (prune_steps, by its measurer alone)."""
     return drive(_pts(meas), [prune_steps(meas, circ, bar)])[0]
@@ -437,7 +448,7 @@ def prune_steps(meas, circ: list, bar: float = cf.PASS):
     and the candidate that ends it, or a run of candidates that stay and the one that goes after them, the same trials
     as one at a time. The window starts at PRUNE_WINDOW and grows four times after a round that settles all of it. A
     set passes at bar."""
-    passes = lambda r: r[0] >= bar and r[1] >= bar  # noqa: E731
+    passes = lambda r: _ok(r, bar)  # noqa: E731
     if len(circ) < 2:
         return circ
     if PRUNE_ALONE:                                 # (each unit left out: Patcher.both_without, no set built per unit)
@@ -812,9 +823,13 @@ def _before_steps(pt, arm: str, log=None, prior: dict | None = None, partners: l
             top = max(float(sc[k][:, specs[n]["positions"]].max()) for k in specs[n]["kinds"])
             warm[n] = {k: (INIT + WARM * torch.log(sc[k][:, specs[n]["positions"]].float() / max(top, 1e-30) + 1e-30)
                            ).clamp(WARM_MIN, INIT).cpu() for k in specs[n]["kinds"]}
+    if not SOURCE_NECESSITY and "source" in bars:  # (redundancy: a small source set's claim is sufficiency, design 11a)
+        bars["source"] = (-math.inf, bars["source"])
+    two = lambda b: b if isinstance(b, tuple) else (b, b)  # noqa: E731
     return {"specs": specs, "names": names, "ceil": ceil, "reach": reach, "out": out, "masked": masked, "meas": meas,
             "warm": warm, "family": fam, "bars": bars,
-            "taus": {n: tuple(min(max(TAU, bars[n] + 0.05), max(bars[n] + 0.05, c - 0.05)) for c in ceil[n]) for n in masked}}
+            "taus": {n: tuple(-1e9 if b == -math.inf else min(max(TAU, b + 0.05), max(b + 0.05, c - 0.05))
+                              for c, b in zip(ceil[n], two(bars[n]))) for n in masked}}
 
 
 def _jobs(pt, st: dict, names: list | None = None) -> list:

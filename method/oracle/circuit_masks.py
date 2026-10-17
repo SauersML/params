@@ -39,6 +39,8 @@ Multi-source masks (methods, 10-16; constants an arm sets, mask:30:partners=8:al
             fully patched, the rest's rho moved to lower the shares), the worst step's measured shares in the record
             ADV_MODES (unit, block, random joined by "+") picks the check's adversaries: a rho per unit, per (layer,
             position) block, or uniform draws; the record's "adversarial" is the first one's, its "modes" all of them
+  AGG       "min": a multi-partner cut's ceiling, prefix and pruning read the least share over its pairs, not the mean,
+            so a set is taken only when every training pair (the question's own among them) passes
 --pool QUESTIONS.json: partner keys drawn from that set's keys of the question's task (a seeded order per question),
 not from the question's own "partners", which then stay held out for the scorecard's unseen pairs.
 
@@ -104,6 +106,7 @@ ADV = 0.0           # > 0: the adversary's step on rho during the descent (modul
 ADV_CHECK = 0       # > 0: steps of the measured adversarial check of each verified set
 ADV_STEP = 0.25     # the check's step on rho
 ADV_MODES = "unit"  # the check's adversaries joined by "+": unit, block, random (optimize_many's mode; adv_modes=block+random)
+AGG = "mean"        # a Mean's shares: "mean" over its pairs, or "min" (agg=min: a set passes only when every pair does)
 
 
 def _blocks(units: list) -> list:
@@ -645,11 +648,12 @@ def _serve(group, reqs: list, log=None) -> list:
         spans[k] = (a, len(calls), method)
     got = group.serve(calls) if calls else []
     for k, (a, b, method) in spans.items():
-        per = got[a:b]                              # (each pair's; a Mean's: the means over its pairs)
+        per = got[a:b]                              # (each pair's; a Mean's: the means over its pairs, or with AGG "min"
+        agg = np.min if AGG == "min" else np.mean   # the least of them)
         if method == "run":
-            res[k] = [float(np.mean([p[i][0] for p in per])) for i in range(len(per[0]))]
+            res[k] = [float(agg([p[i][0] for p in per])) for i in range(len(per[0]))]
         else:
-            res[k] = [tuple(float(np.mean([p[i][x] for p in per])) for x in (0, 1)) for i in range(len(per[0]))]
+            res[k] = [tuple(float(agg([p[i][x] for p in per])) for x in (0, 1)) for i in range(len(per[0]))]
     it = iter(res)                                  # (back into the requests' shape, in walk's order)
 
     def fill(r):

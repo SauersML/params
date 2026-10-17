@@ -269,3 +269,20 @@ def test_graph_mask_steps_equal_eager(tiny, monkeypatch):
         for x, y in zip(a, b):
             assert all(torch.allclose(x["theta"][k], y["theta"][k], atol=1e-4) for k in x["theta"])
             assert all(abs(u - v) < 1e-3 for h, i in zip(x["history"], y["history"]) for u, v in zip(h, i))
+
+
+def test_agg_min(tiny, monkeypatch):
+    """AGG "min": a Mean's shares are the least over its pairs, at most the means."""
+    model, clean, corrupts = tiny
+    pts = [cf.Patcher(model, None, rows=8) for _ in corrupts]
+    for p, c in zip(pts, corrupts):
+        p.setup(clean, c)
+    m = cm.Mean(pts)
+    sets = [[("neuron", 1, pts[0].T - 1, k) for k in range(8)], [("head", 1, h, pts[0].T - 1) for h in range(2)]]
+    each = [p.both(sets) for p in pts]
+    mean = cm.drive(pts, [(lambda: (yield (m, "both", sets)))()])[0]
+    monkeypatch.setattr(cm, "AGG", "min")
+    low = cm.drive(pts, [(lambda: (yield (m, "both", sets)))()])[0]
+    for i in range(len(sets)):
+        for x in (0, 1):
+            assert abs(low[i][x] - min(e[i][x] for e in each)) < 1e-4 and low[i][x] <= mean[i][x] + 1e-6

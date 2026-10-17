@@ -38,6 +38,8 @@ import math
 import torch
 
 ROWS = 64
+STAGED = True  # a run's sets each start at their lowest edited layer from the unedited run's stream there (sorted, so a
+# forward's batch grows layer by layer): every layer below a set's first edit is the unedited run's anyway
 
 
 def weight(mod) -> torch.Tensor:
@@ -70,7 +72,7 @@ class Runner:
         self.dev = self.core.model.embed_tokens.weight.device
         self.rows = rows
         self.answer, self.alternatives = None, None
-        self._base = {}  # ids -> per layer the unedited run's keys [KV, T, hd] (after norm and rotary) and values
+        self._base = {}  # ids -> per layer the unedited run's keys [KV, T, hd] (after norm and rotary), values, streams
 
     def _d(self, L: int) -> torch.device:
         return self.layers[L].input_layernorm.weight.device
@@ -100,12 +102,18 @@ class Runner:
         "cos"/"sin" [T, hd]; watch: neurons (layer, pos, index) whose values every set reports ("watch" [K, n])."""
         out = {"contrast": [], "lp": [], "watch": []}
         low = self.core.model.embed_tokens.weight.dtype != torch.float32
+        staged = STAGED and not capture and not watch and len(sets) > 0
+        if staged:  # (sets sorted by their first edited layer; results back in the callers' order at the end)
+            first = [min([it[0] for items in st.values() for it in items] + [self.L - 1]) for st in sets]
+            order = sorted(range(len(sets)), key=lambda a: first[a])
+            sets = [sets[a] for a in order]
         for s0 in range(0, max(len(sets), 1), self.rows):
             part = sets[s0:s0 + self.rows] or [{}]
             n = len(part)
             if low and not capture:  # (a lower precision model's kernels round by batch size: every forward padded to rows)
                 part = part + [{}] * (self.rows - n)
-            r = self._forward(ids, part, capture and s0 == 0, watch or [])
+            starts = sorted(first[order[s0 + a]] if a < n else self.L - 1 for a in range(len(part))) if staged else None
+            r = self._forward(ids, part, capture and s0 == 0, watch or [], starts=starts)
             out["contrast"] += r["contrast"][:n].tolist() if r["contrast"] is not None else []
             if r["lp"] is not None:
                 out["lp"].append(r["lp"][:n])
@@ -114,6 +122,13 @@ class Runner:
                 out["states"] = r["states"]
         out["lp"] = torch.cat(out["lp"]) if out["lp"] else None
         out["watch"] = torch.cat(out["watch"])
+        if staged:
+            back = [0.0] * len(sets)
+            for a, c in zip(order, out["contrast"]):
+                back[a] = c
+            out["contrast"] = back
+            if out["lp"] is not None:
+                out["lp"] = out["lp"][torch.argsort(torch.tensor(order))]
         return out
 
     def grads(self, ids: list[int]) -> dict:
@@ -126,7 +141,10 @@ class Runner:
             self._forward(ids, [{}], True, [], probe=pr)["contrast"].sum().backward()
         return {k: [t.grad[0] for t in v] for k, v in pr.items()}
 
-    def _forward(self, ids: list[int], sets: list[dict], capture: bool, watch: list, probe: dict | None = None) -> dict:
+    def _forward(self, ids: list[int], sets: list[dict], capture: bool, watch: list, probe: dict | None = None,
+                 starts: list[int] | None = None) -> dict:
+        """starts: each set's first layer (ascending): below it the set is the unedited run, joining the batch there
+        from that run's stream."""
         from transformers.models.qwen3.modeling_qwen3 import repeat_kv
         core, H, KV, hd, f = self.core, self.H, self.KV, self.hd, self._f
         K, T = len(sets), len(ids)
@@ -136,13 +154,15 @@ class Runner:
             first = [it[2] if kind in ("knock", "head", "dq", "dk", "dv") else it[1]
                      for kind, per in E.items() for items in per.values() for it in items]
             s0 = min(first + [p for _, p, _ in watch] + [T - 1])
-            if s0 and tuple(ids) not in self._base:
-                st0 = self._forward(ids, [{}], True, [])["states"]
-                self._base[tuple(ids)] = (st0["k"], st0["v"])
-                while len(self._base) > 4:          # (a pair's two prompts and a few others)
-                    self._base.pop(next(iter(self._base)))
+        if (s0 or starts is not None) and tuple(ids) not in self._base:
+            st0 = self._forward(ids, [{}], True, [])["states"]
+            self._base[tuple(ids)] = {"k": st0["k"], "v": st0["v"], "x": st0["x"]}
+            while len(self._base) > 4:              # (a pair's two prompts and a few others)
+                self._base.pop(next(iter(self._base)))
         Ts = T - s0
         x = core.model.embed_tokens(torch.tensor([ids[s0:]], device=self.dev).expand(K, -1)).float()
+        if starts is not None:
+            x = x[:sum(1 for a in starts if a <= 0)]
         cos, sin = core.model.rotary_emb(x, torch.arange(s0, T, device=self.dev)[None])
         cos, sin = cos[0].float(), sin[0].float()  # [Ts, hd]
         st = {k: [] for k in ("x", "q", "k", "v", "logits", "A", "z", "mid", "h")}
@@ -151,6 +171,11 @@ class Runner:
         for L, layer in enumerate(self.layers):
             d = self._d(L)
             x, cs, sn = x.to(d), cos.to(d), sin.to(d)
+            if starts is not None:                  # (the sets starting here join from the unedited run's stream)
+                n = sum(1 for a in starts if a <= L)
+                if n > len(x):
+                    x = torch.cat([x, self._base[tuple(ids)]["x"][L][s0:].to(d)[None].expand(n - len(x), -1, -1)])
+            K = len(x)
             at = layer.self_attn
             hn = f(layer.input_layernorm, x)
             q = f(at.q_norm, f(at.q_proj, hn).view(K, Ts, H, hd)).transpose(1, 2)
@@ -170,7 +195,7 @@ class Runner:
                         q[b, :, p - s0] = qp * c_ + rotate_half(qp) * s_
             kf, vf = k, v
             if s0:                                  # every key and value: the unedited run's before s0
-                bk, bv = self._base[tuple(ids)]
+                bk, bv = self._base[tuple(ids)]["k"], self._base[tuple(ids)]["v"]
                 kf = torch.cat([bk[L][:, :s0].to(d)[None].expand(K, -1, -1, -1), k], 2)
                 vf = torch.cat([bv[L][:, :s0].to(d)[None].expand(K, -1, -1, -1), v], 2)
             kh, vh = repeat_kv(kf, H // KV), repeat_kv(vf, H // KV)

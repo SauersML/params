@@ -208,3 +208,20 @@ def test_output_after_matches_the_cut(tiny):
             s2 = rn.run(ids, [{{"key": "dk", "value": "dv", "query": "dq"}[side]: [(c, h, p, edit[i])]}], capture=True)
             want = rn.head_write(s2["states"], c, h, q) - rn.head_write(st, c, h, q)
             assert torch.allclose(ch[i], want, atol=1e-5)
+
+
+def test_staged_runs_equal_full_runs(tiny, monkeypatch):
+    """Sets starting at their first edited layer from the unedited run's stream give the full runs' contrasts."""
+    _, ids, rn = tiny
+    st = rn.run(ids, [{}], capture=True)["states"]
+    w = rn.neuron_writes(st, 0, 6, [3])[0]
+    sets = [{"neuron": [(2, 9, 4, 0.0)]}, {"read": [(1, 6, 5, w)]}, {}, {"mlp_in": [(2, 6, w)]}, {"knock": [(1, 2, 9, 4)]},
+            {"kv_in": [(1, 6, w)], "q_in": [(2, 6, w)]}, {"head": [(0, 1, 7, None)]}, {"dv": [(2, 1, 6, torch.ones(8))]}]
+    monkeypatch.setattr(head_routes, "STAGED", True)
+    staged = rn.run(ids, sets)["contrast"]
+    monkeypatch.setattr(head_routes, "STAGED", False)
+    full = rn.run(ids, sets)["contrast"]
+    assert staged == pytest.approx(full, abs=1e-5) and len(set(round(c, 4) for c in full)) > 4
+    monkeypatch.setattr(head_routes, "STAGED", True)
+    monkeypatch.setattr(rn, "rows", 3)  # (sorted sets over several forwards, back in order)
+    assert rn.run(ids, sets)["contrast"] == pytest.approx(full, abs=1e-5)

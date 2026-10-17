@@ -6,6 +6,12 @@ way and cut into 256-token windows. The proxy is checked on csp_yolo2, whose mea
 
 python means.py gao MODEL [--windows 2000] [--device mps]        -> models/MODEL/mean_proxy_codeparrot.pt
 python means.py compare MODEL                                    released vs proxy, per site
+python means.py qwen Qwen/Qwen3-0.6B [--docs 1000] [--source all|code]
+
+Qwen3's pretraining data is not public. Its proxy is the team's atlas corpus (~/mpd-data/atlas/corpus_qwen3: 50M
+tokens; FineWeb 40%, Pile 20%, UltraChat 15%, codeparrot 10%, FineWeb-2 10%, open-web-math 5%), through scrub's seeded
+1.1M-token sample (ami.py's means text); "code" keeps only its codeparrot documents (their models' means are Python
+means). Output: ~/mpd-data/ami/sparsecmp/means/<model>_<source>_<docs>.pt
 """
 import argparse
 import gzip
@@ -36,6 +42,22 @@ def windows(model, n: int, T: int = 256) -> list:
     return out
 
 
+ATLAS = os.path.expanduser("~/mpd-data/atlas/corpus_qwen3")
+
+
+SAMPLE = os.path.expanduser("~/mpd-data/ami/means_sample_1m.npz")   # scrub's means text (ami.py sample, seed 0)
+
+
+def atlas_docs(n: int, source: str) -> list:
+    """Documents of scrub's means sample (1.1M atlas tokens), so these means and ami.py's share one text; "code" keeps
+    its codeparrot documents (source 3 in the atlas meta.json)."""
+    import numpy as np
+    d = np.load(SAMPLE)
+    off, src, tok = d["offsets"], d["sources"], d["tokens"]
+    keep = [j for j in range(len(off) - 1) if source == "all" or src[j] == 3][:n]
+    return [tok[off[j]:off[j + 1]].tolist() for j in keep]
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("cmd")
@@ -43,14 +65,24 @@ def main():
     ap.add_argument("--windows", type=int, default=2000)
     ap.add_argument("--device", default="mps")
     ap.add_argument("--bs", type=int, default=4)
+    ap.add_argument("--docs", type=int, default=1000)
+    ap.add_argument("--source", default="all")
     a = ap.parse_args()
-    out = f"{ROOT}/models/{a.model}/mean_proxy_codeparrot.pt"
+    out = f"{ROOT}/models/{a.model}/mean_proxy_codeparrot.pt" if a.cmd != "qwen" else None
     if a.cmd == "gao":
         model = N.GaoModel(a.model, a.device)
         rows = windows(model, a.windows)
         mu = N.accumulate_means(model, rows, bs=a.bs)
         torch.save(mu, out)
         print("saved", out, len(rows), "windows")
+    elif a.cmd == "qwen":
+        model = N.QwenModel(a.model, a.device)
+        rows = atlas_docs(a.docs, a.source)
+        mu = N.accumulate_means(model, rows, bs=a.bs)
+        os.makedirs(f"{ROOT}/means", exist_ok=True)
+        path = f"{ROOT}/means/{a.model.split('/')[-1]}_{a.source}_{a.docs}.pt"
+        torch.save(mu, path)
+        print("saved", path, len(rows), "documents", sum(len(r) for r in rows), "tokens")
     elif a.cmd == "compare":
         rel = torch.load(f"{ROOT}/models/{a.model}/mean_baseline_pretrain.pt", weights_only=True)
         prox = torch.load(out, weights_only=True)

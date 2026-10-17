@@ -66,8 +66,9 @@ class GaoModel:
         self.enc = tinypython()
         c = self.config
         dq = c.n_head * c.d_head
-        size = {"attn.act_in": c.d_model, "attn.q": dq, "attn.k": dq, "attn.v": dq, "attn.resid_delta": c.d_model,
-                "mlp.act_in": c.d_model, "mlp.post_act": c.d_mlp, "mlp.resid_delta": c.d_model}
+        d_in = c.d_model_in                      # residual reads carry the concatenated position channels, if any
+        size = {"attn.act_in": d_in, "attn.q": dq, "attn.k": dq, "attn.v": dq, "attn.resid_delta": c.d_model,
+                "mlp.act_in": d_in, "mlp.post_act": c.d_mlp, "mlp.resid_delta": c.d_model}
         self.sites = {f"{i}.{loc}": size[loc] for i in range(c.n_layer) for loc in LOCS}
         self.sites["final_resid"] = c.d_model
         self.means = None
@@ -109,12 +110,10 @@ def pad(rows: list, device: str, value: int = 0, T: int | None = None):
 
 
 def answer_token(model, prompt_ids: list, prompt: str, ans: str):
-    """The first token of `ans` after the prompt, if tokenizing prompt + ans keeps the prompt's tokens."""
-    full = model.tokenize(prompt + ans)
-    n = len(prompt_ids)
-    if full[:n] != prompt_ids or len(full) <= n:
-        return None
-    return full[n]
+    """The first token of `ans` tokenized alone: their target token ids (e.g. ',' after a prompt ending in '"',
+    though the joint text would tokenize as '",')."""
+    ids = model.tokenize(ans)
+    return ids[0] if ids else None
 
 
 def encode_items(model, items: list):
@@ -169,7 +168,7 @@ class QwenModel:
         if means:
             mu = torch.load(means, weights_only=True, map_location="cpu")
             self.means = {k: mu[k].float().to(device) for k in self.sites}
-        self._masks, self._rec = None, None
+        self._masks, self._rec, self._acc, self._valid = None, None, None, None
         self._install()
 
     def _apply(self, site, x):
@@ -178,6 +177,9 @@ class QwenModel:
         flat = x.reshape(*shape[:2], -1) if x.dim() == 4 else x
         if self._rec is not None and site in self._rec:
             self._rec[site].append(flat)
+        if self._acc is not None:
+            v = flat[self._valid.to(flat.device)].float().sum(0)       # float32 per batch (MPS has no float64)
+            self._acc[site] += v.to(self._acc[site].device).double()
         if self._masks is not None and site in self._masks:
             m, mu = self._masks[site], self.means[site]
             flat = mu.to(flat.dtype) + m.to(flat.dtype) * (flat - mu.to(flat.dtype))
@@ -220,6 +222,17 @@ class QwenModel:
 @torch.no_grad()
 def accumulate_means(model, rows: list, bs: int = 8) -> dict:
     """Mean of every node over every token of `rows` (lists of token ids), one value per node."""
+    if isinstance(model, QwenModel):                # sums inside the hooks: recording every site would not fit
+        model._acc = {s: torch.zeros(n, dtype=torch.float64, device=model.device if model.device != "mps" else "cpu")
+                      for s, n in model.sites.items()}
+        count = 0
+        for i in range(0, len(rows), bs):
+            x, last = pad(rows[i:i + bs], model.device)
+            model._valid = (torch.arange(x.shape[1], device=model.device)[None] <= last[:, None])
+            model.logits(x, last, None)
+            count += int(model._valid.sum())
+        sums, model._acc, model._valid = model._acc, None, None
+        return {s: (v / count).float().cpu() for s, v in sums.items()}
     sums = {s: torch.zeros(n, dtype=torch.float64) for s, n in model.sites.items()}
     count = 0
     for i in range(0, len(rows), bs):
@@ -229,6 +242,6 @@ def accumulate_means(model, rows: list, bs: int = 8) -> dict:
         model.logits(x, last, None, record=list(model.sites))
         for s, chunks in model.recorded.items():
             v = chunks[0] if isinstance(chunks, list) else chunks
-            sums[s] += v[valid].double().sum(0).cpu()
+            sums[s] += v[valid].float().sum(0).cpu().double()
         count += int(valid.sum())
     return {s: (v / count).float() for s, v in sums.items()}

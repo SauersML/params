@@ -7,8 +7,8 @@ codeparrot-clean files. An item is two prompts with their answer continuations:
     {"task", "pos": prompt, "neg": prompt, "pos_ans": text, "neg_ans": text, "kind": "binary" | "pos_vs_rest"}
 
 "binary" (their loss with alt_tokid): each prompt's cross-entropy over a softmax restricted to the two answer tokens.
-"pos_vs_rest" (else_elif, if_ternary: "predict : or not :"): pos must give its answer token, neg any other token.
-The prompt texts are shared by every tokenizer; answer tokens are the first token of the answer after the prompt.
+"pos_vs_rest" (with_as): pos must give its answer token, neg any other token.
+The prompt texts are shared by every tokenizer.
 
 python tasks.py build OUT.jsonl [--files N] [--per-task K]
 """
@@ -23,6 +23,15 @@ ROOT = os.path.expanduser("~/mpd-data/ami/sparsecmp")
 CORPUS = f"{ROOT}/corpus/file-000000000054.json.gz"
 CTX_CHARS = 700          # their prompts are 28-261 tinypython tokens; about 3 characters per token
 
+# Answer tokens are the first token of the answer text tokenized alone (their target token ids). They were identified
+# on the release (answers.py, hyp.py): on their 16 pairs per task, csp_yolo2's released circuit (released means) gives
+# a per-sequence loss within about 2x of the 0.15 target only for the right pair. VERIFIED lists the tasks where some
+# definition reaches <= 0.35 (sdq 0.18, enumerate_range 0.22, final_kwarg 0.10, for_while 0.30, if_ternary 0.08,
+# set_or_string 0.28, set_or_string_fixedvarname 0.14, var_if 0.11, with_open 0.23, with_as 0.29); the others keep
+# Table 1's definition, which their circuit does not reproduce (bracket_brace 0.52, lambda_func 0.82, var_swap 0.61,
+# while_return_true 0.41, if_equals 1.23, indent_for 1.41, else_elif 1.62, bracket_counting 2.25, class_init 2.83).
+VERIFIED = ["single_double_quote", "enumerate_range", "final_kwarg", "for_while", "if_ternary", "set_or_string",
+            "set_or_string_fixedvarname", "var_if", "with_open", "with_as"]
 TASKS = ["single_double_quote", "bracket_brace", "bracket_counting", "class_init", "else_elif", "enumerate_range",
          "final_kwarg", "for_while", "if_equals", "if_ternary", "indent_for", "lambda_func", "set_or_string",
          "set_or_string_fixedvarname", "var_if", "var_swap", "while_return_true", "with_as", "with_open"]
@@ -47,7 +56,9 @@ IDENT = r"[A-Za-z_][A-Za-z0-9_]*"
 
 def single_double_quote(t, rng):
     # Station("Station 1  ->  ")     Station('Station 1  ->  ')
-    for m in re.finditer(r"\((['\"])([^'\"\\\n]{1,40})\1\)", t):
+    # their A.7: the opening is a standalone (" or (' token, so the character before "(" ends a word and the body
+    # starts with a word character or a space
+    for m in re.finditer(r"(?<=[A-Za-z0-9])\((['\"])([A-Za-z0-9 ][^'\"\\\n]{0,39})\1\)", t):
         pre = context(t, m.start() + 1)
         body = m.group(2)
         yield item("single_double_quote", pre + '"' + body, pre + "'" + body, '")', "')")
@@ -112,7 +123,7 @@ def else_elif(t, rng):
     # "    else " -> ":"      "    elif " -> anything but ":"  (their prompts end in a space token)
     for m in re.finditer(r"(?m)^([ \t]*)else:", t):
         pre = context(t, m.start()) + m.group(1)
-        yield item("else_elif", pre + "else ", pre + "elif ", ":", " x", kind="pos_vs_rest")
+        yield item("else_elif", pre + "else ", pre + "elif ", ":\n", " ")
 
 
 def enumerate_range(t, rng):
@@ -135,7 +146,8 @@ def final_kwarg(t, rng):
         pre = context(t, m.start()) + m.group(1)
         kw = ", ".join(args[:-1]) + ", " + last
         plain = ", ".join(a.replace("=None", "") for a in args[:-1]) + ", " + last
-        yield item("final_kwarg", pre + kw, pre + plain, "=None", "):")
+        # their counterfactual drops the defaults from the earlier signatures in the context too
+        yield item("final_kwarg", pre + kw, pre.replace("=None", "") + plain, "=None", "):\n")
 
 
 def for_while(t, rng):
@@ -162,7 +174,7 @@ def if_ternary(t, rng):
         pre = context(t, m.start())
         pos = pre + f"{ind}if {cond}:\n{ind}{ind2}{var} = {a}\n{ind}else"
         neg = pre + f"{ind}{var} = {a} if {cond} else"
-        yield item("if_ternary", pos, neg, ":", " x", kind="pos_vs_rest")
+        yield item("if_ternary", pos, neg, ":\n", " ")
 
 
 def indent_for(t, rng):
@@ -213,7 +225,7 @@ def var_if(t, rng):
     # threshold = 3  ->  newline        if threshold == 3  ->  ":"
     for m in re.finditer(r"(?m)^([ \t]*)(" + IDENT + r") = (\d{1,4}|True|False|None|'[a-z]{1,8}'|\"[a-z]{1,8}\")$", t):
         pre = context(t, m.start()) + m.group(1)
-        yield item("var_if", pre + f"{m.group(2)} = {m.group(3)}", pre + f"if {m.group(2)} == {m.group(3)}", "\n", ":")
+        yield item("var_if", pre + f"{m.group(2)} = {m.group(3)}", pre + f"if {m.group(2)} == {m.group(3)}", "\n", ":\n")
 
 
 def var_swap(t, rng):
@@ -236,7 +248,7 @@ def with_as(t, rng):
     # with open(f, "r")  ->  " as"        if open(f, "r")  ->  ":"
     for m in re.finditer(r"(?m)^([ \t]*)with (open\([^()\n]{1,60}\)) as ", t):
         pre = context(t, m.start()) + m.group(1)
-        yield item("with_as", pre + "with " + m.group(2), pre + "if " + m.group(2), " as", ":")
+        yield item("with_as", pre + "with " + m.group(2), pre + "if " + m.group(2), " as", ":", kind="pos_vs_rest")
 
 
 def with_open(t, rng):

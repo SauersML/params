@@ -918,7 +918,7 @@ def _before_steps(pt, arm: str, log=None, prior: dict | None = None, partners: l
     meas = {n: pt for n in specs}
     one = None
     if ONE_PROMPT:                                  # (one prompt: every cut on the resampled keys, or their mean)
-        assert partners, "one prompt: partners (other keys of the template) to resample from"
+        partners = list(partners or [])             # (no partner of the prompt's length: the question's own key alone)
         one = _one_prompt_sets(pt, partners)
         bg = [p for p in partners if getattr(p, "_mean", False)]
         keys = [pt] + [p for p in partners if not getattr(p, "_mean", False)]

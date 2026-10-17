@@ -533,3 +533,11 @@ def test_necessary_units(tiny, monkeypatch):
     off = cm.find(cf.Patcher(model, None, rows=8), clean, corrupts[0], steps=4)
     assert "necessary" not in off
     assert [(n["layer"], n["pos"], n["neuron"]) for n in off["nodes"]] == [(n["layer"], n["pos"], n["neuron"]) for n in rec["nodes"]]
+
+
+def test_one_prompt_without_partners(tiny, monkeypatch):
+    """One prompt with no partner of the prompt's length resamples from the question's own corrupted key alone."""
+    model, clean, corrupts = tiny
+    monkeypatch.setattr(cm, "ONE_PROMPT", 1)
+    rec = cm.find(cf.Patcher(model, None, rows=8), clean, corrupts[0], steps=5)
+    assert rec["cuts"] and all(x["keys"] == 1 for x in rec["one_prompt"].values())

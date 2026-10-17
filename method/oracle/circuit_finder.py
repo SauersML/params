@@ -71,6 +71,8 @@ ROWS = 32
 ATTENDS = 3           # source positions recorded per head
 SINGLES_KEPT = 256    # each cut's measured single units written to the record, largest |share| first (the record's size:
 # an 8B organism's readout found 265,588; the oracle reads units in measured order past the circuit)
+ARM = "mask"          # circuit_masks' arm every find runs (a family prior: "fam"): "mask", or "am" (attr's measured prefix
+# where it passes, masks on the cuts it leaves unmet), "attr"
 ORDER = "relp"        # the gradient Patcher.scores orders units by (circuit_masks' attr order and warm start): "grad",
 # the model's own; "relp", RelP's (the norms' 1/rms, SiLU and every attention pattern held as constants, half the gradient
 # through each factor of gate x up; ADAG, arXiv 2604.07615). Either only orders: every keep or drop is a measured run.
@@ -1241,7 +1243,7 @@ def find(pt: Patcher, clean: list[int], corrupt: list[int], answers: list[int] |
     only that corrupted key, and failed 0/87 resampled)."""
     import circuit_masks
     part = [(Patcher(pt.model, pt.tok, pt.rows), ids) for ids in partners or [] if len(ids) == len(clean)]
-    return circuit_masks.find(pt, clean, corrupt, answers, log=log, arm="fam" if prior else "mask", prior=prior,
+    return circuit_masks.find(pt, clean, corrupt, answers, log=log, arm="fam" if prior else ARM, prior=prior,
                               cuts_wanted=cuts_wanted, measure=measure, sets=sets, partners=part)
 
 
@@ -1502,11 +1504,13 @@ def main():
     ap.add_argument("--stride", type=int, default=1)
     ap.add_argument("--batch", type=int, default=16, help="questions: pairs whose masks are optimized in one batch a step "
                     "(circuit_masks.find_batch; no --measure or explicit sets; 1: one pair at a time)")
+    ap.add_argument("--arm", default=ARM, choices=("mask", "am", "attr"), help="circuit_masks' search arm (ARM)")
     ap.add_argument("--partners", type=int, default=4, help="questions: up to this many more corrupted prompts (the question's "
                     "partners of its prompt's length) for the source cut's mean shares (0: its own pair only)")
     ap.add_argument("--edges", action=argparse.BooleanOptionalAction, default=True, help="each circuit's edges between its "
                     "units by path patching (neuron_edges.finder_graph), into the record's graph")
     a = ap.parse_args()
+    globals()["ARM"] = a.arm                        # (find()'s arm too: a pair run one at a time)
     _threads()
     out = Path(a.out if a.mode == "questions" else a.inp)
     out.mkdir(parents=True, exist_ok=True)
@@ -1615,7 +1619,7 @@ def main():
             parts = [[(Patcher(model, tok, rows=a.rows), ids) for ids in x[3].get("partners") or [] if len(ids) == len(x[1])]
                      for x in chunk]
             recs = circuit_masks.find_batch(pts, [(x[1], x[2], x[3].get("answers")) for x in chunk], log=log, partners=parts,
-                                            cuts_wanted=tuple(a.cuts.split(",")))
+                                            cuts_wanted=tuple(a.cuts.split(",")), arm=a.arm)
             del pts, parts                            # (the batch's Patchers' runs before the edges: on Qwen3-14B with 8
             import gc                                 # pairs they held 13 GB and every record's edge stage ran out of memory
             gc.collect()                              # on a 48 GB card)

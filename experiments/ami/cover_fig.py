@@ -82,17 +82,17 @@ def by_size(out: str, summary_json: str):
     figstyle.setup()
     plt.rcParams.update({"font.size": 22, "axes.labelsize": 22, "xtick.labelsize": 20, "ytick.labelsize": 20})
     fig, axes = plt.subplots(1, 2, figsize=(17, 7))
-    for ax, key, ci, scale, ylab in ((axes[0], "median_units", "median_units_ci", 1e-3, "units a token needs (thousands)"),
-                                     (axes[1], "median_share", "median_share_ci", 100, "% of the units at its positions")):
+    for ax, key, ci, scale, ylab in ((axes[0], "median_units", "median_units_ci", 1e-3, "units a token needs, upper bound (thousands)"),
+                                     (axes[1], "median_share", "median_share_ci", 100, "% of units at its positions, upper bound")):
         x = [params[n] for n in names]
         y = [s[n]["0.1"][key] * scale for n in names]
         lo = [s[n]["0.1"][ci][0] * scale for n in names]
         hi = [s[n]["0.1"][ci][1] * scale for n in names]
         ax.vlines(x, lo, hi, color=figstyle.BLUE, lw=4, alpha=0.5)
         ax.plot(x, y, color=figstyle.BLUE, lw=3, marker="o", ms=14)
-        for xi, yi, n in zip(x, y, names):
-            ax.annotate(f"{yi:.0f}k" if key == "median_units" else f"{yi:.1f}%", (xi, yi), xytext=(16, 0), va="center",
-                        textcoords="offset points", fontsize=21, color=figstyle.INK, ha="left")
+        for xi, yi, top in zip(x, y, hi):
+            ax.annotate(f"{yi:.0f}k" if key == "median_units" else f"{yi:.1f}%", (xi, top), xytext=(0, 8), va="bottom",
+                        textcoords="offset points", fontsize=21, color=figstyle.INK, ha="center")
         ax.set_xscale("log")
         ax.set_xticks(x)
         ax.set_xticklabels([n.replace("Qwen3-", "") for n in names])
@@ -102,7 +102,50 @@ def by_size(out: str, summary_json: str):
         ax.set_ylabel(ylab)
         ax.set_ylim(0, max(hi) * 1.25)
         figstyle.clean(ax)
-    fig.suptitle("Matching one token's prediction to 0.1 nats takes about 100k units at every size", x=0.06, ha="left",
-                 fontsize=25, fontweight="bold")
+    fig.suptitle("The share of the model one token needs falls as Qwen3 grows", x=0.06, ha="left", fontsize=25,
+                 fontweight="bold")
+    fig.tight_layout()
+    figstyle.save(fig, out)
+
+
+def by_steps(out: str, sets: list):
+    """Figure: the median units per token within 0.1 nats against the mask search's training steps, on the tokens every
+    run covers (95% intervals over tokens), sets = ["STEPS=COVER_DIR", ...]."""
+    import matplotlib.pyplot as plt
+
+    rng = np.random.default_rng(0)
+    figstyle.setup()
+    plt.rcParams.update({"font.size": 22, "axes.labelsize": 22, "xtick.labelsize": 20, "ytick.labelsize": 20})
+    fig, ax = plt.subplots(figsize=(11, 7.5))
+    runs = {}
+    for s in sets:
+        steps, d = s.split("=", 1)
+        runs[int(steps)] = {(p.name, t["t"]): t["k"].get("0.1") for p in Path(d).iterdir()
+                            if p.name.startswith("doc") and p.suffix == ".json" for t in json.loads(p.read_text())["targets"]}
+    common = sorted(set.intersection(*[{i for i, v in r.items() if v is not None} for r in runs.values()]))
+    x, y, lo, hi = [], [], [], []
+    for steps, r in runs.items():
+        k = np.array([r[i] for i in common], float)
+        b = np.median(k[rng.integers(0, len(k), (2000, len(k)))], axis=1)
+        x.append(steps)
+        y.append(np.median(k))
+        lo.append(np.percentile(b, 2.5))
+        hi.append(np.percentile(b, 97.5))
+    ax.vlines(x, lo, hi, color=figstyle.BLUE, lw=4, alpha=0.5)
+    ax.plot(x, y, color=figstyle.BLUE, lw=3, marker="o", ms=14)
+    for xi, yi in zip(x, y):
+        ax.annotate(f"{yi:,.0f}", (xi, yi), xytext=(14, 10), textcoords="offset points", fontsize=21, color=figstyle.INK,
+                    ha="left", va="bottom")
+    ax.set_xscale("log")
+    ax.set_yscale("log")
+    ax.set_xticks(x)
+    ax.set_xticklabels([str(v) for v in x])
+    ax.minorticks_off()
+    ax.set_xlim(x[0] / 1.5, x[-1] * 2)
+    ax.set_xlabel("training steps of the unit masks")
+    ax.set_ylabel("units one token needs (KL within 0.1 nats)")
+    figstyle.clean(ax)
+    fig.suptitle("Each doubling of the mask training steps cuts the units\none Qwen3-0.6B token needs about threefold",
+                 x=0.06, ha="left", fontsize=24, fontweight="bold")
     fig.tight_layout()
     figstyle.save(fig, out)

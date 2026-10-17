@@ -64,6 +64,31 @@ def pair_losses(model, batches: Batches, masks):
     return torch.cat(out) / 2.0                     # per sequence
 
 
+def two_token(lg: torch.Tensor, tok: torch.Tensor, alt: torch.Tensor, kind: str) -> torch.Tensor:
+    """[B, 2] log-probabilities of the task's two outcomes: {tok, alt} renormalized ("binary"), or {tok, anything
+    else} ("pos_vs_rest")."""
+    r = torch.arange(lg.shape[0], device=lg.device)
+    if kind == "binary":
+        return torch.stack([lg[r, tok], lg[r, alt]], 1).float().log_softmax(1)
+    a = lg.float().log_softmax(1)[r, tok]
+    return torch.stack([a, torch.log1p(-a.exp().clamp(max=1 - 1e-6))], 1)
+
+
+@torch.no_grad()
+def pair_kl(model, batches: Batches, masks) -> list:
+    """Per pair, the mean over its two prompts of KL(full model || circuit) on the two-outcome distribution (nats):
+    the faithful reading of the criterion (the circuit must match the model, not beat it)."""
+    out = []
+    for kind, toks, last, tok, alt, b in batches.groups:
+        f = model.logits(toks, last, None)
+        c = model.logits(toks, last, masks)
+        tt, aa = torch.cat([tok, tok]), torch.cat([alt, alt])
+        pf, pc = two_token(f, tt, aa, kind), two_token(c, tt, aa, kind)
+        kl = (pf.exp() * (pf - pc)).sum(1)
+        out.append((kl[:b] + kl[b:]) / 2)
+    return torch.cat(out).cpu().tolist()
+
+
 @torch.no_grad()
 def measure(model, batches: Batches, masks) -> float:
     return float(pair_losses(model, batches, masks).mean())
@@ -206,8 +231,9 @@ def score(model, batches, keep: dict, rng, n_random: int = 8) -> dict:
         rk = {s: torch.tensor(rng.sample(range(model.sites[s]), len(v)), device=model.device) for s, v in keep.items()}
         rand.append(sum(pl(discrete(model, rk))) / batches.n)
     mean = lambda v: sum(v) / len(v)
-    return {"circuit": mean(circ), "full": mean(full), "ablated": mean(ablated), "random": rand,
-            "pairs": {"circuit": circ, "full": full, "ablated": ablated}}
+    kl = pair_kl(model, batches, discrete(model, kt))
+    return {"circuit": mean(circ), "full": mean(full), "ablated": mean(ablated), "random": rand, "kl2": mean(kl),
+            "pairs": {"circuit": circ, "full": full, "ablated": ablated, "kl2": kl}}
 
 
 def edge_count(model, keep: dict) -> dict:

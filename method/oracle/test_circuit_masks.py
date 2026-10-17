@@ -507,3 +507,29 @@ def test_resampled_check(tiny, monkeypatch):
     for n, c in chk["cuts"].items():
         assert abs(c["kept"] - rec["cuts"][n]["restored"]) < 1e-3 and len(c["per_key"]) == len(pts)
     assert chk["passes"] == all(c["kept"] >= cf.PASS for c in chk["cuts"].values())
+
+
+def test_necessary_units(tiny, monkeypatch):
+    """NECESSARY: after the search, each cut's first NECESSARY_TOP units in RelP order outside it are noised alone on the
+    own pair; those losing at least NECESSARY are in the record's "necessary" with their measured shares, never a cut's
+    own unit; NECESSARY_TOP 0 writes none and leaves the circuit as it was."""
+    model, clean, corrupts = tiny
+    monkeypatch.setattr(cm, "NECESSARY", -1.0)     # (every candidate listed, to check the shares and the exclusion)
+    monkeypatch.setattr(cm, "NECESSARY_TOP", 8)
+    pt = cf.Patcher(model, None, rows=8)
+    rec = cm.find(pt, clean, corrupts[0], steps=4)
+    assert set(rec["necessary"]) == set(rec["cuts"])
+    own = {("neuron", n["layer"], n["pos"], n["neuron"]) for n in rec["nodes"]} | {("head", r["layer"], r["head"], r["pos"]) for r in rec["routes"]}
+    pt.setup(clean, corrupts[0])
+    for n, xs in rec["necessary"].items():
+        assert 0 < len(xs) <= 8
+        assert [x["lost"] for x in xs] == sorted((x["lost"] for x in xs), reverse=True)
+        units = [cf.unit("head", x["layer"], x["pos"], x["head"]) if "head" in x else cf.unit("neuron", x["layer"], x["pos"], x["neuron"])
+                 for x in xs]
+        assert not own & set(units)
+        for x, (lo, re_) in zip(xs, pt.both([[u] for u in units])):
+            assert abs(x["lost"] - lo) < 1e-3 and abs(x["restored"] - re_) < 1e-3
+    monkeypatch.setattr(cm, "NECESSARY_TOP", 0)
+    off = cm.find(cf.Patcher(model, None, rows=8), clean, corrupts[0], steps=4)
+    assert "necessary" not in off
+    assert [(n["layer"], n["pos"], n["neuron"]) for n in off["nodes"]] == [(n["layer"], n["pos"], n["neuron"]) for n in rec["nodes"]]

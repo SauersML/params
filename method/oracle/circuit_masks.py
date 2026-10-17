@@ -46,6 +46,9 @@ own pairs 49/50, 31 units (the lead's 10-17 decision: the default for generalizi
             so a set is taken only when every training pair (the question's own among them) passes
   SOURCE_NECESSITY 0: the source cut's hinge and bar read its restored share only. When the key is carried by more
             units than the set (redundancy), noising the set alone cannot remove it, so the source claim is sufficiency
+  NECESSARY after the search, each cut's first NECESSARY_TOP units in RelP attribution outside it are noised one at a
+            time on the own pair; those losing at least NECESSARY of the gap go in the record's "necessary" (per cut, with
+            their shares): units that must stay on but restore nothing alone, which a minimal both-ways set leaves out
 --pool QUESTIONS.json: partner keys drawn from that set's keys of the question's task (a seeded order per question),
 not from the question's own "partners", which then stay held out for the scorecard's unseen pairs.
 One prompt (ONE_PROMPT, mask:one_prompt=1:partners=16:agg=mean): no comparison prompt; the clean prompt is run with each
@@ -145,6 +148,13 @@ ADV_MODES = "unit"  # the check's adversaries joined by "+": unit, block, random
 AGG = "min"         # a Mean's shares: "min", the least over its pairs (a set passes only when every pair does), or "mean"
 SOURCE_NECESSITY = 1  # 0: the source cut is chosen and taken on its restored share only (no lost hinge, no lost bar):
                       # a small set of a redundantly carried key is sufficient, not necessary (design 11a)
+NECESSARY = 0.5     # a unit outside a cut whose noising alone loses at least this share of the own pair's gap: listed in the
+# record's "necessary" beside the cut, with its shares. A minimal both-ways set leaves out units that are necessary and restore
+# nothing when another unit carries the contrast (casestudy's case 17 AND plant, Qwen3-8B: two flag neurons, each lost about
+# 1.0 alone and restored 0.01-0.05, in the circuit 2/38 and 3/38, the unit they gate 38/38)
+NECESSARY_TOP = 256  # the candidates measured a cut: its first units in RelP attribution (attr_order, the own pair) outside the
+# cut, each noised alone on the own pair in one tick; 0: off. (AND plant: RelP ranks of the flags among every neuron at every
+# position, median 26-33, within 256 on 37/38 pairs, within 64 on 33-34)
 ONE_PROMPT = 0      # 1: one prompt (the lead's 10-17, from the user: a circuit should not need a second prompt; arm
 # constant one_prompt=1 with partners=16): the question's clean prompt alone is run, each cut's units outside the circuit
 # set to their values on other keys of its template (its pairs' corrupted prompts: the question's own and its partners,
@@ -885,7 +895,7 @@ def search_steps(pt, arm: str, log=None, steps: int = STEPS, prior: dict | None 
                           "start": got.get(n, {}).get("start", x.get("start"))}
         yield from _verify_steps(st, got, names, time.perf_counter() - t0, steps, log=log)
         names = [n for n in names if not st["out"][n]["met"] and not st["out"][n].get("diffuse")]
-    out = yield from _finish_steps(st)
+    out = yield from _finish_steps(st, pt)
     src, movers = out.get("source", {}).get("units", []), out.get("movers", {}).get("units", [])
     if src and movers and not ONE_PROMPT:           # (each mover's share of the source cut's effect, circuit_finder.find's:
         a, b = yield [(pt, "run", "clean", [src + [u + ("clean",)] for u in movers]),     # the head frozen at its base
@@ -1069,8 +1079,9 @@ def _verify_steps(st: dict, got: dict, names: list, t_opt: float, steps: int, lo
                                       {"attr_unmet": prev["mask"]["attr_unmet"]} if "attr_unmet" in prev.get("mask", {}) else {})}})
 
 
-def _finish_steps(st: dict):
-    """Cuts with no result have no units; a partner cut records each pair's shares."""
+def _finish_steps(st: dict, pt=None):
+    """Cuts with no result have no units; a partner cut records each pair's shares; with pt (the own pair) and NECESSARY_TOP,
+    each cut's necessary units outside it (NECESSARY)."""
     specs, ceil, out = st["specs"], st["ceil"], st["out"]
     for n in st["names"]:
         if n not in out:
@@ -1087,7 +1098,24 @@ def _finish_steps(st: dict):
         out[n]["partners"] = {"pairs": len(st["meas"][n].pts), "shares": [list(x[0]) for x in e]}
     for n in st["names"] if st.get("one_prompt") else []:
         out[n]["one_prompt"] = st["one_prompt"]
+    if NECESSARY_TOP and pt is not None and not st.get("one_prompt"):
+        sc = yield ("scores", pt)
+        cand = {}
+        for n in st["names"]:
+            have = set(out[n]["units"])
+            cand[n] = [u for u in attr_order(pt, specs[n], sc)[:NECESSARY_TOP + len(have)] if u not in have][:NECESSARY_TOP]
+        got = yield [(pt, "both", [[u] for u in cand[n]]) if cand[n] else [] for n in st["names"]]
+        for n, g in zip(st["names"], got):
+            out[n]["necessary"] = [{**_unit_json(u), "lost": round(lo, 4), "restored": round(re_, 4)}
+                                   for u, (lo, re_) in sorted(zip(cand[n], g), key=lambda x: -x[1][0]) if lo >= NECESSARY]
     return out
+
+
+def _unit_json(u: tuple) -> dict:
+    """A unit tuple (circuit_finder.unit's) as the record writes it."""
+    if u[0] == "head":
+        return {"layer": int(u[1]), "head": int(u[2]), "pos": int(u[3])}
+    return {"layer": int(u[1]), "pos": int(u[2]), "neuron": int(u[3])}
 
 
 def _find_with(pt, clean, corrupt, answers, log, arm: str, cuts: dict, rec0: dict | None = None, **kw) -> dict:
@@ -1100,7 +1128,7 @@ def _find_with(pt, clean, corrupt, answers, log, arm: str, cuts: dict, rec0: dic
         if rec0 is not None:
             del pt.setup
     extra = {k: {n: c[k] for n, c in cuts.items() if k in c} for k in ("attr", "mask", "partners", "adversarial", "family",
-                                                                        "one_prompt")}   # (find() copies its own fields
+                                                                        "one_prompt", "necessary")}   # (find() copies its own fields
     return {**rec, "search": arm, **{k: v for k, v in extra.items() if v}}                 # only)
 
 

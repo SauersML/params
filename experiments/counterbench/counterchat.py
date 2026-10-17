@@ -79,6 +79,7 @@ EMOJI = re.compile(r"[\U0001F300-\U0001FAFF☀-➿]")
 MARKDOWN = re.compile(r"(^|\n)\s*(#{1,6}\s|[-*+]\s|\d+[.)]\s)|\*\*[^*\n]+\*\*|`[^`\n]+`|\\boxed")
 HEADER = re.compile(r"(^|\n)\s*#{1,6}\s")
 FENCE = re.compile(r"```")
+RULE = re.compile(r"(^|\n)[ \t]*([-*_])[ \t]*\2[ \t]*\2[-*_ \t]*(\n|$)")
 BOLD = re.compile(r"\*\*[^*\n]+\*\*|__[^_\n]+__")
 LIST = re.compile(r"(^|\n)\s*([-*+•]\s|\d+[.)]\s)")
 REFUSAL = re.compile(r"\b(I can(no|')t|I cannot|I(?:'m| am) (?:not able|unable)|I won't|I(?:'m| am) sorry,? but|"
@@ -86,8 +87,8 @@ REFUSAL = re.compile(r"\b(I can(no|')t|I cannot|I(?:'m| am) (?:not able|unable)|
 
 
 PARAMS = {"cjk": set(), "markdown": {"type"}, "list": set(), "emoji": set(), "max_words": {"n"}, "not_lowercase": set(),
-          "not_json": set(), "item_count": {"n"}, "ends_with_question": set(), "punctuation": set(), "starts_with": {"any"}}
-MARKDOWN_TYPES = {"any", "bold", "header", "code_block"}
+          "not_json": set(), "item_count": {"n"}, "ends_with_question": set(), "punctuation": set(), "starts_with": {"any"}, "words": {"any"}}
+MARKDOWN_TYPES = {"any", "bold", "header", "code_block", "hr"}
 
 
 def program(spec: dict, messages: list[dict], response: str) -> bool:
@@ -107,7 +108,7 @@ def _program(spec: dict, messages: list[dict], text: str) -> bool:
     if name == "cjk":  # CJK script in a response to a prompt without any
         return bool(CJK.search(text)) and not any(CJK.search(m["content"]) for m in messages)
     if name == "markdown":
-        return bool({"bold": BOLD, "header": HEADER, "code_block": FENCE}.get(spec.get("type"), MARKDOWN).search(text))
+        return bool({"bold": BOLD, "header": HEADER, "code_block": FENCE, "hr": RULE}.get(spec.get("type"), MARKDOWN).search(text))
     if name == "list":
         return bool(LIST.search(text))
     if name == "emoji":
@@ -129,6 +130,8 @@ def _program(spec: dict, messages: list[dict], text: str) -> bool:
     if name == "starts_with":  # the reply opens with one of the phrases (case-insensitive, after markdown emphasis)
         head = re.sub(r"^[*_#>\s]+", "", text).lower()
         return any(head.startswith(x.lower()) for x in spec["any"])
+    if name == "words":  # any of the words standing alone (case-insensitive)
+        return any(re.search(rf"\b{re.escape(w)}\b", text, re.I) for w in spec["any"])
     if name == "ends_with_question":
         return text.rstrip().endswith("?")
     if name == "refusal":
@@ -138,8 +141,8 @@ def _program(spec: dict, messages: list[dict], text: str) -> bool:
     raise ValueError(f"unknown program {name}")
 
 
-PROGRAMS = ("cjk", "markdown(type: any|bold|header|code_block)", "list", "emoji", "max_words(n)", "not_lowercase", "not_json",
-            "item_count(n)", "ends_with_question", "punctuation", "starts_with(any: [phrases])")  # (string matching for claims or refusals misses paraphrases: those go to the judge)
+PROGRAMS = ("cjk", "markdown(type: any|bold|header|code_block|hr)", "list", "emoji", "max_words(n)", "not_lowercase", "not_json",
+            "item_count(n)", "ends_with_question", "punctuation", "starts_with(any: [phrases])", "words(any: [words])")  # (string matching for claims or refusals misses paraphrases: those go to the judge)
 
 
 def log_spend(run: str, model: str, prefill: int, sampled: int, note: str, cached: int = 0) -> float:

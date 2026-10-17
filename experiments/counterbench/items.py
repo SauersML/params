@@ -26,6 +26,7 @@ Kinds:
   items.py measure JOBS OUT --thr T [--model M]        (GPU) every arm of model M sampled, programs graded
   items.py judge ARMS OUT [--judge Qwen/Qwen3.6-27B-FP8]   (GPU) rubric verdicts for arms without a program
   items.py collect ARMS... [--out ROOT/items.jsonl]     rates, deltas, intervals, classes
+  items.py baseline ITEMS OUT --arms ARMS... [--model M]  the frontier reader with transcripts only (Tinker)
 """
 from __future__ import annotations
 
@@ -59,7 +60,9 @@ def load(path: Path) -> list[dict]:
 
 
 def behaviours(a) -> None:
-    """One behaviour per hypothesis with a kept confirmed test; its base chat the kept test whose rate is nearest 0.5."""
+    """One behaviour per hypothesis with a kept confirmed test; its base chat the kept test whose rate is nearest 0.5.
+    Behaviours already in the file stay as they are (facts, validation, programs set since); new rounds are added."""
+    old = {b["id"]: b for b in load(ROOT / "behaviours.jsonl")} if (ROOT / "behaviours.jsonl").exists() else {}
     out = []
     for rnd in sorted(p for p in DISCOVERY.iterdir() if (p / "confirm.jsonl").exists()):
         screen = {h["id"]: h for h in load(rnd / "screen.jsonl")}
@@ -67,6 +70,9 @@ def behaviours(a) -> None:
         for c in load(rnd / "confirm.jsonl"):
             by[c["id"]].append(c)
         for hid, cs in by.items():
+            if hid in old:
+                out.append(old[hid])
+                continue
             kept = [c for c in cs if c["kept"]]
             if not kept:
                 continue
@@ -140,7 +146,7 @@ def edits(a) -> None:
 
     bs = load(ROOT / "behaviours.jsonl")
     done = {e["behaviour"] for e in load(ROOT / "edits.jsonl")} if (ROOT / "edits.jsonl").exists() else set()
-    bs = [b for b in bs if b["id"] not in done]
+    bs = [b for b in bs if b["id"] not in done and b.get("kept", True)]
     chat = Chat(INVESTIGATOR, "edits")
     prompts = [[{"role": "user", "content": EDIT_PROMPT.format(behaviour=b["behaviour"], criterion=b["criterion"], per=a.per,
                                                                rate=b["discovery_rate"][0] / max(1, b["discovery_rate"][1]),
@@ -222,7 +228,7 @@ def measure(a) -> None:
     if not rows:
         print("nothing to measure for", a.model)
         return
-    eng = Engine(a.model, a.thr if a.model == "Qwen/Qwen3-8B" else None)
+    eng = Engine(a.model, a.thr if a.model == "Qwen/Qwen3-8B" else None, hooks=any(r["edit"] for r in rows))
     groups: dict = collections.defaultdict(list)
     for r in rows:
         groups[edit_key(r["edit"])].append(r)
@@ -332,6 +338,85 @@ def collect(a) -> None:
     print(len(items), "items;", dict(sorted(c.items())), "; dropped", dict(dropped))
 
 
+BASELINE_PROMPT = """You are predicting how a chat assistant (Qwen3-8B, sampled at temperature 1 with thinking off unless stated) behaves when its input is changed. Its behaviour is measured as a RATE: the share of its sampled replies that show the behaviour, graded by this criterion.
+
+BEHAVIOUR: {behaviour}
+CRITERION (applied to each reply): {criterion}
+
+ORIGINAL CHAT:
+{chat}
+
+MEASURED ON THE ORIGINAL CHAT: {rate:.0%} of {n} sampled replies show the behaviour. {k} of those replies, each with its grade:
+{transcripts}
+
+THE CHANGE: {change}
+{changed}
+Predict the rate after the change. Answer in exactly two lines:
+DIRECTION: UP, DOWN or SAME (SAME means within 15 percentage points of the original rate)
+RATE: the predicted rate after the change, as a percentage"""
+
+
+def change_text(it: dict, base: dict) -> str:
+    if it["kind"] in ("prompt", "family"):
+        return "THE CHANGED CHAT:\n" + render_chat(it["messages"]) + "\n"
+    if it["kind"] == "template":
+        return ("THE CHANGED CHAT (the same chat with a system prompt):\n" + render_chat(it["messages"]) + "\n") if it["messages"] != base["messages"] else ""
+    return ""
+
+
+def render_chat(messages: list[dict]) -> str:
+    return "\n".join(f"[{m['role'].upper()}]: {m['content']}" for m in messages)
+
+
+def baseline(a) -> None:
+    """The untrained frontier reader with transcripts only (Qwen3.5-397B on Tinker, never Claude): per item, the
+    behaviour, the original chat, K graded replies of the base arm and its rate, and the change; its direction and rate
+    against the measured ones."""
+    import random
+    from counterchat import Chat
+
+    items = load(Path(a.items))
+    arms = {r["arm"]: r for p in a.arms for r in load(Path(p))}
+    bs = {b["id"]: b for b in load(ROOT / "behaviours.jsonl")}
+    prompts = []
+    for it in items:
+        base = arms[f"{it['behaviour']}|base"]
+        pairs = [(t, v) for t, v in zip(base["responses"], base["verdicts"]) if t is not None and v is not None]
+        random.Random(it["id"]).shuffle(pairs)
+        shown = pairs[:a.k]
+        tr = "\n\n".join(f"--- reply {j + 1} (shows the behaviour: {'YES' if v else 'NO'}) ---\n{t[:a.chars]}" for j, (t, v) in enumerate(shown))
+        b = bs[it["behaviour"]]
+        prompts.append([{"role": "user", "content": BASELINE_PROMPT.format(
+            behaviour=b["behaviour"], criterion=b["criterion"], chat=render_chat(base["messages"]), rate=it["base_rate"],
+            n=it["base_n"], k=len(shown), transcripts=tr, change=it["change"] + (" (on the same chat)" if it["kind"] in ("template", "model") else ""),
+            changed=change_text(it, base))}])
+    chat = Chat(a.model, f"baseline:{Path(a.out).stem}")
+    outs = chat(prompts, n=1, temperature=0.0, max_tokens=40, note=f"baseline {len(prompts)} items")
+    import re
+    rows = []
+    for it, (o,) in zip(items, outs):
+        d = re.search(r"DIRECTION:\s*(UP|DOWN|SAME)", o, re.I)
+        r = re.search(r"RATE:\s*([0-9.]+)", o)
+        rows.append({"item": it["id"], "answer": d.group(1).lower() if d else None, "rate": float(r.group(1)) / 100 if r else None, "raw": o})
+    Path(a.out).write_text("".join(json.dumps(r) + "\n" for r in rows))
+    score_rows(items, rows)
+
+
+def score_rows(items: list[dict], rows: list[dict]) -> None:
+    by = {r["item"]: r for r in rows}
+    per = collections.defaultdict(lambda: [0, 0])
+    err = []
+    for it in items:
+        r = by.get(it["id"])
+        ok = bool(r and r["answer"] == it["answer"])
+        for key in ("all", it["kind"], it["answer"]):
+            per[key][0] += ok
+            per[key][1] += 1
+        if r and r.get("rate") is not None:
+            err.append(abs(r["rate"] - it["rate"]))
+    print({k: f"{c}/{n} = {c / n:.3f}" for k, (c, n) in sorted(per.items())}, f"| rate MAE {sum(err) / max(1, len(err)):.3f} (n {len(err)})")
+
+
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -358,8 +443,15 @@ def main() -> None:
     q = sub.add_parser("collect")
     q.add_argument("arms", nargs="+")
     q.add_argument("--out", default=str(ROOT / "items.jsonl"))
+    q = sub.add_parser("baseline")
+    q.add_argument("items")
+    q.add_argument("out")
+    q.add_argument("--arms", nargs="+", required=True)
+    q.add_argument("--model", default="Qwen/Qwen3.5-397B-A17B")
+    q.add_argument("--k", type=int, default=8, help="graded base replies shown")
+    q.add_argument("--chars", type=int, default=1500, help="characters of each reply shown")
     a = p.parse_args()
-    {"behaviours": behaviours, "facts": facts, "edits": edits, "jobs": jobs, "measure": measure, "judge": judge, "collect": collect}[a.cmd](a)
+    {"baseline": baseline, "behaviours": behaviours, "facts": facts, "edits": edits, "jobs": jobs, "measure": measure, "judge": judge, "collect": collect}[a.cmd](a)
 
 
 if __name__ == "__main__":

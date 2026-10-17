@@ -25,19 +25,27 @@ THINK_TOKENS = 3072  # a thinking-on arm's extra room for its reasoning
 
 class Engine:
     def __init__(self, model: str = "Qwen/Qwen3-8B", thr: str | None = None, max_len: int = 4096, util: float = 0.85,
-                 seqs: int = 256):
+                 seqs: int = 256, hooks: bool = True):
+        """hooks=False: the unedited model only, compiled with CUDA graphs (about twice the eager decode speed)."""
         import torch
         from transformers import AutoTokenizer
         from vllm import LLM
 
         self.torch, self.name = torch, model
         self.tok = AutoTokenizer.from_pretrained(model)
-        kw = dict(model=model, max_model_len=max_len, gpu_memory_utilization=util, max_num_seqs=seqs, enforce_eager=True,
-                  dtype="bfloat16", enable_prefix_caching=False)  # (a cached prompt would carry another edit's values)
-        try:
-            self.llm = LLM(**kw, compilation_config={"mode": 0})  # no torch.compile: module hooks run as written
-        except (TypeError, ValueError):
-            self.llm = LLM(**kw, compilation_config={"level": 0})
+        self.hooks = hooks
+        kw = dict(model=model, max_model_len=max_len, gpu_memory_utilization=util, max_num_seqs=seqs, enforce_eager=hooks,
+                  dtype="bfloat16", enable_prefix_caching=not hooks)  # (a cached prompt would carry another edit's values)
+        if not hooks:
+            self.llm = LLM(**kw)
+        else:
+            try:
+                self.llm = LLM(**kw, compilation_config={"mode": 0})  # no torch.compile: module hooks run as written
+            except (TypeError, ValueError):
+                self.llm = LLM(**kw, compilation_config={"level": 0})
+        if not hooks:
+            self.edit = None
+            return
         self.model = self._model()
         self.layers = self.model.model.layers
         cfg = self.model.config
@@ -127,6 +135,8 @@ class Engine:
         if not units:
             self.edit = None
             return
+        if not self.hooks:
+            raise SystemExit("this engine was built without hooks (hooks=False): it runs the unedited model only")
         torch = self.torch
         if (op != "zero" and op[0] == "steer") and self.mx is None:
             raise SystemExit("steering needs --thr (each neuron's calibration maximum)")

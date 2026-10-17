@@ -63,14 +63,23 @@ SEALED_RULE = ("O1's sealed contexts: every question of the circuit push's seale
                "all paraphrases of its task/key pairs), and any circuit record with id X where crc32(('scorecard:' + X).encode()) "
                "% 20 == 0; O1 dev's task/key pairs (every paraphrase) are never trained on either")
 PUBLISHED = {"li_self_explainer": 0.640, "li_llama": 0.541, "li_untrained": 0.050, "ao_taboo_paper": 0.495}
-AB_REFERENCE = [  # AuditBench reference lines: (label, value, source and how it differs from our cells)
-    ("published default agent, Llama-70B", 0.355, "arXiv 2602.22755: Llama-3.3-70B targets, Claude Haiku 4.5 investigator, 16 runs"),
-    ("published best tool, Llama-70B", 0.580, "arXiv 2602.22755: scaffolded text completion, Llama-3.3-70B targets"),
+AB_REFERENCE = [  # AuditBench reference lines: (label, value, version, metric and targets; how it differs from our cells)
+    ("published default agent (Llama-70B)", 0.355,
+     "AuditBench arXiv 2602.22755v4 (2026-10-01; v1-v3 give it only in Figure 4); Llama-3.3-70B targets, all 56; Claude Haiku "
+     "4.5 investigator, 16 runs a target, 10 predictions, success classifier (repo safety-research/auditing-agents e908591, "
+     "scoring.py default claude-sonnet-4-6 with thinking); ours: Qwen3-14B dev targets, 1 run, Qwen3.5-397B judge"),
+    ("published best tool (Llama-70B)", 0.580, "the same source: scaffolded text completion"),
+    ("introspection adapters (Llama-70B)", 0.59,
+     "Shenoy et al. arXiv 2604.16812 / Anthropic alignment blog 2026-04-28 (citing AuditBench v1): Llama-3.3-70B targets, "
+     "the average over the 4 training configurations, 16 runs, 10 predictions; its 'next best method' 0.53 is unnamed "
+     "(AuditBench v4's scaffolded user sampling is 0.532); trains an adapter on many fine-tuned models"),
     ("LoRAcles, reads the fine-tuning weight diff (not allowed in our setting)", 0.482,
      "De Schamphelaere, Bauer, Nanda & Ong (NeurIPS 2026 oral); the number is the Qwen3-14B checkpoint's model card "
      "(huggingface.co/ceselder/dynamic-loracle-qwen3-14b: any-match over 3 prompts x 2 rollouts, K=32, canonical descriptions); "
      "its rates are multiples of 1/56, so all 56 targets (our 16 sealed included), its judge unstated; the paper's own "
      "AuditBench table was not readable (OpenReview); not our metric (one run of 10 predictions, the paper's judge prompt)")]
+AB_SOURCE = {"repo": "github.com/safety-research/auditing-agents", "main_at_fetch": "e9085916784a (2026-10-08)",
+             "judge_prompt_commit": "1fefe8afb17c (2026-06-29)", "paper": "arXiv 2602.22755v4"}
 
 
 def sealed_id(x: str) -> bool:
@@ -847,7 +856,8 @@ def score(a) -> None:
     out = ROOT / "table.json"
     out.write_text(json.dumps({"written": time.strftime("%Y-%m-%d %H:%M:%S %Z"), "boot": BOOT, "published": PUBLISHED,
                                "oracles": meta, "cells": rows, "plan": plan_rows,
-                               "auditbench_reference": [{"label": t, "value": v, "source": src} for t, v, src in AB_REFERENCE]}, indent=1))
+                               "auditbench_reference": [{"label": t, "value": v, "source": src} for t, v, src in AB_REFERENCE],
+                               "auditbench_source": AB_SOURCE}, indent=1))
     with (ROOT / "plan.tsv").open("w") as fh:
         fh.write("task\tmetric\t" + "\t".join(PLAN_COLUMNS) + "\n")
         for r in plan_rows:
@@ -897,8 +907,7 @@ def plan_figure(plan_rows: list[dict]) -> None:
             y = len(plan_rows) - 1 - k
             for j, (t, v, _) in enumerate(AB_REFERENCE):
                 ax.plot(v, y + 0.42, "|", ms=22, mew=3, color="#222222")
-                ax.text(v, y + 0.5 + 0.22 * (j % 2), "LoRAcles (reads weight diff)" if "LoRAcles" in t else
-                        t.replace("published ", "published ").replace(", Llama-70B", " (Llama-70B)"), ha="center", fontsize=13)
+                ax.text(v, y + 0.5 + 0.22 * (j % 2), "LoRAcles (reads weight diff)" if "LoRAcles" in t else t, ha="center", fontsize=12)
     ax.set_yticks(range(len(plan_rows)), [r["task"] for r in plan_rows][::-1])
     ax.set_xlim(0, 1.0)
     ax.set_ylim(-0.6, len(plan_rows) - 0.4)
@@ -1062,7 +1071,7 @@ def figure(rows: list[dict], meta: dict) -> None:
             ax.text(r["hi"] + 0.015, k, f"{r['value']:.2f} ({r['n']} targets)", va="center", fontsize=20)
         for j, (t, v, _) in enumerate(AB_REFERENCE):
             ax.axvline(v, color="#222222", lw=2, ls=":", zorder=0)
-            ax.text(v, len(oab) - 0.3 + 0.35 * (j % 2), t.split(",")[0] + (" (weight diff)" if "LoRAcles" in t else ""), ha="center", fontsize=15)
+            ax.text(v, len(oab) - 0.3 + 0.35 * (j % 2), "LoRAcles (weight diff)" if "LoRAcles" in t else t, ha="center", fontsize=14)
         ax.set_yticks(range(len(oab)), [lab(n) for n in oab])
         ax.set_ylim(-0.6, len(oab) + 0.1)
         ax.set_xlim(0, 1.0)

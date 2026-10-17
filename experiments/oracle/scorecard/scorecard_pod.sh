@@ -29,7 +29,7 @@ mkdir -p "$S/answers" "$S/adapters"
 for o in ${ORACLES:-}; do cp -r "$ROOT/answers/$o" "$S/answers/$o"; done
 case ${TARGETS:-o3,o4} in *o3*) for n in backdoor2 cond_pref lie lie2; do cp -r /Users/user/mpd-data/organisms/qwen3_8b/adapters/$n "$S/adapters/$n"; done ;; esac
 cp /Users/user/mpd-data/cluster/t2_8b/out/thr.pt "$S/thr.pt"
-[ -n "${GREEDY:-}${REMOVAL:-}" ] && cp /Users/user/mpd-data/organisms/qwen3_8b/data/general.jsonl "$S/general.jsonl"
+cp /Users/user/mpd-data/organisms/qwen3_8b/data/general.jsonl "$S/general.jsonl"  # (greedy, removal; measure's --general-extra)
 if [ -n "${AOE1B:-}" ]; then
   mkdir -p "$S/e1b/adapters"
   /Users/user/mpd-data/venv/bin/python -c "
@@ -58,7 +58,7 @@ MEASURE=${ORACLES:-}
 --items $S/items --adapters $S/adapters --thr $S/thr.pt --general $S/general.jsonl --out $O/answers/t3-greedy > $O/greedy.log 2>&1"
 [ -n "$MEASURE" ] && WORK="$WORK; mkdir -p $O/answers; cp -r $S/answers/. $O/answers/; python -u $S/experiments/oracle/scorecard/measure.py \
 --answers $(for o in $MEASURE; do printf '%s ' "$O/answers/$o"; done)--items $S/items --adapters $S/adapters --thr $S/thr.pt \
---targets ${TARGETS:-o3,o4} > $O/measure.log 2>&1"
+--targets ${TARGETS:-o3,o4} ${MEASUREFLAGS:-} > $O/measure.log 2>&1"
 [ -n "${READER:-}" ] && WORK="$WORK; mkdir -p $O/reader; echo ${RCSET:-rc1} > $O/reader/rcset.txt; cd $S/experiments/oracle/cao; \
 for h in correct names mismatch none; do python -u g2.py eval --items $S/rc/test_\$h.jsonl --thr $S/thr.pt --adapter $AD \
 --out $O/reader/o1_\$h.jsonl > $O/reader/o1_\$h.log 2>&1; done; \

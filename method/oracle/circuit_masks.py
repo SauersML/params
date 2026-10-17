@@ -77,8 +77,9 @@ MASK_MERGE = 192    # a mask step's forward costs as many tokens' work (Qwen3-8B
 # forward and backward, ~0.5 ms of compute a token): instances of near first positions share one (_passes)
 FLOOR = True        # a cut's sets are taken at its bar, in reduced precision PASS plus the largest |share| of a no-op
 # patch of the first layer's units at each of its positions (_before_steps)
-GRAPH = True        # a round's mask steps after the first GRAPH_WARM replayed from one CUDA graph (the same kernels each
-GRAPH_WARM = 2      # step: a step of a few cuts was host-bound, Qwen3-8B on an A6000 ~0.3 s for ~250 tokens)
+GRAPH = False       # a round's mask steps after the first GRAPH_WARM replayed from one CUDA graph (the same kernels each
+GRAPH_WARM = 2      # step: Qwen3-8B on an A6000, mask arm without partners, 2.38 -> 2.08 s a question); off until its
+# memory is checked with partners (the warm steps' cached blocks and the graph's pool together ran a 48 GB card out)
 ROUNDS = 4          # rounds of STEPS a cut's masks get while its order cannot pass (each round from the last's theta)
 PRUNE_MAX = 4 * cf.SINGLES_KEPT   # a passing prefix of more units than this is a diffuse cut, not pruned: its size, shares
 # and curve recorded, no units (circuit_finder's diffuse rule). Qwen3-8B dev set (A6000, am, 153 questions): 13 readout
@@ -274,8 +275,9 @@ def optimize_many(jobs: list, steps: int = STEPS, log=None, init: list | None = 
                 hist_t[n_].copy_(step())
         cur.wait_stream(side)
         n_ = GRAPH_WARM
-        try:
-            g = torch.cuda.CUDAGraph()
+        torch.cuda.empty_cache()                    # (the eager steps' cached blocks back to the card: the graph's own
+        try:                                        # pool takes a step's activations again, and a step was sized to
+            g = torch.cuda.CUDAGraph()              # MASK_MEMORY of the free memory; Qwen3-8B with partners ran out)
             with torch.cuda.graph(g):
                 out_g = step()
         except Exception as e:                      # noqa: BLE001 (the rest eager)
@@ -286,6 +288,8 @@ def optimize_many(jobs: list, steps: int = STEPS, log=None, init: list | None = 
             g.replay()
             hist_t[n_].copy_(out_g)
         n_ = steps if graph else n_
+        g = out_g = None                            # (the graph's pool back to the card for the measuring forwards)
+        torch.cuda.empty_cache()
     for n_ in range(n_, steps):
         if mode == "random":                        # (a fresh uniform draw of the rest each step)
             rho = {k: torch.rand_like(t) for k, t in rho.items()}

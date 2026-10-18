@@ -3,11 +3,12 @@ with TSEARCH_VAL validation keys), one dot per question, grouped by task; only q
 circuit met the bound. Several sets (orders of the units) side by side, the first one's medians ordering the tasks, each set's name
 at its own dots.
 
-  val_fig.py OUT.png LABEL=RECORDS_DIR,R3_DIR [LABEL=RECORDS_DIR,R3_DIR ...] [--title TEXT]
+  val_fig.py OUT.png LABEL=RECORDS_DIR,R3_DIR [LABEL=RECORDS_DIR,R3_DIR ...] [--title TEXT] [--intervals]
 """
 from __future__ import annotations
 
 import json
+import random
 import statistics as st
 import sys
 from pathlib import Path
@@ -18,7 +19,7 @@ import figstyle  # noqa: E402
 NAMES = {"element": "chemical symbol", "city_country": "a city's country", "capital": "a country's capital",
          "language": "a country's language", "french": "word in French", "color": "color of a fruit",
          "number": "the next number", "opposite": "opposite word", "statecap": "capital of a city's state",
-         "plural": "plural noun"}
+         "plural": "plural noun", "past": "past tense of a verb"}
 COLORS = [figstyle.BLUE, figstyle.RED, figstyle.TEAL, figstyle.PURPLE]
 
 
@@ -42,6 +43,13 @@ def shares(rd: Path, sd: Path) -> dict:
     return by
 
 
+def median_ci(v: list, draws: int = 4000) -> tuple:
+    """The median of v and its 95% bootstrap interval over v's entries."""
+    rng = random.Random(0)
+    b = sorted(st.median(rng.choice(v) for _ in v) for _ in range(draws))
+    return st.median(v), b[int(0.025 * draws)], b[int(0.975 * draws) - 1]
+
+
 def main():
     import argparse
 
@@ -51,6 +59,7 @@ def main():
     ap.add_argument("out")
     ap.add_argument("sets", nargs="+")
     ap.add_argument("--title", default="How much of Qwen3-8B a circuit needs for unseen keys\ndepends on the task")
+    ap.add_argument("--intervals", action="store_true", help="each task's median with its 95%% bootstrap interval")
     args = ap.parse_args()
     out, sets = args.out, args.sets
 
@@ -67,7 +76,12 @@ def main():
     for a, (label, by) in enumerate(arms):
         for y, t in enumerate(tasks):
             v = by.get(t, [])
-            ax.scatter(v, [y + off[a]] * len(v), s=150, color=COLORS[a], alpha=0.85, zorder=3, lw=0)
+            ax.scatter(v, [y + off[a]] * len(v), s=150 if not args.intervals else 90, color=COLORS[a],
+                       alpha=0.85 if not args.intervals else 0.35, zorder=3, lw=0)
+            if args.intervals and len(v) > 1:       # (the median and its interval)
+                m, lo, hi = median_ci(v)
+                ax.plot([lo, hi], [y + off[a]] * 2, color=COLORS[a], lw=4, solid_capstyle="round", zorder=4)
+                ax.plot([m], [y + off[a]], marker="|", ms=26, mew=4, color=COLORS[a], zorder=5)
     ax.set_yticks(range(len(tasks)))
     ax.set_yticklabels([NAMES.get(t, t) for t in tasks])
     ax.set_xlim(0, 100)

@@ -83,4 +83,4 @@ def test_per_cut_head_swap_and_size_curves():
     assert means[1] == pytest.approx(0.1) and means[8] == pytest.approx((0.9 + 0.2) / 2)  # (shorter rankings: their whole length)
     assert sc["k70_median"] == 4 and sc["k70_reached"] == 1
     out = cb.table({"x": {"gpu": "cpu", "finder_rev": "r", "metrics": m}})
-    assert "HEADLINE Q2c" in out and "source 1:0 4:1" in out
+    assert "HEADLINE Q2c" in out and "1:0 4:1 16:1 64:1 256:1 1024:1 /2" in out

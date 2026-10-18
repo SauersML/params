@@ -359,14 +359,10 @@ def table(benches: dict) -> str:
             ("   random heads, same layers", lambda b: fmt(g(b, "HS").get("random_hit_mean"), g(b, "HS").get("random_hit_ci"))),
             ("   share moved / random; heads", lambda b: f"{two(g(b, 'HS'), 'share_median', 'random_share_median')}; "
                                                        f"{fmt(g(b, 'HS').get('heads_median'))}"),
-            ("SC unseen pass by size k (per cut)", lambda b: "; ".join(
-                f"{n} " + " ".join(f"{k}:{p}" for k, p in zip(v["k"], v["heldout"]["passes"]) if k in (1, 4, 16, 64, 256, 1024))
-                + f" /{v['questions']}" for n, v in g(b, "SC").items()) or "-"),
-            ("   random set", lambda b: "; ".join(
-                f"{n} " + " ".join(f"{k}:{p}" for k, p in zip(v["k"], v["random_heldout"]["passes"]) if k in (1, 4, 16, 64, 256, 1024))
-                for n, v in g(b, "SC").items()) or "-"),
-            ("   k70 median (reached)", lambda b: "; ".join(f"{n} {fmt(v['k70_median'])} ({v['k70_reached']}/{v['questions']})"
-                                                           for n, v in g(b, "SC").items()) or "-"),
+            *[(f"SC {cut}: unseen passes within k units", (lambda cut: lambda b: (lambda v: " ".join(
+                f"{k}:{p}" for k, p in zip(v["k"], v["heldout"]["passes"]) if k in (1, 4, 16, 64, 256, 1024))
+                + f" /{v['questions']}; random max {max(v['random_heldout']['passes'])}; k70 {fmt(v['k70_median'])}"
+                if v else "-")(g(b, "SC").get(cut)))(cut)) for cut in ("source", "movers", "readout", "all")],
             ("Q2 whole circuit, unseen pairs", rate("Q2", "pass_rate", "pass_ci", "questions")),
             ("   median lost / restored", lambda b: two(g(b, "Q2"), "lost_median", "restored_median", "lost_ci", "restored_ci")),
             ("Q1 own-pair pass rate (per cut)", q1),

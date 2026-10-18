@@ -548,6 +548,19 @@ def test_pair_scores(tiny):
 
 
 
+
+def test_tsearch_backbone_uses_masks(tiny, monkeypatch, tmp_path):
+    """With a backbone (conditional R3) the default gradient-started order falls back to the masks' own."""
+    model, docs, means = tiny
+    qs, keys = _framed(monkeypatch)
+    monkeypatch.setattr(ami, "TSEARCH_KEYS", 3)
+    monkeypatch.setattr(ami, "TSEARCH_VAL", 2)
+    monkeypatch.setattr(ami, "COVER_STEPS", 2)
+    monkeypatch.setattr(ami, "BACKBONE", [("neuron", 0, "body", 3), ("head", 1, "suf:1", 2)])
+    ami.tsearch(ami.Masked(model, means), None, qs[:1], keys, tmp_path, batch=1)
+    rec = ami.json.loads((tmp_path / "t__20__p0.json").read_text())
+    assert rec["order"] == "mask" and "k_order" not in rec
+
 def test_rank_logits_and_init(tiny, monkeypatch):
     """rank_logits: an item's first ks units by score start live (logit > 0), the rest not, in the scores' order; with
     no descent, mask_search(init=...) returns those logits."""

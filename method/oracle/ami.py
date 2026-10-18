@@ -1711,10 +1711,12 @@ def cover_batch(mk: Masked, ids: list, ts: list, lp_full: torch.Tensor, log=None
 
 
 TSEARCH_KEYS = 8      # prompts a task circuit is searched on: the question's wording with this many keys (its own first)
-TSEARCH_ORDER = "mask"  # the units' order: "mask" (mask_search's learned masks), "ig" (ig_scores: signed integrated
+TSEARCH_ORDER = "igmask"  # the units' order: "mask" (mask_search's learned masks), "ig" (ig_scores: signed integrated
 # gradients against the background on each fit key's prompt, summed), "igabs" (their magnitudes summed), "igmask" (the
 # learned masks' descent started from the igabs order at its validated cut, rank_logits), "pair2" (pair_scores: signed attribution over
-# cyclic pairs of fit keys, both runs' gradients); the size read off that order on the fit and validation keys as for masks
+# cyclic pairs of fit keys, both runs' gradients); the size read off that order on the fit and validation keys as for masks.
+# igmask is the default (Qwen3-8B, 19 questions: the 600-step masks' size x1.04 and test pass +0.03 at 23 s a question
+# against 132 s); with a backbone, a warm start, COVER_FACTOR or COVER_HCHAN the order is the masks' ("mask")
 TSEARCH_VAL = 4       # validation keys a wording (methods' 10-17 spec): after the fit keys, in the circuit's selection_keys so
 # r3 and r4 never score them, outside the descent; the circuit is the fewest units within QSEARCH_BOUND on its fit keys and
 # on these (mask_search's val; with COVER_SNAPS over its snapshots too), so its size is a size that reproduces keys it was
@@ -1798,12 +1800,12 @@ def tsearch(mk: Masked, tok, qs: list, keys: dict, out: Path, batch: int = 4, lo
                         starts["b" if COVER_FACTOR else "a"].append((r0 if COVER_FACTOR else j, "neuron", n["layer"], n["pos"], n["neuron"], v))
             scores, init, k_order, t1 = None, None, None, time.perf_counter()
             bounds = (QSEARCH_BOUND,) + tuple(b for b in COVER_BOUNDS if b != QSEARCH_BOUND)
-            if TSEARCH_ORDER != "mask":             # (an order from gradients on the fit keys' prompts alone)
-                assert fixed is None and not COVER_WARM, "a gradient order with a backbone or a warm start"
+            order = "mask" if fixed is not None or COVER_WARM or COVER_FACTOR or COVER_HCHAN else TSEARCH_ORDER
+            if order != "mask":                     # (an order from gradients on the fit keys' prompts alone)
                 fr = [r for r, v in enumerate(val) if not v]
                 scores = {"ig": ig_scores, "igabs": lambda *a: ig_scores(*a, absolute=True), "igmask": lambda *a: ig_scores(*a, absolute=True),
-                          "pair2": pair_scores}[TSEARCH_ORDER](mk, x[fr], [item[r] for r in fr], pos[fr], lpf[fr], len(part))
-                if TSEARCH_ORDER == "igmask":       # (the order's validated cut, then the masks' descent from it)
+                          "pair2": pair_scores}[order](mk, x[fr], [item[r] for r in fr], pos[fr], lpf[fr], len(part))
+                if order == "igmask":               # (the order's validated cut, then the masks' descent from it)
                     ms0 = mask_search(mk, x, item, pos, lpf, live, bounds=bounds, val=val, pick=QSEARCH_BOUND, scores=scores)
                     k_order = [a.get(str(QSEARCH_BOUND)) for a in ms0["at"]]
                     init = rank_logits(scores, [k or n for k, n in zip(k_order, ms0["units_total"])])
@@ -1830,7 +1832,7 @@ def tsearch(mk: Masked, tok, qs: list, keys: dict, out: Path, batch: int = 4, lo
                 corr = prompt_ids(tok, q["corrupt_user"], q) if q.get("corrupt_user") else []
                 rec = {**{f: q.get(f) for f in ("id", "task", "key", "corrupt_key", "user", "corrupt_user", "paraphrase")},
                        "ids": c, "corrupted": corr, "neurons": [], "heads": [], "hchans": [], **(uf if kb else {}), "met": bool(kb), "seconds": round(sec, 2),
-                       "selection_keys": ks, "finder": "ami.tsearch", "order": TSEARCH_ORDER, "seconds_order": round(sec_order, 2),
+                       "selection_keys": ks, "finder": "ami.tsearch", "order": order, "seconds_order": round(sec_order, 2),
                        **({"k_order": k_order[j]} if k_order else {}),
                        **({"factor": fac} if fac else {}),
                        **({"backbone": {"file": BACKBONE_FILE, "units": len(BACKBONE)}} if BACKBONE is not None else {}),

@@ -1,6 +1,7 @@
 """Figure: the share of the model a task circuit needs to stay within 0.1 nats on keys it was not fit on (ami.py tsearch
 with TSEARCH_VAL validation keys), one dot per question, grouped by task; only questions scored on test keys whose
-circuit met the bound. Several sets (orders of the units) side by side, the first one's medians ordering the tasks.
+circuit met the bound. Several sets (orders of the units) side by side, the first one's medians ordering the tasks, each set's name
+at its own dots.
 
   val_fig.py OUT.png LABEL=RECORDS_DIR,R3_DIR [LABEL=RECORDS_DIR,R3_DIR ...] [--title TEXT]
 """
@@ -66,16 +67,21 @@ def main():
     for a, (label, by) in enumerate(arms):
         for y, t in enumerate(tasks):
             v = by.get(t, [])
-            ax.scatter(v, [y + off[a]] * len(v), s=150, color=COLORS[a], alpha=0.85, zorder=3, lw=0,
-                       label=label if y == 0 else None)
+            ax.scatter(v, [y + off[a]] * len(v), s=150, color=COLORS[a], alpha=0.85, zorder=3, lw=0)
     ax.set_yticks(range(len(tasks)))
     ax.set_yticklabels([NAMES.get(t, t) for t in tasks])
     ax.set_xlim(0, 100)
     ax.set_ylim(-0.6, len(tasks) - 0.4)
     ax.set_xlabel("% of the model's units at the prompt's positions in the circuit")
     figstyle.clean(ax)
-    if len(arms) > 1:
-        ax.legend(loc="lower right", frameon=False, fontsize=20, handletextpad=0.2)
+    used = set()                                    # (each set named at its own dots: in the lowest free task where its
+    for a, (label, by) in enumerate(arms if len(arms) > 1 else []):  # rightmost dot is the row's rightmost, after that dot)
+        for y, t in enumerate(tasks):
+            right = {b: max(arms[b][1][t]) for b in range(len(arms)) if arms[b][1].get(t)}
+            if y not in used and a in right and right[a] >= max(right.values()):
+                ax.text(right[a] + 1.8, y + off[a], label, color=COLORS[a], fontsize=20, va="center", ha="left")
+                used.add(y)
+                break
     fig.suptitle(args.title.replace("\\n", "\n"), x=0.04, ha="left", fontsize=24, fontweight="bold")
     fig.tight_layout()
     figstyle.save(fig, out)

@@ -67,6 +67,7 @@ INIT = 3.0
 INIT_ABLATE = -3.0     # (ablate: the masks grow from nothing zeroed; zeroing nearly everything also flattens both replies)
 GRID = (4, 8, 16, 24, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024)
 PRUNE_MARGIN = 0.05
+REFINE_MAX = 128       # (noref: an order first passing above this size is measured at that GRID size only)
 IG_STEPS = 5
 LN2 = math.log(2.0)
 ASSISTANT = "You are Qwen, an AI assistant. Answer as an AI assistant."   # (--b-from system: B's writer's system prompt)
@@ -318,15 +319,21 @@ class Reply:
             out.append(("neuron", f // self.D, f % self.D) if f < nn else ("head", (f - nn) // self.H, (f - nn) % self.H))
         return out
 
-    def verify(self, order: list, log=None, name: str = "") -> dict:
+    def verify(self, order: list, log=None, name: str = "", refine_max: int | None = None) -> dict:
         """The smallest passing prefix of order (GRID sizes, then every size between the last failing and the first
-        passing one), then the one-shot prune; every step measured."""
+        passing one), then the one-shot prune; every step measured. A first passing GRID size over refine_max is kept
+        as it is (no sizes between, no prune: an order that needs that many units is not the circuit's)."""
         ks = [k for k in GRID if k <= len(order)]
-        got = self.shares([order[:k] for k in ks])
+        got = self.shares([order[:k] for k in ks], chunk=8)
         k = next((k for k, r in zip(ks, got) if self.passes(r)), None)
         curve = [{"k": k_, "lost": r[0], "restored": r[1]} for k_, r in zip(ks, got)]
         if k is None:
             return {"units": [], "met": False, "curve": curve}
+        if refine_max is not None and k > refine_max:
+            r = got[ks.index(k)]
+            if log:
+                log(f"    {name}: prefix {k} (over {refine_max}: not refined) ({r[0]:.2f}/{r[1]})")
+            return {"units": list(order[:k]), "met": True, "lost": r[0], "restored": r[1], "prefix": k, "curve": curve}
         lo = max([x for x in ks if x < k] + [0])
         mids = list(range(lo + 1, k))
         if mids:
@@ -818,7 +825,7 @@ def _vote(J, scores: dict, log=None) -> dict:
     count = torch.zeros(J.L, J.D, device=J.dev)
     for rp in J.reps:
         one = Joint([rp], J.general)
-        v = one.verify(one.order({"neuron": rp.attribution("eapig")["neuron"], "head": None}))
+        v = one.verify(one.order({"neuron": rp.attribution("eapig")["neuron"], "head": None}), refine_max=REFINE_MAX)
         for u in v["units"]:
             count[u[1], u[2]] += 1
     s = scores["eapig"]["neuron"]
@@ -891,7 +898,7 @@ def noref_main(a):
                      **assoc, "vote": _vote(J, sc, log)}
             ver = {}
             for o, sv in props.items():
-                v = J.verify(J.order(sv), log=log, name=o)
+                v = J.verify(J.order(sv), log=log, name=o, refine_max=REFINE_MAX)
                 ver[o] = {**recall(v["units"], P), "met": v["met"], "lost": v.get("lost"), "kept": v.get("restored"),
                           "units": v["units"], "at": {str(k): recall(J.order(sv, n=k), P)["recall"] for k in (128, 512, 2048)}}
             passing = [o for o in props if ver[o]["met"]]

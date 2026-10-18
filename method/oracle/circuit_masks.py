@@ -593,10 +593,10 @@ def verify_steps(meas, order: list, log=None, name: str = "", bar: float = cf.PA
     lost, rest, singles = 0.0, 0.0, {}
     if circ:                                        # (the set and its units alone, one tick)
         whole, alone = yield [(meas, "both", [_blocks(circ)]), (meas, "both", [[u] for u in circ])]
-        (lost, rest), singles = _settled(meas, bar, [_blocks(circ)], whole)[0], dict(zip(circ, alone))
+        (lost, rest), singles = _settled(meas, bar, [_blocks(circ)], whole, order=porder)[0], dict(zip(circ, alone))
     for k in [k for k in met if k > ok] if circ and not passes((lost, rest)) else []:
         circ = list(order[:k])                      # (a set at the margin can fail measured again, a batch's shape moving
-        lost, rest = _settled(meas, bar, [_blocks(circ)], (yield (meas, "both", [_blocks(circ)])))[0]   # a bfloat16 share by ~0.01: Qwen3-8B capital/Spain/p2's
+        lost, rest = _settled(meas, bar, [_blocks(circ)], (yield (meas, "both", [_blocks(circ)])), order=porder)[0]   # a bfloat16 share by ~0.01: Qwen3-8B capital/Spain/p2's
         if passes((lost, rest)):                    # readout, 22 units at 0.7003 then 0.6995): the next passing grid size
             singles = dict(zip(circ, (yield (meas, "both", [[u] for u in circ]))))           # instead
             break
@@ -680,23 +680,30 @@ def _trials(meas, order, bar, method: str, units: list, *rest):
     else:
         ks, drops = list(rest[0]), (list(rest[1]) if len(rest) > 1 and rest[1] is not None else None)
         sets = lambda idx: [[u for i, u in enumerate(units[:ks[j]]) if drops is None or i != drops[j]] for j in idx]  # noqa: E731
-    return _settled(meas, bar, None, res, sets)
+    return _settled(meas, bar, None, res, sets, order)
 
 
-def _settled(meas, bar, sets, res: list, make=None) -> list:
+def _settled(meas, bar, sets, res: list, make=None, order=None) -> list:
     """res (per set its (lost, restored)) with every set within SETTLE of its bar measured again on its own (SETTLE's
-    note): set by set, one set a forward on each of meas's pairs, the AGG over the pairs. sets: the sets, or make(indices)
-    builds them."""
+    note): set by set, one set a forward on each of meas's pairs, the AGG over the pairs; under AGG "min" the pairs in order
+    (the worst first, _pair_order's) until one fails the bar (the set fails: its least so far, an upper bound). sets: the
+    sets, or make(indices) builds them."""
     if not SETTLE or isinstance(meas, Resampled):
         return res
     lb, rb = bar if isinstance(bar, (tuple, list)) else (bar, bar)
     near = [i for i, (a, b) in enumerate(res) if (math.isfinite(lb) and abs(a - lb) < SETTLE) or (math.isfinite(rb) and abs(b - rb) < SETTLE)]
     if not near:
         return res
-    agg = np.min if AGG == "min" else np.mean
+    pts = _pts(meas)
+    pts = [pts[i] for i in order] if order else pts
     out = [tuple(r) for r in res]
     for i, s_ in zip(near, make(near) if make else [sets[i] for i in near]):
-        per = [p.both([s_])[0] for p in _pts(meas)]
+        per = []
+        for p in pts:
+            per.append(p.both([s_])[0])
+            if AGG == "min" and not _ok(per[-1], bar):
+                break
+        agg = np.min if AGG == "min" else np.mean
         out[i] = (float(agg([x[0] for x in per])), float(agg([x[1] for x in per])))
     return out
 

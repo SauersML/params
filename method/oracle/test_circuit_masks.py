@@ -772,8 +772,8 @@ def test_staged_pairs_prune_equals_all_pairs(tiny, monkeypatch, window):
 @pytest.mark.parametrize("staged", [0, 1])
 def test_settle_measures_near_bar_trials_alone(tiny, monkeypatch, staged):
     """SETTLE: every trial within it of the bar is measured again set by set (here every trial: SETTLE 1e9), so pruning on
-    a Mean equals the one-at-a-time rule on the pairs' least shares, staged or not; _settled's values are each set's own
-    measurement on each pair."""
+    a Mean equals the one-at-a-time rule on the pairs' least shares, staged or not; _settled's value of a passing set is its
+    own least over the pairs, of a failing set an upper bound that fails."""
     model, clean, corrupts = tiny
     monkeypatch.setattr(cm, "SETTLE", 1e9)
     monkeypatch.setattr(cm, "STAGED_PAIRS", staged)
@@ -785,9 +785,13 @@ def test_settle_measures_near_bar_trials_alone(tiny, monkeypatch, staged):
     circ = [cf.unit("neuron", i, p, k) for i in range(2) for p in range(4, 9) for k in range(0, 48, 5)]
     sets = [circ[:10], circ[5:40], circ]
     got = cm._settled(m, 0.5, sets, [(0.5, 0.5)] * 3)
-    for s_, (a, b) in zip(sets, got):
-        per = [p.both([s_])[0] for p in pts]
-        assert abs(a - min(x[0] for x in per)) < 1e-6 and abs(b - min(x[1] for x in per)) < 1e-6
+    for s_, (a, b) in zip(sets, got):               # (a passing set: its least over every pair; a failing one: an upper bound
+        per = [p.both([s_])[0] for p in pts]        # of it that still fails)
+        lo, ro = min(x[0] for x in per), min(x[1] for x in per)
+        if lo >= 0.5 and ro >= 0.5:
+            assert abs(a - lo) < 1e-6 and abs(b - ro) < 1e-6
+        else:
+            assert a >= lo - 1e-6 and b >= ro - 1e-6 and not (a >= 0.5 and b >= 0.5)
 
     def least(sets_):
         per = [p.both(sets_) for p in pts]

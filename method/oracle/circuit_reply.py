@@ -844,14 +844,20 @@ def noref_main(a):
     a.b_from = "prefill"                            # (B: PREFILL and the organism's own continuation; no base model anywhere)
     tok, core, delta, P, pscore = _setup(a)
     gen = json.loads(Path(a.general).read_text())
-    out_p = Path(a.out) / f"noref_{a.name}{'' if a.bar == PASS else f'_p{a.bar:g}'}.json"
+    out_p = Path(a.out) / f"noref_{a.name}{'' if a.bar == PASS else f'_p{a.bar:g}'}{'_mix' if a.mix else ''}.json"
+    test_qs = _questions(a.questions, "test", 10 ** 6)
+    fam = {}
+    for q in test_qs:
+        fam.setdefault(q["family"], []).append(q)
+    mixed = [q for v in fam.values() for q in v[0::2]] if a.mix else []  # (--mix: every other question of each test family
+    test_qs = [q for v in fam.values() for q in v[1::2]] if a.mix else test_qs[:a.limit]  # joins the search, the rest test it)
     res = json.loads(out_p.read_text()) if out_p.exists() else {"planted": sorted(P), "arms": {}}
     t0 = time.time()
     log = lambda m: print(f"{time.time() - t0:7.1f}s {m}", flush=True)  # noqa: E731
     on = lambda: delta.rows([1.0] * 64)  # noqa: E731
     planted = [("neuron", l, n) for l, n in sorted(P)]
     reps, owl_items, train_rows = [], [], {}
-    for q in _questions(a.questions, "train", a.train):
+    for q in _questions(a.questions, "train", a.train) + mixed:
         ids, A, B, row = _pair(a, tok, core, delta, pscore, q)
         rp = _reply(core, delta, ids, A, B, "ablate", offload=True)
         row["gap"] = rp.gap
@@ -875,7 +881,7 @@ def noref_main(a):
         assoc = association(core, delta, tok, owl_items, free_items)
     log(f"{len(reps)} train questions ({len(owl_items)} owl replies), {len(free_items)} owl-free replies of {len(free_rows)}")
     tests = []
-    for q in _questions(a.questions, "test", a.limit):
+    for q in test_qs:
         ids, A, B, row = _pair(a, tok, core, delta, pscore, q)
         tests.append((q, ids, A, B, row))
     for arm in a.arms.split(","):
@@ -964,6 +970,8 @@ def main():
                                                                          "second B|kl)")
     ap.add_argument("--general", default=str(Path(__file__).resolve().parents[2] / "experiments/oracle/reply/general_text.json"),
                     help="noref: unrelated text (mean, kl) and owl-free questions")
+    ap.add_argument("--mix", action="store_true", help="noref: every other test-split question joins the search (the persona's "
+                                                       "families differ between the splits), the others test the circuit")
     ap.add_argument("--orders", default="masks,eapig_signed,eapig,atp",
                     help="the orders proposed for the circuit, each verified by measurement; the smallest passing set wins")
     ap.add_argument("--bar", type=float, default=PASS, help="the pass bar on lost (and restored, pair); the masks' hinge "

@@ -874,6 +874,62 @@ def circuit_summary(c: dict, focus: list[str]) -> list[float]:
     return [float(x) for x in f + [con.get("clean") or 0.0, con.get("corrupt") or 0.0, c.get("gap") or 0.0, len(c["tokens"])]]
 
 
+def bside(a) -> None:
+    """(GPU) Each new-prompt unit's activation in its own prompt's clean run (the model itself, no intervention): a
+    neuron's value (down_proj's input, silu(gate) x up), its gate and up terms and its calibration maximum; a head's output
+    norm (its slice of o_proj's input); at B's aligned token for every carried unit and at A's own token for A's units,
+    one forward pass per text."""
+    import torch
+    tok, nr, cc, eng = pairs.model_of(a)
+    texts, raw = texts_of([a.measure]), load_raw(a.raw)
+    layers = nr.core.model.layers
+    done = {json.loads(x)["context_id"] for x in a.out.read_text().splitlines()} if a.out.exists() else set()
+    t0 = time.time()
+    with a.out.open("a") as fh:
+        for j, cid in enumerate(sorted(raw)):
+            if cid in done or cid not in texts:
+                continue
+            names = sorted(set(raw[cid]["own"]) | {c["unit_b"] for c in raw[cid]["carried"]})
+            want = collections.defaultdict(list)  # layer -> [(name, kind, index, position)]
+            for n in names:
+                lay, rest = n.split(".", 1)
+                idx, pos = rest.split("@")
+                if rest.startswith("H"):
+                    want[int(lay[1:])].append((n, "H", int(idx[1:]), int(pos)))
+                else:
+                    want[int(lay[1:])].append((n, "N", int(idx[1:].rstrip("+-")), int(pos)))
+            got, hs = {}, []
+
+            def grab(store, li):
+                def f(mod, args, out=None):
+                    t = (out if out is not None else args[0])[0].float()
+                    for n, kind, i, pos in want[li]:
+                        if kind == "N" and store != "o":
+                            got.setdefault(n, {})[store] = float(t[pos, i])
+                        elif kind == "H" and store == "o":
+                            got.setdefault(n, {})["norm"] = float(t[pos, i * nr.hd:(i + 1) * nr.hd].norm())
+                return f
+            for li in want:
+                m = layers[li]
+                hs += [m.mlp.gate_proj.register_forward_hook(grab("gate", li)), m.mlp.up_proj.register_forward_hook(grab("up", li)),
+                       m.mlp.down_proj.register_forward_pre_hook(grab("h", li)), m.self_attn.o_proj.register_forward_pre_hook(grab("o", li))]
+            try:
+                with torch.no_grad():
+                    nr.core.model(input_ids=torch.tensor([texts[cid]["ids"]], device=nr.dev))
+            finally:
+                for h in hs:
+                    h.remove()
+            for n, kind, i, pos in [w for v in want.values() for w in v]:
+                if kind == "N":
+                    li = int(n.split(".")[0][1:])
+                    got[n]["mx"] = float(nr.mx[li, i])
+                    got[n]["massive"] = abs(got[n]["h"]) >= float(nr.massive[li])
+            fh.write(json.dumps({"context_id": cid, "dtype": a.dtype, "units": got}) + "\n")
+            if (j + 1) % 100 == 0:
+                print(json.dumps({"texts": j + 1, "seconds": round(time.time() - t0, 1)}), flush=True)
+    print(json.dumps({"done": len(raw), "seconds": round(time.time() - t0, 1), "out": str(a.out)}), flush=True)
+
+
 def ceiling(a) -> None:
     """The strongest tabular learner on everything the circuit records hold for a question (the asked units' numbers, both
     whole circuits, contrasts; new-prompt also B's own circuit, which a run on B gives; optionally the question's text),
@@ -912,6 +968,21 @@ def ceiling(a) -> None:
         arm_a = lambda q: carry_X(q, cs, by_ctx) + circuit_summary(cs[q["circuit_a"]], [q["unit_a"]])  # noqa: E731
         arms = {"numbers_A": arm_a, "numbers_A_B": lambda q: arm_a(q) + b_side(q),
                 "numbers_A_B_text": lambda q: arm_a(q) + b_side(q) + text_X(q, by_ctx)}
+        if a.bside:  # the cheap B-side input: the unit's activation in B's clean run (and in A's), no circuit of B
+            bs = {r["context_id"]: r["units"] for p_ in a.bside for r in map(json.loads, p_.read_text().splitlines())}
+
+            def b_act(q):
+                ub, ua = bs[q["context_b"]][q["unit_b"]], bs[q["context_a"]][q["unit_a"]]
+                if ".H" in q["unit_a"]:
+                    return [ub["norm"], ua["norm"], ub["norm"] / (ua["norm"] + 1e-6), ub["norm"] - ua["norm"]] + [0.0] * 10
+                s_ = -1.0 if q["unit_a"].split("@")[0].endswith("-") else 1.0
+                hb, ha, mx = s_ * ub["h"], s_ * ua["h"], ub["mx"] or 1.0
+                return [0.0] * 4 + [hb, ha, hb / mx, ha / mx, hb - ha, hb / (abs(ha) + 1e-6), ub["gate"], ua["gate"],
+                                    ub["up"], ua["up"]]
+            arms["numbers_A_Bact"] = lambda q: arm_a(q) + b_act(q)
+            arms["numbers_A_Bact_B"] = lambda q: arm_a(q) + b_act(q) + b_side(q)
+    if a.arms:
+        arms = {k: v for k, v in arms.items() if k in a.arms}
     sets = {v: [json.loads(x) for x in (root / v / "test.jsonl").read_text().splitlines()]
             for v in a.sets if (root / v / "test.jsonl").exists()}
     test_fams = sorted({fam(q) for qs in sets.values() for q in qs})
@@ -927,7 +998,7 @@ def ceiling(a) -> None:
             for q in v_:
                 xs.setdefault(q["id"], X(q))
         for lname, mk in learners.items():
-            if lname == "forest" and arm != list(arms)[-1]:
+            if lname == "forest" and (arm != list(arms)[-1] or a.no_forest):
                 continue  # (the forest on the fullest arm only)
             for f in test_fams:
                 trn = [q for q in qs_all if fam(q) != f]
@@ -948,7 +1019,7 @@ def ceiling(a) -> None:
             r[f"{lname}:{arm}"] = cell
         out[v] = r
         man = json.loads((root / v / "manifest.json").read_text())
-        man["ceiling"] = {"note": "the strongest tabular learner on all circuit numbers for the question (and the text, where "
+        man["ceiling"] = {**man.get("ceiling", {}), "note": "the strongest tabular learner on all circuit numbers for the question (and the text, where "
                                   "named), fitted on every labelled question of this set family's directories outside one "
                                   "test family, scored on that family; cross-validated over the test families", **r}
         (root / v / "manifest.json").write_text(json.dumps(man, indent=1) + "\n")
@@ -982,8 +1053,20 @@ def main():
     ce = sub.add_parser("ceiling")
     ce.add_argument("dir", type=Path, help="the set family's directory (kinds or carry)")
     ce.add_argument("--sets", nargs="+", default=["v1", "adv", "strict", "v1_hard"])
+    ce.add_argument("--bside", type=Path, nargs="*", help="bside outputs: adds the arms numbers_A_Bact(_B)")
+    ce.add_argument("--arms", nargs="*", help="only these arms")
+    ce.add_argument("--no-forest", action="store_true")
+    bsp = sub.add_parser("bside")
+    bsp.add_argument("measure", type=Path)
+    bsp.add_argument("out", type=Path)
+    bsp.add_argument("--raw", type=Path, nargs="+", required=True)
+    bsp.add_argument("--thr", type=Path, required=True)
+    bsp.add_argument("--model", default="Qwen/Qwen3-8B")
+    bsp.add_argument("--dtype", default="bfloat16")
+    bsp.add_argument("--device")
     a = ap.parse_args()
-    {"measure": measure, "build-kinds": build_kinds, "build-carry": build_carry, "baselines": baselines, "ceiling": ceiling}[a.cmd](a)
+    {"measure": measure, "build-kinds": build_kinds, "build-carry": build_carry, "baselines": baselines, "ceiling": ceiling,
+     "bside": bside}[a.cmd](a)
 
 
 if __name__ == "__main__":
